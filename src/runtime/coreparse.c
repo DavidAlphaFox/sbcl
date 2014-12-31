@@ -383,6 +383,7 @@ process_directory(int fd, lispobj *ptr, int count, os_vm_offset_t file_offset)
     }
 }
 
+//开始加载lisp的Core文件
 lispobj
 load_core_file(char *file, os_vm_offset_t file_offset)
 {
@@ -401,6 +402,7 @@ load_core_file(char *file, os_vm_offset_t file_offset)
     }
 
     lseek(fd, file_offset, SEEK_SET);
+    //分配出来一个内存页
     header = calloc(os_vm_page_size, 1);
 
     count = read(fd, header, os_vm_page_size);
@@ -418,7 +420,7 @@ load_core_file(char *file, os_vm_offset_t file_offset)
              CORE_MAGIC);
     }
     SHOW("found CORE_MAGIC");
-
+    //扫描文件，寻找初始化函数的地址
     while (val != END_CORE_ENTRY_TYPE_CODE) {
         val = *ptr++;
         len = *ptr++;

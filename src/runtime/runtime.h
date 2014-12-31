@@ -231,6 +231,8 @@ typedef intptr_t  sword_t;
 
 /* FIXME: we do things this way because of the alpha32 port.  once
    alpha64 has arrived, all this nastiness can go away */
+//定义指针为lispobj
+//不是struct?
 #if 64 == N_WORD_BITS
 #define LOW_WORD(c) ((pointer_sized_uint_t)c)
 #define OBJ_FMTX "lx"

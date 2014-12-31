@@ -770,7 +770,7 @@ create_thread_struct(lispobj initial_function) {
     th->stepping = NIL;
     return th;
 }
-
+//创建主线程
 void create_initial_thread(lispobj initial_function) {
     struct thread *th=create_thread_struct(initial_function);
 #ifdef LISP_FEATURE_SB_THREAD
