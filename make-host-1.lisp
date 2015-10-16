@@ -4,7 +4,8 @@
 ;;; enormous (or infinitely circular) low-level representations of
 ;;; things.)
 (setf *print-level* 5 *print-length* 5)
-
+;; 使用冷编译，需要用别的lisp先编译出来一个sbcl的交叉编译环境
+;; 这个时候，只能使用标准的lisp环境，还不能使用sbcl所特有的特性
 (load "src/cold/shared.lisp")
 (load "tools-for-build/ldso-stubs.lisp")
 (in-package "SB-COLD")

@@ -110,6 +110,9 @@
 ;;; In order to refer to target features specifically, we refer to
 ;;; *SHEBANG-FEATURES* instead of *FEATURES*, and use the #!+ and #!-
 ;;; readmacros instead of the ordinary #+ and #- readmacros.
+;;; 当进行交叉编译的时候，我们使用*shebang-features*来代表target的lisp的特性
+;;; 并用#!+和#!-来代替传统的读取宏
+
 (setf *shebang-features*
       (let* ((default-features
                (funcall (compile
@@ -141,7 +144,7 @@
   (format t
           "target backend-subfeatures *SHEBANG-BACKEND-FEATURES*=~@<~S~:>~%"
           *shebang-backend-subfeatures*))
-
+;;;判断硬件平台
 (let ((arch (intersection '(:alpha :arm :hppa :mips :ppc :sparc :x86 :x86-64)
                           *shebang-features*)))
   (cond ((not arch) (error "No architecture selected"))
@@ -151,6 +154,7 @@
 ;;; fail until quite a ways into the build.  Pick off the more obvious
 ;;; combinations now, and provide a description of what the actual
 ;;; failure is (not always obvious from when the build fails).
+;;; 特性测试，某些特性在某些平台上是无法实现的
 (let ((feature-compatibility-tests
        '(("(and sb-thread (not gencgc))"
           ":SB-THREAD requires :GENCGC")
