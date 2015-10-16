@@ -90,6 +90,9 @@ void update_thread_state_from_context(x86_thread_state64_t *thread_state,
 }
 
 /* Modify a context to push new data on its stack. */
+//修改栈帧
+//%rsp  X64栈指针寄存器，指向栈顶
+//将数据压入栈顶，X86/X64的栈是从高地址向低地址增长的
 void push_context(u64 data, x86_thread_state64_t *context)
 {
     u64 *stack_pointer;
@@ -98,7 +101,7 @@ void push_context(u64 data, x86_thread_state64_t *context)
     *(--stack_pointer) = data;
     context->rsp = (u64) stack_pointer;
 }
-
+//对齐线程栈
 void align_context_stack(x86_thread_state64_t *context)
 {
     /* 16byte align the stack (provided that the stack is, as it
@@ -147,6 +150,9 @@ void open_stack_allocation(x86_thread_state64_t *context)
 /* Stack allocation of data starts with a context with a mod-16 ESP
  * value and reserves some space on it by manipulating the ESP
  * register. */
+//从栈上分配下来段内存
+//%esp X32栈指针寄存器，指向栈顶
+//需要保证16 byte的对齐
 void *stack_allocate(x86_thread_state64_t *context, size_t size)
 {
     /* round up size to 16byte multiple */
