@@ -234,14 +234,14 @@ typedef intptr_t  sword_t;
 //定义指针为lispobj
 //不是struct?
 #if 64 == N_WORD_BITS
-#define LOW_WORD(c) ((pointer_sized_uint_t)c)
-#define OBJ_FMTX "lx"
-typedef uintptr_t lispobj;
+  #define LOW_WORD(c) ((pointer_sized_uint_t)c)
+  #define OBJ_FMTX "lx"
+  typedef uintptr_t lispobj;
 #else
-#define OBJ_FMTX "x"
-#define LOW_WORD(c) ((long)(c) & 0xFFFFFFFFL)
-/* fake it on alpha32 */
-typedef unsigned int lispobj;
+  #define OBJ_FMTX "x"
+  #define LOW_WORD(c) ((long)(c) & 0xFFFFFFFFL)
+  /* fake it on alpha32 */
+  typedef unsigned int lispobj;
 #endif
 
 static inline int

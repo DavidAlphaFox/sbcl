@@ -22,7 +22,7 @@
 (defpackage "SB-COLD" (:use "CL"))
 
 (in-package "SB-COLD")
-
+;; 定义sb-cold包，并切换到sb-cold包中
 ;;; prefixes for filename stems when cross-compiling. These are quite arbitrary
 ;;; (although of course they shouldn't collide with anything we don't want to
 ;;; write over). In particular, they can be either relative path names (e.g.
@@ -94,6 +94,7 @@
 
 ;;; other miscellaneous tools
 (load "src/cold/read-from-file.lisp")
+;; 从文件将表达式读取出来
 (load "src/cold/rename-package-carefully.lisp")
 (load "src/cold/with-stuff.lisp")
 
