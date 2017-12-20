@@ -379,6 +379,9 @@ os_map(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
 void
 os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
 {
+  // 使用mprotect来分配页面
+  // 可以通过PROT_EXEC来指定页面可执行
+  // JIT都是将代码放在可执行页面中来完成代码注入
     if (mprotect(address, length, prot) == -1) {
         if (errno == ENOMEM) {
             lose("An mprotect call failed with ENOMEM. This probably means that the maximum amount\n"
