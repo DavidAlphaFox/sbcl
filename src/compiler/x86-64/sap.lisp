@@ -99,6 +99,8 @@
   (:translate int-sap)
   (:policy :fast-safe)
   (:generator 1
+    ;; 直接将整形移入特定内存，不进行make_lispobj或make_fixn
+    ;; 用于处理真实的内存地址
     (move sap int)))
 
 ;;;; POINTER+ and POINTER-
@@ -351,4 +353,3 @@
       (if (location= sap vector)
           (inst add sap disp)
           (inst lea sap (make-ea :qword :base vector :disp disp))))))
-

@@ -322,7 +322,7 @@ make_lispobj(void *o, int low_tag)
 {
     return LOW_WORD(o) | low_tag;
 }
-
+// 将地址转成固定值
 #define MAKE_FIXNUM(n) (n << N_FIXNUM_TAG_BITS)
 static inline lispobj
 make_fixnum(sword_t n)

@@ -131,12 +131,14 @@ alloc_number(sword_t n)
     struct bignum *ptr;
 
     if (-0x20000000 < n && n < 0x20000000)
+        // 在这个大小范围内直接用fixnum来表示，是不会有溢出的
         return make_fixnum(n);
     else {
+        // 剩余的情况需要使用bignum 结构进行封装处理
         ptr = (struct bignum *)alloc_unboxed(BIGNUM_WIDETAG, 1);
 
         ptr->digits[0] = n;
-
+        // 返回一个lispobj对象
         return make_lispobj(ptr, OTHER_POINTER_LOWTAG);
     }
 }
