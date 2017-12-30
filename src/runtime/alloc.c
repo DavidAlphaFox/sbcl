@@ -124,7 +124,7 @@ alloc_unboxed(int type, int words)
     *result = (lispobj) (words << N_WIDETAG_BITS) | type;
     return result;
 }
-
+// 分配数字类型
 lispobj
 alloc_number(sword_t n)
 {
@@ -142,7 +142,7 @@ alloc_number(sword_t n)
         return make_lispobj(ptr, OTHER_POINTER_LOWTAG);
     }
 }
-
+// 分配代码类型
 lispobj
 alloc_code_object (unsigned boxed, unsigned unboxed) {
     struct code * code;

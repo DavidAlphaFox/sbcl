@@ -22,6 +22,7 @@
 #include "interrupt.h"
 
 /* This is implemented in assembly language and called from C: */
+// 使用汇编进行堆栈修改
 extern lispobj call_into_lisp(lispobj fun, lispobj *args, int nargs)
 #ifdef LISP_FEATURE_X86_64
     __attribute__((sysv_abi))

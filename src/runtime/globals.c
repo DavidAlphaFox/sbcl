@@ -55,7 +55,7 @@ lispobj *current_dynamic_space;
 #if defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_GCC_TLS)
 pthread_key_t specials=0;
 #endif
-
+// 全局初始化
 void globals_init(void)
 {
     /* Space, stack, and free pointer vars are initialized by
@@ -83,6 +83,7 @@ void globals_init(void)
 #endif
 
 #if defined(LISP_FEATURE_SB_THREAD) && !defined(LISP_FEATURE_GCC_TLS)
+  // 线程绑定变量
     pthread_key_create(&specials,0);
 #endif
 }
