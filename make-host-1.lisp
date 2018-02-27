@@ -34,7 +34,7 @@
 (sb-cold::slurp-ucd)
 (sb-cold::slurp-proplist)
 (sb-cold::output)
-
+;;; 根据编译环境生成C语言需要的底层定义
 ;;; propagate structure offset and other information to the C runtime
 ;;; support code.
 (host-cload-stem "src/compiler/generic/genesis" nil)

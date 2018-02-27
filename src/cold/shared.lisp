@@ -14,7 +14,7 @@
 ;;;; public domain. The software is in the public domain and is
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
-
+;;; 用来构建最开始的sbcl核心文件
 ;;; SB-COLD holds stuff used to build the initial SBCL core file
 ;;; (including not only the final construction of the core file, but
 ;;; also the preliminary steps like e.g. building the cross-compiler

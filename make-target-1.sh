@@ -29,7 +29,7 @@ if [ -n "$SBCL_HOST_LOCATION" ]; then
     rsync -a "$SBCL_HOST_LOCATION/src/runtime/genesis" src/runtime
     rsync -a "$SBCL_HOST_LOCATION/src/runtime/ldso-stubs.S" src/runtime/
 fi
-
+### 生成SBCL的runtime程序和symbol表
 # Build the runtime system and symbol table (.nm) file.
 #
 # (This C build has to come after the first genesis in order to get

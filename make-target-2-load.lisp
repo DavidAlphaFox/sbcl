@@ -1,7 +1,7 @@
 ;;; Now that we use the compiler for macros, interpreted /SHOW doesn't
 ;;; work until later in init.
 #+sb-show (print "/hello, world!")
-
+;;; 使用新生成的sbcl环境，将cold的core生成为sbcl的warm core
 ;;; Do warm init without compiling files.
 (defvar *compile-files-p* nil)
 #+sb-show (print "/about to LOAD warm.lisp (with *compile-files-p* = NIL)")

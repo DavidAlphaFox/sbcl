@@ -1,4 +1,5 @@
 ;;; Set up the cross-compiler.
+;;; 生成SBCL的交叉编译环境，这次主要生成lisp层的代码
 (setf *print-level* 5 *print-length* 5)
 (load "src/cold/shared.lisp")
 (in-package "SB-COLD")
