@@ -9,10 +9,21 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(defun lowest-set-bit-index (integer-value)
-  (max 0 (1- (integer-length (logand integer-value (- integer-value))))))
+(defun repeating-pattern-p (val)
+  (declare (type (unsigned-byte 32) val))
+  (and (= (ldb (byte 16 0) val)
+          (ldb (byte 16 16) val))
+       (not (encodable-immediate (ldb (byte 16 16) val)))))
+
+;;; This should be put into composite-immediate-instruction, but that
+;;; macro is too scary.
+(defun load-repeating-pattern (dest val)
+  (declare (type (signed-byte 32) val))
+  (inst mov dest (ldb (byte 8 0) val))
+  (inst orr dest dest (mask-field (byte 8 8) val))
+  (inst orr dest dest (lsl dest 16)))
 
 (defun load-immediate-word (y val)
   (cond ((let ((unsigned (ldb (byte 32 0) val)))
@@ -25,6 +36,8 @@
              t)))
         ((< val 0)
          (composite-immediate-instruction bic y y val :first-op mvn :first-no-source t :invert-y t))
+        ((repeating-pattern-p val)
+         (load-repeating-pattern y val))
         (t
          (composite-immediate-instruction orr y y val :first-op mov :first-no-source t))))
 
@@ -58,7 +71,7 @@
 (define-move-fun (load-system-area-pointer 1) (vop x y)
   ((immediate) (sap-reg))
   (let ((immediate-label (gen-label)))
-    (assemble (*elsewhere*)
+    (assemble (:elsewhere)
       (emit-label immediate-label)
       (inst word (sap-int (tn-value x))))
     (inst ldr y (@ immediate-label))))
@@ -83,8 +96,7 @@
    (sap-stack) (sap-reg)
    (signed-stack) (signed-reg)
    (unsigned-stack) (unsigned-reg))
-  (let ((nfp (current-nfp-tn vop)))
-    (loadw y nfp (tn-offset x))))
+  (load-stack-offset y (current-nfp-tn vop) x))
 
 (define-move-fun (store-stack 5) (vop x y)
   ((any-reg descriptor-reg) (control-stack))
@@ -95,8 +107,7 @@
    (sap-reg) (sap-stack)
    (signed-reg) (signed-stack)
    (unsigned-reg) (unsigned-stack))
-  (let ((nfp (current-nfp-tn vop)))
-    (storew x nfp (tn-offset y))))
+  (store-stack-offset x (current-nfp-tn vop) y))
 
 
 ;;;; The Move VOP:
@@ -104,21 +115,18 @@
   (:args (x :target y
             :scs (any-reg descriptor-reg null)
             :load-if (not (location= x y))))
-  (:results (y :scs (any-reg descriptor-reg)
+  (:results (y :scs (any-reg descriptor-reg control-stack)
                :load-if (not (location= x y))))
-  (:effects)
-  (:affected)
   (:generator 0
-    (move y x)))
+    (cond ((location= x y))
+          ((sc-is y control-stack)
+           (store-stack-tn y x))
+          (t
+           (move y x)))))
 
 (define-move-vop move :move
   (any-reg descriptor-reg)
   (any-reg descriptor-reg))
-
-;;; Make MOVE the check VOP for T so that type check generation
-;;; doesn't think it is a hairy type.  This also allows checking of a
-;;; few of the values in a continuation to fall out.
-(primitive-type-vop move (:check) t)
 
 ;;; The MOVE-ARG VOP is used for moving descriptor values into another
 ;;; frame for argument or known value passing.
@@ -133,28 +141,11 @@
       ((any-reg descriptor-reg)
        (move y x))
       (control-stack
-       (storew x fp (tn-offset y))))))
+       (store-stack-offset x fp y)))))
 ;;;
 (define-move-vop move-arg :move-arg
   (any-reg descriptor-reg)
   (any-reg descriptor-reg))
-
-
-
-;;;; ILLEGAL-MOVE
-
-;;; This VOP exists just to begin the lifetime of a TN that couldn't
-;;; be written legally due to a type error.  An error is signalled
-;;; before this VOP is so we don't need to do anything (not that there
-;;; would be anything sensible to do anyway.)
-(define-vop (illegal-move)
-  (:args (x) (type))
-  (:results (y))
-  (:ignore y)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 666
-    (error-call vop 'object-not-type-error x type)))
 
 ;;;; Moves and coercions:
 
@@ -181,7 +172,7 @@
   (:vop-var vop)
   (:note "constant load")
   (:generator 1
-    (cond ((sb!c::tn-leaf x)
+    (cond ((sb-c::tn-leaf x)
            (load-immediate-word y (tn-value x)))
           (t
            (load-constant vop x y)
@@ -222,13 +213,11 @@
 ;;; RESULT may be a bignum, so we have to check.  Use a worst-case
 ;;; cost to make sure people know they may be number consing.
 (define-vop (move-from-signed)
-  (:args (arg :scs (signed-reg unsigned-reg) :target x))
+  (:args (x :scs (signed-reg unsigned-reg)))
   (:results (y :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 0)) x)
   (:temporary (:sc non-descriptor-reg :offset ocfp-offset) pa-flag)
   (:note "signed word to integer coercion")
   (:generator 20
-    (move x arg)
     (inst adds pa-flag x x)
     (inst adds :vc y pa-flag pa-flag)
     (inst b :vc DONE)
@@ -239,17 +228,37 @@
 (define-move-vop move-from-signed :move
   (signed-reg) (descriptor-reg))
 
+(define-vop (move-from-fixnum+1)
+  (:args (x :scs (signed-reg unsigned-reg) :target temp))
+  (:results (y :scs (any-reg descriptor-reg)))
+  (:temporary (:scs (non-descriptor-reg) :from (:argument 0)) temp)
+  (:vop-var vop)
+  (:generator 4
+    (inst adds temp x x)
+    (inst adds :vc y temp temp)
+    (inst b :vc DONE)
+    (load-constant vop (emit-constant (1+ sb-xc:most-positive-fixnum))
+                   y)
+    DONE))
+
+(define-vop (move-from-fixnum-1 move-from-fixnum+1)
+  (:generator 4
+    (inst adds temp x x)
+    (inst adds :vc y temp temp)
+    (inst b :vc DONE)
+    (load-constant vop (emit-constant (1- sb-xc:most-negative-fixnum))
+                   y)
+    DONE))
+
 ;;; Check for fixnum, and possibly allocate one or two word bignum
 ;;; result.  Use a worst-case cost to make sure people know they may
 ;;; be number consing.
 (define-vop (move-from-unsigned)
-  (:args (arg :scs (signed-reg unsigned-reg) :target x))
+  (:args (x :scs (signed-reg unsigned-reg)))
   (:results (y :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg) :from (:argument 0)) x)
   (:temporary (:sc non-descriptor-reg :offset ocfp-offset) pa-flag)
   (:note "unsigned word to integer coercion")
   (:generator 20
-    (move x arg)
     (inst tst x (ash (1- (ash 1 (- n-word-bits
                                    n-positive-fixnum-bits)))
                      n-positive-fixnum-bits))
@@ -279,8 +288,6 @@
             :load-if (not (location= x y))))
   (:results (y :scs (signed-reg unsigned-reg)
                :load-if (not (location= x y))))
-  (:effects)
-  (:affected)
   (:note "word integer move")
   (:generator 0
     (move y x)))
@@ -293,7 +300,7 @@
   (:args (x :target y
             :scs (signed-reg unsigned-reg))
          (fp :scs (any-reg)
-             :load-if (not (sc-is y sap-reg))))
+             :load-if (not (sc-is y signed-reg unsigned-reg))))
   (:results (y))
   (:note "word integer argument move")
   (:generator 0
@@ -301,7 +308,7 @@
       ((signed-reg unsigned-reg)
        (move y x))
       ((signed-stack unsigned-stack)
-       (storew x fp (tn-offset y))))))
+       (store-stack-offset x fp y)))))
 (define-move-vop move-word-arg :move-arg
   (descriptor-reg any-reg signed-reg unsigned-reg) (signed-reg unsigned-reg))
 

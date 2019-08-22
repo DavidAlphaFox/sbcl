@@ -9,7 +9,28 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
+
+;;; Regarding several reader-conditionalized MUFFLE-CONDITION declarations
+;;; throughout this file, here's why: Transforms produce sexprs that as far
+;;; as the compiler is concerned could have been user-supplied.
+;;; In as much as the forms mention a type-name, that name had best be
+;;; recognized, or else it's a style-warning (or worse).
+;;; And in cross-compilation, COMPILER-NOTE isn't known early enough for
+;;; the transforms in this file to refer to a known type.
+;;; But mysteriously the xc would report a style-warning about COMPILER-NOTE
+;;; - or any descendant - being unknown, and then go on with life.
+;;; How was this possible? Well, it's only trying to _parse_ the type
+;;; on account of the declarations saying to muffle things of that type.
+;;; Indeed the declaration merits a warning.
+;;; But this is an extremely sad and confusing state of affairs,
+;;; because while we expect some CODE-DELETION-NOTEs, we don't expect to see
+;;; that CODE-DELETION-NOTE is an undefined type.
+;;; Alternatively, we could invent DEFINE!-CONDITION which would cause
+;;; the cross-compiler to be born knowing all the required types.
+;;; Moreover, it would be nice if some of the declarations were commented
+;;; with their reason for existence.
+
 
 ;;;; mapping onto lists: the MAPFOO functions
 
@@ -52,7 +73,11 @@
               (let ((temp (gensym))
                     (map-result (gensym)))
                 `(let ((,map-result
-                        (locally (declare (muffle-conditions compiler-note))
+                        ;; MUFFLE- is not injected when cross-compiling.
+                        ;; See top of file for explanation.
+                        (locally
+                            #-sb-xc-host
+                            (declare (muffle-conditions compiler-note))
                           (list nil))))
                    (declare (truly-dynamic-extent ,map-result))
                    (do-anonymous ((,temp ,map-result) . ,(do-clauses))
@@ -62,15 +87,23 @@
               (let ((temp (gensym))
                     (map-result (gensym)))
                 `(let ((,map-result
-                        (locally (declare (muffle-conditions compiler-note))
+                        ;; MUFFLE- is not injected when cross-compiling.
+                        ;; See top of file for explanation.
+                        (locally
+                            #-sb-xc-host
+                            (declare (muffle-conditions compiler-note))
                           (list nil))))
                    (declare (truly-dynamic-extent ,map-result))
                    (do-anonymous ((,temp ,map-result) . ,(do-clauses))
-                     (,endtest (truly-the list (cdr ,map-result)))
+                     (,endtest
+                      (%rplacd ,temp nil) ;; replace the 0
+                      (truly-the list (cdr ,map-result)))
                      ;; Accumulate using %RPLACD. RPLACD becomes (SETF CDR)
                      ;; which becomes %RPLACD but relies on "defsetfs".
                      ;; This is for effect, not value, so makes no difference.
-                     (%rplacd ,temp (setq ,temp (list ,call)))))))
+                     (%rplacd ,temp (setq ,temp
+                                          ;; 0 is not written to the heap
+                                          (cons ,call 0)))))))
              ((nil)
               `(let ((,n-first ,(first arglists)))
                  (do-anonymous ,(do-clauses)
@@ -113,7 +146,9 @@
                                  (lvar-value result-type-arg)))
                             (if (null result-type-arg-value)
                                 'null
-                                result-type-arg-value)))))
+                                result-type-arg-value))))
+         (result-ctype (ir1-transform-specifier-type
+                        result-type)))
     `(lambda (result-type-arg fun ,@seq-names)
        (truly-the ,result-type
          ,(cond ((policy node (< safety 3))
@@ -125,25 +160,23 @@
                  `(sequence-of-checked-length-given-type ,bare
                                                          result-type-arg))
                 (t
-                 (let ((result-ctype (ir1-transform-specifier-type
-                                      result-type)))
-                   (if (array-type-p result-ctype)
-                       (let ((dims (array-type-dimensions result-ctype)))
-                         (unless (and (listp dims) (= (length dims) 1))
-                           (give-up-ir1-transform "invalid sequence type"))
-                         (let ((dim (first dims)))
-                           (if (eq dim '*)
-                               bare
-                               `(vector-of-checked-length-given-length ,bare
-                                                                       ,dim))))
-                       ;; FIXME: this is wrong, as not all subtypes of
-                       ;; VECTOR are ARRAY-TYPEs [consider, for
-                       ;; example, (OR (VECTOR T 3) (VECTOR T
-                       ;; 4))]. However, it's difficult to see what we
-                       ;; should put here... maybe we should
-                       ;; GIVE-UP-IR1-TRANSFORM if the type is a
-                       ;; subtype of VECTOR but not an ARRAY-TYPE?
-                       bare))))))))
+                 (if (array-type-p result-ctype)
+                     (let ((dims (array-type-dimensions result-ctype)))
+                       (unless (singleton-p dims)
+                         (give-up-ir1-transform "invalid sequence type"))
+                       (let ((dim (first dims)))
+                         (if (eq dim '*)
+                             bare
+                             `(vector-of-checked-length-given-length ,bare
+                                                                     ,dim))))
+                     ;; FIXME: this is wrong, as not all subtypes of
+                     ;; VECTOR are ARRAY-TYPEs [consider, for
+                     ;; example, (OR (VECTOR T 3) (VECTOR T
+                     ;; 4))]. However, it's difficult to see what we
+                     ;; should put here... maybe we should
+                     ;; GIVE-UP-IR1-TRANSFORM if the type is a
+                     ;; subtype of VECTOR but not an ARRAY-TYPE?
+                     bare)))))))
 
 ;;; Return a DO loop, mapping a function FUN to elements of
 ;;; sequences. SEQS is a list of lvars, SEQ-NAMES - list of variables,
@@ -215,54 +248,50 @@
 
 ;;; Try to compile %MAP efficiently when we can determine sequence
 ;;; argument types at compile time.
-;;;
-;;; Note: This transform was written to allow open coding of
-;;; quantifiers by expressing them in terms of (MAP NIL ..). For
-;;; non-NIL values of RESULT-TYPE, it's still useful, but not
-;;; necessarily as efficient as possible. In particular, it will be
-;;; inefficient when RESULT-TYPE is a SIMPLE-ARRAY with specialized
-;;; numeric element types. It should be straightforward to make it
-;;; handle that case more efficiently, but it's left as an exercise to
-;;; the reader, because the code is complicated enough already and I
-;;; don't happen to need that functionality right now. -- WHN 20000410
 (deftransform %map ((result-type fun seq &rest seqs) * *
                     :node node :policy (>= speed space))
   "open code"
   (unless (constant-lvar-p result-type)
     (give-up-ir1-transform "RESULT-TYPE argument not constant"))
-  (labels ( ;; 1-valued SUBTYPEP, fails unless second value of SUBTYPEP is true
-           (fn-1subtypep (fn x y)
-             (multiple-value-bind (subtype-p valid-p) (funcall fn x y)
-               (if valid-p
-                   subtype-p
-                   (give-up-ir1-transform
-                    "can't analyze sequence type relationship"))))
-           (1subtypep (x y) (fn-1subtypep #'sb!xc:subtypep x y)))
+  (flet ( ;; 1-valued SUBTYPEP, fails unless second value of SUBTYPEP is true
+         (1subtypep (x y)
+           (multiple-value-bind (subtype-p valid-p)
+               (csubtypep x (specifier-type y))
+             (if valid-p
+                 subtype-p
+                 (give-up-ir1-transform
+                  "can't analyze sequence type relationship")))))
     (let* ((result-type-value (lvar-value result-type))
+           (result-type-ctype (ir1-transform-specifier-type result-type-value))
            (result-supertype (cond ((null result-type-value) 'null)
-                                   ((1subtypep result-type-value 'vector)
+                                   ((1subtypep result-type-ctype 'vector)
                                     'vector)
-                                   ((1subtypep result-type-value 'list)
+                                   ((1subtypep result-type-ctype 'list)
                                     'list)
                                    (t
                                     (give-up-ir1-transform
                                      "result type unsuitable")))))
-      (cond ((and result-type-value (null seqs))
+      (cond ((and (eq result-supertype 'list) (null seqs))
              ;; The consing arity-1 cases can be implemented
              ;; reasonably efficiently as function calls, and the cost
              ;; of consing should be significantly larger than
              ;; function call overhead, so we always compile these
              ;; cases as full calls regardless of speed-versus-space
              ;; optimization policy.
-             (cond ((subtypep result-type-value 'list)
-                    '(%map-to-list-arity-1 fun seq))
-                   ( ;; (This one can be inefficient due to COERCE, but
-                    ;; the current open-coded implementation has the
-                    ;; same problem.)
-                    (subtypep result-type-value 'vector)
-                    `(coerce (%map-to-simple-vector-arity-1 fun seq)
-                             ',result-type-value))
-                   (t (bug "impossible (?) sequence type"))))
+             '(%map-to-list-arity-1 fun seq))
+            ;; (We use the same idiom, of returning a LAMBDA from
+            ;; DEFTRANSFORM, as is used in the DEFTRANSFORMs for
+            ;; FUNCALL and ALIEN-FUNCALL, and for the same
+            ;; reason: we need to get the runtime values of each
+            ;; of the &REST vars.)
+            ((eq result-supertype 'vector)
+             (let* ((all-seqs (cons seq seqs))
+                    (seq-args (make-gensym-list (length all-seqs))))
+               `(lambda (result-type fun ,@seq-args)
+                  (map-into (make-sequence result-type
+                                           (min ,@(loop for arg in seq-args
+                                                        collect `(length ,arg))))
+                            fun ,@seq-args))))
             (t
              (let* ((all-seqs (cons seq seqs))
                     (seq-args (make-gensym-list (length all-seqs))))
@@ -270,71 +299,83 @@
                    (ecase result-supertype
                      (null (values nil nil))
                      (list (values `(push funcall-result acc)
-                                   `(nreverse acc)))
-                     (vector (values `(push funcall-result acc)
-                                     `(coerce (nreverse acc)
-                                              ',result-type-value))))
-                 ;; (We use the same idiom, of returning a LAMBDA from
-                 ;; DEFTRANSFORM, as is used in the DEFTRANSFORMs for
-                 ;; FUNCALL and ALIEN-FUNCALL, and for the same
-                 ;; reason: we need to get the runtime values of each
-                 ;; of the &REST vars.)
-                 (block nil
-                   (let ((gave-up
-                           (catch 'give-up-ir1-transform
-                             (return
-                               `(lambda (result-type fun ,@seq-args)
-                                  (declare (ignore result-type))
-                                  (let ((fun (%coerce-callable-to-fun fun))
-                                        (acc nil))
-                                    (declare (type list acc))
-                                    (declare (ignorable acc))
-                                    ,(build-sequence-iterator
-                                      all-seqs seq-args
-                                      :result result
-                                      :body push-dacc
-                                      :fast (policy node (> speed space)))))))))
-                     (if (and (null result-type-value) (null seqs))
-                         '(%map-for-effect-arity-1 fun seq)
-                         (throw 'give-up-ir1-transform gave-up)))))))))))
+                                   `(nreverse acc))))
+                 (catch-give-up-ir1-transform
+                     (`(lambda (result-type fun ,@seq-args)
+                         (declare (ignore result-type))
+                         (let ((fun (%coerce-callable-to-fun fun))
+                               (acc nil))
+                           (declare (type list acc))
+                           (declare (ignorable acc))
+                           ,(build-sequence-iterator
+                             all-seqs seq-args
+                             :result result
+                             :body push-dacc
+                             :fast (policy node (> speed space))))))
+                   (if (and (null result-type-value) (null seqs))
+                       '(%map-for-effect-arity-1 fun seq)
+                       (%give-up))))))))))
 
 ;;; MAP-INTO
+(defmacro mapper-from-typecode (typecode)
+  #+sb-xc-host
+  `(svref ,(let ((a (make-array 256)))
+             (dovector (info sb-vm:*specialized-array-element-type-properties* a)
+               (setf (aref a (sb-vm:saetp-typecode info))
+                     (package-symbolicate "SB-IMPL" "VECTOR-MAP-INTO/"
+                                          (sb-vm:saetp-primitive-type-name info)))))
+          ,typecode)
+  #-sb-xc-host
+  `(%fun-name (svref sb-impl::%%vector-map-into-funs%% ,typecode)))
+
 (deftransform map-into ((result fun &rest seqs)
                         (vector * &rest *)
                         * :node node)
   "open code"
-  (let ((seqs-names (mapcar (lambda (x)
-                              (declare (ignore x))
-                              (gensym))
-                            seqs)))
-    `(lambda (result fun ,@seqs-names)
-       ,(if (and (policy node (> speed space))
-                 (not (csubtypep (lvar-type result)
-                                 (specifier-type '(simple-array * 1)))))
-            (let ((data  (gensym "DATA"))
-                  (start (gensym "START"))
-                  (end   (gensym "END")))
-              `(with-array-data ((,data result)
-                                 (,start)
-                                 (,end))
-                 (declare (ignore ,end))
-                 ,(build-sequence-iterator
-                   seqs seqs-names
-                   :result '(when (array-has-fill-pointer-p result)
-                             (setf (fill-pointer result) index))
-                   :into 'result
-                   :body `(locally (declare (optimize (insert-array-bounds-checks 0)))
-                           (setf (aref ,data (truly-the index (+ index ,start)))
-                                 funcall-result))
-                   :fast t)))
-            (build-sequence-iterator
-             seqs seqs-names
-             :result '(when (array-has-fill-pointer-p result)
-                       (setf (fill-pointer result) index))
-             :into 'result
-             :body '(locally (declare (optimize (insert-array-bounds-checks 0)))
-                     (setf (aref result index) funcall-result))))
-       result)))
+  (let* ((seqs-names (make-gensym-list (length seqs)))
+         (result-type (lvar-type result))
+         (non-complex-vector-type-p (csubtypep result-type
+                                               (specifier-type '(simple-array * 1)))))
+    (catch-give-up-ir1-transform
+        (`(lambda (result fun ,@seqs-names)
+            ,(if (and (policy node (> speed space))
+                      (not non-complex-vector-type-p))
+                 (let ((data  (gensym "DATA"))
+                       (start (gensym "START"))
+                       (end   (gensym "END")))
+                   `(with-array-data ((,data result)
+                                      (,start)
+                                      (,end))
+                      (declare (ignore ,end))
+                      ,(build-sequence-iterator
+                        seqs seqs-names
+                        :result '(when (array-has-fill-pointer-p result)
+                                  (setf (fill-pointer result) index))
+                        :into 'result
+                        :body `(locally (declare (optimize (insert-array-bounds-checks 0)))
+                                 (setf (aref ,data (truly-the index (+ index ,start)))
+                                       funcall-result))
+                        :fast t)))
+                 (build-sequence-iterator
+                  seqs seqs-names
+                  :result '(when (array-has-fill-pointer-p result)
+                            (setf (fill-pointer result) index))
+                  :into 'result
+                  :body '(locally (declare (optimize (insert-array-bounds-checks 0)))
+                          (setf (aref result index) funcall-result))))
+            result))
+      (cond ((and non-complex-vector-type-p
+                  (array-type-p result-type)
+                  (not (eq (array-type-specialized-element-type result-type)
+                           *wild-type*)))
+             (let ((saetp (find-saetp-by-ctype (array-type-specialized-element-type result-type))))
+               (unless saetp
+                 (give-up-ir1-transform "Uknown upgraded array element type of the result"))
+               `(progn (,(mapper-from-typecode (sb-vm:saetp-typecode saetp))
+                        result 0 (length result) (%coerce-callable-to-fun fun) seqs)
+                       result)))
+            (t
+             (%give-up))))))
 
 
 ;;; FIXME: once the confusion over doing transforms with known-complex
@@ -362,15 +403,15 @@
              (or end length)
              (sequence-bounding-indices-bad-error vector start end)))))
 
-(def!type eq-comparable-type ()
-  '(or fixnum (not number)))
+(sb-xc:deftype eq-comparable-type ()
+  '(or fixnum #+64-bit single-float (not number)))
 
 ;;; True if EQL comparisons involving type can be simplified to EQ.
 (defun eq-comparable-type-p (type)
   (csubtypep type (specifier-type 'eq-comparable-type)))
 
 (defun specialized-list-seek-function-name (function-name key-functions &optional variant)
-  (or (find-symbol (with-output-to-string (s)
+  (or (find-symbol (with-simple-output-to-string (s)
                      ;; Write "%NAME-FUN1-FUN2-FUN3", etc. Not only is
                      ;; this ever so slightly faster then FORMAT, this
                      ;; way we are also proof against *PRINT-CASE*
@@ -383,7 +424,7 @@
                      (when variant
                        (write-char #\- s)
                        (write-string (symbol-name variant) s)))
-                   (load-time-value (find-package "SB!KERNEL")))
+                   #.(find-package "SB-KERNEL"))
       (bug "Unknown list item seek transform: name=~S, key-functions=~S variant=~S"
            function-name key-functions variant)))
 
@@ -407,7 +448,7 @@
               (null-type (specifier-type 'null)))
           (cond ((csubtypep key-type null-type)
                  (values nil nil))
-                ((csubtypep null-type key-type)
+                ((types-equal-or-intersect null-type key-type)
                  (values key '(if key
                                (%coerce-callable-to-fun key)
                                #'identity)))
@@ -448,7 +489,9 @@
                      (apply #'ensure-lvar-fun-form args))))
         (let* ((cp (constant-lvar-p list))
                (c-list (when cp (lvar-value list))))
-          (cond ((and cp c-list (member name '(assoc rassoc member))
+          (cond ((not (proper-list-p c-list))
+                 (abort-ir1-transform "Argument to ~a is not a proper list." name))
+                ((and cp c-list (member name '(assoc rassoc member))
                       (policy node (>= speed space))
                       (not (nthcdr *list-open-code-limit* c-list)))
                  `(let ,(mapcar (lambda (fun) `(,(second fun) ,(ensure-fun fun))) funs)
@@ -476,7 +519,7 @@
               (null-type (specifier-type 'null)))
           (cond ((csubtypep key-type null-type)
                  (values nil nil))
-                ((csubtypep null-type key-type)
+                ((types-equal-or-intersect null-type key-type)
                  (values key '(if key
                                (%coerce-callable-to-fun key)
                                #'identity)))
@@ -505,7 +548,9 @@
                         ,(open-code (cdr tail))))))
         (let* ((cp (constant-lvar-p list))
                (c-list (when cp (lvar-value list))))
-          (cond ((and cp c-list (policy node (>= speed space))
+          (cond ((and cp c-list
+                      (proper-list-p c-list)
+                      (policy node (>= speed space))
                       (not (nthcdr *list-open-code-limit* c-list)))
                  `(let ((pred ,pred-expr)
                         ,@(when key `((key ,key-form))))
@@ -579,6 +624,91 @@
                     (list t &key (:start t) (:end t)))
   '(list-fill* seq item start end))
 
+(defun find-basher (saetp &optional item node)
+  (let* ((element-type (sb-vm:saetp-specifier saetp))
+         (element-ctype (sb-vm:saetp-ctype saetp))
+         (n-bits (sb-vm:saetp-n-bits saetp))
+         (basher-name (format nil "UB~D-BASH-FILL" n-bits))
+         (basher (or (find-symbol basher-name #.(find-package "SB-KERNEL"))
+                     (abort-ir1-transform
+                      "Unknown fill basher, please report to sbcl-devel: ~A"
+                      basher-name)))
+         (kind (cond ((sb-vm:saetp-fixnum-p saetp) :tagged)
+                     ((member element-type '(character base-char)) :char)
+                     ((eq element-type 'single-float) :single-float)
+                     #+64-bit
+                     ((eq element-type 'double-float) :double-float)
+                     #+64-bit
+                     ((equal element-type '(complex single-float))
+                      :complex-single-float)
+                     (t
+                      (aver (integer-type-p element-ctype))
+                      :bits)))
+         ;; BASH-VALUE is a word that we can repeatedly smash
+         ;; on the array: for less-than-word sized elements it
+         ;; contains multiple copies of the fill item.
+         (bash-value
+           (if (constant-lvar-p item)
+               (let ((tmp (lvar-value item)))
+                 (unless (ctypep tmp element-ctype)
+                   (abort-ir1-transform "~S is not ~S" tmp element-type))
+                 (let* ((bits
+                          (ldb (byte n-bits 0)
+                               (ecase kind
+                                 (:tagged
+                                  (ash tmp sb-vm:n-fixnum-tag-bits))
+                                 (:char
+                                  (char-code tmp))
+                                 (:bits
+                                  tmp)
+                                 (:single-float
+                                  (single-float-bits tmp))
+                                 #+64-bit
+                                 (:double-float
+                                  (double-float-bits tmp))
+                                 #+64-bit
+                                 (:complex-single-float
+                                  (logior (ash (single-float-bits (imagpart tmp)) 32)
+                                          (ldb (byte 32 0)
+                                               (single-float-bits (realpart tmp))))))))
+                        (res bits))
+                   (loop for i of-type sb-vm:word from n-bits by n-bits
+                         until (= i sb-vm:n-word-bits)
+                         do (setf res (ldb (byte sb-vm:n-word-bits 0)
+                                           (logior res (ash bits i)))))
+                   res))
+               (progn
+                 (when node
+                   (delay-ir1-transform node :constraint))
+                 (if (and (eq kind :bits)
+                          (= n-bits 1))
+                     `(ldb (byte ,sb-vm:n-word-bits 0) (- item))
+                     `(let ((res (ldb (byte ,n-bits 0)
+                                      ,(ecase kind
+                                         (:tagged
+                                          `(ash item ,sb-vm:n-fixnum-tag-bits))
+                                         (:char
+                                          `(char-code item))
+                                         (:bits
+                                          `item)
+                                         (:single-float
+                                          `(single-float-bits item))
+                                         #+64-bit
+                                         (:double-float
+                                          `(double-float-bits item))
+                                         #+64-bit
+                                         (:complex-single-float
+                                          `(logior (ash (single-float-bits (imagpart item)) 32)
+                                                   (ldb (byte 32 0)
+                                                        (single-float-bits (realpart item)))))))))
+                        (declare (type sb-vm:word res))
+                        ,@(loop for i of-type sb-vm:word = n-bits then (* 2 i)
+                                until (= i sb-vm:n-word-bits)
+                                collect
+                                `(setf res (dpb res (byte ,i ,i) res)))
+                        res))))))
+    (values basher bash-value)))
+
 (deftransform fill ((seq item &key (start 0) (end nil))
                     (vector t &key (:start t) (:end t))
                     *
@@ -591,89 +721,8 @@
     (cond ((eq *wild-type* element-ctype)
            (delay-ir1-transform node :constraint)
            `(vector-fill* seq item start end))
-          ((and saetp (sb!vm::valid-bit-bash-saetp-p saetp))
-           (let* ((n-bits (sb!vm:saetp-n-bits saetp))
-                  (basher-name (format nil "UB~D-BASH-FILL" n-bits))
-                  (basher (or (find-symbol basher-name
-                                           (load-time-value (find-package :sb!kernel)))
-                              (abort-ir1-transform
-                               "Unknown fill basher, please report to sbcl-devel: ~A"
-                               basher-name)))
-                  (kind (cond ((sb!vm:saetp-fixnum-p saetp) :tagged)
-                              ((member element-type '(character base-char)) :char)
-                              ((eq element-type 'single-float) :single-float)
-                              #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
-                              ((eq element-type 'double-float) :double-float)
-                              #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
-                              ((equal element-type '(complex single-float))
-                               :complex-single-float)
-                              (t
-                               (aver (integer-type-p element-ctype))
-                               :bits)))
-                  ;; BASH-VALUE is a word that we can repeatedly smash
-                  ;; on the array: for less-than-word sized elements it
-                  ;; contains multiple copies of the fill item.
-                  (bash-value
-                   (if (constant-lvar-p item)
-                       (let ((tmp (lvar-value item)))
-                         (unless (ctypep tmp element-ctype)
-                           (abort-ir1-transform "~S is not ~S" tmp element-type))
-                         (let* ((bits
-                                 (ldb (byte n-bits 0)
-                                      (ecase kind
-                                        (:tagged
-                                         (ash tmp sb!vm:n-fixnum-tag-bits))
-                                        (:char
-                                         (char-code tmp))
-                                        (:bits
-                                         tmp)
-                                        (:single-float
-                                         (single-float-bits tmp))
-                                        #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
-                                        (:double-float
-                                         (logior (ash (double-float-high-bits tmp) 32)
-                                                 (double-float-low-bits tmp)))
-                                        #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
-                                        (:complex-single-float
-                                         (logior (ash (single-float-bits (imagpart tmp)) 32)
-                                                 (ldb (byte 32 0)
-                                                      (single-float-bits (realpart tmp))))))))
-                                (res bits))
-                           (loop for i of-type sb!vm:word from n-bits by n-bits
-                                 until (= i sb!vm:n-word-bits)
-                                 do (setf res (ldb (byte sb!vm:n-word-bits 0)
-                                                   (logior res (ash bits i)))))
-                           res))
-                       (progn
-                         (delay-ir1-transform node :constraint)
-                        `(let* ((bits (ldb (byte ,n-bits 0)
-                                           ,(ecase kind
-                                                   (:tagged
-                                                    `(ash item ,sb!vm:n-fixnum-tag-bits))
-                                                   (:char
-                                                    `(char-code item))
-                                                   (:bits
-                                                    `item)
-                                                   (:single-float
-                                                    `(single-float-bits item))
-                                                   #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
-                                                   (:double-float
-                                                    `(logior (ash (double-float-high-bits item) 32)
-                                                             (double-float-low-bits item)))
-                                                   #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
-                                                   (:complex-single-float
-                                                    `(logior (ash (single-float-bits (imagpart item)) 32)
-                                                             (ldb (byte 32 0)
-                                                                  (single-float-bits (realpart item))))))))
-                                (res bits))
-                           (declare (type sb!vm:word res))
-                           ,@(unless (= sb!vm:n-word-bits n-bits)
-                                     `((loop for i of-type sb!vm:word from ,n-bits by ,n-bits
-                                             until (= i sb!vm:n-word-bits)
-                                             do (setf res
-                                                      (ldb (byte ,sb!vm:n-word-bits 0)
-                                                           (logior res (ash bits (truly-the (integer 0 ,(- sb!vm:n-word-bits n-bits)) i))))))))
-                           res)))))
+          ((and saetp (sb-vm:valid-bit-bash-saetp-p saetp))
+           (multiple-value-bind (basher bash-value) (find-basher saetp item node)
              (values
               ;; KLUDGE: WITH-ARRAY data in its full glory is going to mess up
               ;; dynamic-extent for MAKE-ARRAY :INITIAL-ELEMENT initialization.
@@ -681,22 +730,22 @@
                   `(let* ((len (length seq))
                           (end (or end len))
                           (bound (1+ end)))
-                     ;; Minor abuse %CHECK-BOUND for bounds checking.
+                     ;; Minor abuse CHECK-BOUND for bounds checking.
                      ;; (- END START) may still end up negative, but
                      ;; the basher handle that.
                      (,basher ,bash-value seq
-                              (%check-bound seq bound start)
-                              (- (if end (%check-bound seq bound end) len)
+                              (check-bound seq bound start)
+                              (- (if end (check-bound seq bound end) len)
                                  start)))
-               `(with-array-data ((data seq)
-                                  (start start)
-                                  (end end)
-                                  :check-fill-pointer t)
-                  (declare (type (simple-array ,element-type 1) data))
-                  (declare (type index start end))
-                  (declare (optimize (safety 0) (speed 3)))
-                  (,basher ,bash-value data start (- end start))
-                  seq))
+                  `(with-array-data ((data seq)
+                                     (start start)
+                                     (end end)
+                                     :check-fill-pointer t)
+                     (declare (type (simple-array ,element-type 1) data))
+                     (declare (type index start end))
+                     (declare (optimize (safety 0) (speed 3)))
+                     (,basher ,bash-value data start (- end start))
+                     seq))
               `((declare (type ,element-type item))))))
           ((policy node (> speed space))
            (values
@@ -708,11 +757,18 @@
                (declare (type index start end))
                ;; WITH-ARRAY-DATA did our range checks once and for all, so
                ;; it'd be wasteful to check again on every AREF...
-               (declare (optimize (safety 0) (speed 3)))
-               (do ((i start (1+ i)))
-                   ((= i end) seq)
-                 (declare (type index i))
-                 (setf (aref data i) item)))
+               ;; Force bounds-checks to 0 even if local policy had it >0.
+               (declare (optimize (safety 0) (speed 3)
+                                  (insert-array-bounds-checks 0)))
+               ,(cond #+x86-64
+                      ((type= element-ctype *universal-type*)
+                       '(vector-fill/t data item start end))
+                      (t
+                       `(do ((i start (1+ i)))
+                            ((= i end))
+                          (declare (type index i))
+                          (setf (aref data i) item))))
+               seq)
             ;; ... though we still need to check that the new element can fit
             ;; into the vector in safe code. -- CSR, 2002-07-05
             `((declare (type ,element-type item)))))
@@ -723,7 +779,7 @@
 
 (deftransform fill ((seq item &key (start 0) (end nil))
                     ((and sequence (not vector) (not list)) t &key (:start t) (:end t)))
-  `(sb!sequence:fill seq item
+  `(sb-sequence:fill seq item
                      :start start
                      :end (%check-generic-sequence-bounds seq start end)))
 
@@ -764,7 +820,7 @@
                                    (simple-base-string simple-base-string t t t t) *)
                 `(let* ((end1 (if (not end1) (length string1) end1))
                         (end2 (if (not end2) (length string2) end2))
-                        (index (sb!impl::%sp-string-compare
+                        (index (sb-impl::%sp-string-compare
                                 string1 start1 end1 string2 start2 end2)))
                   (if index
                       (cond ((= index end1)
@@ -810,7 +866,6 @@
                                  (constant-arg null)))
   (cond ((and (constant-lvar-p string1)
               (equal (lvar-value string1) ""))
-         (lvar-type string2)
          `(and (plusp (length string2))
                0))
         ((and (constant-lvar-p string2)
@@ -824,7 +879,7 @@
              `(deftransform ,name ((string1 string2 start1 end1 start2 end2)
                                    (simple-base-string simple-base-string t t t t) *)
                 `(,',result-fun
-                  (sb!impl::%sp-string-compare
+                  (sb-impl::%sp-string-compare
                    string1 start1 (or end1 (length string1))
                    string2 start2 (or end2 (length string2)))))))
   (def string=* not) ; FIXME: this xform looks counterproductive.
@@ -840,13 +895,9 @@
       (give-up-ir1-transform)))
 
 (deftransform string ((x) (symbol)) '(symbol-name x))
+(deftransform string ((x) (string)) '(progn x))
 
 ;;;; transforms for sequence functions
-
-;;; Moved here from generic/vm-tran.lisp to satisfy clisp.  Only applies
-;;; to vectors based on simple arrays.
-(def!constant vector-data-bit-offset
-  (* sb!vm:vector-data-offset sb!vm:n-word-bits))
 
 ;;; FIXME: In the copy loops below, we code the loops in a strange
 ;;; fashion:
@@ -884,9 +935,9 @@
 ;;; This transform is critical to the performance of string streams.  If
 ;;; you tweak it, make sure that you compare the disassembly, if not the
 ;;; performance of, the functions implementing string streams
-;;; (e.g. SB!IMPL::STRING-OUCH).
+;;; (e.g. SB-IMPL::BASE-STRING-SOUT).
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (defun make-replace-transform (saetp sequence-type1 sequence-type2)
+  (defun !make-replace-transform (saetp sequence-type1 sequence-type2)
     `(deftransform replace ((seq1 seq2 &key (start1 0) (start2 0) end1 end2)
                             (,sequence-type1 ,sequence-type2 &rest t)
                             ,sequence-type1
@@ -903,11 +954,11 @@
                 (unless (<= 0 start2 end2 len2)
                   (sequence-bounding-indices-bad-error seq2 start2 end2))))
           ,',(cond
-               ((and saetp (sb!vm:valid-bit-bash-saetp-p saetp))
-                (let* ((n-element-bits (sb!vm:saetp-n-bits saetp))
+               ((and saetp (sb-vm:valid-bit-bash-saetp-p saetp))
+                (let* ((n-element-bits (sb-vm:saetp-n-bits saetp))
                        (bash-function (intern (format nil "UB~D-BASH-COPY"
                                                       n-element-bits)
-                                              (find-package "SB!KERNEL"))))
+                                              (find-package "SB-KERNEL"))))
                   `(funcall (function ,bash-function) seq2 start2
                     seq1 start1 replace-len)))
                (t
@@ -916,9 +967,9 @@
                       ;; SEQ2 must be distinct arrays.
                       ,(eql sequence-type1 sequence-type2)
                       (eq seq1 seq2) (> start1 start2))
-                     (do ((i (truly-the index (+ start1 replace-len -1))
+                     (do ((i (truly-the (or (eql -1) index) (+ start1 replace-len -1))
                              (1- i))
-                          (j (truly-the index (+ start2 replace-len -1))
+                          (j (truly-the (or (eql -1) index) (+ start2 replace-len -1))
                              (1- j)))
                          ((< i start1))
                        (declare (optimize (insert-array-bounds-checks 0)))
@@ -933,16 +984,16 @@
 
 (macrolet
     ((define-replace-transforms ()
-       (loop for saetp across sb!vm:*specialized-array-element-type-properties*
-             for sequence-type = `(simple-array ,(sb!vm:saetp-specifier saetp) (*))
-             unless (= (sb!vm:saetp-typecode saetp) sb!vm::simple-array-nil-widetag)
-             collect (make-replace-transform saetp sequence-type sequence-type)
+       (loop for saetp across sb-vm:*specialized-array-element-type-properties*
+             for sequence-type = `(simple-array ,(sb-vm:saetp-specifier saetp) (*))
+             unless (= (sb-vm:saetp-typecode saetp) sb-vm::simple-array-nil-widetag)
+             collect (!make-replace-transform saetp sequence-type sequence-type)
              into forms
              finally (return `(progn ,@forms))))
      (define-one-transform (sequence-type1 sequence-type2)
-       (make-replace-transform nil sequence-type1 sequence-type2)))
+       (!make-replace-transform nil sequence-type1 sequence-type2)))
   (define-replace-transforms)
-  #!+sb-unicode
+  #+sb-unicode
   (progn
    (define-one-transform (simple-array base-char (*)) (simple-array character (*)))
    (define-one-transform (simple-array character (*)) (simple-array base-char (*)))))
@@ -961,7 +1012,7 @@
                             dst dst-offset
                             length n-elems-per-word)
   (declare (ignore src dst length))
-  (let ((n-bits-per-elem (truncate sb!vm:n-word-bits n-elems-per-word)))
+  (let ((n-bits-per-elem (truncate sb-vm:n-word-bits n-elems-per-word)))
     (multiple-value-bind (src-word src-elt)
         (truncate (lvar-value src-offset) n-elems-per-word)
       (multiple-value-bind (dst-word dst-elt)
@@ -989,7 +1040,7 @@
                     ;; sign of the shift count prior to shifting when
                     ;; all we need is a simple negate and shift
                     ;; right.  Yuck.
-                    (mask (ash #.(1- (ash 1 sb!vm:n-word-bits))
+                    (mask (ash most-positive-word
                                (* (- extra ,n-elems-per-word)
                                   ,n-bits-per-elem))))
                (setf (%vector-raw-bits dst end)
@@ -1013,23 +1064,20 @@
                    (%vector-raw-bits src (1- i))))
            (values))))))
 
-#.(loop for i = 1 then (* i 2)
-        collect `(deftransform ,(intern (format nil "UB~D-BASH-COPY" i)
-                                        "SB!KERNEL")
-                                                        ((src src-offset
-                                                          dst dst-offset
-                                                          length)
-                                                        ((simple-unboxed-array (*))
-                                                         (constant-arg index)
-                                                         (simple-unboxed-array (*))
-                                                         (constant-arg index)
-                                                         index)
-                                                        *)
-                  (frob-bash-transform src src-offset
-                                       dst dst-offset length
-                                       ,(truncate sb!vm:n-word-bits i))) into forms
-        until (= i sb!vm:n-word-bits)
-        finally (return `(progn ,@forms)))
+#.
+(let ((arglist '((src src-offset dst dst-offset length)
+                 ((simple-unboxed-array (*)) (constant-arg index)
+                  (simple-unboxed-array (*)) (constant-arg index)
+                  index)
+                 *)))
+  (loop for i = 1 then (* i 2)
+     for name = (intern (format nil "UB~D-BASH-COPY" i) "SB-KERNEL")
+     collect `(deftransform ,name ,arglist
+                (frob-bash-transform src src-offset
+                                     dst dst-offset length
+                                     ,(truncate sb-vm:n-word-bits i))) into forms
+     until (= i sb-vm:n-word-bits)
+     finally (return `(progn ,@forms))))
 
 ;;; We expand copy loops inline in SUBSEQ and COPY-SEQ if we're copying
 ;;; arrays with elements of size >= the word size.  We do this because
@@ -1065,7 +1113,7 @@
                                       element-type)
   (let ((saetp (find-saetp element-type)))
     (aver saetp)
-    (if (>= (sb!vm:saetp-n-bits saetp) sb!vm:n-word-bits)
+    (if (>= (sb-vm:saetp-n-bits saetp) sb-vm:n-word-bits)
         (expand-aref-copy-loop src src-offset dst dst-offset length)
         `(locally (declare (optimize (safety 0)))
            (replace ,dst ,src :start1 ,dst-offset :start2 ,src-offset :end1 ,length)))))
@@ -1084,7 +1132,7 @@
             (j (+ ,dst-offset ,length) (1- j)))
            ((<= i ,src-offset))
          (declare (optimize (insert-array-bounds-checks 0))
-                  (type (integer 0 #.sb!xc:array-dimension-limit) j i))
+                  (type (integer 0 #.sb-xc:array-dimension-limit) j i))
          (setf (aref ,dst (1- j)) (aref ,src (1- i))))))
 
 ;;; MAKE-SEQUENCE, SUBSEQ, COPY-SEQ
@@ -1096,75 +1144,79 @@
              (values spec (ir1-transform-specifier-type spec))))
     (unless type
       (give-up-ir1-transform))
-    (multiple-value-bind (elt-type dim complexp)
-        (cond ((and (union-type-p type)
-                    (csubtypep type (specifier-type 'string)))
-               (let* ((types (union-type-types type))
-                      (first (first types)))
-                 (when (array-type-p first)
-                   (let ((dim (first (array-type-dimensions first)))
-                         (complexp (array-type-complexp first)))
-                     ;; Require sameness of dim and complexp. Give up on
-                     ;;   (OR (VECTOR CHARACTER) (VECTOR BASE-CHAR 2))
-                     ;; which eventually fails in the call to the function.
-                     (when (every (lambda (x)
-                                    (and (array-type-p x)
-                                         (eql (first (array-type-dimensions x))
-                                              dim)
-                                         (eq (array-type-complexp x) complexp)))
-                                  (rest types))
-                       (values
-                        `(or ,@(mapcar
-                                (lambda (x)
-                                  (type-specifier (array-type-element-type x)))
-                                types))
-                        dim complexp))))))
-              ((and (array-type-p type)
-                    (csubtypep type (specifier-type 'vector)))
-               (when (contains-unknown-type-p (array-type-element-type type))
-                 (give-up-ir1-transform "~S is an unknown vector type" spec))
-               (values (let ((et (array-type-element-type type)))
-                         ;; VECTOR means (VECTOR T)
-                         (if (type= et *wild-type*) 't (type-specifier et)))
-                       (first (array-type-dimensions type))
-                       (array-type-complexp type))))
-      ;; Don't transform if size is present in the specifier
-      ;; and the SIZE argument is not known to be equal.
-      (if (and (or (eq '* dim)
-                   (and dim (constant-lvar-p size) (eql (lvar-value size) dim)))
-               ;; not sure what it would mean to make it non-simple
-               (neq complexp t))
-          `(make-array size :element-type ',elt-type
-                       ,@(when initial-element
-                           `(:initial-element initial-element)))
-          ;; no transform, but we can detect some style issues
-          (progn
-            (when dim ; was a recognizable vector subtype
-              (let* ((elt-ctype (specifier-type elt-type))
-                     (saetp (find-saetp-by-ctype elt-ctype)))
-                (cond ((not initial-element)
-                       (let ((default-initial-element
-                               (sb!vm:saetp-initial-element-default saetp)))
-                         (unless (ctypep default-initial-element elt-ctype)
-                           ;; As with MAKE-ARRAY, this is merely undefined
-                           ;; behavior, not an error.
-                           (compiler-style-warn
-                            "The default initial element ~S is not a ~S."
-                            default-initial-element elt-type))))
-                      ;; In would be possible in some cases,
-                      ;; like :INITIAL-ELEMENT (IF X #\x #\y) in a call
-                      ;; to MAKE-SEQUENCE '(VECTOR (MEMBER #\A #\B))
-                      ;; to detect erroneous non-constants initializers,
-                      ;; but it is not important enough to bother with.
-                      ((and (constant-lvar-p initial-element)
-                            (not (ctypep (lvar-value initial-element)
-                                         elt-ctype)))
-                       ;; MAKE-ARRAY considers this a warning, not an error.
-                       (compiler-warn "~S ~S is not a ~S"
-                                      :initial-element
-                                      (lvar-value initial-element)
-                                      elt-type)))))
-            (give-up-ir1-transform))))))
+    (if (type= type (specifier-type 'list))
+        `(%make-list size initial-element)
+        (multiple-value-bind (elt-type dim complexp)
+            (cond ((and (union-type-p type)
+                        (csubtypep type (specifier-type 'string)))
+                   (let* ((types (union-type-types type))
+                          (first (first types)))
+                     (when (array-type-p first)
+                       (let ((dim (first (array-type-dimensions first)))
+                             (complexp (array-type-complexp first)))
+                         ;; Require sameness of dim and complexp. Give up on
+                         ;;   (OR (VECTOR CHARACTER) (VECTOR BASE-CHAR 2))
+                         ;; which eventually fails in the call to the function.
+                         (when (every (lambda (x)
+                                        (and (array-type-p x)
+                                             (eql (first (array-type-dimensions x))
+                                                  dim)
+                                             (eq (array-type-complexp x) complexp)))
+                                      (rest types))
+                           (values
+                            `(or ,@(mapcar
+                                    (lambda (x)
+                                      (type-specifier (array-type-element-type x)))
+                                    types))
+                            dim complexp))))))
+                  ((and (array-type-p type)
+                        (csubtypep type (specifier-type 'vector)))
+                   (when (contains-unknown-type-p (array-type-element-type type))
+                     (give-up-ir1-transform "~S is an unknown vector type" spec))
+                   (values (let ((et (array-type-element-type type)))
+                             ;; VECTOR means (VECTOR T)
+                             (if (type= et *wild-type*)
+                                 t
+                                 (type-specifier et)))
+                           (first (array-type-dimensions type))
+                           (array-type-complexp type))))
+          ;; Don't transform if size is present in the specifier
+          ;; and the SIZE argument is not known to be equal.
+          (cond ((and (or (eq '* dim)
+                          (and dim (constant-lvar-p size) (eql (lvar-value size) dim)))
+                      ;; not sure what it would mean to make it non-simple
+                      (neq complexp t))
+                 `(make-array size :element-type ',elt-type
+                              ,@(when initial-element
+                                  `(:initial-element initial-element))))
+                ;; no transform, but we can detect some style issues
+                (t
+                 (when dim         ; was a recognizable vector subtype
+                   (let* ((elt-ctype (specifier-type elt-type))
+                          (saetp (find-saetp-by-ctype elt-ctype)))
+                     (cond ((not initial-element)
+                            (let ((default-initial-element
+                                    (sb-vm:saetp-initial-element-default saetp)))
+                              (unless (ctypep default-initial-element elt-ctype)
+                                ;; As with MAKE-ARRAY, this is merely undefined
+                                ;; behavior, not an error.
+                                (compiler-style-warn
+                                 "The default initial element ~S is not a ~S."
+                                 default-initial-element elt-type))))
+                           ;; In would be possible in some cases,
+                           ;; like :INITIAL-ELEMENT (IF X #\x #\y) in a call
+                           ;; to MAKE-SEQUENCE '(VECTOR (MEMBER #\A #\B))
+                           ;; to detect erroneous non-constants initializers,
+                           ;; but it is not important enough to bother with.
+                           ((and (constant-lvar-p initial-element)
+                                 (not (ctypep (lvar-value initial-element)
+                                              elt-ctype)))
+                            ;; MAKE-ARRAY considers this a warning, not an error.
+                            (compiler-warn "~S ~S is not a ~S"
+                                           :initial-element
+                                           (lvar-value initial-element)
+                                           elt-type)))))
+                 (give-up-ir1-transform)))))))
 
 (deftransform subseq ((seq start &optional end)
                       (vector t &optional t)
@@ -1197,7 +1249,7 @@
 
 (deftransform subseq ((seq start &optional end)
                       ((and sequence (not vector) (not list)) t &optional t))
-  '(sb!sequence:subseq seq start end))
+  '(sb-sequence:subseq seq start end))
 
 (deftransform copy-seq ((seq) (vector))
   (let ((type (lvar-type seq)))
@@ -1214,7 +1266,41 @@
   '(list-copy-seq* seq))
 
 (deftransform copy-seq ((seq) ((and sequence (not vector) (not list))))
-  '(sb!sequence:copy-seq seq))
+  '(sb-sequence:copy-seq seq))
+
+(deftransform search ((pattern text &key start1 start2 end1 end2 test test-not
+                               key from-end)
+                      ((constant-arg sequence) * &rest *))
+  (if key
+      (give-up-ir1-transform)
+      (let* ((pattern (lvar-value pattern))
+             (pattern-start (cond ((not (proper-sequence-p pattern))
+                                   (give-up-ir1-transform))
+                                  ((constant-lvar-p start1)
+                                   (lvar-value start1))
+                                  ((not start1)
+                                   0)
+                                  (t
+                                   (give-up-ir1-transform))))
+             (pattern-end (cond ((constant-lvar-p end1)
+                                 (lvar-value end1))
+                                ((not end1)
+                                 (length pattern))
+                                (t
+                                 (give-up-ir1-transform))))
+             (pattern (if (and (= (- pattern-end pattern-start) 1)
+                               (sequence-of-length-at-least-p pattern
+                                                              (1+ pattern-start)))
+                          (elt pattern pattern-start)
+                          (give-up-ir1-transform))))
+        (macrolet ((maybe-arg (arg &optional (key (keywordicate arg)))
+                     `(and ,arg `(,,key ,',arg))))
+          `(position ',pattern text
+                     ,@(maybe-arg start2 :start)
+                     ,@(maybe-arg end2 :end)
+                     ,@(maybe-arg test)
+                     ,@(maybe-arg test-not)
+                     ,@(maybe-arg from-end))))))
 
 ;;; FIXME: it really should be possible to take advantage of the
 ;;; macros used in code/seq.lisp here to avoid duplication of code,
@@ -1304,6 +1390,212 @@
                         (return nil)))
                 (return index2)))))))))
 
+(defoptimizer (search derive-type) ((sequence1 sequence2
+                                               &key start1 end1 start2 end2
+                                               &allow-other-keys))
+  (let* ((constant-start1 (and (constant-lvar-p start1)
+                               (lvar-value start1)))
+         (constant-end1 (and (constant-lvar-p end1)
+                             (lvar-value end1)))
+         (constant-start2 (and (constant-lvar-p start2)
+                               (lvar-value start2)))
+         (constant-end2 (and (constant-lvar-p end2)
+                             (lvar-value end2)))
+         (min-result (or constant-start2 0))
+         (max-result (or constant-end2 (1- sb-xc:array-dimension-limit)))
+         (max2 (sequence-lvar-dimensions sequence2))
+         (max-result (if (integerp max2)
+                         (min max-result max2)
+                         max-result))
+         (min1 (nth-value 1 (sequence-lvar-dimensions sequence1)))
+         (min-sequence1-length (cond ((and constant-start1 constant-end1)
+                                      (- constant-end1 constant-start1))
+                                     ((and constant-end1 (not start1))
+                                      constant-end1)
+                                     ((and constant-start1
+                                           (not end1)
+                                           (integerp min1))
+                                      (- min1 constant-start1))
+                                     ((or start1 end1 (not (integerp min1)))
+                                      ;; The result can be equal to MAX-RESULT only when
+                                      ;; searching for "" and :start2 being equal to :end2
+                                      (if (or (and start2
+                                                   (not constant-start2))
+                                              (= max-result min-result))
+                                          0
+                                          1))
+                                     (t
+                                      min1))))
+    (specifier-type `(or (integer ,min-result
+                                  ,(- max-result min-sequence1-length))
+                         null))))
+
+(defun index-into-sequence-derive-type (sequence start end &key (inclusive t))
+  (let* ((constant-start (and (constant-lvar-p start)
+                              (lvar-value start)))
+         (constant-end (and (constant-lvar-p end)
+                            (lvar-value end)))
+         (min-result (or constant-start 0))
+         (max-result (or constant-end (1- sb-xc:array-dimension-limit)))
+         (max (sequence-lvar-dimensions sequence))
+         (max-result (if (integerp max)
+                         (min max-result max)
+                         max-result)))
+    (values min-result (if inclusive
+                           max-result
+                           (1- max-result)))))
+
+(defoptimizer (mismatch derive-type) ((sequence1 sequence2
+                                                 &key start1 end1
+                                                 &allow-other-keys))
+  (declare (ignorable sequence2))
+  ;; Could be as smart as the SEARCH one above but I ran out of steam.
+  (multiple-value-bind (min max) (index-into-sequence-derive-type sequence1 start1 end1)
+    (specifier-type `(or (integer ,min ,max) null))))
+
+(defoptimizer (position derive-type) ((item sequence
+                                            &key start end
+                                            key test test-not
+                                            &allow-other-keys))
+  (multiple-value-bind (min max)
+      (index-into-sequence-derive-type sequence start end :inclusive nil)
+    (let ((integer-range `(integer ,min ,max))
+          (definitely-foundp nil))
+      ;; Figure out whether this call will not return NIL.
+      ;; This could be smarter about the keywords args, but the primary intent
+      ;; is to avoid a style-warning about arithmetic in such forms such as
+      ;;  (1+ (position (the (member :x :y) item) #(:foo :bar :x :y))).
+      ;; In that example, a more exact bound could be determined too.
+      (cond ((or (not (constant-lvar-p sequence))
+                 start end key test test-not))
+            (t
+             (let ((const-seq (lvar-value sequence))
+                   (item-type (lvar-type item)))
+               (when (and (or (vectorp const-seq) (proper-list-p const-seq))
+                          (member-type-p item-type))
+                 (setq definitely-foundp t) ; assume best case
+                 (block nil
+                   (mapc-member-type-members
+                    (lambda (possibility)
+                      (unless (find possibility const-seq)
+                        (setq definitely-foundp nil)
+                        (return)))
+                    item-type))))))
+      (specifier-type (if definitely-foundp
+                          integer-range
+                          `(or ,integer-range null))))))
+
+(defoptimizer (position-if derive-type) ((function sequence
+                                                   &key start end
+                                                   &allow-other-keys))
+  (declare (ignore function))
+  (multiple-value-bind (min max)
+      (index-into-sequence-derive-type sequence start end :inclusive nil)
+    (specifier-type `(or (integer ,min ,max) null))))
+
+(defoptimizer (position-if-not derive-type) ((function sequence
+                                                       &key start end
+                                                       &allow-other-keys))
+  (declare (ignore function))
+  (multiple-value-bind (min max)
+      (index-into-sequence-derive-type sequence start end :inclusive nil)
+    (specifier-type `(or (integer ,min ,max) null))))
+
+(defoptimizer (count derive-type) ((item sequence
+                                         &key start end
+                                         &allow-other-keys))
+  (declare (ignore item))
+  (multiple-value-bind (min max)
+      (index-into-sequence-derive-type sequence start end)
+    (specifier-type `(integer 0 ,(- max min)))))
+
+(defoptimizer (count-if derive-type) ((function sequence
+                                                &key start end
+                                                &allow-other-keys))
+  (declare (ignore function))
+  (multiple-value-bind (min max)
+      (index-into-sequence-derive-type sequence start end)
+    (specifier-type `(integer 0 ,(- max min)))))
+
+(defoptimizer (count-if-not derive-type) ((function sequence
+                                                    &key start end
+                                                    &allow-other-keys))
+  (declare (ignore function))
+  (multiple-value-bind (min max)
+      (index-into-sequence-derive-type sequence start end)
+    (specifier-type `(integer 0 ,(- max min)))))
+
+(defoptimizer (subseq derive-type) ((sequence start &optional end) node)
+  (let* ((sequence-type (lvar-type sequence))
+         (constant-start (and (constant-lvar-p start)
+                              (lvar-value start)))
+         (constant-end (and (constant-lvar-p end)
+                            (lvar-value end)))
+         (index-length (and constant-start constant-end
+                            (- constant-end constant-start)))
+         (list-type (specifier-type 'list)))
+    (flet ((bad ()
+             (let ((*compiler-error-context* node))
+               (compiler-warn "Bad bounding indices ~s, ~s for ~
+                               ~/sb-impl:print-type/"
+                              constant-start constant-end sequence-type))))
+      (cond ((and index-length
+                  (minusp index-length))
+             ;; Would be a good idea to transform to something like
+             ;; %compile-time-type-error
+             (bad))
+            ((csubtypep sequence-type list-type)
+             (let ((null-type (specifier-type 'null)))
+               (cond ((csubtypep sequence-type null-type)
+                      (cond ((or (and constant-start
+                                      (plusp constant-start))
+                                 (and index-length
+                                      (plusp index-length)))
+                             (bad))
+                            ((eql constant-start 0)
+                             null-type)
+                            (t
+                             list-type)))
+                     ((not index-length)
+                      list-type)
+                     ((zerop index-length)
+                      null-type)
+                     (t
+                      (specifier-type 'cons)))))
+            ((csubtypep sequence-type (specifier-type 'vector))
+             (let* ((dimensions
+                      ;; Can't trust lengths from non-simple vectors due to
+                      ;; fill-pointer and adjust-array
+                      (and (csubtypep sequence-type (specifier-type 'simple-array))
+                           (ctype-array-dimensions sequence-type)))
+                    (dimensions-length
+                      (and (singleton-p dimensions)
+                           (integerp (car dimensions))
+                           (car dimensions)))
+                    (length (cond (index-length)
+                                  ((and dimensions-length
+                                        (not end)
+                                        constant-start)
+                                   (- dimensions-length constant-start))))
+                    (simplified (simplify-vector-type sequence-type)))
+               (cond ((and dimensions-length
+                           (or
+                            (and constant-start
+                                 (> constant-start dimensions-length))
+                            (and constant-end
+                                 (> constant-end dimensions-length))))
+                      (bad))
+                     (length
+                      (type-intersection simplified
+                                         (specifier-type `(simple-array * (,length)))))
+                     (t
+                      simplified))))
+            ((not index-length)
+             nil)
+            ((zerop index-length)
+             (specifier-type '(not cons)))
+            (t
+             (specifier-type '(not null)))))))
 
 ;;; Open-code CONCATENATE for strings. It would be possible to extend
 ;;; this transform to non-strings, but I chose to just do the case that
@@ -1320,22 +1612,28 @@
 ;;; in the right ballpark.
 (defvar *concatenate-open-code-limit* 129)
 
-(deftransform concatenate ((result-type &rest lvars)
-                           ((constant-arg
-                             (member string simple-string base-string simple-base-string))
-                            &rest sequence)
-                           * :node node)
-  (let ((vars (loop for x in lvars collect (sb!xc:gensym)))
-        (type (lvar-value result-type)))
+(defun string-concatenate-transform (node type lvars)
+  (let ((vars (make-gensym-list (length lvars))))
     (if (policy node (<= speed space))
         ;; Out-of-line
-        `(lambda (.dummy. ,@vars)
-           (declare (ignore .dummy.))
-           ,(ecase type
-              ((string simple-string)
-               `(%concatenate-to-string ,@vars))
-              ((base-string simple-base-string)
-               `(%concatenate-to-base-string ,@vars))))
+        (let ((constants-to-string
+                ;; Strings are handled more efficiently by
+                ;; %concatenate-to-* functions
+                (loop for var in vars
+                      for lvar in lvars
+                      collect (if (and (constant-lvar-p lvar)
+                                       (proper-sequence-p (lvar-value lvar))
+                                       (every #'characterp (lvar-value lvar)))
+                                  (coerce (lvar-value lvar) 'string)
+                                  var))))
+          `(lambda (.dummy. ,@vars)
+             (declare (ignore .dummy.)
+                      (ignorable ,@vars))
+             ,(ecase type
+                ((string simple-string)
+                 `(%concatenate-to-string ,@constants-to-string))
+                ((base-string simple-base-string)
+                 `(%concatenate-to-base-string ,@constants-to-string)))))
         ;; Inline
         (let* ((element-type (ecase type
                                ((string simple-string) 'character)
@@ -1348,64 +1646,129 @@
                        for var in vars
                        collect (if value
                                    (length value)
-                                   `(sb!impl::string-dispatch ((simple-array * (*))
+                                   `(sb-impl::string-dispatch ((simple-array * (*))
                                                                sequence)
                                                               ,var
+                                      #-sb-xc-host
                                       (declare (muffle-conditions compiler-note))
                                       (length ,var)))))
                (non-constant-start
                  (loop for value in lvar-values
                        while (and (stringp value)
-                                    (< (length value) *concatenate-open-code-limit*))
+                                  (< (length value) *concatenate-open-code-limit*))
                        sum (length value))))
-          `(apply
-            (lambda ,vars
-              (declare (ignorable ,@vars))
-              (declare (optimize (insert-array-bounds-checks 0)))
-              (let* ((.length. (+ ,@lengths))
-                     (.pos. ,non-constant-start)
-                     (.string. (make-string .length. :element-type ',element-type)))
-                (declare (type index .length. .pos.)
-                         (muffle-conditions compiler-note)
-                         (ignorable .pos.))
-                ,@(loop with constants = -1
-                        for first = t then nil
-                        for value in lvar-values
-                        for var in vars
-                        collect
-                        (cond ((and (stringp value)
-                                    (< (length value) *concatenate-open-code-limit*))
-                               ;; Fold the array reads for constant arguments
-                               `(progn
-                                  ,@(loop for c across value
-                                          for i from 0
-                                          collect
-                                          ;; Without truly-the we get massive numbers
-                                          ;; of pointless error traps.
-                                          `(setf (aref .string.
-                                                       (truly-the index ,(if constants
-                                                                             (incf constants)
-                                                                             `(+ .pos. ,i))))
-                                                 ,c))
-                                  ,(unless constants
-                                     `(incf (truly-the index .pos.) ,(length value)))))
-                              (t
-                               (prog1
-                                   `(sb!impl::string-dispatch
-                                        (#!+sb-unicode
-                                         (simple-array character (*))
-                                         (simple-array base-char (*))
-                                         t)
-                                        ,var
-                                      (replace .string. ,var
-                                               ,@(cond ((not constants)
-                                                        '(:start1 .pos.))
-                                                       ((plusp non-constant-start)
-                                                        `(:start1 ,non-constant-start))))
-                                      (incf (truly-the index .pos.) (length ,var)))
-                                 (setf constants nil)))))
-                .string.))
-            lvars)))))
+          `(lambda (.dummy. ,@vars)
+             (declare (ignore .dummy.)
+                      (ignorable ,@vars))
+             (declare (optimize (insert-array-bounds-checks 0)))
+             (let* ((.length. (+ ,@lengths))
+                    (.pos. ,non-constant-start)
+                    (.string. (make-string .length. :element-type ',element-type)))
+               (declare (type index .length. .pos.)
+                        #-sb-xc-host (muffle-conditions compiler-note)
+                        (ignorable .pos.))
+               ,@(loop with constants = -1
+                       for value in lvar-values
+                       for var in vars
+                       collect
+                       (cond ((and (stringp value)
+                                   (< (length value) *concatenate-open-code-limit*))
+                              ;; Fold the array reads for constant arguments
+                              `(progn
+                                 ,@(loop for c across value
+                                         for i from 0
+                                         collect
+                                         ;; Without truly-the we get massive numbers
+                                         ;; of pointless error traps.
+                                         `(setf (aref .string.
+                                                      (truly-the index ,(if constants
+                                                                            (incf constants)
+                                                                            `(+ .pos. ,i))))
+                                                ,c))
+                                 ,(unless constants
+                                    `(incf (truly-the index .pos.) ,(length value)))))
+                             (t
+                              (prog1
+                                  `(sb-impl::string-dispatch
+                                       (#+sb-unicode
+                                        (simple-array character (*))
+                                        (simple-array base-char (*))
+                                        t)
+                                       ,var
+                                     (replace .string. ,var
+                                              ,@(cond ((not constants)
+                                                       '(:start1 .pos.))
+                                                      ((plusp non-constant-start)
+                                                       `(:start1 ,non-constant-start))))
+                                     (incf (truly-the index .pos.) (length ,var)))
+                                (setf constants nil)))))
+               .string.))))))
+
+(defun vector-specifier-widetag (type)
+  ;; FIXME: This only accepts vectors without dimensions even though
+  ;; it's not that hard to support them for the concatenate transform,
+  ;; but it's probably not used often enough to bother.
+  (cond ((and (array-type-p type)
+              (equal (array-type-dimensions type) '(*)))
+         (let* ((el-ctype (array-type-element-type type))
+                (el-ctype (if (eq el-ctype *wild-type*)
+                              *universal-type*
+                              el-ctype))
+                (saetp (find-saetp-by-ctype el-ctype)))
+           (when saetp
+             (sb-vm:saetp-typecode saetp))))
+        ((and (union-type-p type)
+              (csubtypep type (specifier-type 'string))
+              (loop for type in (union-type-types type)
+                    always (and (array-type-p type)
+                                (equal (array-type-dimensions type) '(*)))))
+         #+sb-unicode
+         sb-vm:simple-character-string-widetag
+         #-sb-unicode
+         sb-vm:simple-base-string-widetag)))
+
+(deftransform concatenate ((result-type &rest lvars)
+                           ((constant-arg t)
+                            &rest sequence)
+                           * :node node)
+  (let* ((type (ir1-transform-specifier-type (lvar-value result-type)))
+         (vector-widetag (vector-specifier-widetag type)))
+    (flet ((coerce-constants (vars type)
+             ;; Lists are faster to iterate over than vectors of
+             ;; unknown type.
+             (loop for var in vars
+                   for lvar in lvars
+                   collect (if (and (constant-lvar-p lvar)
+                                    (proper-sequence-p (lvar-value lvar))
+                                    (not (typep (lvar-value lvar) type)))
+                               `',(coerce (lvar-value lvar) type)
+                               var))))
+
+      (cond ((type= type (specifier-type 'list))
+             (let ((vars (make-gensym-list (length lvars))))
+               `(lambda (type ,@vars)
+                  (declare (ignore type)
+                           (ignorable ,@vars))
+                  (%concatenate-to-list ,@(coerce-constants vars 'list)))))
+            ((not vector-widetag)
+             (give-up-ir1-transform))
+            ((= vector-widetag sb-vm:simple-base-string-widetag)
+             (string-concatenate-transform node 'simple-base-string lvars))
+            #+sb-unicode
+            ((= vector-widetag sb-vm:simple-character-string-widetag)
+             (string-concatenate-transform node 'string lvars))
+            ;; FIXME: other vectors may use inlined expansion from
+            ;; STRING-CONCATENATE-TRANSFORM as well.
+            (t
+             (let ((vars (make-gensym-list (length lvars))))
+               `(lambda (type ,@vars)
+                  (declare (ignore type)
+                           (ignorable ,@vars))
+                  ,(if (= vector-widetag sb-vm:simple-vector-widetag)
+                       `(%concatenate-to-simple-vector
+                         ,@(coerce-constants vars 'vector))
+                       `(%concatenate-to-vector
+                         ,vector-widetag ,@(coerce-constants vars 'list))))))))))
 
 ;;;; CONS accessor DERIVE-TYPE optimizers
 
@@ -1429,6 +1792,36 @@
 
 ;;;; FIND, POSITION, and their -IF and -IF-NOT variants
 
+(defoptimizer (find derive-type) ((item sequence &key key test
+                                        start end from-end))
+  (declare (ignore sequence start end from-end))
+  (let ((key-fun (or (and key (lvar-fun-name* key)) 'identity)))
+    ;; If :KEY is a known function, then regardless of the :TEST,
+    ;; FIND returns an object of the type that KEY accepts, or nil.
+    ;; If LVAR-FUN-NAME can't be determined, it returns NIL.
+    ;; :KEY NIL is valid, and means #'IDENTITY.
+    ;; So either way, we get IDENTITY which skips this code.
+    (unless (eq key-fun 'identity)
+      (acond ((info :function :info key-fun)
+              (let ((type (info :function :type key-fun)))
+                (return-from find-derive-type-optimizer
+                  (awhen (and (fun-type-p type)
+                              (fun-type-required type))
+                    (type-union (first it) (specifier-type 'null))))))
+             ((structure-instance-accessor-p key-fun)
+              (return-from find-derive-type-optimizer
+                (specifier-type `(or ,(dd-name (car it)) null)))))))
+  ;; Otherwise maybe FIND returns ITEM itself (or an EQL number).
+  ;; :TEST is allowed only if EQ or EQL (where NIL means EQL).
+  ;; :KEY is allowed only if IDENTITY or NIL.
+  (when (and (or (not test)
+                 (lvar-fun-is test '(eq eql))
+                 (and (constant-lvar-p test) (null (lvar-value test))))
+             (or (not key)
+                 (lvar-fun-is key '(identity))
+                 (and (constant-lvar-p key) (null (lvar-value key)))))
+    (type-union (lvar-type item) (specifier-type 'null))))
+
 ;;; We want to make sure that %FIND-POSITION is inline-expanded into
 ;;; %FIND-POSITION-IF only when %FIND-POSITION-IF has an inline
 ;;; expansion, so we factor out the condition into this function.
@@ -1449,55 +1842,76 @@
             "sequence type not known at compile time")))))
 
 ;;; %FIND-POSITION-IF and %FIND-POSITION-IF-NOT for LIST data
+(defun %find/position-if-list-expansion (sense from-end start end node)
+  (declare (ignore from-end))
+  ;; Circularity detection slows things down. It is permissible not to.
+  ;; In fact, FIND is given as an archetypal example of a function that
+  ;; "should be prepared to signal an error" but might not [CLHS 1.4.2].
+  ;; We relax the definition of "safe" from safety=3 to >=2.
+  (let ((safe (policy node (>= safety 2)))
+        ;; The secondary value is inconsequential when flowing into a non-MV
+        ;; combination, so we avoid counting loop iterations if possible.
+        ;; This is limited in power, but good enough, for want of a proper
+        ;; dead-code-elimination phase of the compiler.
+        (indexed
+         (not (and (lvar-single-value-p (node-lvar node))
+                   (constant-lvar-p start)
+                   (eql (lvar-value start) 0)
+                   (constant-lvar-p end)
+                   (null (lvar-value end))))))
+    `(let ((find nil)
+           (position nil))
+       (flet ((bounds-error ()
+                (sequence-bounding-indices-bad-error sequence start end)))
+         (if (and end (> start end))
+             (bounds-error)
+           (do ((slow sequence (cdr slow))
+                ,@(when safe '((fast (cdr sequence) (cddr fast))))
+                ,@(when indexed '((index 0 (+ index 1)))))
+               ((cond ((null slow)
+                       (,@(if indexed
+                              '(if (and end (> end index)) (bounds-error))
+                              '(progn))
+                        (return (values find position))))
+                      ,@(when indexed
+                          '(((and end (>= index end))
+                             (return (values find position)))))
+                      ,@(when safe
+                          '(((eq slow fast)
+                             (circular-list-error sequence)))))
+                (bug "never"))
+             (declare (list slow ,@(and safe '(fast)))
+                      ;; If you have as many as INDEX conses on a 32-bit build,
+                      ;; then you've either used up 4GB of memory (impossible)
+                      ;; or you're stuck in a circular list in unsafe code.
+                      ;; Correspondingly larger limit for 64-bit.
+                      ,@(and indexed '((index index))))
+             (,@(if indexed '(when (>= index start)) '(progn))
+               (let ((element (car slow)))
+                 ;; This hack of dealing with non-NIL FROM-END for list data
+                 ;; by iterating forward through the list and keeping track of
+                 ;; the last time we found a match might be more screwy than
+                 ;; what the user expects, but it seems to be allowed by the
+                 ;; ANSI standard. (And if the user is screwy enough to ask
+                 ;; for FROM-END behavior on list data, turnabout is fair play.)
+                 ;;
+                 ;; It's also not enormously efficient, calling PREDICATE
+                 ;; and KEY more often than necessary; but all the alternatives
+                 ;; seem to have their own efficiency problems.
+                 (,sense (funcall predicate (funcall key element))
+                   (if from-end
+                       (setf find element position ,(and indexed 'index))
+                       (return (values element ,(and indexed 'index)))))))))))))
+
 (macrolet ((def (name condition)
              `(deftransform ,name ((predicate sequence from-end start end key)
                                    (function list t t t function)
                                    *
+                                   :node node
                                    :policy (> speed space))
                 "expand inline"
-                `(let ((find nil)
-                       (position nil))
-                   (flet ((bounds-error ()
-                            (sequence-bounding-indices-bad-error sequence start end)))
-                     (if (and end (> start end))
-                         (bounds-error)
-                         (do ((slow sequence (cdr slow))
-                              (fast (cdr sequence) (cddr fast))
-                              (index 0 (+ index 1)))
-                             ((cond ((null slow)
-                                     (if (and end (> end index))
-                                         (bounds-error)
-                                         (return (values find position))))
-                                    ((and end (>= index end))
-                                     (return (values find position)))
-                                    ((eq slow fast)
-                                     (circular-list-error sequence)))
-                              (bug "never"))
-                           (declare (list slow fast))
-                           (when (>= index start)
-                             (let* ((element (car slow))
-                                    (key-i (funcall key element)))
-                               (,',condition (funcall predicate key-i)
-                                             ;; This hack of dealing with non-NIL
-                                             ;; FROM-END for list data by iterating
-                                             ;; forward through the list and keeping
-                                             ;; track of the last time we found a
-                                             ;; match might be more screwy than what
-                                             ;; the user expects, but it seems to be
-                                             ;; allowed by the ANSI standard. (And
-                                             ;; if the user is screwy enough to ask
-                                             ;; for FROM-END behavior on list data,
-                                             ;; turnabout is fair play.)
-                                             ;;
-                                             ;; It's also not enormously efficient,
-                                             ;; calling PREDICATE and KEY more often
-                                             ;; than necessary; but all the
-                                             ;; alternatives seem to have their own
-                                             ;; efficiency problems.
-                                             (if from-end
-                                                 (setf find element
-                                                       position index)
-                                                 (return (values element index)))))))))))))
+                (%find/position-if-list-expansion ',condition
+                                                  from-end start end node))))
   (def %find-position-if when)
   (def %find-position-if-not unless))
 
@@ -1533,36 +1947,38 @@
                                                             element
                                                             done-p-expr)
   (with-unique-names (offset block index n-sequence sequence end)
-    `(let* ((,n-sequence ,sequence-arg))
-       (with-array-data ((,sequence ,n-sequence :offset-var ,offset)
-                         (,start ,start)
-                         (,end ,end-arg)
-                         :check-fill-pointer t)
-         (block ,block
-           (macrolet ((maybe-return ()
-                        ;; WITH-ARRAY-DATA has already performed bounds
-                        ;; checking, so we can safely elide the checks
-                        ;; in the inner loop.
-                        '(let ((,element (locally (declare (optimize (insert-array-bounds-checks 0)))
-                                           (aref ,sequence ,index))))
-                          (when ,done-p-expr
-                            (return-from ,block
-                              (values ,element
-                                      (- ,index ,offset)))))))
-             (if ,from-end
-                 (loop for ,index
-                       ;; (If we aren't fastidious about declaring that
-                       ;; INDEX might be -1, then (FIND 1 #() :FROM-END T)
-                       ;; can send us off into never-never land, since
-                       ;; INDEX is initialized to -1.)
-                       of-type index-or-minus-1
-                       from (1- ,end) downto ,start do
-                       (maybe-return))
-                 (loop for ,index of-type index from ,start below ,end do
-                          (maybe-return))))
-           (values nil nil))))))
+    (let ((maybe-return
+            ;; WITH-ARRAY-DATA has already performed bounds
+            ;; checking, so we can safely elide the checks
+            ;; in the inner loop.
+            `(let ((,element (locally (declare (optimize (insert-array-bounds-checks 0)))
+                               (aref ,sequence ,index))))
+               (when ,done-p-expr
+                 (return-from ,block
+                   (values ,element
+                           (- ,index ,offset)))))))
+     `(let* ((,n-sequence ,sequence-arg))
+        (with-array-data ((,sequence ,n-sequence :offset-var ,offset)
+                          (,start ,start)
+                          (,end ,end-arg)
+                          :check-fill-pointer t)
+          (block ,block
+            (if ,from-end
+                (loop for ,index
+                      ;; (If we aren't fastidious about declaring that
+                      ;; INDEX might be -1, then (FIND 1 #() :FROM-END T)
+                      ;; can send us off into never-never land, since
+                      ;; INDEX is initialized to -1.)
+                      of-type index-or-minus-1
+                      from (1- ,end) downto ,start
+                      do
+                      ,maybe-return)
+                (loop for ,index of-type index from ,start below ,end
+                      do
+                      ,maybe-return))
+            (values nil nil)))))))
 
-(def!macro %find-position-vector-macro (item sequence
+(sb-xc:defmacro %find-position-vector-macro (item sequence
                                              from-end start end key test)
   (with-unique-names (element)
     (%find-position-or-find-position-if-vector-expansion
@@ -1576,7 +1992,7 @@
      ;; or after the checked sequence element.)
      `(funcall ,test ,item (funcall ,key ,element)))))
 
-(def!macro %find-position-if-vector-macro (predicate sequence
+(sb-xc:defmacro %find-position-if-vector-macro (predicate sequence
                                                      from-end start end key)
   (with-unique-names (element)
     (%find-position-or-find-position-if-vector-expansion
@@ -1587,7 +2003,7 @@
      element
      `(funcall ,predicate (funcall ,key ,element)))))
 
-(def!macro %find-position-if-not-vector-macro (predicate sequence
+(sb-xc:defmacro %find-position-if-not-vector-macro (predicate sequence
                                                          from-end start end key)
   (with-unique-names (element)
     (%find-position-or-find-position-if-vector-expansion
@@ -1637,20 +2053,27 @@
   (when (or test key)
     (delay-ir1-transform node :optimize)
     (give-up-ir1-transform "non-trivial :KEY or :TEST"))
-  (catch 'not-a-bit
+  (block not-a-bit
     `(with-array-data ((bits sequence :offset-var offset)
                        (start start)
                        (end end)
                        :check-fill-pointer t)
-       (let ((p ,(if (constant-lvar-p item)
-                     (case (lvar-value item)
-                       (0 `(%bit-position/0 bits from-end start end))
-                       (1 `(%bit-position/1 bits from-end start end))
-                       (otherwise (throw 'not-a-bit `(values nil nil))))
-                     `(%bit-position item bits from-end start end))))
-         (if p
-             (values item (the index (- (truly-the index p) offset)))
-             (values nil nil))))))
+       (let ((p ,(let* ((dir (cond ((not (constant-lvar-p from-end)) 0) ; unknown
+                                   ((lvar-value from-end) 2) ; reverse
+                                   (t 1))) ; forward
+                        (from-end-arg (if (eql dir 0) '(from-end) '())))
+                   (if (constant-lvar-p item)
+                       (case (lvar-value item)
+                         (0 `(,(elt #(%bit-position/0 %bit-pos-fwd/0 %bit-pos-rev/0) dir)
+                              bits ,@from-end-arg start end))
+                         (1 `(,(elt #(%bit-position/1 %bit-pos-fwd/1 %bit-pos-rev/1) dir)
+                              bits ,@from-end-arg start end))
+                         (otherwise (return-from not-a-bit `(values nil nil))))
+                       `(,(elt #(%bit-position %bit-pos-fwd %bit-pos-rev) dir)
+                         item bits ,@from-end-arg start end)))))
+           (if p
+               (values item (the index (- (truly-the index p) offset)))
+               (values nil nil))))))
 
 (deftransform %find-position ((item sequence from-end start end key test)
                               (character string t t t function function)
@@ -1658,7 +2081,7 @@
                               :policy (> speed space))
   (if (eq '* (upgraded-element-type-specifier sequence))
       (let ((form
-             `(sb!impl::string-dispatch ((simple-array character (*))
+             `(sb-impl::string-dispatch ((simple-array character (*))
                                          (simple-array base-char (*))
                                          (simple-array nil (*)))
                   sequence
@@ -1690,6 +2113,11 @@
        ;; inefficient, but since the TEST-NOT option is deprecated
        ;; anyway, we don't care.)
        (complement (%coerce-callable-to-fun ,test-not)))
+      ;; :TEST of NIL (whether implicit or explicit) means #'EQL.
+      ;; This behavior is not specified by CLHS, but is fairly conventional.
+      ;; (KEY is expressly specified as allowing NIL, but TEST is not)
+      ;; In our implementation, it has to be this way because we don't track
+      ;; whether the :TEST and :TEST-NOT args were actually present.
       (t #'eql))))
 (define-source-transform effective-find-position-key (key)
   (once-only ((key key))
@@ -1697,20 +2125,70 @@
          (%coerce-callable-to-fun ,key)
          #'identity)))
 
-(macrolet ((define-find-position (fun-name values-index)
+(macrolet ((define-find-position (fun-name values-index &optional preamble)
              `(deftransform ,fun-name ((item sequence &key
                                              from-end (start 0) end
                                              key test test-not)
                                        (t (or list vector) &rest t))
-                '(nth-value ,values-index
-                            (%find-position item sequence
-                                            from-end start
-                                            end
-                                            (effective-find-position-key key)
-                                            (effective-find-position-test
-                                             test test-not))))))
+                (let ((effective-test
+                       (unless test-not
+                         (if test (lvar-fun-name* test) 'eql)))
+                      (test-form '(effective-find-position-test test test-not))
+                      (const-seq (when (constant-lvar-p sequence)
+                                   (lvar-value sequence))))
+                  ,@preamble
+                  ;; For both FIND and POSITION, try to optimize EQL into EQ.
+                  (when (and (eq effective-test 'eql)
+                             const-seq
+                             (or (vectorp const-seq) (proper-list-p const-seq))
+                             (let ((key (if key
+                                            (let ((name (lvar-fun-name* key)))
+                                              (and (constant-fold-arg-p name)
+                                                   name))
+                                            #'identity)))
+                               (and key
+                                    (every (lambda (x)
+                                             (block nil
+                                               (sb-xc:typep (handler-case (funcall key x)
+                                                              (error ()
+                                                                (return)))
+                                                            'eq-comparable-type)))
+                                           const-seq))))
+                    (setq test-form '#'eq))
+                  `(nth-value ,',values-index
+                              (%find-position item sequence
+                                              from-end start
+                                              end
+                                              (effective-find-position-key key)
+                                              ,test-form))))))
   (define-find-position find 0)
-  (define-find-position position 1))
+  (define-find-position position 1
+   ((let ((max-inline 10))
+      ;; Destructive modification of constants is illegal.
+      ;; Therefore if this sequence would have been output as a code header
+      ;; constant, its contents can't change. We don't need to reference
+      ;; the sequence itself to compare elements.
+      ;; Later transforms will change EQL to EQ if appropriate.
+      (when (and const-seq
+                 (member effective-test '(eql eq))
+                 (not start) (not end) (not key)
+                 (or (not from-end) (constant-lvar-p from-end))
+                 (cond ((listp const-seq)
+                        (not (nthcdr max-inline const-seq)))
+                       ((vectorp const-seq)
+                        (<= (length const-seq) max-inline))))
+        (let ((clauses (loop for x in (coerce const-seq 'list)
+                             for i from 0
+                             collect `((,effective-test item ',x) ,i))))
+          ;; It seems silly to use :from-end and a constant list
+          ;; in a way where it actually matters (duplicate elements),
+          ;; but we either have to do it right or not do it.
+          (when (and from-end (lvar-value from-end))
+            (setq clauses (nreverse clauses)))
+          (return-from position
+                       `(lambda (item sequence &rest junk)
+                          (declare (ignore sequence junk))
+                          (cond ,@clauses)))))))))
 
 (macrolet ((define-find-position-if (fun-name values-index)
              `(deftransform ,fun-name ((predicate sequence &key
@@ -1827,14 +2305,14 @@
                         `(list* ,@variants ',tail)
                         `(list ,@variants)))))))))
 
-(deftransform sb!impl::|List| ((&rest elts))
+(deftransform sb-impl::|List| ((&rest elts))
   (transform-backq-list-or-list* 'list elts))
 
-(deftransform sb!impl::|List*| ((&rest elts))
+(deftransform sb-impl::|List*| ((&rest elts))
   (transform-backq-list-or-list* 'list* elts))
 
 ;; Merge adjacent constant values
-(deftransform sb!impl::|Append| ((&rest elts))
+(deftransform sb-impl::|Append| ((&rest elts))
   (let ((gensyms (make-gensym-list (length elts)))
         (acc nil)
         (ignored '())
@@ -1861,3 +2339,118 @@
       `(lambda ,gensyms
          (declare (ignore ,@ignored))
          (append ,@arguments)))))
+
+(deftransform reverse ((sequence) (vector) * :important nil)
+  `(sb-impl::vector-reverse sequence))
+
+(deftransform reverse ((sequence) (list) * :important nil)
+  `(sb-impl::list-reverse sequence))
+
+(deftransform nreverse ((sequence) (vector) * :important nil)
+  `(sb-impl::vector-nreverse sequence))
+
+(deftransform nreverse ((sequence) (list) * :important nil)
+  `(sb-impl::list-nreverse sequence))
+
+(deftransforms (intersection nintersection)
+    ((list1 list2 &key key test test-not))
+  (let ((null-type (specifier-type 'null)))
+    (cond ((or (csubtypep (lvar-type list1) null-type)
+               (csubtypep (lvar-type list2) null-type))
+           nil)
+          ((and (same-leaf-ref-p list1 list2)
+                (not test-not)
+                (not key)
+                (or (not test)
+                    (lvar-fun-is test '(eq eql equal equalp))))
+           'list1)
+          (t
+           (give-up-ir1-transform)))))
+
+(deftransforms (union nunion) ((list1 list2 &key key test test-not))
+  (let ((null-type (specifier-type 'null)))
+    (cond ((csubtypep (lvar-type list1) null-type)
+           'list2)
+          ((csubtypep (lvar-type list2) null-type)
+           'list1)
+          ((and (same-leaf-ref-p list1 list2)
+                (not test-not)
+                (not key)
+                (or (not test)
+                    (lvar-fun-is test '(eq eql equal equalp))))
+           'list1)
+          (t
+           (give-up-ir1-transform)))))
+
+(defoptimizer (union derive-type) ((list1 list2 &rest args))
+  (declare (ignore args))
+  (let ((cons-type (specifier-type 'cons)))
+    (if (or (csubtypep (lvar-type list1) cons-type)
+            (csubtypep (lvar-type list2) cons-type))
+        cons-type
+        (specifier-type 'list))))
+
+(defoptimizer (nunion derive-type) ((list1 list2 &rest args))
+  (declare (ignore args))
+  (let ((cons-type (specifier-type 'cons)))
+    (if (or (csubtypep (lvar-type list1) cons-type)
+            (csubtypep (lvar-type list2) cons-type))
+        cons-type
+        (specifier-type 'list))))
+
+(deftransforms (set-difference nset-difference)
+    ((list1 list2 &key key test test-not))
+  (let ((null-type (specifier-type 'null)))
+    (cond ((csubtypep (lvar-type list1) null-type)
+           nil)
+          ((csubtypep (lvar-type list2) null-type)
+           'list1)
+          ((and (same-leaf-ref-p list1 list2)
+                (not test-not)
+                (not key)
+                (or (not test)
+                    (lvar-fun-is test '(eq eql equal equalp))))
+           nil)
+          (t
+           (give-up-ir1-transform)))))
+
+(deftransform subsetp ((list1 list2 &key key test test-not))
+  (cond ((csubtypep (lvar-type list1) (specifier-type 'null))
+         t)
+        ((and (same-leaf-ref-p list1 list2)
+              (not test-not)
+              (not key)
+              (or (not test)
+                  (lvar-fun-is test '(eq eql equal equalp))))
+         t)
+        (t
+         (give-up-ir1-transform))))
+
+(deftransforms (set-exclusive-or nset-exclusive-or)
+    ((list1 list2 &key key test test-not))
+  (let ((null-type (specifier-type 'null)))
+    (cond ((csubtypep (lvar-type list1) null-type)
+           'list2)
+          ((csubtypep (lvar-type list2) null-type)
+           'list1)
+          ((and (same-leaf-ref-p list1 list2)
+                (not test-not)
+                (not key)
+                (or (not test)
+                    (lvar-fun-is test '(eq eql equal equalp))))
+           'list1)
+          (t
+           (give-up-ir1-transform)))))
+
+(deftransform tree-equal ((list1 list2 &key test test-not))
+  (cond ((and (same-leaf-ref-p list1 list2)
+              (not test-not)
+              (or (not test)
+                  (lvar-fun-is test '(eq eql equal equalp))))
+         t)
+        ((and (not test-not)
+              (or (not test)
+                  (lvar-fun-is test '(eql))))
+         `(sb-impl::tree-equal-eql list1 list2))
+        (t
+         (give-up-ir1-transform))))

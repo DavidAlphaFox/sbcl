@@ -14,28 +14,7 @@
 
 #include "runtime.h"
 #include <string.h>
-
-/*
- * This is a workaround for some slightly silly Linux/GNU Libc
- * behaviour: glibc defines sigset_t to support 1024 signals, which is
- * more than the kernel.  This is usually not a problem, but becomes
- * one when we want to save a signal mask from a ucontext, and restore
- * it later into another ucontext: the ucontext is allocated on the
- * stack by the kernel, so copying a libc-sized sigset_t into it will
- * overflow and cause other data on the stack to be corrupted */
-/* FIXME: do not rely on NSIG being a multiple of 8 */
-
-#ifdef LISP_FEATURE_WIN32
-# define REAL_SIGSET_SIZE_BYTES (4)
-#else
-# define REAL_SIGSET_SIZE_BYTES ((NSIG/8))
-#endif
-
-static inline void
-sigcopyset(sigset_t *new, sigset_t *old)
-{
-    memcpy(new, old, REAL_SIGSET_SIZE_BYTES);
-}
+#include "genesis/static-symbols.h"
 
 extern void get_current_sigmask(sigset_t *sigset);
 
@@ -62,12 +41,10 @@ extern void check_deferrables_unblocked_or_lose(sigset_t *sigset);
 extern void check_blockables_unblocked_or_lose(sigset_t *sigset);
 extern void check_gc_signals_unblocked_or_lose(sigset_t *sigset);
 
-extern void block_deferrable_signals(sigset_t *where, sigset_t *old);
-extern void block_blockable_signals(sigset_t *where, sigset_t *old);
-extern void block_gc_signals(sigset_t *where, sigset_t *old);
+extern void block_deferrable_signals(sigset_t *old);
+extern void block_blockable_signals(sigset_t *old);
 
 extern void unblock_deferrable_signals(sigset_t *where, sigset_t *old);
-extern void unblock_blockable_signals(sigset_t *where, sigset_t *old);
 extern void unblock_gc_signals(sigset_t *where, sigset_t *old);
 
 extern void maybe_save_gc_mask_and_block_deferrables(sigset_t *sigset);
@@ -97,11 +74,6 @@ extern void maybe_save_gc_mask_and_block_deferrables(sigset_t *sigset);
  *
  * -- NS 2007-01-29
  */
-/* No longer defined here, but in 'compiler/generic/parms.lisp' due to
-   requirement that Lisp skip this many words when assigning thread-local
-   storage indices */
-// #define MAX_INTERRUPTS 1024
-
 union interrupt_handler {
     lispobj lisp;
     void (*c)(int, siginfo_t*, os_context_t*);
@@ -121,7 +93,7 @@ struct interrupt_data {
      * and with no pending handler. Both deferrable interrupt handlers
      * and gc are careful not to clobber each other's pending_mask. */
     boolean gc_blocked_deferrables;
-#ifdef GENCGC_IS_PRECISE
+#if GENCGC_IS_PRECISE
     /* On PPC when consing wants to turn to alloc(), it does so via a
      * trap. When alloc() wants to save the sigmask it consults
      * allocation_trap_context. It does not look up the most recent
@@ -148,7 +120,10 @@ extern boolean handle_guard_page_triggered(os_context_t *,os_vm_address_t);
 extern boolean maybe_defer_handler(void *handler, struct interrupt_data *data,
                                    int signal, siginfo_t *info,
                                    os_context_t *context);
-#if defined LISP_FEATURE_GENCGC
+
+#ifdef DO_PENDING_INTERRUPT
+#define do_pending_interrupt ((void(*)(void))SYMBOL(DO_PENDING_INTERRUPT)->value)
+#elif defined(LISP_FEATURE_GENCGC)
 /* assembly language stub that executes trap_PendingInterrupt */
 extern void do_pending_interrupt(void);
 #endif
@@ -162,9 +137,8 @@ extern void undoably_install_low_level_interrupt_handler (
                         interrupt_handler_t handler);
 extern uword_t install_handler(int signal,
                                interrupt_handler_t handler,
+                               lispobj ohandler,
                                int synchronous);
-
-extern union interrupt_handler interrupt_handlers[NSIG];
 
 /* The void* casting here avoids having to mess with the various types
  * of function argument lists possible for signal handlers:

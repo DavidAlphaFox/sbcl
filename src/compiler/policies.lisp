@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (define-optimization-quality check-constant-modification
     safety
@@ -56,14 +56,15 @@ more reliable bactracing across foreign calls.")
   ("no" "maybe" "yes" "yes"))
 
 (define-optimization-quality insert-debug-catch
-    (cond ((and (= debug 3)
-                (> debug speed))
-           3)
-          ((and (> debug 0)
-                (>= debug speed))
-           1)
-          (t
-           0))
+  (cond ((and (= debug 3)
+              (> debug speed))
+         3)
+        #+unwind-to-frame-and-call-vop
+        ((and (> debug 0)
+              (>= debug speed))
+         1)
+        (t
+         0))
   ("no" "maybe" "yes" "yes")
   "Enables possibility of returning from stack frames with the debugger.
 The default value 1 doesn't prevent tail call optimization, while >1 does.")
@@ -103,7 +104,11 @@ This option has no effect without COMPUTE-DEBUG-FUN.")
 
 (define-optimization-quality compute-debug-fun
     debug
-  ("no" "minimal" "yes" "yes"))
+  ("minimal" "yes" "yes" "yes"))
+
+(define-optimization-quality store-source-form
+    debug
+  ("no" "maybe" "yes" "yes"))
 
 (define-optimization-quality preserve-single-use-debug-variables
     (if (and (>= debug 2)
@@ -133,7 +138,11 @@ debugger.")
     0
   ("no" "no" "yes" "yes"))
 
-#!+sb-safepoint
+(define-optimization-quality instrument-consing
+    1
+  ("no" "no" "yes" "yes"))
+
+#+sb-safepoint
 (define-optimization-quality inhibit-safepoints
     0
   ("no" "no" "yes" "yes")
@@ -149,3 +158,23 @@ compiled with this declaration in effect.")
 (define-optimization-quality store-closure-debug-pointer
     0
   ("no" "no" "yes" "yes"))
+
+;;; ALLOW-NON-RETURNING-TAIL-CALL unsupresses the supression of tail-call
+;;; optimization of nil-returning functions.
+;;;
+;;; At present this is used only by the ARG-COUNT-ERROR function, but would be
+;;; useful in similar functions whose sole purpose is to accept positional
+;;; arguments, shaping them into keyword arguments with which to call ERROR.
+;;; Generally any function tail-calling a nil-returning function remains on the
+;;; stack to allow a debugger to see variables in the signaling frame.
+;;; However ARG-COUNT-ERROR is not supposed to be visible.
+;;; Techniques that evolved to address its invisibility were brittle:
+;;; undocumented DEBUG versus SPEED policy-based decisions in TAIL-ANNOTATE,
+;;; or inefficient (performing FIND-CALLER-FRAME before calling ERROR).
+;;; Frobbing *STACK-TOP-HINT* seems no better than a declaration saying
+;;; "do what I mean," as the latter at least produces a consistent backtrace
+;;; between Lisp and ldb or gdb.
+;;;
+(define-optimization-quality allow-non-returning-tail-call
+    0
+  ("no" "no" "no" "yes"))

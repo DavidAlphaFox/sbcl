@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; The :full-call assembly-routines must use the same full-call
 ;;; unknown-values return convention as a normal call, as some
@@ -23,7 +23,8 @@
 ;;; value, which again simplifies the return path.
 ;;;    -- AB, 2006/Feb/05.
 
-(defun generate-call-sequence (name style vop)
+(defun generate-call-sequence (name style vop options)
+  (declare (ignore options))
   (ecase style
     ((:raw :none)
      (values
@@ -39,7 +40,7 @@
 (defun generate-return-sequence (style)
   (ecase style
     (:raw
-     `(inst ret))
+     `((inst ret)))
     (:full-call
      `((inst clc)
        (inst ret)))

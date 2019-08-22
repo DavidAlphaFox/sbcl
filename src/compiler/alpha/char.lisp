@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; moves and coercions
 
@@ -39,8 +39,6 @@
             :load-if (not (location= x y))))
   (:results (y :scs (character-reg)
                :load-if (not (location= x y))))
-  (:effects)
-  (:affected)
   (:generator 0
     (move x y)))
 (define-move-vop character-move :move
@@ -124,7 +122,7 @@
 
 (define-vop (character-compare/c)
   (:args (x :scs (character-reg)))
-  (:arg-types character (:constant character))
+  (:arg-types character (:constant (character-set ((0 . #xFF)))))
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:conditional)
   (:info target not-p y)
@@ -133,9 +131,9 @@
   (:variant-vars cond)
   (:generator 2
     (ecase cond
-      (:eq (inst cmpeq x (sb!xc:char-code y) temp))
-      (:lt (inst cmplt x (sb!xc:char-code y) temp))
-      (:gt (inst cmple x (sb!xc:char-code y) temp)))
+      (:eq (inst cmpeq x (sb-xc:char-code y) temp))
+      (:lt (inst cmplt x (sb-xc:char-code y) temp))
+      (:gt (inst cmple x (sb-xc:char-code y) temp)))
     (if not-p
         (if (eq cond :gt)
             (inst bne temp target)

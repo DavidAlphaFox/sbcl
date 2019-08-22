@@ -27,14 +27,16 @@
 
 ;;;; utilities to support tests
 
-;;; string equality modulo deletion of TABs and SPACEs (as a crude way
+;;; string equality modulo deletion of consecutive whitespace (as a crude way
 ;;; of washing away irrelevant differences in indentation)
 (defun string-modulo-tabspace (s)
-  (remove-if (lambda (c)
-               (or (char= c #\space)
-                   (char= c #\tab)
-                   (char= c #\newline)))
-             s))
+  (let ((s (string-trim '(#\Space) (substitute #\Space #\Newline
+                                               (substitute #\Space #\Tab s)))))
+    (loop (let ((p (search "  " s)))
+            (if (not p) (return s))
+            ;; Extremely inefficient but simple algorithm.
+            (setq s (concatenate 'string (subseq s 0 p) (subseq s (1+ p))))))))
+
 (defun string=-modulo-tabspace (x y)
   (string= (string-modulo-tabspace x)
            (string-modulo-tabspace y)))
@@ -982,11 +984,9 @@ Form: 2   Context: EVAL
              (take-it-out-for-a-test-walk (cond (a b)
                                                 ((foo bar) a (foo a)))))
            "Form: (COND (A B) ((FOO BAR) A (FOO A)))   Context: EVAL
-Form: (IF A (PROGN B) (COND ((FOO BAR) A (FOO A))))   Context: EVAL
+Form: (IF A B (IF (FOO BAR) (PROGN A (FOO A)) NIL))   Context: EVAL
 Form: A   Context: EVAL
-Form: (PROGN B)   Context: EVAL
 Form: B   Context: EVAL
-Form: (COND ((FOO BAR) A (FOO A)))   Context: EVAL
 Form: (IF (FOO BAR) (PROGN A (FOO A)) NIL)   Context: EVAL
 Form: (FOO BAR)   Context: EVAL
 Form: 'GLOBAL-FOO   Context: EVAL

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Moves and coercions:
 
@@ -42,8 +42,6 @@
   (:results (y :scs (character-reg)
                :load-if (not (location= x y))))
   (:note "character move")
-  (:effects)
-  (:affected)
   (:generator 0
     (move y x)))
 (define-move-vop character-move :move
@@ -62,7 +60,7 @@
       (character-reg
        (move y x))
       (character-stack
-       (storew x fp (tn-offset y))))))
+       (store-stack-offset x fp y)))))
 (define-move-vop move-character-arg :move-arg
   (any-reg character-reg) (character-reg))
 

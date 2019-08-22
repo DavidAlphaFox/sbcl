@@ -14,8 +14,6 @@ Examples:
  (make-instance 'sb-bsd-sockets:inet6-socket :type :datagram :protocol :udp)
 ")))
 
-(defparameter *inet6-address-any* (vector 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0))
-
 (defun address-numbers/v6 (address)
   (loop for i from 0 below 16 by 2 collect
        (+ (* 256 (elt address i)) (elt address (1+ i)))))
@@ -35,18 +33,18 @@ Examples:
      (endpoint-string/v6 address port))))
 
 (defun unparse-inet6-address (address)
-  (let ((max-length sockint::INET6-ADDRSTRLEN))
-    (sb-alien:with-alien ((octets (array char 16))
-                          (storage (sb-alien:c-string) (make-string max-length)))
-      (dotimes (i 16)
-        (setf (sb-alien:deref octets i) (elt address i)))
-      (socket-error-case ("inet_ntop"
-                          (sockint::inet-ntop
-                           sockint::af-inet6
-                           (sb-alien:cast octets (* sb-alien:unsigned-char))
-                           storage max-length)
-                          result (null result))
-          result))))
+  (sb-alien:with-alien ((octets (array sb-alien:unsigned-char 16))
+                        (storage (array sb-alien:char #.sockint::INET6-ADDRSTRLEN)))
+    (dotimes (i 16)
+      (setf (sb-alien:deref octets i) (elt address i)))
+    (socket-error-case ("inet_ntop"
+                        (sockint::inet-ntop
+                         sockint::af-inet6
+                         (sb-alien:cast octets (* t))
+                         (sb-alien:cast storage (* sb-alien:char))
+                         sockint::INET6-ADDRSTRLEN)
+                        result (null result))
+        result)))
 
 (defun make-inet6-address (colon-separated-integers)
   "Return a vector of octets given a string representation of an IPv6
@@ -107,11 +105,12 @@ malformed."
 (defmethod size-of-sockaddr ((socket inet6-socket))
   sockint::size-of-sockaddr-in6)
 
-(defmethod bits-of-sockaddr ((socket inet6-socket) sockaddr)
+(defmethod bits-of-sockaddr ((socket inet6-socket) sockaddr &optional size)
   "Returns address and port of SOCKADDR as multiple values"
+  (declare (ignore size))
   (values
    (coerce (loop for i from 0 below 16
-                 collect (sb-alien:deref (sockint::sockaddr-in6-addr sockaddr) i))
+              collect (sb-alien:deref (sockint::sockaddr-in6-addr sockaddr) i))
            '(vector (unsigned-byte 8) 16))
    (+ (* 256 (sb-alien:deref (sockint::sockaddr-in6-port sockaddr) 0))
       (sb-alien:deref (sockint::sockaddr-in6-port sockaddr) 1))))

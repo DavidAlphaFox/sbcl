@@ -11,7 +11,7 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-#-sb-eval
+#-(or sb-eval sb-fasteval)
 (sb-ext:exit :code 104)
 
 (setf sb-ext:*evaluator-mode* :interpret)
@@ -36,7 +36,7 @@
   (eval '(progn
           (defstruct evaluated-struct
             (pointer nil)
-            (word 0 :type (unsigned-byte #.sb-vm:n-word-bytes))
+            (word 0 :type sb-ext:word)
             (single 0.0 :type single-float)
             (double 0.0d0 :type double-float)
             (csingle (complex 0.0 0.0) :type (complex single-float))
@@ -75,7 +75,7 @@
             (cl:ed)))
         42)))))
 
-(defvar *file* #p"full-eval-temp.lisp")
+(defvar *file* (scratch-file-name "lisp"))
 (with-test (:name (:full-eval :redefinition-warnings))
   (with-open-file (stream *file* :direction :output :if-exists :supersede)
     (write '(defun function-for-redefinition () nil) :stream stream))
@@ -104,3 +104,13 @@
   (let* ((foo 3)
          (foo (lambda () (typep foo 'integer))))
     (assert (funcall foo))))
+
+(declaim (inline some-inline-fun))
+(locally
+ (declare (muffle-conditions compiler-note))
+ (defun some-inline-fun (x) (- x)))
+(with-test (:name :inline-fun-captures-decl :fails-on (not :sb-fasteval))
+  (assert (equal (sb-int:fun-name-inline-expansion 'some-inline-fun)
+                 '(sb-c:lambda-with-lexenv
+                   (:declare ((muffle-conditions compiler-note))) (x)
+                   (block some-inline-fun (- x))))))

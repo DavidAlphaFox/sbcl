@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (defun mask-signed-field (size integer)
   (cond ((zerop size)
@@ -46,12 +46,12 @@
   `(progn ,@(forms)))
 
 #.`
-(defun ,(intern (format nil "ASH-LEFT-MOD~D" sb!vm:n-machine-word-bits)
-                "SB!VM")
+(defun ,(intern (format nil "ASH-LEFT-MOD~D" sb-vm:n-machine-word-bits)
+                "SB-VM")
     (integer amount)
-  (ldb (byte ,sb!vm:n-machine-word-bits 0) (ash integer amount)))
+  (ldb (byte ,sb-vm:n-machine-word-bits 0) (ash integer amount)))
 
-#!+(or x86 x86-64 arm)
-(defun sb!vm::ash-left-modfx (integer amount)
-  (mask-signed-field (- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits)
+#+(or x86 x86-64 arm arm64)
+(defun sb-vm::ash-left-modfx (integer amount)
+  (mask-signed-field (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits)
                      (ash integer amount)))

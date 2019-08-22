@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-vop (reset-stack-pointer)
   (:args (ptr :scs (any-reg)))
@@ -23,20 +23,21 @@
   (:results (r-moved-ptrs :scs (any-reg) :more t))
   (:temporary (:sc any-reg) src)
   (:temporary (:sc any-reg) dest)
-  (:temporary (:sc non-descriptor-reg) temp)
+  (:temporary (:sc non-descriptor-reg) cmp-temp)
+  (:temporary (:sc descriptor-reg) temp)
   (:ignore r-moved-ptrs)
   (:generator 1
     (move last-nipped-ptr dest)
     (move last-preserved-ptr src)
-    (inst cmple csp-tn src temp)
-    (inst bne temp DONE)
+    (inst cmple csp-tn src cmp-temp)
+    (inst bne cmp-temp DONE)
     LOOP
     (loadw temp src)
     (inst addq dest n-word-bytes dest)
     (inst addq src n-word-bytes src)
     (storew temp dest -1)
-    (inst cmple csp-tn src temp)
-    (inst beq temp LOOP)
+    (inst cmple csp-tn src cmp-temp)
+    (inst beq cmp-temp LOOP)
     DONE
     (inst lda csp-tn 0 dest)
     (inst subq src dest src)
@@ -95,7 +96,7 @@
   (:policy :fast-safe)
   (:results (start :scs (any-reg))
             (count :scs (any-reg)))
-  (:temporary (:scs (descriptor-reg) :type list :from (:argument 0)) list)
+  (:temporary (:scs (descriptor-reg) :from (:argument 0)) list)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:vop-var vop)
@@ -114,7 +115,7 @@
     (inst and list lowtag-mask ndescr)
     (inst xor ndescr list-pointer-lowtag ndescr)
     (inst beq ndescr loop)
-    (error-call vop bogus-arg-to-values-list-error list)
+    (cerror-call vop 'bogus-arg-to-values-list-error list)
 
     DONE
     (inst subq csp-tn start count)))

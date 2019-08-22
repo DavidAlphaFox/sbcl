@@ -11,32 +11,36 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_HASH_TABLE
-#define SBCL_GENESIS_HASH_TABLE 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_HASH_TABLE
+#ifndef __ASSEMBLER__
 
 struct hash_table {
-    lispobj header;
-    lispobj _layout;
-    lispobj test;
-    lispobj test_fun;
-    lispobj hash_fun;
-    lispobj rehash_size;
-    lispobj raw_slot_padding5;
-    lispobj rehash_trigger;
-    lispobj number_entries;
-    lispobj table;
-    lispobj next_weak_hash_table;
-    lispobj weakness;
-    lispobj next_free_kv;
+    lispobj header; // = word_0_
+    lispobj gethash_impl;
+    lispobj puthash_impl;
+    lispobj remhash_impl;
+    lispobj clrhash_impl;
+    lispobj pairs;
     lispobj cache;
     lispobj index_vector;
     lispobj next_vector;
     lispobj hash_vector;
+    lispobj flags;
     lispobj lock;
-    lispobj needs_rehash_p;
-    lispobj synchronized_p;
+    lispobj test_fun;
+    lispobj hash_fun;
+    lispobj test;
+    lispobj rehash_size;
+    lispobj word_16_; // rehash_threshold
+    lispobj _count;
+    lispobj next_free_kv;
+    lispobj n_rehashfind;
+    lispobj n_lsearch;
+    lispobj smashed_cells;
+    lispobj next_weak_hash_table;
+    lispobj culled_values;
 };
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_HASH-TABLE */
+#endif

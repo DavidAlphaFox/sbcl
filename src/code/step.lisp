@@ -79,7 +79,7 @@
   (values))
 
 (defvar *stepper-hook* 'single-step
-  #+sb-doc "Customization hook for alternative single-steppers.
+  "Customization hook for alternative single-steppers.
 *STEPPER-HOOK* is bound to NIL prior to calling the bound function
 with the STEP-CONDITION as argument.")
 
@@ -92,7 +92,6 @@ with the STEP-CONDITION as argument.")
         (funcall hook condition)))))
 
 (defmacro step (form)
-  #+sb-doc
   "The form is evaluated with single stepping enabled. Function calls
 outside the lexical scope of the form can be stepped into only if the
 functions in question have been compiled with sufficient DEBUG policy

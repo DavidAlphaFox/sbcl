@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Tags for the main low-level types are stored in the low n (usually three)
 ;;; bits to identify the type of a machine word.  Certain constraints
@@ -50,13 +50,13 @@
 ;;;
 ;;; If you change the tag layout, check the various functions in
 ;;; src/runtime/runtime.h to see if they need to be updated, along
-;;; with print_obj() in src/runtime/print.c, possibly gc_init_tables()
-;;; in src/runtime/gc-common-c and possibly the code in src/code/room.
+;;; with print_obj() in src/runtime/print.c, possibly 'late-objdef.lisp'
+;;; and possibly the code in src/code/room.
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; The EVAL-WHEN is necessary (at least for Lispworks), because the
   ;; second DEFENUM uses the value of OTHER-IMMEDIATE-0-LOWTAG, which is
   ;; defined in the first DEFENUM. -- AL 20000216
-  #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+  #+64-bit
   (defenum ()
     even-fixnum-lowtag
     other-immediate-0-lowtag
@@ -74,7 +74,7 @@
     other-immediate-3-lowtag
     pad5-lowtag
     other-pointer-lowtag)
-  #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
+  #-64-bit
   (defenum ()
     even-fixnum-lowtag
     instance-pointer-lowtag
@@ -85,12 +85,12 @@
     other-immediate-1-lowtag
     other-pointer-lowtag))
 
-(def!constant nil-value
+(defconstant nil-value
     (+ static-space-start n-word-bytes other-pointer-lowtag))
 
 (defconstant-eqx fixnum-lowtags
     #.(let ((fixtags nil))
-        (do-external-symbols (sym "SB!VM")
+        (do-external-symbols (sym "SB-VM")
           (let* ((name (symbol-name sym))
                  (len (length name)))
             (when (and (boundp sym)
@@ -117,7 +117,7 @@
 ;;; * BIGNUM + RATIO (+ FIXNUM) = RATIONAL
 ;;;
 ;;; * SINGLE-FLOAT + DOUBLE-FLOAT + LONG-FLOAT = FLOAT
-;;;   But: There's not a snowball's chance that #!+long-float works.
+;;;   But: There's not a snowball's chance that #+long-float works.
 ;;;        changeset 7646ae obliterated LONG-FLOAT-WIDETAG.
 ;;;
 ;;; * RATIONAL + FLOAT = REAL
@@ -165,10 +165,11 @@
 ;; and simple vector of T to SIMPLE-VECTOR-T. Just because CL says that
 ;; SIMPLE-VECTOR means the latter doesn't make it right for SBCL internals.
 
-(defenum (;; The first widetag must be greater than SB!VM:LOWTAG-LIMIT
+(eval-when (:compile-toplevel :load-toplevel :execute)
+(defenum (;; The first widetag must be greater than SB-VM:LOWTAG-LIMIT
           ;; otherwise code in generic/early-type-vops will suffer
           ;; a long, horrible death.  --njf, 2004-08-09
-          :start (+ (ash 1 n-lowtag-bits) other-immediate-0-lowtag)
+          :start #.(+ (ash 1 n-lowtag-bits) other-immediate-0-lowtag)
           :step 4)
                                             ; +unicode -unicode
 ;;                             Word bits    ;  32 | 64  32 | 64
@@ -184,107 +185,150 @@
 
   code-header-widetag                       ;  26   2D  26   2D
 
-  simple-fun-header-widetag                 ;  2A   31  2A   31
-  closure-header-widetag                    ;  2E   35  2E   35
-  funcallable-instance-header-widetag       ;  32   39  32   39
+  simple-fun-widetag                        ;  2A   31  2A   31
+  closure-widetag                           ;  2E   35  2E   35
+  funcallable-instance-widetag              ;  32   39  32   39
 
-  return-pc-header-widetag                  ;  36   3D  36   3D
-  value-cell-header-widetag                 ;  3A   41  3A   41
-  symbol-header-widetag                     ;  3E   45  3E   45
+  ;; x86[-64] does not have objects with this widetag,
+  #+(or x86 x86-64) unused00-widetag
+  #-(or x86 x86-64)
+  return-pc-widetag                         ;  36   3D  36   3D
+
+  value-cell-widetag                        ;  3A   41  3A   41
+  symbol-widetag                            ;  3E   45  3E   45
   character-widetag                         ;  42   49  42   49
   sap-widetag                               ;  46   4D  46   4D
   unbound-marker-widetag                    ;  4A   51  4A   51
   weak-pointer-widetag                      ;  4E   55  4E   55
-  instance-header-widetag                   ;  52   59  52   59
+  instance-widetag                          ;  52   59  52   59
   fdefn-widetag                             ;  56   5D  56   5D
 
   no-tls-value-marker-widetag               ;  5A   61  5A   61
-  #!-sb-simd-pack
+  #-sb-simd-pack
   unused01-widetag                          ;  5E       5E
-  #!+sb-simd-pack
+  #+sb-simd-pack
   simd-pack-widetag                         ;       65       65
-  unused02-widetag                          ;  62   69  62   69
-  unused03-widetag                          ;  66   6D  66   6D
+  #-sb-simd-pack-256
+  unused03-widetag                          ;  62   69  62   69
+  #+sb-simd-pack-256
+  simd-pack-256-widetag                     ;  62   69  62   69
+  filler-widetag                            ;  66   6D  66   6D
   unused04-widetag                          ;  6A   71  6A   71
   unused05-widetag                          ;  6E   75  6E   75
   unused06-widetag                          ;  72   79  72   79
   unused07-widetag                          ;  76   7D  76   7D
-  #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
+  #-64-bit
   unused08-widetag                          ;  7A       7A
-  #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
+  #-64-bit
   unused09-widetag                          ;  7E       7E
 
-  #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
-  unused10-widetag                          ;  82       82
-  #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
-  unused11-widetag                          ;  86       86
+  simple-array-widetag                      ;  82   81  82   81
+  simple-array-unsigned-byte-2-widetag      ;  86   85  86   85
+  simple-array-unsigned-byte-4-widetag      ;  8A   89  8A   89
+  simple-array-unsigned-byte-7-widetag      ;  8E   8D  8E   8D
+  simple-array-unsigned-byte-8-widetag      ;  92   91  92   91
+  simple-array-unsigned-byte-15-widetag     ;  96   95  96   95
+  simple-array-unsigned-byte-16-widetag     ;  9A   99  9A   99
 
-  simple-array-widetag                      ;  8A   81  8A   81
-  simple-array-unsigned-byte-2-widetag      ;  8E   85  8E   85
-  simple-array-unsigned-byte-4-widetag      ;  92   89  92   89
-  simple-array-unsigned-byte-7-widetag      ;  96   8D  96   8D
-  simple-array-unsigned-byte-8-widetag      ;  9A   91  9A   91
-  simple-array-unsigned-byte-15-widetag     ;  9E   95  9E   95
-  simple-array-unsigned-byte-16-widetag     ;  A2   99  A2   99
-
-  #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
-  simple-array-unsigned-fixnum-widetag      ;  A6   A5  A6   A5
-  simple-array-unsigned-byte-31-widetag     ;  AA   9D  AA   9D
-  simple-array-unsigned-byte-32-widetag     ;  AE   A1  AE   A1
-  #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
-  simple-array-unsigned-fixnum-widetag      ;  A6   A5  A6   A5
-  #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+  #-64-bit
+  simple-array-unsigned-fixnum-widetag      ;  9E   A5  9E   A5
+  simple-array-unsigned-byte-31-widetag     ;  A2   9D  A2   9D
+  simple-array-unsigned-byte-32-widetag     ;  A6   A1  A6   A1
+  #+64-bit
+  simple-array-unsigned-fixnum-widetag      ;  9E   A5  9E   A5
+  #+64-bit
   simple-array-unsigned-byte-63-widetag     ;       A9       A9
-  #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+  #+64-bit
   simple-array-unsigned-byte-64-widetag     ;       AD       AD
-  simple-array-signed-byte-8-widetag        ;  B2   B1  B2   B1
-  simple-array-signed-byte-16-widetag       ;  B6   B5  B6   B5
-  #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
-  simple-array-fixnum-widetag               ;  BA   BD  BA   BD
-  simple-array-signed-byte-32-widetag       ;  BE   B9  BE   B9
-  #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
-  simple-array-fixnum-widetag               ;  BA   BD  BA   BD
-  #!+#.(cl:if (cl:= 64 sb!vm:n-word-bits) '(and) '(or))
+  simple-array-signed-byte-8-widetag        ;  AA   B1  AA   B1
+  simple-array-signed-byte-16-widetag       ;  AE   B5  AE   B5
+  #-64-bit
+  simple-array-fixnum-widetag               ;  B2   BD  B2   BD
+  simple-array-signed-byte-32-widetag       ;  B6   B9  B6   B9
+  #+64-bit
+  simple-array-fixnum-widetag               ;  B2   BD  B2   BD
+  #+64-bit
   simple-array-signed-byte-64-widetag       ;       C1       C1
-  simple-array-single-float-widetag         ;  C2   C5  C2   C5
-  simple-array-double-float-widetag         ;  C6   C9  C6   C9
-  simple-array-complex-single-float-widetag ;  CA   CD  CA   CD
-  simple-array-complex-double-float-widetag ;  CE   D1  CE   D1
-  simple-bit-vector-widetag                 ;  D2   D5  D2   D5
-  simple-vector-widetag                     ;  D6   D9  D6   D9
+  simple-array-single-float-widetag         ;  BA   C5  BA   C5
+  simple-array-double-float-widetag         ;  BE   C9  BE   C9
+  simple-array-complex-single-float-widetag ;  C2   CD  C2   CD
+  simple-array-complex-double-float-widetag ;  C6   D1  C6   D1
+  simple-bit-vector-widetag                 ;  CA   D5  CA   D5
+  simple-vector-widetag                     ;  CE   D9  CE   D9
 
   ;; Strings
-  simple-array-nil-widetag                  ;  DA   DD  DA   DD
-  simple-base-string-widetag                ;  DE   E1  DE   E1
-  #!+sb-unicode
-  simple-character-string-widetag           ;  E2   E5
-  #!+sb-unicode
-  complex-character-string-widetag          ;  E6   E9
-  complex-base-string-widetag               ;  EA   ED  E2   E5
-  complex-vector-nil-widetag                ;  EE   F1  E6   E9
+  simple-array-nil-widetag                  ;  D2   DD  D2   DD
+  simple-base-string-widetag                ;  D6   E1  D6   E1
+  #+sb-unicode
+  simple-character-string-widetag           ;  DA   E5
+  #+sb-unicode
+  complex-character-string-widetag          ;  DE   E9
+  complex-base-string-widetag               ;  E2   ED  DA   E5
+  complex-vector-nil-widetag                ;  E6   F1  DE   E9
 
-  complex-bit-vector-widetag                ;  F2   F5  EA   ED
-  complex-vector-widetag                    ;  F6   F9  EE   F1
-  complex-array-widetag                     ;  FA   FD  F2   F5
+  complex-bit-vector-widetag                ;  EA   F5  E2   ED
+  complex-vector-widetag                    ;  EE   F9  E6   F1
+  complex-array-widetag                     ;  F2   FD  EA   F5
+))
 
-  #!+#.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
-  unused12-widetag                          ;  FE       F6
-  #!+(and #.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
-          (not sb-unicode))
-  unused13-widetag                          ;           FA
-  #!+(and #.(cl:if (cl:= 32 sb!vm:n-word-bits) '(and) '(or))
-          (not sb-unicode))
-  unused14-widetag                          ;           FE
-)
+(defconstant-eqx +function-widetags+
+    '#.(list funcallable-instance-widetag simple-fun-widetag closure-widetag)
+  #'equal)
 
-;;; the different vector subtypes
-(defenum ()
-  vector-normal-subtype
-  vector-unused-subtype
-  vector-valid-hashing-subtype)
+;;; the different vector subtypes, can be ORed together.
+(defconstant vector-normal-subtype       0)
+;; Weak vectors that are NOT hash-table backing vectors use this bit to track
+;; whether we've already recorded the vector for deferred scavenging.
+;; Hash-tables use an entirely different mechanism. Flag bit used only in C.
+(defconstant vector-weak-visited-subtype 8)
+;; All hash-table backing vectors are marked with this bit.
+;; Essentially it informs GC that the vector has a high-water mark.
+(defconstant vector-hashing-subtype      4)
+;; Set if hash-table contains address-sensitive keys and possibly
+;; an associated vector of 32-bit hashes.
+;; When upsizing a table, both the old and new vector may have this bit set.
+(defconstant vector-addr-hashing-subtype 2)
+;; Set if vector is weak. Weak hash tables have both this AND the hashing bit.
+(defconstant vector-weak-subtype         1)
+
+;;; These next two constants must not occupy the same byte of a
+;;; vector header word as the values in the preceding defenum.
+
+;; A vector tagged as +VECTOR-SHAREABLE+ is logically readonly,
+;; and permitted to be shared with another vector per the CLHS standard
+;; under the concept of similarity as constant. A vector so tagged is
+;; often the print-name of a symbol, or was a literal in source code
+;; and loaded from a fasl, or used in a few others situations
+;; which warrant sharing.
+(defconstant +vector-shareable+ #x100)
+
+;; A vector tagged as +VECTOR-SHAREABLE-NONSTD+ is logically readonly,
+;; and *not* technically permitted by the standard to be shared.
+;; If, despite the apparent prohibition, the user opts to make these
+;; shareable, we'll do it. This typically occurs with compilation
+;; into memory, where the requirement is that the machine code
+;; reference "the same" object as appeared in source, but where,
+;; nonetheless, opportunities for sharing abound.
+(defconstant +vector-shareable-nonstd+ #x200)
+
+;;; This is so that COMPILE-FILE knows that things like :ALLOW-OTHER-KEYS
+;;; can be immediate constants.
+;;; Note also that sb-fasteval uses 2 bits of the symbol header.
+#+(and immobile-space (not immobile-symbols))
+(defconstant +initial-core-symbol-bit+ 8) ; bit index, not bit value
+
+#+immobile-space
+(progn
+  ;; See 'doc/internal-notes/compact-instance' for rationale
+  (defconstant layout-align #+64-bit 128 #-64-bit 256) ; in bytes
+
+  ;; FUNCTION-LAYOUT is a fixnum whose bits are ORed in "as-is" with the
+  ;; low half of a closure header to form the full header word.
+  #-sb-thread
+  (defglobal function-layout 0))        ; set by genesis
 
 #|
-;; Run this in the SB-VM or SB!VM package once for each target feature combo.
+;; Run this in the SB-VM or SB-VM package once for each target feature combo.
 (defun rewrite-widetag-comments ()
   (rename-file "src/compiler/generic/early-objdef.lisp" "early-objdef.old")
   (with-open-file (in "src/compiler/generic/early-objdef.old")
@@ -292,7 +336,7 @@
                          :direction :output :if-exists :supersede)
       (let* ((target-features
               (if (find-package "SB-COLD")
-                  (symbol-value (find-symbol "*SHEBANG-FEATURES*" "SB-COLD"))
+                  (symbol-value (find-symbol "*FEATURES*" "SB-XC"))
                   *features*))
              (feature-bits
               (+ (if (= n-word-bits 64) 1 0)

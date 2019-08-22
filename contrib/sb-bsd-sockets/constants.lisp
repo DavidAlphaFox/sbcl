@@ -90,6 +90,8 @@
  (:integer ESOCKTNOSUPPORT "ESOCKTNOSUPPORT")
  (:integer ENETUNREACH "ENETUNREACH")
  (:integer ENOTCONN "ENOTCONN")
+ (:integer EAFNOSUPPORT "EAFNOSUPPORT")
+ (:integer EINPROGRESS "EINPROGRESS")
 
  (:integer NETDB-INTERNAL #+hpux "h_NETDB_INTERNAL" #-hpux "NETDB_INTERNAL" "See errno.")
  (:integer NETDB-SUCCESS #+hpux "h_NETDB_SUCCESS" #-hpux "NETDB_SUCCESS" "No problem.")
@@ -117,8 +119,6 @@
 
  ;; for socket-receive
  (:type socklen-t "socklen_t")
- (:type size-t "size_t")
- (:type ssize-t "ssize_t")
 
                                         #|
  ;;; stat is nothing to do with sockets, but I keep it around for testing

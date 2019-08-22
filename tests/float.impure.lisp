@@ -120,24 +120,17 @@
   (setf (aref (the myarraytype array) 0)
         sb-ext:double-float-positive-infinity))
 
-;;; bug 407
-;;;
-;;; FIXME: it may be that TYPE-ERROR is wrong, and we should
-;;; instead signal an overflow or coerce into an infinity.
-(defun bug-407a ()
-  (loop for n from (expt 2 1024) upto (+ 10 (expt 2 1024))
-        do (handler-case
-               (coerce n 'single-float)
-             (simple-type-error ()
-               (return-from bug-407a :type-error)))))
-(assert (eq :type-error (bug-407a)))
-(defun bug-407b ()
-  (loop for n from (expt 2 1024) upto (+ 10 (expt 2 1024))
-        do (handler-case
-               (format t "~E~%" (coerce n 'single-float))
-             (simple-type-error ()
-               (return-from bug-407b :type-error)))))
-(assert (eq :type-error (bug-407b)))
+(with-test (:name :bug-407a)
+  (assert-error
+   (loop for n from (expt 2 1024) upto (+ 10 (expt 2 1024))
+         do (coerce n 'single-float))
+   floating-point-overflow))
+
+(with-test (:name :bug-407b)
+  (assert-error
+   (loop for n from (expt 2 1024) upto (+ 10 (expt 2 1024))
+         do (format nil "~E~%" n))
+   floating-point-overflow))
 
 ;; 1.0.29.44 introduces a ton of changes for complex floats
 ;; on x86-64. Huge test of doom to help catch weird corner
@@ -193,47 +186,54 @@
 (def-compute compute-single single-float)
 (def-compute compute-double double-float)
 
-(labels ((equal-enough (x y)
-           (cond ((eql x y))
-                 ((or (complexp x)
-                      (complexp y))
-                  (or (eql (coerce x '(complex double-float))
-                           (coerce y '(complex double-float)))
-                      (and (equal-enough (realpart x) (realpart y))
-                           (equal-enough (imagpart x) (imagpart y)))))
-                 ((numberp x)
-                  (or (eql (coerce x 'double-float) (coerce y 'double-float))
-                      (< (abs (- x y))  1d-5))))))
-  (let* ((reals     '(0 1 2))
-         (complexes '#.(let ((reals '(0 1 2))
-                             (cpx   '()))
-                         (dolist (x reals (nreverse cpx))
-                           (dolist (y reals)
-                             (push (complex x y) cpx))))))
-    (declare (notinline every))
-    (dolist (r reals)
-      (dolist (x complexes)
-        (dolist (y complexes)
-          (let ((value  (compute-number x y r))
-                (single (compute-single (coerce x '(complex single-float))
-                                        (coerce y '(complex single-float))
-                                        (coerce r 'single-float)))
-                (double (compute-double (coerce x '(complex double-float))
-                                        (coerce y '(complex double-float))
-                                        (coerce r 'double-float))))
-            (assert (every (lambda (pos ref single double)
-                             (declare (ignorable pos))
-                             (every (lambda (ref single double)
-                                      (or (and (equal-enough ref single)
-                                               (equal-enough ref double))
-                                          (and (not (numberp single)) ;; -ve 0s
-                                               (equal-enough single double))))
-                                    (fourth ref) (fourth single) (fourth double)))
-                           '((0 0) (0 1) (0 2) (0 3)
-                             (1 0) (1 1) (1 2) (1 3)
-                             (2 0) (2 1) (2 2) (2 3)
-                             (3 0) (3 1) (3 2) (3 3))
-                           value single double))))))))
+
+(with-test (:name :complex-float)
+  (labels ((equal-enough (x y)
+             (cond ((eql x y))
+                   ((or (complexp x)
+                        (complexp y))
+                    (or (eql (coerce x '(complex double-float))
+                             (coerce y '(complex double-float)))
+                        (and (equal-enough (realpart x) (realpart y))
+                             (equal-enough (imagpart x) (imagpart y)))))
+                   ((numberp x)
+                    (or (eql (coerce x 'double-float) (coerce y 'double-float))
+                        (< (abs (- x y))  1d-5))))))
+    (let* ((reals     '(0 1 2))
+           (complexes '#.(let ((reals '(0 1 2))
+                               (cpx   '()))
+                           (dolist (x reals (nreverse cpx))
+                             (dolist (y reals)
+                               (push (complex x y) cpx))))))
+      (declare (notinline every))
+      (dolist (r reals)
+        (dolist (x complexes)
+          (dolist (y complexes)
+            (let ((value  (compute-number x y r))
+                  (single (compute-single (coerce x '(complex single-float))
+                                          (coerce y '(complex single-float))
+                                          (coerce r 'single-float)))
+                  (double (compute-double (coerce x '(complex double-float))
+                                          (coerce y '(complex double-float))
+                                          (coerce r 'double-float))))
+
+              (mapc (lambda (pos ref single double)
+                      (declare (ignorable pos))
+                      (mapc (lambda (ref single double)
+                              (unless
+                                  (or (and (equal-enough ref single)
+                                           (equal-enough ref double))
+                                      (and (not (numberp single)) ;; -ve 0s
+                                           (equal-enough single double)))
+                                (error "r: ~a, x: ~a, y: ~a~%ref: ~a, single: ~a, double ~a"
+                                       r x y
+                                       ref single double)))
+                            (fourth ref) (fourth single) (fourth double)))
+                    '((0 0) (0 1) (0 2) (0 3)
+                      (1 0) (1 1) (1 2) (1 3)
+                      (2 0) (2 1) (2 2) (2 3)
+                      (3 0) (3 1) (3 2) (3 3))
+                    value single double))))))))
 
 ;; The x86 port used not to reduce the arguments of transcendentals
 ;; correctly.
@@ -244,7 +244,7 @@
 ;; that can differ by arbitrarily large amounts for large inputs.
 ;; The test expects the x87 results.
 (with-test (:name (:range-reduction :x87)
-            :skipped-on '(not :x86))
+            :skipped-on (not :x86))
   (flet ((almost= (x y)
            (< (abs (- x y)) 1d-5)))
     (macrolet ((foo (op value)
@@ -303,7 +303,7 @@ fractional bits."
 ;; (:range-reduction :x87) above.
 (with-test (:name (:range-reduction :precise-pi)
             :skipped-on :x86
-            :fails-on '(and :openbsd :x86-64))
+            :fails-on (and :openbsd :x86-64))
   (let ((rational-pi-half (/ (pi-gauss-legendre 2200) 2)))
     (labels ((round-pi-half (x)
                "Return two values as if (ROUND X (/ PI 2)) was called

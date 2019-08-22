@@ -27,9 +27,14 @@ ARCH_SRC = ppc-arch.c
 CPPFLAGS += -no-cpp-precomp
 
 ifdef LISP_FEATURE_GENCGC
-  GC_SRC = gencgc.c
+  GC_SRC = fullcgc.c gencgc.c traceroot.c
 else
   GC_SRC = cheneygc.c
+endif
+
+ifdef LISP_FEATURE_SB_LINKABLE_RUNTIME
+  LIBSBCL = libsbcl.a
+  USE_LIBSBCL = -Wl,-force_load libsbcl.a
 endif
 
 .PHONY: after-grovel-headers

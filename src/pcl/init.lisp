@@ -29,6 +29,7 @@
   (apply #'make-instance (find-class class) initargs))
 
 (defmethod make-instance ((class class) &rest initargs)
+  (declare (inline ensure-class-finalized))
   (let ((instance-or-nil (maybe-call-ctor class initargs)))
     (when instance-or-nil
       (return-from make-instance instance-or-nil)))
@@ -104,7 +105,7 @@
   ((initarg :initarg :initarg :reader slotd-initialization-error-initarg)
    (kind :initarg :kind :reader slotd-initialization-error-kind)
    (value :initarg :value :initform nil :reader slotd-initialization-error-value))
-  (:default-initargs :references (list '(:amop :initialization slot-definition)))
+  (:default-initargs :references '((:amop :initialization slot-definition)))
   (:report (lambda (condition stream)
              (let ((initarg (slotd-initialization-error-initarg condition))
                    (kind (slotd-initialization-error-kind condition))
@@ -210,26 +211,29 @@
   ;; the same name exists in the previous class."
   (let ((added-slots '())
         (current-slotds (class-slots (class-of current)))
-        (previous-slot-names (mapcar #'slot-definition-name
-                                     (class-slots (class-of previous)))))
+        (previous-slotds (class-slots (class-of previous))))
     (dolist (slotd current-slotds)
-      (if (and (not (memq (slot-definition-name slotd) previous-slot-names))
-               (eq (slot-definition-allocation slotd) :instance))
-          (push (slot-definition-name slotd) added-slots)))
-    (check-initargs-1
-     (class-of current) initargs
-     (list (list* 'update-instance-for-different-class previous current initargs)
-           (list* 'shared-initialize current added-slots initargs)))
+      (when (and (eq (slot-definition-allocation slotd) :instance)
+                 (not (member (slot-definition-name slotd) previous-slotds
+                              :key #'slot-definition-name
+                              :test #'eq)))
+        (push (slot-definition-name slotd) added-slots)))
+    (when initargs
+      (let ((call-list (list (list* 'update-instance-for-different-class previous current initargs)
+                             (list* 'shared-initialize current added-slots initargs))))
+        (declare (dynamic-extent call-list))
+        (check-initargs-1 (class-of current) initargs call-list)))
     (apply #'shared-initialize current added-slots initargs)))
 
 (defmethod update-instance-for-redefined-class
     ((instance standard-object) added-slots discarded-slots property-list
      &rest initargs)
-  (check-initargs-1
-   (class-of instance) initargs
-   (list (list* 'update-instance-for-redefined-class
-                instance added-slots discarded-slots property-list initargs)
-         (list* 'shared-initialize instance added-slots initargs)))
+  (when initargs
+    (check-initargs-1
+     (class-of instance) initargs
+     (list (list* 'update-instance-for-redefined-class
+                  instance added-slots discarded-slots property-list initargs)
+           (list* 'shared-initialize instance added-slots initargs))))
   (apply #'shared-initialize instance added-slots initargs))
 
 (defmethod shared-initialize ((instance slot-object) slot-names &rest initargs)
@@ -256,15 +260,13 @@
                              (slot-boundp-using-class class instance slotd))
                    (setf (slot-value-using-class class instance slotd)
                          (funcall initfun)))))))
-    (let* ((class (class-of instance))
-           (initfn-slotds
-            (loop for slotd in (class-slots class)
-                  unless (initialize-slot-from-initarg class instance slotd)
-                  collect slotd)))
-      (dolist (slotd initfn-slotds)
-        (when (or (eq t slot-names)
-                  (memq (slot-definition-name slotd) slot-names))
-          (initialize-slot-from-initfunction class instance slotd))))
+    (let ((class (class-of instance)))
+      (loop for slotd in (class-slots class)
+            unless (initialize-slot-from-initarg class instance slotd)
+            do
+            (when (or (eq t slot-names)
+                      (memq (slot-definition-name slotd) slot-names))
+              (initialize-slot-from-initfunction class instance slotd))))
     instance))
 
 ;;; If initargs are valid return nil, otherwise signal an error.
@@ -292,12 +294,12 @@
     ;; any point we come across &allow-other-keys, we can
     ;; just quit.
     (dolist (method methods)
-      (multiple-value-bind (nreq nopt keysp restp allow-other-keys keys)
+      (multiple-value-bind (llks nreq nopt keys)
           (analyze-lambda-list (if (consp method)
                                    (early-method-lambda-list method)
                                    (method-lambda-list method)))
-        (declare (ignore nreq nopt keysp restp))
-        (when allow-other-keys
+        (declare (ignore nreq nopt))
+        (when (ll-kwds-allowp llks)
           (return-from check-initargs-values (values nil t)))
         (setq legal (append keys legal))))
     (values legal nil)))
@@ -305,13 +307,16 @@
 (define-condition initarg-error (reference-condition program-error)
   ((class :reader initarg-error-class :initarg :class)
    (initargs :reader initarg-error-initargs :initarg :initargs))
-  (:default-initargs :references (list '(:ansi-cl :section (7 1 2))))
+  (:default-initargs :references '((:ansi-cl :section (7 1 2))))
   (:report (lambda (condition stream)
              (format stream "~@<Invalid initialization argument~P: ~2I~_~
                              ~<~{~S~^, ~} ~@:>~I~_in call for class ~S.~:>"
                      (length (initarg-error-initargs condition))
                      (list (initarg-error-initargs condition))
                      (initarg-error-class condition)))))
+
+(defun initarg-error (class invalid-keys)
+  (error 'initarg-error :class class :initargs invalid-keys))
 
 (defun check-initargs-2-plist (initargs class legal &optional (error-p t))
   (let ((invalid-keys ()))
@@ -324,7 +329,7 @@
                     (eq key :allow-other-keys))
           (push key invalid-keys)))
       (when (and invalid-keys error-p)
-        (error 'initarg-error :class class :initargs invalid-keys)))
+        (initarg-error class invalid-keys)))
     invalid-keys))
 
 (defun check-initargs-2-list (initkeys class legal &optional (error-p t))
@@ -336,5 +341,5 @@
         (unless (memq key legal)
           (push key invalid-keys)))
       (when (and invalid-keys error-p)
-        (error 'initarg-error :class class :initargs invalid-keys)))
+        (initarg-error class invalid-keys)))
     invalid-keys))

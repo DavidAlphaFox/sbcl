@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Additional constants
 
@@ -19,7 +19,7 @@
 ;;; slots are required by architecture for a place to spill register windows.
 ;;;
 ;;; FIXME: Where is this used?
-(def!constant number-stack-displacement
+(defconstant number-stack-displacement
   (* 16 n-word-bytes))
 
 ;;;; Define the registers
@@ -30,7 +30,7 @@
 (macrolet ((defreg (name offset)
                (let ((offset-sym (symbolicate name "-OFFSET")))
                  `(eval-when (:compile-toplevel :load-toplevel :execute)
-                   (def!constant ,offset-sym ,offset)
+                   (defconstant ,offset-sym ,offset)
                    (setf (svref *register-names* ,offset-sym)
                         ,(symbol-name name)))))
 
@@ -87,42 +87,24 @@
   (defregset descriptor-regs
       a0 a1 a2 a3 a4 a5 ocfp lra cname lexenv l0)
 
+  ;; OAOOM: Same as runtime/sparc-lispregs.h
+  (defregset boxed-regs
+      a0 a1 a2 a3 a4 a5 cname lexenv
+      ocfp lra l0 code)
+
   (defregset *register-arg-offsets*
       a0 a1 a2 a3 a4 a5))
 
 ;;;; SB and SC definition
 
+(!define-storage-bases
 (define-storage-base registers :finite :size 32)
 (define-storage-base float-registers :finite :size 64)
 (define-storage-base control-stack :unbounded :size 8)
 (define-storage-base non-descriptor-stack :unbounded :size 0)
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
-
-;;; handy macro so we don't have to keep changing all the numbers
-;;; whenever we insert a new storage class
-(defmacro !define-storage-classes (&rest classes)
-  (do ((forms (list 'progn)
-              (let* ((class (car classes))
-                     (sc-name (car class))
-                     (constant-name (intern (concatenate 'simple-string
-                                                         (string sc-name)
-                                                         "-SC-NUMBER"))))
-                (list* `(define-storage-class ,sc-name ,index
-                          ,@(cdr class))
-                       `(def!constant ,constant-name ,index)
-                       ;; (The CMU CL version of this macro did
-                       ;;   `(EXPORT ',CONSTANT-NAME)
-                       ;; here, but in SBCL we try to have package
-                       ;; structure described statically in one
-                       ;; master source file, instead of building it
-                       ;; dynamically by letting all the system code
-                       ;; modify it as the system boots.)
-                       forms)))
-       (index 0 (1+ index))
-       (classes classes (cdr classes)))
-      ((null classes)
-       (nreverse forms))))
+)
 
 (!define-storage-classes
 
@@ -172,13 +154,13 @@
   (single-stack non-descriptor-stack) ; single-floats
   (double-stack non-descriptor-stack
                 :element-size 2 :alignment 2) ; double floats.
-  #!+long-float
+  #+long-float
   (long-stack non-descriptor-stack :element-size 4 :alignment 4) ; long floats.
   ;; complex-single-floats
   (complex-single-stack non-descriptor-stack :element-size 2)
   ;; complex-double-floats.
   (complex-double-stack non-descriptor-stack :element-size 4 :alignment 2)
-  #!+long-float
+  #+long-float
   ;; complex-long-floats.
   (complex-long-stack non-descriptor-stack :element-size 8 :alignment 4)
 
@@ -232,7 +214,7 @@
 
   ;; Non-Descriptor double-floats.
   (double-reg float-registers
-   :locations #.(loop for i from 0 to #!-sparc-64 31 #!+sparc-64 63
+   :locations #.(loop for i from 0 to #-sparc-64 31 #+sparc-64 63
                       by 2 collect i)
    :element-size 2 :alignment 2
    :reserve-locations (28 30)
@@ -241,9 +223,9 @@
    :alternate-scs (double-stack))
 
   ;; Non-Descriptor double-floats.
-  #!+long-float
+  #+long-float
   (long-reg float-registers
-   :locations #.(loop for i from 0 to #!-sparc-64 31 #!+sparc-64 63
+   :locations #.(loop for i from 0 to #-sparc-64 31 #+sparc-64 63
                       by 4 collect i)
    :element-size 4 :alignment 4
    :reserve-locations (28)
@@ -260,7 +242,7 @@
    :alternate-scs (complex-single-stack))
 
   (complex-double-reg float-registers
-   :locations #.(loop for i from 0 to #!-sparc-64 31 #!+sparc-64 63
+   :locations #.(loop for i from 0 to #-sparc-64 31 #+sparc-64 63
                       by 4 collect i)
    :element-size 4 :alignment 4
    :reserve-locations (28)
@@ -268,9 +250,9 @@
    :save-p t
    :alternate-scs (complex-double-stack))
 
-  #!+long-float
+  #+long-float
   (complex-long-reg float-registers
-   :locations #.(loop for i from 0 to #!-sparc-64 31 #!+sparc-64 63
+   :locations #.(loop for i from 0 to #-sparc-64 31 #+sparc-64 63
                       by 8 collect i)
    :element-size 8 :alignment 8
    :constant-scs ()
@@ -278,8 +260,8 @@
    :alternate-scs (complex-long-stack))
 
 
-  ;; A catch or unwind block.
-  (catch-block control-stack :element-size catch-block-size))
+  (catch-block control-stack :element-size catch-block-size)
+  (unwind-block control-stack :element-size unwind-block-size))
 
 ;;;; Make some miscellaneous TNs for important registers.
 (macrolet ((defregtn (name sc)
@@ -307,38 +289,37 @@
 (defun immediate-constant-sc (value)
   (typecase value
     ((integer 0 0)
-     (sc-number-or-lose 'zero))
+     zero-sc-number)
     (null
-     (sc-number-or-lose 'null))
-    ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
+     null-sc-number)
+    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
          character)
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
     (symbol
      (if (static-symbol-p value)
-         (sc-number-or-lose 'immediate)
+         immediate-sc-number
          nil))))
 
 (defun boxed-immediate-sc-p (sc)
-  (or (eql sc (sc-number-or-lose 'zero))
-      (eql sc (sc-number-or-lose 'null))
-      (eql sc (sc-number-or-lose 'immediate))))
+  (or (eql sc zero-sc-number)
+      (eql sc null-sc-number)
+      (eql sc immediate-sc-number)))
 
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values.
-(def!constant register-arg-scn (sc-number-or-lose 'descriptor-reg))
-(def!constant immediate-arg-scn (sc-number-or-lose 'any-reg))
-(def!constant control-stack-arg-scn (sc-number-or-lose 'control-stack))
+(defconstant immediate-arg-scn any-reg-sc-number)
+(defconstant control-stack-arg-scn control-stack-sc-number)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
   ;; offsets of special stack frame locations
-  (def!constant ocfp-save-offset 0)
-  (def!constant lra-save-offset 1)
-  (def!constant nfp-save-offset 2)
+  (defconstant ocfp-save-offset 0)
+  (defconstant lra-save-offset 1)
+  (defconstant nfp-save-offset 2)
 
   ;; the number of arguments/return values passed in registers.
-  (def!constant register-arg-count 6)
+  (defconstant register-arg-count 6)
 
   ;; names to use for the argument registers.
   (defparameter register-arg-names '(a0 a1 a2 a3 a4 a5))
@@ -354,7 +335,7 @@
           *register-arg-offsets*))
 
 ;;; This is used by the debugger.
-(def!constant single-value-return-byte-offset 8)
+(defconstant single-value-return-byte-offset 8)
 
 ;;; This function is called by debug output routines that want a
 ;;; pretty name for a TN's location. It returns a thing that can be
@@ -373,7 +354,7 @@
       (immediate-constant "Immed"))))
 
 (defun combination-implementation-style (node)
-  (declare (type sb!c::combination node) (ignore node))
+  (declare (type sb-c::combination node) (ignore node))
   (values :default nil))
 
 (defun primitive-type-indirect-cell-type (ptype)

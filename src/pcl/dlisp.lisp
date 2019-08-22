@@ -30,14 +30,14 @@
 ;;;; these symbols are bound.
 
 (declaim (list *dfun-arg-symbols*))
-(defvar *dfun-arg-symbols* '(.ARG0. .ARG1. .ARG2. .ARG3.))
+(define-load-time-global *dfun-arg-symbols* '(.ARG0. .ARG1. .ARG2. .ARG3.))
 
 (defun dfun-arg-symbol (arg-number)
   (or (nth arg-number *dfun-arg-symbols*)
       (format-symbol *pcl-package* ".ARG~A." arg-number)))
 
 (declaim (list *slot-vector-symbols*))
-(defvar *slot-vector-symbols* '(.SLOTS0. .SLOTS1. .SLOTS2. .SLOTS3.))
+(define-load-time-global *slot-vector-symbols* '(.SLOTS0. .SLOTS1. .SLOTS2. .SLOTS3.))
 
 (defun slot-vector-symbol (arg-number)
   (or (nth arg-number *slot-vector-symbols*)
@@ -178,7 +178,9 @@
 (defun generating-lisp (closure-variables args form)
   (let ((lambda `(lambda ,closure-variables
                    ,@(when (member 'miss-fn closure-variables)
-                           `((declare (type function miss-fn))))
+                       `((declare (type function miss-fn))))
+                   (declare (optimize (sb-c:store-source-form 0)))
+                   (declare (optimize (sb-c::store-closure-debug-pointer 3)))
                    #'(lambda ,args
                        (let ()
                          (declare #.*optimize-speed*)
@@ -217,12 +219,12 @@
                                ,@(unless class-slot-p
                                    `((setq slots
                                            (std-instance-slots ,instance))))
-                               (std-instance-wrapper ,instance))
+                               (%instance-layout ,instance))
                               ((fsc-instance-p ,instance)
                                ,@(unless class-slot-p
                                    `((setq slots
                                            (fsc-instance-slots ,instance))))
-                               (fsc-instance-wrapper ,instance)))))
+                               (%funcallable-instance-layout ,instance)))))
         (block access
           (when (and wrapper
                      (not (zerop (layout-clos-hash wrapper)))
@@ -233,11 +235,11 @@
             ,@(ecase reader/writer
                 (:reader
                  `((let ((value ,read-form))
-                     (unless (eq value +slot-unbound+)
+                     (unless (unbound-marker-p value)
                        (return-from access value)))))
                 (:boundp
                  `((let ((value ,read-form))
-                     (return-from access (not (eq value +slot-unbound+))))))
+                     (return-from access (not (unbound-marker-p value))))))
                 (:writer
                  `((return-from access (setf ,read-form ,(car arglist)))))))
           (funcall miss-fn ,@arglist))))))
@@ -249,7 +251,7 @@
 
 (defun emit-boundp-check (value-form miss-fn arglist)
   `(let ((value ,value-form))
-     (if (eq value +slot-unbound+)
+     (if (unbound-marker-p value)
          (funcall ,miss-fn ,@arglist)
          value)))
 
@@ -258,7 +260,7 @@
   (let ((read-form (emit-slot-read-form class-slot-p index slots)))
     (ecase reader/writer
       (:reader (emit-boundp-check read-form miss-fn arglist))
-      (:boundp `(not (eq ,read-form +slot-unbound+)))
+      (:boundp `(not (unbound-marker-p ,read-form)))
       (:writer `(setf ,read-form ,(car arglist))))))
 
 (defmacro emit-reader/writer-macro (reader/writer 1-or-2-class class-slot-p)
@@ -383,18 +385,18 @@
      (with-unique-names (wrapper)
        `(cond ((std-instance-p ,argument)
                ,(if slots-var
-                    `(let ((,wrapper (std-instance-wrapper ,argument)))
+                    `(let ((,wrapper (%instance-layout ,argument)))
                        (when (layout-for-std-class-p ,wrapper)
                          (setq ,slots-var (std-instance-slots ,argument)))
                        ,wrapper)
-                    `(std-instance-wrapper ,argument)))
+                    `(%instance-layout ,argument)))
               ((fsc-instance-p ,argument)
                ,(if slots-var
-                    `(let ((,wrapper (fsc-instance-wrapper ,argument)))
+                    `(let ((,wrapper (%funcallable-instance-layout ,argument)))
                        (when (layout-for-std-class-p ,wrapper)
                          (setq ,slots-var (fsc-instance-slots ,argument)))
                        ,wrapper)
-                    `(fsc-instance-wrapper ,argument)))
+                    `(%funcallable-instance-layout ,argument)))
                (t (go ,miss-tag)))))
     ;; Sep92 PCL used to distinguish between some of these cases (and
     ;; spuriously exclude others).  Since in SBCL

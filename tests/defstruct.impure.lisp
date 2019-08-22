@@ -9,9 +9,7 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(load "assertoid.lisp")
 (load "compiler-test-util.lisp")
-(use-package "ASSERTOID")
 
 ;;;; examples from, or close to, the Common Lisp DEFSTRUCT spec
 
@@ -21,40 +19,58 @@
 (defstruct person age (name 007 :type string)) ; not an error until 007 used
 (make-person :name "James") ; not an error, 007 not used
 
-#+#.(cl:if (cl:eq sb-ext:*evaluator-mode* :compile) '(and) '(or))
-(assert-error (make-person) type-error)
-#+#.(cl:if (cl:eq sb-ext:*evaluator-mode* :compile) '(and) '(or))
-(assert-error (setf (person-name (make-person :name "Q")) 1)
-              type-error)
+#.(if (legacy-eval-p) (values)
+    '(assert-error (make-person) type-error))
+#.(if (legacy-eval-p) (values)
+    '(assert-error (setf (person-name (make-person :name "Q")) 1)
+                   type-error))
 
 ;;; An &AUX variable in a boa-constructor without a default value
 ;;; means "do not initialize slot" and does not cause type error
-(declaim (notinline opaque-identity))
-(defun opaque-identity (x) x)
-
+(defstruct (boa-saux (:constructor make-boa-saux (&aux a (b 3) (c))))
+  (a #\! :type (integer 1 2))
+  (b #\? :type (integer 3 4))
+  (c #\# :type (integer 5 6)))
+(defstruct (boa-kid (:include boa-saux)))
+(defstruct (boa-grandkid (:include boa-kid)))
 (with-test (:name :defstruct-boa-typecheck)
-  (defstruct (boa-saux (:constructor make-boa-saux (&aux a (b 3) (c))))
-    (a #\! :type (integer 1 2))
-    (b #\? :type (integer 3 4))
-    (c #\# :type (integer 5 6)))
-  (let ((s (make-boa-saux)))
-    (locally (declare (optimize (safety 3))
-                      (inline boa-saux-a))
-      (assert-error (opaque-identity (boa-saux-a s)) type-error))
-    (setf (boa-saux-a s) 1)
-    (setf (boa-saux-c s) 5)
-    (assert (eql (boa-saux-a s) 1))
-    (assert (eql (boa-saux-b s) 3))
-    (assert (eql (boa-saux-c s) 5))))
+  (flet ((dsd-always-boundp (dsd)
+           ;; A copy of sb-kernel::dsd-always-boundp, which may not
+           ;; survive make-target-2's shake-packages.
+           (logbitp 3 (sb-kernel::dsd-bits dsd))))
+    (dolist (dsd (sb-kernel:dd-slots
+                  (sb-kernel:find-defstruct-description 'boa-saux)))
+      (let ((name (sb-kernel:dsd-name dsd))
+            (always-boundp (dsd-always-boundp dsd)))
+        (ecase name
+          ((a c) (assert (not always-boundp)))
+          (b (assert always-boundp)))))
+    (let ((dd (sb-kernel:find-defstruct-description 'boa-grandkid)))
+      (assert (not (dsd-always-boundp (car (sb-kernel:dd-slots dd))))))
+    (let ((s (make-boa-saux)))
+      (locally (declare (optimize (safety 3))
+                        (inline boa-saux-a))
+        (assert-error (opaque-identity (boa-saux-a s)) type-error))
+      (setf (boa-saux-a s) 1)
+      (setf (boa-saux-c s) 5)
+      (assert (eql (boa-saux-a s) 1))
+      (assert (eql (boa-saux-b s) 3))
+      (assert (eql (boa-saux-c s) 5)))))
+
+(with-test (:name :defstruct-boa-nice-error :skipped-on :interpreter)
+  (let ((err (nth-value 1 (ignore-errors (boa-saux-a (make-boa-saux))))))
+    (assert (and (typep err 'simple-type-error)
+                 (search "Accessed uninitialized slot"
+                         (simple-condition-format-control err))))))
+
                                         ; these two checks should be
                                         ; kept separated
 
-#+#.(cl:if (cl:eq sb-ext:*evaluator-mode* :compile) '(and) '(or))
-(with-test (:name :defstruct-boa-no-error)
+(with-test (:name :defstruct-boa-no-error :skipped-on :interpreter)
  (let ((s (make-boa-saux)))
    (locally (declare (optimize (safety 0))
                      (inline boa-saux-a))
-     (assert (eql (opaque-identity (boa-saux-a s)) 0)))
+     (assert (sb-int:unbound-marker-p (opaque-identity (boa-saux-a s)))))
    (setf (boa-saux-a s) 1)
    (setf (boa-saux-c s) 5)
    (assert (eql (boa-saux-a s) 1))
@@ -141,7 +157,16 @@
                                   town-elevation))
       (assert (eql (funcall slot-accessor-name town1)
                    (funcall slot-accessor-name town2))))
-    (assert (not (fboundp '(setf town-elevation)))))) ; 'cause it's :READ-ONLY
+    (assert (not (fboundp '(setf town-elevation)))) ; 'cause it's :READ-ONLY
+    ;; The source-transform for SETF was too eager,
+    ;; and would accept read-only slots.
+    (assert-error
+     (setf (town-elevation (make-town)) 5))
+    (assert-error
+     (funcall (compile nil (lambda (x y)
+                             (setf (town-readonly x) y)
+                             x))
+              (make-town) 5))))
 
 ;;; example 2
 (defstruct (clown (:conc-name bozo-))
@@ -228,10 +253,9 @@
 (declaim (optimize (debug 2)))
 
 (defmacro test-variant (defstructname &key colontype boa-constructor-p)
-  `(progn
-
-     (format t "~&/beginning PROGN for COLONTYPE=~S~%" ',colontype)
-
+  `(locally
+     (declare (muffle-conditions style-warning)) ; &OPTIONAL and &KEY
+     #+nil(format t "~&/beginning PROGN for COLONTYPE=~S~%" ',colontype)
      (defstruct (,defstructname
                   ,@(when colontype `((:type ,colontype)))
                   ,@(when boa-constructor-p
@@ -257,7 +281,7 @@
        ;; more ordinary tagged slots
        (refcount 0 :type (and unsigned-byte fixnum)))
 
-     (format t "~&/done with DEFSTRUCT~%")
+     #+nil(format t "~&/done with DEFSTRUCT~%")
 
      (let* ((cn (string+ ',defstructname "-")) ; conc-name
             (ctor (symbol-function ',(symbol+ (if boa-constructor-p
@@ -275,7 +299,7 @@
                                            `(:refcount 1)))))
 
        ;; Check that ctor set up slot values correctly.
-       (format t "~&/checking constructed structure~%")
+       #+nil(format t "~&/checking constructed structure~%")
        (assert (string= "some id" (read-slot cn "ID" *instance*)))
        (assert (eql (find-package :cl) (read-slot cn "HOME" *instance*)))
        (assert (string= "" (read-slot cn "COMMENT" *instance*)))
@@ -285,13 +309,13 @@
        (assert (= 1 (read-slot cn "REFCOUNT" *instance*)))
 
        ;; There should be no writers for read-only slots.
-       (format t "~&/checking no read-only writers~%")
+       #+nil(format t "~&/checking no read-only writers~%")
        (assert (not (fboundp `(setf ,(symbol+ cn "HOME")))))
        (assert (not (fboundp `(setf ,(symbol+ cn "HASH")))))
        ;; (Read-only slot values are checked in the loop below.)
 
        (dolist (inlinep '(t nil))
-         (format t "~&/doing INLINEP=~S~%" inlinep)
+         #+nil(format t "~&/doing INLINEP=~S~%" inlinep)
          ;; Fiddle with writable slot values.
          (let ((new-id (format nil "~S" (random 100)))
                (new-comment (format nil "~X" (random 5555)))
@@ -305,7 +329,7 @@
            ;;  (error "WEIGHT mismatch: ~S vs. ~S"
            ;;         new-weight (read-slot cn "WEIGHT" *instance*)))
            (assert (eql new-weight (read-slot cn "WEIGHT" *instance*)))))
-       (format t "~&/done with INLINEP loop~%")
+       #+nil(format t "~&/done with INLINEP loop~%")
 
        ;; :TYPE FOO objects don't go in the Lisp type system, so we
        ;; can't test TYPEP stuff for them.
@@ -315,19 +339,19 @@
        ,@(unless colontype
            `(;; Fiddle with predicate function.
              (let ((pred-name (symbol+ ',defstructname "-P")))
-               (format t "~&/doing tests on PRED-NAME=~S~%" pred-name)
+               #+nil(format t "~&/doing tests on PRED-NAME=~S~%" pred-name)
                (assert (funcall pred-name *instance*))
                (assert (not (funcall pred-name 14)))
                (assert (not (funcall pred-name "test")))
                (assert (not (funcall pred-name (make-hash-table))))
                (let ((compiled-pred
                       (compile nil `(lambda (x) (,pred-name x)))))
-                 (format t "~&/doing COMPILED-PRED tests~%")
+                 #+nil(format t "~&/doing COMPILED-PRED tests~%")
                  (assert (funcall compiled-pred *instance*))
                  (assert (not (funcall compiled-pred 14)))
                  (assert (not (funcall compiled-pred #()))))
                ;; Fiddle with TYPEP.
-               (format t "~&/doing TYPEP tests, COLONTYPE=~S~%" ',colontype)
+               #+nil(format t "~&/doing TYPEP tests, COLONTYPE=~S~%" ',colontype)
                (assert (typep *instance* ',defstructname))
                (assert (not (typep 0 ',defstructname)))
                (assert (funcall (symbol+ "TYPEP") *instance* ',defstructname))
@@ -338,7 +362,7 @@
                  (assert (funcall compiled-typep *instance*))
                  (assert (not (funcall compiled-typep nil))))))))
 
-     (format t "~&/done with PROGN for COLONTYPE=~S~%" ',colontype)))
+     #+nil(format t "~&/done with PROGN for COLONTYPE=~S~%" ',colontype)))
 
 (test-variant vanilla-struct)
 (test-variant vector-struct :colontype vector)
@@ -463,7 +487,7 @@
                      :d d
                      :e e)
             *manyraw*)))
-  (room)
+  (let ((*standard-output* (make-broadcast-stream))) (room))
   (sb-ext:gc))
 (with-test (:name :defstruct-raw-slot-gc)
   (check-manyraws *manyraw*))
@@ -500,7 +524,7 @@
    self
    :slot-names
    ;; skip the slot named A so that the optimization that turns
-   ;; MAKE-LOAD-FORM-SAVING-SLOTS into :SB-JUST-DUMP-IT-NORMALLY
+   ;; MAKE-LOAD-FORM-SAVING-SLOTS into "dump normally"
    ;; (change 4bf626e745d5d2e34630ec4dd67b7c17bd9b8f28) can not be used.
    (delete 'a (mapcar 'sb-kernel:dsd-name
                       (sb-kernel:dd-slots
@@ -531,24 +555,25 @@
 ;;; fasl dumper and loader also have special handling of raw slots, so
 ;;; dump all of them into a fasl
 (defmethod make-load-form ((self manyraw) &optional env)
-  self env
-  :sb-just-dump-it-normally)
-(with-open-file (s "tmp-defstruct.manyraw.lisp"
+  (make-load-form-saving-slots self :environment env))
+(defvar *tempfile* (scratch-file-name "lisp"))
+(with-open-file (s *tempfile*
                  :direction :output
                  :if-exists :supersede)
   (write-string "(defun dumped-manyraws () '#.*manyraw*)" s)
   (terpri s)
   (write-string "(defun dumped-huge-manyraw () '#.(make-huge-manyraw))" s)
   (write-string "(defun dumped-hugest-manyraw () '#.(make-hugest-manyraw))" s))
-(compile-file "tmp-defstruct.manyraw.lisp")
-(delete-file "tmp-defstruct.manyraw.lisp")
+(defvar *tempfasl* (compile-file *tempfile*))
+(delete-file *tempfile*)
 
 ;;; nuke the objects and try another GC just to be extra careful
 (setf *manyraw* nil)
 (sb-ext:gc :full t)
 
 ;;; re-read the dumped structures and check them
-(load "tmp-defstruct.manyraw.fasl")
+(load *tempfasl*)
+(delete-file *tempfasl*)
 (with-test (:name (:defstruct-raw-slot load))
   (check-manyraws (dumped-manyraws))
   (check-huge-manyraw (make-huge-manyraw))
@@ -653,7 +678,7 @@
 
 
 ;;; bug 3d: type safety with redefined type constraints on slots
-#+#.(cl:if (cl:eq sb-ext:*evaluator-mode* :compile) '(and) '(or))
+#+#.(cl:if (assertoid:legacy-eval-p) '(or) '(and))
 (macrolet
     ((test (type)
        (let* ((base-name (intern (format nil "bug3d-~A" type)))
@@ -729,16 +754,15 @@
             (setf (find-class 'foo) nil)
             (defstruct foo slot-1)))))
 
-;;; bug 348, evaluation order of slot writer arguments. Fixed by Gabor
-;;; Melis.
 (defstruct bug-348 x)
 
-(assert (eql -1 (let ((i (eval '-2))
-                      (x (make-bug-348)))
-                  (funcall #'(setf bug-348-x)
-                           (incf i)
-                           (aref (vector x) (incf i)))
-                  (bug-348-x x))))
+(with-test (:name :eval-order-slot-writer-arguments)
+  (assert (eql -1 (let ((i (eval '-2))
+                        (x (make-bug-348)))
+                    (funcall #'(setf bug-348-x)
+                             (incf i)
+                             (aref (vector x) (incf i)))
+                    (bug-348-x x)))))
 
 ;;; obsolete instance trapping
 ;;;
@@ -834,12 +858,7 @@
 delete the files at the end."
   (let* ((paths (loop for var in vars
                       as index upfrom 0
-                      collect (make-pathname
-                                   :case :common
-                                   :name (format nil
-                                                 "DEFSTRUCT-REDEF-TEST-~D"
-                                                 index)
-                                   :type "LISP")))
+                      collect (scratch-file-name "lisp")))
          (binding-spec (mapcar
                         (lambda (var path) `(,var ,path)) vars paths)))
     (labels ((frob (n)
@@ -848,6 +867,10 @@ delete the files at the end."
                        ,@(if (plusp n)
                              (frob (1- n))
                              body))
+                   (ignore-errors
+                    (delete-file ,(namestring
+                                   (merge-pathnames (make-pathname :type "fasl")
+                                                    (elt paths n)))))
                    (delete-file ,(elt paths n))))))
       `(let ,binding-spec
          ,@(frob (1- (length vars)))))))
@@ -937,11 +960,11 @@ redefinition."
 ;;; Tests begin.
 ;; Base case: recklessly-continue.
 (with-defstruct-redefinition-test :defstruct/recklessly
-    (((defstruct ctor pred) :class-name redef-test-1 :slots (a))
-     ((defstruct*) :class-name redef-test-1 :slots (a b)))
-    ((path1 defstruct)
-     (path2 defstruct*))
-    recklessly-continue-from-incompatible-defstruct-error
+  (((defstruct ctor pred) :class-name redef-test-1 :slots (a))
+   ((defstruct*) :class-name redef-test-1 :slots (a b)))
+  ((path1 defstruct)
+   (path2 defstruct*))
+  recklessly-continue-from-incompatible-defstruct-error
   (load path1)
   (let ((instance (funcall ctor)))
     (load path2)
@@ -1101,6 +1124,13 @@ redefinition."
     (assert-invalid instance)
     (assert-invalid instance)))
 
+;; Unfortunately this test is fubar by relying on formerly broken behavior of
+;; the WITH-FILES macro - it expects that the fasl file from a prior test
+;; remain accessible in this test.
+;; If that's the intended behavor, then is needs to be part of a single test,
+;; or use a "well-known" file name stored in defvar, and not just accidentally
+;; see what was ostensibly a temporary remnant that accidentally stuck around.
+#+nil
 (with-defstruct-redefinition-test
     :defstruct/subclass-in-other-file-funny-operation-order-continue
     (((defstruct ignore pred1) :class-name redef-test-11 :slots (a))
@@ -1147,7 +1177,7 @@ redefinition."
         (error "fail"))
     (type-error (e)
       (assert (eq 'string (type-error-expected-type e)))
-      (assert (zerop (type-error-datum e))))))
+      (assert (sb-int:unbound-marker-p (type-error-datum e))))))
 
 (with-test (:name :defstruct-copier-typechecks-argument)
   (copy-person (make-astronaut :name "Neil"))
@@ -1186,7 +1216,8 @@ redefinition."
            (a 42 :type fixnum)))))
 
 (with-test (:name (:boa-supplied-p &optional))
-  (handler-bind ((warning #'error))
+  (handler-bind ((sb-c:inlining-dependency-failure #'muffle-warning)
+                 (warning #'error))
     (eval `(defstruct (boa-supplied-p.1 (:constructor make-boa-supplied-p.1
                                             (&optional (bar t barp))))
              bar
@@ -1199,7 +1230,8 @@ redefinition."
     (assert (eq t (boa-supplied-p.1-barp b2)))))
 
 (with-test (:name (:boa-supplied-p &key))
-  (handler-bind ((warning #'error))
+  (handler-bind ((sb-c:inlining-dependency-failure #'muffle-warning)
+                 (warning #'error))
     (eval `(defstruct (boa-supplied-p.2 (:constructor make-boa-supplied-p.2
                                             (&key (bar t barp))))
              bar
@@ -1297,3 +1329,109 @@ redefinition."
              (defstruct (s (:type (vector (or (eql s) integer))) :named) x y)
              ))
     (assert-error (macroexpand form))))
+
+(defstruct (foo-not-too-something
+            (:constructor make-foo-not-too-strong (x &aux (x (abs x))))
+            (:constructor make-foo-not-too-weak (&optional x)))
+  (x nil :type unsigned-byte))
+
+(with-test (:name :defstruct-ftype-correctness)
+  (assert (make-foo-not-too-strong -3)) ; should be allowed
+  (assert-error (make-foo-not-too-weak))) ; should not set X slot to NIL
+
+(defstruct fruitbat a (b #xbadf00d :type sb-ext:word) (c 'hi))
+(mapc 'fmakunbound '(fruitbat-a fruitbat-b fruitbat-c))
+(with-test (:name :defstruct-printer-robust)
+  (assert (string= (princ-to-string (make-fruitbat :a "test"))
+                   "#S(FRUITBAT :A test :B 195948557 :C HI)")))
+
+;; lp#540063
+(defstruct x y)
+(with-test (:name :redefine-accessor-as-random-defun)
+  (flet ((assert-that (expect form)
+           ;; test by STRING= since there's no condition class,
+           ;; being a little more thorough than merely ASSERT-SIGNAL.
+           (let (win)
+             (handler-bind ((simple-warning
+                             (lambda (c)
+                               (when (string= (princ-to-string c) expect)
+                                 (setq win t)
+                                 (muffle-warning)))))
+               (eval form)
+               (assert win)))))
+    (assert-that "redefinition of X-Y clobbers structure accessor"
+                 '(defun x-y (z) (list :x-y z)))
+    (assert-that "redefinition of COPY-X clobbers structure copier"
+                 '(defun copy-x (a b) (list a b)))
+    (assert-that "redefinition of X-P clobbers structure predicate"
+                 '(defun x-p (z) (list 'bork z))))
+  (assert (equalp
+           (funcall (compile nil '(lambda (z) (x-y z)))
+                    (make-x :y t))
+           '(:X-Y #S(X :Y T))))
+  (assert (equalp
+           (funcall (compile nil '(lambda (z)
+                                    (declare (notinline x-y))
+                                    (x-y z)))
+                    (make-x :y t))
+           '(:X-Y #S(X :Y T)))))
+
+(in-package sb-kernel)
+
+;; The word order for halves of double-floats on 32-bit platforms
+;; should match the platform's native order.
+(defun compare-memory (obj1 obj1-word-ofs obj2 obj2-word-ofs n-words)
+  (with-pinned-objects (obj1 obj2)
+    (let ((sap1 (int-sap (logandc2 (get-lisp-obj-address obj1) sb-vm:lowtag-mask)))
+          (sap2 (int-sap (logandc2 (get-lisp-obj-address obj2) sb-vm:lowtag-mask))))
+      (dotimes (i n-words)
+        (let ((w1 (sap-ref-32 sap1 (ash (+ obj1-word-ofs i) sb-vm:word-shift)))
+              (w2 (sap-ref-32 sap2 (ash (+ obj2-word-ofs i) sb-vm:word-shift))))
+          (assert (= w1 w2)))))))
+
+(defstruct struct-df (a pi :type double-float))
+(defvar *c* (complex (exp 1d0) pi))
+(defstruct struct-cdf (a *c* :type (complex double-float)))
+
+(defvar *adf* (make-array 1 :element-type 'double-float
+                            :initial-element pi))
+(defvar *acdf* (make-array 1 :element-type '(complex double-float)
+                             :initial-element *c*))
+
+(test-util:with-test (:name :dfloat-endianness
+                      :skipped-on (not (or :mips :x86))) ; only tested on these
+  (compare-memory pi 2 *adf* 2 2) ; Array
+  (compare-memory pi 2 (make-struct-df) 2 2) ; Structure
+
+  (compare-memory *c* 2 *acdf* 2 4) ; Array
+  (compare-memory *c* 2 (make-struct-cdf) 2 4)) ; Structure
+
+(test-util:with-test (:name :recklessly-continuable-defstruct)
+  (flet ((redefine-defstruct (from to)
+           (eval from)
+           (handler-bind
+               ((error (lambda (c)
+                         (declare (ignore c))
+                         (return-from redefine-defstruct
+                           ;; RESTARTs are DX, don't return it.
+                           (not (null (find 'sb-kernel::recklessly-continue
+                                            (compute-restarts)
+                                            :key 'restart-name))))))
+                (warning #'muffle-warning))
+               (eval to))))
+    (assert (not (redefine-defstruct
+                  '(defstruct not-redefinable (a 0 :type sb-ext:word))
+                  '(defstruct not-redefinable (a)))))
+    (assert (redefine-defstruct
+             ;; Incompatible types has nothing to do with whether
+             ;; RECKLESSLY-CONTINUE is offered.
+             '(defstruct redefinable (a nil :type symbol))
+             '(defstruct redefinable (a nil :type cons))))))
+
+(test-util:with-test (:name :non-total-satisfies-predicate)
+  ;; This definition is perfectly fine as long as you always pass
+  ;; only numbers to the constructor.
+  ;; In particular, the macroexpander must not test whether a random
+  ;; object (specifically NIL) meets the test for the slot.
+  (assert (macroexpand-1
+           '(defstruct strangestruct (a nil :type (satisfies plusp))))))

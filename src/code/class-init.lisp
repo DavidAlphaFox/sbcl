@@ -13,19 +13,21 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 ;;; built-in classes
 (/show0 "beginning class-init.lisp")
-(dolist (x *built-in-classes*)
+(dolist (x +!built-in-classes+)
   (destructuring-bind (name &key (translation nil trans-p) &allow-other-keys)
       x
-    (/show0 "doing class with NAME=..")
-    (/primitive-print (symbol-name name))
+    (/show "doing class with" name)
     (when trans-p
-      (/show0 "in TRANS-P case")
       (let ((classoid (classoid-cell-classoid (find-classoid-cell name :create t)))
             (type (specifier-type translation)))
+        ;; The classoid T gets its translation dumped in genesis.
+        ;; May as well double-check that it's right.
+        (when (typep (built-in-classoid-translation classoid) 'ctype)
+          (aver (eq (built-in-classoid-translation classoid) type)))
         (setf (built-in-classoid-translation classoid) type)
         (setf (info :type :builtin name) type)))))
 

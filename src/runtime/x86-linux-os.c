@@ -45,93 +45,50 @@
 #include <linux/version.h>
 #include "thread.h"             /* dynamic_values_bytes */
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,0)
-#define user_desc  modify_ldt_ldt_s
-#endif
-
-static inline int modify_ldt(int func, void *ptr, unsigned long bytecount)
+static inline int set_thread_area(struct user_desc *u_info)
 {
-  return syscall(SYS_modify_ldt, func, ptr, bytecount);
+    return syscall(SYS_set_thread_area, u_info);
 }
 
 #include "validate.h"
 size_t os_vm_page_size;
 
-u32 local_ldt_copy[LDT_ENTRIES*LDT_ENTRY_SIZE/sizeof(u32)];
-
-/* This is never actually called, but it's great for calling from gdb when
- * users have thread-related problems that maintainers can't duplicate */
-
-void debug_get_ldt()
-{
-    int n=modify_ldt (0, local_ldt_copy, sizeof local_ldt_copy);
-    printf("%d bytes in ldt: print/x local_ldt_copy\n", n);
-}
-
-#ifdef LISP_FEATURE_SB_THREAD
-pthread_mutex_t modify_ldt_lock = PTHREAD_MUTEX_INITIALIZER;
-#endif
-
 int arch_os_thread_init(struct thread *thread) {
     stack_t sigstack;
 #ifdef LISP_FEATURE_SB_THREAD
-    struct user_desc ldt_entry = {
-        1, 0, 0, /* index, address, length filled in later */
-        1, MODIFY_LDT_CONTENTS_DATA, 0, 0, 0, 1
+    struct user_desc desc = {
+        0, (unsigned long) thread, dynamic_values_bytes,
+        1, 0, 0, 1, 0, 1
     };
-    int n;
-    thread_mutex_lock(&modify_ldt_lock);
-    n=modify_ldt(0,local_ldt_copy,sizeof local_ldt_copy);
-    /* get next free ldt entry */
 
-    if(n) {
-        u32 *p;
-        for(n=0,p=local_ldt_copy;*p;p+=LDT_ENTRY_SIZE/sizeof(u32))
-            n++;
-    }
-    ldt_entry.entry_number=n;
-    ldt_entry.base_addr=(unsigned long) thread;
-    ldt_entry.limit=dynamic_values_bytes;
-    ldt_entry.limit_in_pages=0;
-    if (modify_ldt (1, &ldt_entry, sizeof (ldt_entry)) != 0) {
-        thread_mutex_unlock(&modify_ldt_lock);
-        /* modify_ldt call failed: something magical is not happening */
+    static int entry_number = -1;
+
+    desc.entry_number = entry_number;
+
+    if (set_thread_area(&desc) != 0) {
         return 0;
     }
+
+    entry_number = desc.entry_number;
+
     __asm__ __volatile__ ("movw %w0, %%fs" : : "q"
-                          ((n << 3) /* selector number */
-                           + (1 << 2) /* TI set = LDT */
-                           + 3)); /* privilege level */
-    thread->tls_cookie=n;
-    pthread_mutex_unlock(&modify_ldt_lock);
+                          ((entry_number << 3) + 3));
 
-    /* now %fs:0 refers to the current thread.  Useful!  Less usefully,
-     * Linux/x86 isn't capable of reporting a faulting si_addr on a
-     * segment as defined above (whereas faults on the segment that %gs
-     * usually points are reported just fine...).  As a special
-     * workaround, we store each thread structure's absolute address as
-     * as slot in itself, so that within the thread,
-     *   movl %fs:SELFPTR_OFFSET,x
-     * stores the absolute address of %fs:0 into x.
-     */
-#ifdef LISP_FEATURE_SB_SAFEPOINT
-    thread->selfptr = thread;
-#endif
-
-    if(n<0) return 0;
+    if(entry_number < 0) return 0;
 #ifdef LISP_FEATURE_GCC_TLS
     current_thread = thread;
 #else
     pthread_setspecific(specials,thread);
 #endif
 #endif
+
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
     /* Signal handlers are run on the control stack, so if it is exhausted
      * we had better use an alternate stack for whatever signal tells us
      * we've exhausted it */
-    sigstack.ss_sp=((void *) thread)+dynamic_values_bytes;
-    sigstack.ss_flags=0;
-    sigstack.ss_size = 32*SIGSTKSZ;
+    sigstack.ss_sp    = calc_altstack_base(thread);
+    sigstack.ss_flags = 0;
+    sigstack.ss_size  = calc_altstack_size(thread);
     if(sigaltstack(&sigstack,0)<0)
         lose("Cannot sigaltstack: %s\n",strerror(errno));
 #endif
@@ -149,17 +106,7 @@ struct thread *debug_get_fs() {
  */
 
 int arch_os_thread_cleanup(struct thread *thread) {
-    struct user_desc ldt_entry = {
-        0, 0, 0,
-        0, MODIFY_LDT_CONTENTS_DATA, 0, 0, 0, 0
-    };
-    int result;
-
-    ldt_entry.entry_number=thread->tls_cookie;
-    thread_mutex_lock(&modify_ldt_lock);
-    result = modify_ldt(1, &ldt_entry, sizeof (ldt_entry));
-    thread_mutex_unlock(&modify_ldt_lock);
-    return result;
+    return 1;
 }
 
 
@@ -222,6 +169,12 @@ os_restore_fp_control(os_context_t *context)
 {
     if (context->uc_mcontext.fpregs)
         asm ("fldcw %0" : : "m" (context->uc_mcontext.fpregs->cw));
+}
+
+os_context_register_t *
+os_context_float_register_addr(os_context_t *context, int offset)
+{
+    return (os_context_register_t*)&context->uc_mcontext.fpregs->_st[offset];
 }
 
 void

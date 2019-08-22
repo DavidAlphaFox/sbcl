@@ -9,18 +9,17 @@
 # provided with absolutely no warranty. See the COPYING and CREDITS
 # files for more information.
 
-CFLAGS = -g -marm -march=armv5
-#LINKFLAGS += -v -rdynamic -m32
+CFLAGS += -marm -march=armv5
 NM = ./linux-nm
 
 ASSEM_SRC = arm-assem.S ldso-stubs.S
 ARCH_SRC = arm-arch.c
 
-OS_SRC = linux-os.c arm-linux-os.c
+OS_SRC = linux-os.c linux-mman.c arm-linux-os.c
 OS_LIBS = -ldl
 
 ifdef LISP_FEATURE_GENCGC
-  GC_SRC = gencgc.c
+  GC_SRC = fullcgc.c gencgc.c traceroot.c
 else
   GC_SRC = cheneygc.c
 endif

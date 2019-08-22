@@ -37,11 +37,6 @@
 
 (in-package "SB-PCL")
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-(defvar *optimize-speed*
-  '(optimize (speed 3) (safety 0) (sb-ext:inhibit-warnings 3)))
-) ; EVAL-WHEN
-
 (defmacro dotimes-fixnum ((var count &optional (result nil)) &body body)
   `(dotimes (,var (the fixnum ,count) ,result)
      (declare (fixnum ,var))
@@ -49,7 +44,7 @@
 
 (declaim (inline random-fixnum))
 (defun random-fixnum ()
-  (random (1+ most-positive-fixnum)))
+  (random (1+ sb-xc:most-positive-fixnum)))
 
 ;;; Lambda which executes its body (or not) randomly. Used to drop
 ;;; random cache entries.
@@ -69,28 +64,7 @@
            (setf ,drops (random-fixnum)
                  ,drop-pos sb-vm:n-positive-fixnum-bits))))))
 
-;;;; PCL's view of funcallable instances
-
-(!defstruct-with-alternate-metaclass standard-funcallable-instance
-  ;; KLUDGE: Note that neither of these slots is ever accessed by its
-  ;; accessor name as of sbcl-0.pre7.63. Presumably everything works
-  ;; by puns based on absolute locations. Fun fun fun.. -- WHN 2001-10-30
-  :slot-names (clos-slots name hash-code)
-  :boa-constructor %make-standard-funcallable-instance
-  :superclass-name function
-  :metaclass-name standard-classoid
-  :metaclass-constructor make-standard-classoid
-  :dd-type funcallable-structure
-  ;; Only internal implementation code will access these, and these
-  ;; accesses (slot readers in particular) could easily be a
-  ;; bottleneck, so it seems reasonable to suppress runtime type
-  ;; checks.
-  ;;
-  ;; (Except note KLUDGE above that these accessors aren't used at all
-  ;; (!) as of sbcl-0.pre7.63, so for now it's academic.)
-  :runtime-type-checks-p nil)
-
-(import 'sb-kernel:funcallable-instance-p)
+(import 'sb-kernel:funcallable-instance-p) ; why?
 
 (defun set-funcallable-instance-function (fin new-value)
   (declare (type function new-value)
@@ -101,28 +75,25 @@
            ;; PCL's internal use of SET-FUNCALLABLE-INSTANCE-FUNCTION
            ;; doesn't obey this restriction.
            (type funcallable-instance fin))
-  (setf (funcallable-instance-fun fin) new-value))
+  (setf (%funcallable-instance-fun fin) new-value))
 
 ;;; FIXME: these macros should just go away.  It's not clear whether
 ;;; the inline functions defined by
 ;;; !DEFSTRUCT-WITH-ALTERNATE-METACLASS are as efficient as they could
 ;;; be; ordinary defstruct accessors are defined as source transforms.
+(declaim (inline fsc-instance-p))
 (defun fsc-instance-p (fin)
   (funcallable-instance-p fin))
-(define-compiler-macro fsc-instance-p (fin)
-  `(funcallable-instance-p ,fin))
-(defmacro fsc-instance-wrapper (fin)
-  `(%funcallable-instance-layout ,fin))
 (defmacro fsc-instance-slots (fin)
-  `(%funcallable-instance-info ,fin 1))
-(defmacro fsc-instance-hash (fin)
-  `(%funcallable-instance-info ,fin 3))
+  `(truly-the simple-vector
+              (%funcallable-instance-info
+               ,fin ,(get-dsd-index standard-funcallable-instance clos-slots))))
 
 (declaim (inline clos-slots-ref (setf clos-slots-ref)))
-(declaim (ftype (function (simple-vector index) t) clos-slots-ref))
+(declaim (ftype (function (simple-vector t) t) clos-slots-ref))
 (defun clos-slots-ref (slots index)
   (svref slots index))
-(declaim (ftype (function (t simple-vector index) t) (setf clos-slots-ref)))
+(declaim (ftype (function (t simple-vector t) t) (setf clos-slots-ref)))
 (defun (setf clos-slots-ref) (new-value slots index)
   (setf (svref slots index) new-value))
 
@@ -131,46 +102,9 @@
 ;;; and normal instances, so we can return true on structures also. A
 ;;; few uses of (OR STD-INSTANCE-P FSC-INSTANCE-P) are changed to
 ;;; PCL-INSTANCE-P.
+(declaim (inline std-instance-p))
 (defun std-instance-p (x)
   (%instancep x))
-(define-compiler-macro std-instance-p (x)
-  `(%instancep ,x))
-
-;; a temporary definition used for debugging the bootstrap
-#+sb-show
-(defun print-std-instance (instance stream depth)
-  (declare (ignore depth))
-  (print-unreadable-object (instance stream :type t :identity t)
-    (let ((class (class-of instance)))
-      (when (or (eq class (find-class 'standard-class nil))
-                (eq class (find-class 'funcallable-standard-class nil))
-                (eq class (find-class 'system-class nil))
-                (eq class (find-class 'built-in-class nil)))
-        (princ (early-class-name instance) stream)))))
-
-;;; This is the value that we stick into a slot to tell us that it is
-;;; unbound. It may seem gross, but for performance reasons, we make
-;;; this an interned symbol. That means that the fast check to see
-;;; whether a slot is unbound is to say (EQ <val> '..SLOT-UNBOUND..).
-;;; That is considerably faster than looking at the value of a special
-;;; variable.
-;;;
-;;; It seems only reasonable to also export this for users, since
-;;; otherwise dealing with STANDARD-INSTANCE-ACCESS becomes harder
-;;; -- and slower -- than it needs to be.
-(defconstant +slot-unbound+ '..slot-unbound..
-  #+sb-doc
-  "SBCL specific extensions to MOP: if this value is read from an
-instance using STANDARD-INSTANCE-ACCESS, the slot is unbound.
-Similarly, an :INSTANCE allocated slot can be made unbound by
-assigning this to it using (SETF STANDARD-INSTANCE-ACCESS).
-
-Value of +SLOT-UNBOUND+ is unspecified, and should not be relied to be
-of any particular type, but it is guaranteed to be suitable for EQ
-comparison.")
-
-(defmacro std-instance-class (instance)
-  `(wrapper-class* (std-instance-wrapper ,instance)))
 
 ;;; When given a funcallable instance, SET-FUN-NAME *must* side-effect
 ;;; that FIN to give it the name. When given any other kind of
@@ -180,31 +114,34 @@ comparison.")
 ;;; In all cases, SET-FUN-NAME must return the new (or same)
 ;;; function. (Unlike other functions to set stuff, it does not return
 ;;; the new value.)
-(declaim (ftype function class-of))
+;; This is an absolutely terrible name for a function which both assigns
+;; the name slot of a function, and _sometimes_ binds a name to a function.
 (defun set-fun-name (fun new-name)
-  #+sb-doc
   "Set the name of a compiled function object. Return the function."
   (when (valid-function-name-p fun)
     (setq fun (fdefinition fun)))
   (typecase fun
-    (%method-function (setf (%method-function-name fun) new-name))
-    #+sb-eval
-    (sb-eval:interpreted-function
-     (setf (sb-eval:interpreted-function-name fun) new-name))
-    (closure
-     (setq fun (sb-impl::set-closure-name fun new-name)))
-    (funcallable-instance ;; KLUDGE: probably a generic function...
-     (cond ((if (eq **boot-state** 'complete)
-                (typep fun 'generic-function) ; FIXME: inefficient forward-ref
-                (eq (class-of fun) *the-class-standard-generic-function*))
-            (setf (%funcallable-instance-info fun 2) new-name))
-           (t
-            (bug "unanticipated function type")))))
+    (%method-function fun)
+    ;; a closure potentially becomes a different closure
+    (closure (setq fun (set-closure-name fun t new-name)))
+    (t (setf (%fun-name fun) new-name)))
   ;; Fixup name-to-function mappings in cases where the function
   ;; hasn't been defined by DEFUN.  (FIXME: is this right?  This logic
   ;; comes from CMUCL).  -- CSR, 2004-12-31
+  ;;
+  ;; Now, given this logic is somewhat suspect to begin with, and is the final
+  ;; remaining contributor to the immortalization of EQL-specialized methods,
+  ;; I'm going to say that we don't create an fdefn for anything
+  ;; whose specializers are not symbols.
+  ;; Otherwise, adding+removing N methods named
+  ;;  (SLOW-METHOD BLAH ((EQL <HAIRY-LIST-OBJECT>)))
+  ;; makes them all permanent because FDEFNs are compared by name EQUALity,
+  ;; so each gets its own FDEFN. This is bad, and pretty much useless anyway.
   (when (and (consp new-name)
-             (member (car new-name) '(slow-method fast-method slot-accessor)))
+             (or (eq (car new-name) 'slot-accessor)
+                 (and (member (car new-name) '(slow-method fast-method))
+                      ;; name is: ({SLOW|FAST}-METHOD root <qual>* spec+)
+                      (every #'symbolp (car (last new-name))))))
     (setf (fdefinition new-name) fun))
   fun)
 
@@ -231,38 +168,14 @@ comparison.")
          (t (return-from %pcl-instance-p nil)))))
 
 ;;; This definition is for interpreted code.
-(defun pcl-instance-p (x) (%pcl-instance-p x))
-
-;;; CMU CL comment:
-;;;   We define this as STANDARD-INSTANCE, since we're going to
-;;;   clobber the layout with some standard-instance layout as soon as
-;;;   we make it, and we want the accessor to still be type-correct.
-#|
-(defstruct (standard-instance
-            (:predicate nil)
-            (:constructor %%allocate-instance--class ())
-            (:copier nil)
-            (:alternate-metaclass instance
-                                  cl:standard-class
-                                  make-standard-class))
-  (slots nil))
-|#
-(!defstruct-with-alternate-metaclass standard-instance
-  :slot-names (slots hash-code)
-  :boa-constructor %make-standard-instance
-  :superclass-name t
-  :metaclass-name standard-classoid
-  :metaclass-constructor make-standard-classoid
-  :dd-type structure
-  :runtime-type-checks-p nil)
+(defun pcl-instance-p (x) (declare (explicit-check)) (%pcl-instance-p x))
 
 ;;; Both of these operations "work" on structures, which allows the above
 ;;; weakening of STD-INSTANCE-P.
-(defmacro std-instance-slots (x) `(%instance-ref ,x 1))
-(defmacro std-instance-wrapper (x) `(%instance-layout ,x))
-;;; KLUDGE: This one doesn't "work" on structures.  However, we
-;;; ensure, in SXHASH and friends, never to call it on structures.
-(defmacro std-instance-hash (x) `(%instance-ref ,x 2))
+;;; FIXME: what does the preceding comment mean? You can't use instance-slots
+;;; on a structure. (Consider especially a structure of 0 slots.)
+(defmacro std-instance-slots (x)
+  `(truly-the simple-vector (%instance-ref ,x ,(get-dsd-index standard-instance slots))))
 
 ;;; FIXME: These functions are called every place we do a
 ;;; CALL-NEXT-METHOD, and probably other places too. It's likely worth
@@ -290,27 +203,6 @@ comparison.")
     `(progn
        (aver (layout-for-std-class-p ,wrapper))
        ,wrapper)))
-
-;;;; support for useful hashing of PCL instances
-
-(defvar *instance-hash-code-random-state* (make-random-state))
-(defun get-instance-hash-code ()
-  ;; ANSI SXHASH wants us to make a good-faith effort to produce
-  ;; hash-codes that are well distributed within the range of
-  ;; non-negative fixnums, and this RANDOM operation does that, unlike
-  ;; the sbcl<=0.8.16 implementation of this operation as
-  ;; (INCF COUNTER).
-  ;;
-  ;; Hopefully there was no virtue to the old counter implementation
-  ;; that I am insufficiently insightful to insee. -- WHN 2004-10-28
-  (random most-positive-fixnum
-          *instance-hash-code-random-state*))
-
-(defun sb-impl::sxhash-instance (x)
-  (cond
-    ((std-instance-p x) (std-instance-hash x))
-    ((fsc-instance-p x) (fsc-instance-hash x))
-    (t (bug "SXHASH-INSTANCE called on some weird thing: ~S" x))))
 
 ;;;; structure-instance stuff
 ;;;;
@@ -356,10 +248,40 @@ comparison.")
         (fdefinition name)
         (uninitialized-accessor-function :reader slotd))))
 
+;;; Return a function to write the slot identified by SLOTD.
+;;; This is easy for read/write slots - we just return the accessor
+;;; that was already set up - but it requires work for read-only slots.
+;;; Basically we get the slotter-setter-lambda-form and compile it.
+;;; Using (COERCE lambda-form 'FUNCTION) as used to be done might produce
+;;; an interpreted function. I'm not sure whether that's right or wrong,
+;;; because if the DEFSTRUCT itself were evaluated, then the ordinary
+;;; accessors would indeed be interpreted. However if the DEFSTRUCT were
+;;; compiled, and the fasl loaded in a Lisp with *EVALUATOR-MODE* = :INTERPRET,
+;;; arguably this is against the expectation that all things got compiled.
+;;; But can people really expect that manipulating read-only slots
+;;; via (SETF SLOT-VALUE) should be fast?
+;;;
+;;; Damned-if-you-do / damned-if-you don't - the best thing would be to
+;;; compile all accessors at "really" compile-time but not store the writer
+;;; for a reaadonly slot under the #<fdefn> for #'(SETF slot-name).
+;;;
 (defun structure-slotd-writer-function (type slotd)
+  ;; TYPE is not used, because the DD is taken from runtime data.
+  (declare (ignore type))
   (if (dsd-read-only slotd)
-      (let ((dd (find-defstruct-description type)))
-        (coerce (slot-setter-lambda-form dd slotd) 'function))
+      ;; We'd like to compile the writer just-in-time and store it
+      ;; back into the STRUCTURE-DIRECT-SLOT-DEFINITION and also
+      ;; the LAYOUT for the class, but we don't have a handle on
+      ;; any of the containing objects. So this has to be a closure.
+      (let ((setter 0))
+        (lambda (newval instance)
+          (if (eql setter 0)
+              (let* ((dd (layout-info (%instance-layout instance)))
+                     (f (compile nil (slot-setter-lambda-form dd slotd))))
+                (if (functionp f)
+                    (funcall (setq setter f) newval instance)
+                    (uninitialized-accessor-function :writer slotd)))
+              (funcall (truly-the function setter) newval instance))))
       (let ((name `(setf ,(dsd-accessor-name slotd))))
         (if (fboundp name)
             (fdefinition name)
@@ -370,32 +292,3 @@ comparison.")
 
 (defun structure-slotd-init-form (slotd)
   (dsd-default slotd))
-
-;;; method function stuff.
-;;;
-;;; PCL historically included a so-called method-fast-function, which
-;;; is essentially a method function but with (a) a precomputed
-;;; continuation for CALL-NEXT-METHOD and (b) a permutation vector for
-;;; slot access.  [ FIXME: see if we can understand these two
-;;; optimizations before commit. ]  However, the presence of the
-;;; fast-function meant that we violated AMOP and the effect of the
-;;; :FUNCTION initarg, and furthermore got to potentially confusing
-;;; situations where the function and the fast-function got out of
-;;; sync, so that calling (method-function method) with the defined
-;;; protocol would do different things from (call-method method) in
-;;; method combination.
-;;;
-;;; So we define this internal method function structure, which we use
-;;; when we create a method function ourselves.  This means that we
-;;; can hang the various bits of information that we want off the
-;;; method function itself, and also that if a user overrides method
-;;; function creation there is no danger of having the system get
-;;; confused.
-(!defstruct-with-alternate-metaclass %method-function
-  :slot-names (fast-function name)
-  :boa-constructor %make-method-function
-  :superclass-name function
-  :metaclass-name static-classoid
-  :metaclass-constructor make-static-classoid
-  :dd-type funcallable-structure)
-

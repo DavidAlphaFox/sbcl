@@ -1,4 +1,4 @@
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Return-multiple with other than one value
 
@@ -131,23 +131,23 @@
   (declare (ignore start count))
 
 
-  (let ((error (generate-error-code nil invalid-unwind-error)))
+  (let ((error (generate-error-code nil 'invalid-unwind-error)))
     (inst bc := nil block zero-tn error))
 
   (load-symbol-value cur-uwp *current-unwind-protect-block*)
-  (loadw target-uwp block unwind-block-current-uwp-slot)
+  (loadw target-uwp block unwind-block-uwp-slot)
   (inst bc :<> nil cur-uwp target-uwp DO-UWP)
 
   (move block cur-uwp)
 
   DO-EXIT
-  (loadw cfp-tn cur-uwp unwind-block-current-cont-slot)
-  (loadw code-tn cur-uwp unwind-block-current-code-slot)
+  (loadw cfp-tn cur-uwp unwind-block-cfp-slot)
+  (loadw code-tn cur-uwp unwind-block-code-slot)
   (loadw lra cur-uwp unwind-block-entry-pc-slot)
   (lisp-return lra :frob-code nil)
 
   DO-UWP
-  (loadw next-uwp cur-uwp unwind-block-current-uwp-slot)
+  (loadw next-uwp cur-uwp unwind-block-uwp-slot)
   (inst b DO-EXIT)
   (store-symbol-value next-uwp *current-unwind-protect-block*))
 
@@ -165,7 +165,7 @@
   (load-symbol-value catch *current-catch-block*)
 
   LOOP
-  (let ((error (generate-error-code nil unseen-throw-tag-error target)))
+  (let ((error (generate-error-code nil 'unseen-throw-tag-error target)))
     (inst bc := nil catch zero-tn error))
   (loadw tag catch catch-block-tag-slot)
   (inst comb := tag target EXIT :nullify t)
@@ -177,43 +177,7 @@
     (inst ble fixup lisp-heap-space fix))
   (move catch target t))
 
-; we need closure-tramp and funcallable-instance-tramp in
-; same space as other lisp-code, because caller is doing
-; normal lisp-calls where we doesnt specify space.
-; if we doesnt have the lisp-function (code from defun, closure, lambda etc..)
-; machine-address, resolve it here and jump to it.
-(define-assembly-routine
-  (closure-tramp (:return-style :none))
-  ((:temp lip interior-reg lip-offset)
-   (:temp nl0 descriptor-reg nl0-offset))
-  (inst ldw (- (* fdefn-fun-slot n-word-bytes)
-               other-pointer-lowtag)
-            fdefn-tn lexenv-tn)
-  (inst ldw (- (* closure-fun-slot n-word-bytes)
-                  fun-pointer-lowtag)
-            lexenv-tn nl0)
-  (inst addi (- (* simple-fun-code-offset n-word-bytes)
-                fun-pointer-lowtag)
-        nl0 lip)
-  (inst bv lip :nullify t))
-
-(define-assembly-routine
-  (funcallable-instance-tramp (:return-style :none))
-  nil
-  (inst nop)
-  (inst nop)
-  (inst nop)
-  (inst nop)
-  (inst nop)
-  (inst ldw 3 lexenv-tn lexenv-tn)
-  (inst ldw (- (* closure-fun-slot n-word-bytes)
-                  fun-pointer-lowtag)
-            lexenv-tn code-tn)
-  (inst addi (- (* simple-fun-code-offset n-word-bytes)
-                fun-pointer-lowtag) code-tn lip-tn)
-  (inst bv lip-tn :nullify t))
-
-#!+hpux
+#+hpux
 (define-assembly-routine
   (return-from-lisp-stub (:return-style :none))
   ((:temp lip interior-reg lip-offset)
@@ -227,7 +191,7 @@
   ; either use 16 or 20, finetune it...
   (inst addi 19 nl0 lra) ; then setup the new LRA (rest of this routine after branch)
   (inst bv lip :nullify t)
-  (inst word return-pc-header-widetag)
+  (inst word return-pc-widetag)
   ; ok, we are back from the lisp-call, lets return to c
   ; FIX-lav: steal more stuff from call_into_lisp here, ideally the whole thing
   (inst move ocfp-tn csp-tn) ; dont think we should ever get here

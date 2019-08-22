@@ -9,14 +9,14 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
-
-(/show0 "entering backq.lisp")
+(in-package "SB-IMPL")
 
 ;; An unquoting COMMA struct.
 (defstruct (comma (:constructor unquote (expr &optional (kind 0)))
+                  #+sb-xc-host (:include structure!object)
                   ;; READing unpretty commas requires a default constructor.
-                  (:constructor %default-comma-constructor)
+                  ;; Not needed on the host.
+                  #-sb-xc-host (:constructor %default-comma-constructor)
                   (:copier nil))
  (expr nil :read-only t)
  (kind nil :read-only t :type (member 0 1 2)))
@@ -32,26 +32,11 @@
 (defun comma-constructor (x)
   (svref #(unquote unquote-nsplice unquote-splice) (comma-kind x)))
 (defun comma-splicing-p (comma) (not (zerop (comma-kind comma))))
-
-(declaim (inline singleton-p))
-(defun singleton-p (list)
-  (and (consp list)
-       (null (rest list))))
-
-#+sb-xc-host
-(progn
-  ;; tell the host how to dump it
-  (defmethod make-load-form ((self comma) &optional environment)
-    (declare (ignore environment))
-    (list (comma-constructor self) (list 'quote (comma-expr self))))
-  ;; tell the cross-compiler that it can do :just-dump-it-normally
-  (setf (get 'comma :sb-xc-allow-dumping-instances) t))
+(!set-load-form-method comma (:host :xc :target))
 
 (declaim (type (and fixnum unsigned-byte) *backquote-depth*))
-(defvar *backquote-depth* 0 #!+sb-doc "how deep we are into backquotes")
+(defvar *backquote-depth* 0 "how deep we are into backquotes")
 (defvar *bq-error* "Comma not inside a backquote.")
-
-(/show0 "backq.lisp 50")
 
 ;;; the actual character macro
 (defun backquote-charmacro (stream char)
@@ -65,10 +50,9 @@
          stream "~S is not a well-formed backquote expression" result)
         result)))
 
-(/show0 "backq.lisp 64")
-
 (defun comma-charmacro (stream char)
   (declare (ignore char))
+  (declare (notinline read-char unread-char))
   (unless (> *backquote-depth* 0)
     (when *read-suppress*
       (return-from comma-charmacro nil))
@@ -86,8 +70,7 @@
     (unquote (let ((*backquote-depth* (1- *backquote-depth*)))
                (read stream t nil t)) flag)))
 
-(/show0 "backq.lisp 83")
-
+;; KLUDGE: 'sfunction' is not a defined type yet.
 (declaim (ftype (function (t fixnum boolean) (values t t &optional))
                 qq-template-to-sexpr qq-template-1))
 
@@ -148,8 +131,6 @@
                                (t 'unquote*))
                          subexpr)
                    operator)))))
-
-(/show0 "backq.lisp 139")
 
 ;; Find the longest suffix comprised wholly of self-evaluating and/or quoted
 ;; SUBFORMS. DOTTED-P indicates that the last item represents what was in the
@@ -332,10 +313,12 @@
 ;;; exist on the target Lisp, we ensure that backquote expansions in
 ;;; code-generating code work properly.)
 
-(defun !backq-cold-init ()
-  (set-macro-character #\` 'backquote-charmacro)
-  (set-macro-character #\, 'comma-charmacro))
-#-sb-xc (!backq-cold-init)
+(defun !backq-cold-init (&optional (rt *readtable*))
+  (set-macro-character #\` 'backquote-charmacro nil rt)
+  (set-macro-character #\, 'comma-charmacro nil rt))
+;;; This is a load-time effect, not compile-time, and *READTABLE* will have been
+;;; reverted to the standard one, so be sure to assign into ours, not that.
+#-sb-xc (!backq-cold-init sb-cold:*xc-readtable*)
 
 ;;; Since our backquote is installed on the host lisp, and since
 ;;; developers make mistakes with backquotes and commas too, let's
@@ -343,6 +326,4 @@
 ;;; function condition on SIMPLE-READER-ERROR.
 #+sb-xc-host ; proper definition happens for the target
 (defun simple-reader-error (stream format-string &rest format-args)
-  (bug "READER-ERROR on stream ~S: ~?" stream format-string format-args))
-
-(/show0 "done with backq.lisp")
+  (error "READER-ERROR on stream ~S: ~?" stream format-string format-args))

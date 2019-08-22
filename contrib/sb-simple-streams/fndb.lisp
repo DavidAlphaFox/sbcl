@@ -64,6 +64,8 @@ TODO (rudi 2003-05-19): make the above work, make (defknown open) use it.
 ||#
 
 
+;; This adds keywords for :MAPPED, :INPUT-HANDLE :OUTPUT-HANDLE.
+;; But [BUG?] why is the first arg type T instead of PATHNAME-DESIGNATOR?
 (sb-c:defknown open (t &rest t
                        &key (:direction (member :input :output :io :probe))
                        (:element-type sb-kernel:type-specifier)
@@ -84,7 +86,7 @@ TODO (rudi 2003-05-19): make the above work, make (defknown open) use it.
 
 (sb-c:defknown listen (&optional sb-kernel:stream-designator
                                  (or null (integer 1 10) (member character)))
-    boolean (sb-c::unsafely-flushable sb-c::explicit-check)
+    boolean (sb-c::unsafely-flushable)
   :overwrite-fndb-silently t)
 
 (sb-c:defknown read-sequence (sequence stream &key (:start sb-int:index)
@@ -93,6 +95,5 @@ TODO (rudi 2003-05-19): make the above work, make (defknown open) use it.
     (sb-int:index) ()
   :overwrite-fndb-silently t)
 
-(sb-c:defknown clear-input (&optional stream boolean) null
-    (sb-c::explicit-check)
+(sb-c:defknown clear-input (&optional stream boolean) null ()
   :overwrite-fndb-silently t)

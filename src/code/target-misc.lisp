@@ -1,7 +1,5 @@
-;;;; Environment query functions, DOCUMENTATION and DRIBBLE.
+;;;; Environment query functions, and DRIBBLE.
 ;;;;
-;;;; FIXME: If there are exactly three things in here, it could be
-;;;; exactly three files named e.g. equery.lisp, doc.lisp, and dribble.lisp.
 
 ;;;; This software is part of the SBCL system. See the README file for
 ;;;; more information.
@@ -12,177 +10,30 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
-;;;; Generalizing over SIMPLE-FUN, CLOSURE, and FUNCALLABLE-INSTANCEs
+(in-package "SB-IMPL")
 
-;;; Underlying SIMPLE-FUN
-(defun %fun-fun (function)
-  (declare (function function))
-  ;; It's too bad that TYPECASE isn't able to generate equivalent code.
-  (case (fun-subtype function)
-    (#.sb!vm:simple-fun-header-widetag
-     function)
-    (#.sb!vm:closure-header-widetag
-     (%closure-fun function))
-    (#.sb!vm:funcallable-instance-header-widetag
-     ;; %FUNCALLABLE-INSTANCE-FUNCTION is not known to return a FUNCTION.
-     ;; Is that right? Shouldn't we always initialize to something
-     ;; that is a function, such as an error-signaling trampoline?
-     (%fun-fun (%funcallable-instance-function function)))))
-
-(defun %fun-lambda-list (function)
-  (typecase function
-    #!+sb-eval
-    (sb!eval:interpreted-function
-     (sb!eval:interpreted-function-debug-lambda-list function))
-    (t
-     (%simple-fun-arglist (%fun-fun function)))))
-
-(defun (setf %fun-lambda-list) (new-value function)
-  (typecase function
-    #!+sb-eval
-    (sb!eval:interpreted-function
-     (setf (sb!eval:interpreted-function-debug-lambda-list function) new-value))
-    ;; FIXME: Eliding general funcallable-instances for now.
-    ((or simple-fun closure)
-     (setf (%simple-fun-arglist (%fun-fun function)) new-value)))
-  new-value)
-
-(defun %fun-type (function)
-  (%simple-fun-type (%fun-fun function)))
-
-(defglobal *closure-name-marker* (make-symbol ".CLOSURE-NAME."))
-(defun closure-name (closure)
-  (declare (closure closure))
-  (let ((len (get-closure-length closure)))
-    (if (and (>= len 4)
-             ;; The number of closure-values is 1- the len.
-             ;; The index of the last value is 1- that.
-             ;; The index of the name-marker is 1- that.
-             ;; (closure index 0 is the first closed-over value)
-             (eq (%closure-index-ref closure (- len 3))
-                 (load-time-value *closure-name-marker* t)))
-        (values (%closure-index-ref closure (- len 2)) t)
-        (values nil nil))))
-
-;; Add 2 "slots" to the payload of a closure, one for the magic symbol
-;; signifying that there is a name, and one for the name itself.
-(defun nameify-closure (closure)
-  (declare (closure closure))
-  (let* ((physical-len (get-closure-length closure)) ; excluding header
-         ;; subtract 1 because physical-len includes the trampoline word.
-         (new-n-closure-vals (+ 2 (1- physical-len)))
-         ;; Closures and funcallable-instances are pretty much the same to GC.
-         ;; They're both varying-length boxed-payload objects.
-         ;; But funcallable-instance has <tramp, function, info>
-         ;; where closure has <tramp, info> so subtract 1 more word.
-         (copy (%make-funcallable-instance (1- new-n-closure-vals))))
-    (with-pinned-objects (closure copy)
-      ;; change the widetag from funcallable-instance to closure.
-      (setf (sap-ref-word (int-sap (get-lisp-obj-address copy))
-                          (- sb!vm:fun-pointer-lowtag))
-            (logior (ash (+ physical-len 2) 8) sb!vm:closure-header-widetag))
-      (macrolet ((word (obj index)
-                   `(sap-ref-lispobj (int-sap (get-lisp-obj-address ,obj))
-                                     (+ (- sb!vm:fun-pointer-lowtag)
-                                        (ash ,index sb!vm:word-shift)))))
-        (loop for i from 1 to physical-len
-              do (setf (word copy i) (word closure i)))
-        (setf (word copy (1+ physical-len))
-              (load-time-value *closure-name-marker* t))))
-    copy))
-
-;; Rename a closure. Doing so changes its identity unless it was already named.
-;; To do this without allocating a new closure, we'd need an interface that
-;; requests a placeholder from the outset. One possibility is that
-;; (NAMED-LAMBDA NIL (x) ...) would allocate the name, initially stored as nil.
-;; In that case, the simple-fun's debug-info could also contain a bit that
-;; indicates that all closures over it are named, eliminating the storage
-;; and check for *closure-name-marker* in the closure values.
-(defun set-closure-name (closure new-name)
-  (declare (closure closure))
-  (unless (nth-value 1 (closure-name closure))
-    (setq closure (nameify-closure closure)))
-  ;; There are no closure slot setters, and in fact SLOT-SET
-  ;; does not exist in a variant that takes a non-constant index.
-  (with-pinned-objects (closure)
-    (setf (sap-ref-lispobj (int-sap (get-lisp-obj-address closure))
-                           (+ (- sb!vm:fun-pointer-lowtag)
-                              (ash (get-closure-length closure)
-                                   sb!vm:word-shift)))
-          new-name))
-  closure)
-
-;;; a SETFable function to return the associated debug name for FUN
-;;; (i.e., the third value returned from CL:FUNCTION-LAMBDA-EXPRESSION),
-;;; or NIL if there's none
-(defun %fun-name (function)
-  (typecase function
-    #!+sb-eval
-    (sb!eval:interpreted-function
-     (sb!eval:interpreted-function-debug-name function))
-    (t
-     (let (name namedp)
-       (if (and (closurep function)
-                (progn
-                  (multiple-value-setq (name namedp) (closure-name function))
-                  namedp))
-           name
-           (%simple-fun-name (%fun-fun function)))))))
-
-(defun (setf %fun-name) (new-value function)
-  (typecase function
-    #!+sb-eval
-    (sb!eval:interpreted-function
-     (setf (sb!eval:interpreted-function-debug-name function) new-value))
-    ;; FIXME: Eliding general funcallable-instances for now.
-    ;; This does not set the name of an un-named closure because doing so
-    ;; is not a side-effecting operation that it ought to be.
-    ;; In contrast, SB-PCL::SET-FUN-NAME specifically says that only if the
-    ;; argument fun is a funcallable instance must it retain its identity.
-    ;; That function *is* allowed to cons a new closure to name it.
-    ((or simple-fun closure)
-     (if (and (closurep function) (nth-value 1 (closure-name function)))
-         (set-closure-name function new-value)
-         (setf (%simple-fun-name (%fun-fun function)) new-value))))
-  new-value)
-
-(defun %fun-doc (function)
-  (typecase function
-    #!+sb-eval
-    (sb!eval:interpreted-function
-     (sb!eval:interpreted-function-documentation function))
-    (t
-     (%simple-fun-doc (%fun-fun function)))))
-
-(defun (setf %fun-doc) (new-value function)
-  (declare (type (or null string) new-value))
-  (typecase function
-    #!+sb-eval
-    (sb!eval:interpreted-function
-     (setf (sb!eval:interpreted-function-documentation function) new-value))
-    ((or simple-fun closure)
-     (setf (%simple-fun-doc (%fun-fun function)) new-value)))
-  new-value)
-
 ;;; various environment inquiries
 
-(defvar *features*
-  '#.(sort (copy-list sb-cold:*shebang-features*) #'string<)
-  #!+sb-doc
+(defparameter *features*
+   ;; The :SB-XC keyword indicates the build phase and is not intended
+   ;; to persist into the target.
+   ;; GCC_TLS is not a Lisp feature- it's just freeloading off the means
+   ;; by which additional #defines get into "genesis/config.h".
+   ;; Literally nothing except C code tests for it.
+   '#.(remove-if (lambda (x) (member x '(:sb-xc :gcc-tls)))
+                 sb-xc:*features*)
   "a list of symbols that describe features provided by the
    implementation")
 
 (defun machine-instance ()
-  #!+sb-doc
   "Return a string giving the name of the local machine."
-  #!+win32 (sb!win32::get-computer-name)
-  #!-win32 (sb!unix:unix-gethostname))
+  #+win32 (sb-win32::get-computer-name)
+  #-win32 (truly-the simple-string (sb-unix:unix-gethostname)))
 
+(declaim (type (or null string) *machine-version*))
 (defvar *machine-version*)
 
 (defun machine-version ()
-  #!+sb-doc
   "Return a string describing the version of the computer hardware we
 are running on, or NIL if we can't find any useful information."
   (unless (boundp '*machine-version*)
@@ -195,27 +46,24 @@ are running on, or NIL if we can't find any useful information."
 ;;; from ANSI 11.1.2.1.1 "Constraints on the COMMON-LISP Package
 ;;; for Conforming Implementations" it is kosher to add a SETF function for
 ;;; a symbol in COMMON-LISP..
-(defvar *short-site-name* nil
-  #!+sb-doc
+(declaim (type (or null string) *short-site-name* *long-site-name*))
+(define-load-time-global *short-site-name* nil
   "The value of SHORT-SITE-NAME.")
-(defvar *long-site-name* nil
-  #!+sb-doc "the value of LONG-SITE-NAME")
+(define-load-time-global *long-site-name* nil
+  "The value of LONG-SITE-NAME.")
 (defun short-site-name ()
-  #!+sb-doc
   "Return a string with the abbreviated site name, or NIL if not known."
   *short-site-name*)
 (defun long-site-name ()
-  #!+sb-doc
   "Return a string with the long form of the site name, or NIL if not known."
   *long-site-name*)
 
 ;;;; ED
-(defvar *ed-functions* nil
-  #!+sb-doc
+(declaim (type list *ed-functions*))
+(defvar *ed-functions* '()
   "See function documentation for ED.")
 
 (defun ed (&optional x)
-  #!+sb-doc
   "Starts the editor (on a file or a function if named).  Functions
 from the list *ED-FUNCTIONS* are called in order with X as an argument
 until one of them returns non-NIL; these functions are responsible for
@@ -225,7 +73,7 @@ the file system."
            (error 'extension-failure
                   :format-control "Don't know how to ~S ~A"
                   :format-arguments (list 'ed x)
-                  :references (list '(:sbcl :variable *ed-functions*))))
+                  :references '((:sbcl :variable *ed-functions*))))
     (when (funcall fun x)
       (return t))))
 
@@ -243,56 +91,171 @@ the file system."
 ;;; and the values of *DRIBBLE-STREAM*, *STANDARD-INPUT*, and
 ;;; *STANDARD-OUTPUT* are popped from *PREVIOUS-DRIBBLE-STREAMS*.
 
-(defvar *previous-dribble-streams* nil)
+(defvar *previous-dribble-streams* '())
 (defvar *dribble-stream* nil)
 
 (defun dribble (&optional pathname &key (if-exists :append))
-  #!+sb-doc
   "With a file name as an argument, dribble opens the file and sends a
   record of further I/O to that file. Without an argument, it closes
   the dribble file, and quits logging."
-  (cond (pathname
-         (let* ((new-dribble-stream
-                 (open pathname
-                       :direction :output
-                       :if-exists if-exists
-                       :if-does-not-exist :create))
-                (new-standard-output
-                 (make-broadcast-stream *standard-output* new-dribble-stream))
-                (new-error-output
-                 (make-broadcast-stream *error-output* new-dribble-stream))
-                (new-standard-input
-                 (make-echo-stream *standard-input* new-dribble-stream)))
+  (flet ((install-streams (dribble input output error)
+           (setf *dribble-stream* dribble
+                 *standard-input* input
+                 *standard-output* output
+                 *error-output* error)))
+    (cond (pathname
            (push (list *dribble-stream* *standard-input* *standard-output*
                        *error-output*)
                  *previous-dribble-streams*)
-           (setf *dribble-stream* new-dribble-stream)
-           (setf *standard-input* new-standard-input)
-           (setf *standard-output* new-standard-output)
-           (setf *error-output* new-error-output)))
-        ((null *dribble-stream*)
-         (error "not currently dribbling"))
-        (t
-         (let ((old-streams (pop *previous-dribble-streams*)))
+           (let ((new-dribble (open pathname
+                                    :direction :output
+                                    :if-exists if-exists
+                                    :if-does-not-exist :create)))
+             (install-streams
+              new-dribble
+              (make-echo-stream *standard-input* new-dribble)
+              (make-broadcast-stream *standard-output* new-dribble)
+              (make-broadcast-stream *error-output* new-dribble))))
+          ((null *dribble-stream*)
+           (error "not currently dribbling"))
+          (t
            (close *dribble-stream*)
-           (setf *dribble-stream* (first old-streams))
-           (setf *standard-input* (second old-streams))
-           (setf *standard-output* (third old-streams))
-           (setf *error-output* (fourth old-streams)))))
+           (apply #'install-streams (pop *previous-dribble-streams*)))))
   (values))
-
-(defun %byte-blt (src src-start dst dst-start dst-end)
-  (%byte-blt src src-start dst dst-start dst-end))
 
 ;;;; some *LOAD-FOO* variables
 
 (defvar *load-print* nil
-  #!+sb-doc
   "the default for the :PRINT argument to LOAD")
 
 (defvar *load-verbose* nil
   ;; Note that CMU CL's default for this was T, and ANSI says it's
   ;; implementation-dependent. We choose NIL on the theory that it's
   ;; a nicer default behavior for Unix programs.
-  #!+sb-doc
   "the default for the :VERBOSE argument to LOAD")
+
+;;; DEFmumble helpers
+
+(defun %defglobal (name value source-location &optional (doc nil docp))
+  (%compiler-defglobal name :always-bound
+                       (not (unbound-marker-p value)) value)
+  (when docp
+    (setf (documentation name 'variable) doc))
+  (when source-location
+    (setf (info :source-location :variable name) source-location))
+  name)
+
+(defun %defparameter (var val source-location &optional (doc nil docp))
+  (%compiler-defvar var)
+  (set var val)
+  (when docp
+    (setf (documentation var 'variable) doc))
+  (when source-location
+    (setf (info :source-location :variable var) source-location))
+  var)
+
+(defun %defvar (var source-location &optional (val nil valp) (doc nil docp))
+  (%compiler-defvar var)
+  (when (and valp
+             (not (boundp var)))
+    (set var val))
+  (when docp
+    (setf (documentation var 'variable) doc))
+  (when source-location
+    (setf (info :source-location :variable var) source-location))
+  var)
+
+(defun %defun (name def &optional inline-lambda extra-info)
+  (declare (type function def))
+  ;; should've been checked by DEFMACRO DEFUN
+  (aver (legal-fun-name-p name))
+  ;; If a warning handler decides to disallow this redefinition
+  ;; by nonlocally exiting, then we'll skip the rest of this stuff.
+  (when (and (fboundp name)
+             *type-system-initialized*)
+    (handler-bind (((satisfies sb-c::handle-condition-p)
+                     #'sb-c::handle-condition-handler))
+      (warn 'redefinition-with-defun :name name :new-function def)))
+  (sb-c:%compiler-defun name nil inline-lambda extra-info)
+  (setf (fdefinition name) def)
+  ;; %COMPILER-DEFUN doesn't do this except at compile-time, when it
+  ;; also checks package locks. By doing this here we let (SETF
+  ;; FDEFINITION) do the load-time package lock checking before
+  ;; we frob any existing inline expansions.
+  (sb-c::%set-inline-expansion name nil inline-lambda extra-info)
+  (sb-c::note-name-defined name :function)
+  name)
+
+(in-package "SB-C")
+
+(defun real-function-name (name)
+  ;; Resolve the actual name of the function named by NAME
+  ;; e.g. (setf (name-function 'x) #'car)
+  ;; (real-function-name 'x) => CAR
+  (cond ((not (fboundp name))
+         nil)
+        ((and (symbolp name)
+              (macro-function name))
+         (let ((name (%fun-name (macro-function name))))
+           (and (consp name)
+                (eq (car name) 'macro-function)
+                (cadr name))))
+        (t
+         (%fun-name (fdefinition name)))))
+
+(defun random-documentation (name type)
+  (cdr (assoc type (info :random-documentation :stuff name))))
+
+(defun (setf random-documentation) (new-value name type)
+  (let ((pair (assoc type (info :random-documentation :stuff name))))
+    (if pair
+        (setf (cdr pair) new-value)
+        (push (cons type new-value)
+              (info :random-documentation :stuff name))))
+  new-value)
+
+(defun split-version-string (string)
+  (loop with subversion and start = 0
+        with end = (length string)
+        when (setf (values subversion start)
+                   (parse-integer string :start start :junk-allowed t))
+        collect it
+        while (and subversion
+                   (< start end)
+                   (char= (char string start) #\.))
+        do (incf start)))
+
+(defun version>= (x y)
+  (unless (or x y)
+    (return-from version>= t))
+  (let ((head-x (or (first x) 0))
+        (head-y (or (first y) 0)))
+    (or (> head-x head-y)
+        (and (= head-x head-y)
+             (version>= (rest x) (rest y))))))
+
+(defun assert-version->= (&rest subversions)
+  "Asserts that the current SBCL is of version equal to or greater than
+the version specified in the arguments.  A continuable error is signaled
+otherwise.
+
+The arguments specify a sequence of subversion numbers in big endian order.
+They are compared lexicographically with the runtime version, and versions
+are treated as though trailed by an unbounded number of 0s.
+
+For example, (assert-version->= 1 1 4) asserts that the current SBCL is
+version 1.1.4[.0.0...] or greater, and (assert-version->= 1) that it is
+version 1[.0.0...] or greater."
+  (let ((version (split-version-string (lisp-implementation-version))))
+    (unless (version>= version subversions)
+      (cerror "Disregard this version requirement."
+              "SBCL ~A is too old for this program (version ~{~A~^.~} ~
+               or later is required)."
+              (lisp-implementation-version)
+              subversions))))
+
+(defparameter sb-pcl::*!docstrings* nil)
+(defun (setf documentation) (string name doc-type)
+  (declare (type (or null string) string))
+  (push (list string name doc-type) sb-pcl::*!docstrings*)
+  string)

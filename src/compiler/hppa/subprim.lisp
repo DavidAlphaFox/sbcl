@@ -1,4 +1,4 @@
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 
@@ -9,8 +9,8 @@
   (:args (object :scs (descriptor-reg) :target ptr))
   (:arg-types list)
   (:temporary (:scs (descriptor-reg) :from (:argument 0)) ptr)
-  (:temporary (:scs (non-descriptor-reg) :type random) temp)
-  (:temporary (:scs (any-reg) :type fixnum :to (:result 0) :target result)
+  (:temporary (:scs (non-descriptor-reg)) temp)
+  (:temporary (:scs (any-reg) :to (:result 0) :target result)
               count)
   (:results (result :scs (any-reg descriptor-reg)))
   (:policy :fast-safe)
@@ -33,9 +33,7 @@
     (loadw ptr ptr cons-cdr-slot list-pointer-lowtag)
 
     LOSE
-    (cerror-call vop done object-not-list-error ptr)
+    (cerror-call vop 'object-not-list-error ptr)
 
     DONE
     (move count result)))
-
-(define-static-fun length (object) :translate length)

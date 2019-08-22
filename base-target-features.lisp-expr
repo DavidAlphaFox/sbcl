@@ -70,13 +70,6 @@
  ;; the executable I'm running.
  :sb-doc
 
- ;; Do regression and other tests when building the system. You might
- ;; or might not want this if you're not a developer, depending on how
- ;; paranoid you are. You probably do want it if you are a developer.
- ;; This test does not affect the target system (in much the same way
- ;; as :sb-after-xc-core, below).
- :sb-test
-
  ;; Make more debugging information available (for debugging SBCL
  ;; itself). If you aren't hacking or troubleshooting SBCL itself,
  ;; you probably don't want this set.
@@ -102,10 +95,10 @@
  ;; readtable configured so that the system sources can be read.
  ; :sb-show
 
- ;; Build SBCL with the old CMU CL low level debugger, "ldb". In the
- ;; ideal world you would not need this unless you are messing with
- ;; SBCL at a very low level (e.g., trying to diagnose GC problems, or
- ;; trying to debug assembly code for a port to a new CPU). However,
+ ;; Enable the low level debugger, "ldb", by default. In the ideal
+ ;; world you would not need this unless you are messing with SBCL at
+ ;; a very low level (e.g., trying to diagnose GC problems, or trying
+ ;; to debug assembly code for a port to a new CPU). However,
  ;; experience shows that sooner or later everyone lose()'s, in which
  ;; case SB-LDB can at least provide an informative backtrace.
  :sb-ldb
@@ -161,58 +154,47 @@
  ;;
  ;; FIXME: Should this be :SB-CYCLE-COUNTER instead? If so, then the same goes
  ;; for :COMPARE-AND-SWAP-VOPS as well, and a bunch of others. Perhaps
- ;; built-time convenience features like this should all live in eg. SB!INT
+ ;; built-time convenience features like this should all live in eg. SB-INT
  ;; instead?
  ;;
  ; :cycle-counter
 
- ;; Enabled automatically for platforms which implement complex arithmetic
- ;; VOPs. Such platforms should implement real-complex, complex-real and
- ;; complex-complex addition and subtractions (for complex-single-float
- ;; and complex-double-float). They should also also implement complex-real
- ;; and real-complex multiplication, complex-real division, and
- ;; sb!vm::swap-complex, which swaps the real and imaginary parts.
- ;; Finally, they should implement conjugate and complex-real, real-complex
- ;; and complex-complex CL:= (complex-complex EQL would usually be a good
- ;; idea).
- ;;
- ; :complex-float-vops
+ ;; Allow the main dynamic space to be allocated anywhere
+ ;; by the OS kernel regardless of the configuration-time value
+ ;; of dynamic-space-start.
+ ;; The downside is the potential need for startup-time relocation.
+ ;; Enabled by default if supported
+ ; :relocatable-heap
 
- ;; Enabled automatically for platforms which implement VOPs for EQL
- ;; of single and double floats.
- ;;
- ; :float-eql-vops
+ ;; Build with support for an additional dynamic heap
+ ;; differing from the main dynamic heap in two ways:
+ ;;  1. it is guaranteed to reside below 4GB so that all pointers
+ ;;      into it fit in 32 bits. (Only an issue for >32 bit address space)
+ ;;  2. all objects therein are immovable, and space is reclaimed
+ ;;     by a mark-and-sweep collector.
+ ;; That combination of aspects potentially allows various efficiencies
+ ;; in code generation, especially for the x86-64 backend.
+ ;; The extra space has a fixed size which can only be changed by a rebuild,
+ ;; and out-of-space conditions are not easily preventable, so the space
+ ;; is sized rather generously to sidestep the issue.
+ ;; Additionally, it is assumed that for all objects in the immobile heap,
+ ;; speed of allocation of those objects is relatively unimportant.
+ ;; If unexpected performance regressions are observed,
+ ;; consider disabling this feature and reporting a bug.
+ ; :immobile-space
 
- ;; Enabled automatically for platform that can implement inline constants.
- ;;
- ;; Such platform must implement 5 functions, in SB!VM:
- ;; * canonicalize-inline-constant: converts a constant descriptor (list) into
- ;;    a canonical description, to be used as a key in an EQUAL hash table
- ;;    and to guide the generation of the constant itself.
- ;; * inline-constant-value: given a canonical constant descriptor, computes
- ;;    two values:
- ;;     1. A label that will be used to emit the constant (usually a
- ;;         sb!assem:label)
- ;;     2. A value that will be returned to code generators referring to
- ;;         the constant (on x86oids, an EA object)
- ;; * sort-inline-constants: Receives a vector of unique constants;
- ;;    the car of each entry is the constant descriptor, and the cdr the
- ;;    corresponding label. Destructively returns a vector of constants
- ;;    sorted in emission order. It could actually perform arbitrary
- ;;    modifications to the vector, e.g. to fuse constants of different
- ;;    size.
- ;; * emit-constant-segment-header: receives the vector of sorted constants
- ;;    and a flag (true iff speed > space). Expected to emit padding
- ;;    of some sort between the ELSEWHERE segment and the constants, or some
- ;;    metadata.
- ;; * emit-inline-constant: receives a constant descriptor and its associated
- ;;    label. Emits the constant.
- ;;
- ;; Implementing this features lets VOP generators use sb!c:register-inline-constant
- ;; to get handles (as returned by sb!vm:inline-constant-value) from constant
- ;; descriptors.
- ;;
- ; :inline-constants
+ ;; Allocate most functions in the immobile space.
+ ;; Enabled by default if supported.
+ ;; The down-side of this feature is that the allocator is significantly
+ ;; slower than the allocator for movable code. If a particular application
+ ;; is performance-constrained by speed of creation of compiled functions
+ ;; (not including closures), the feature can be disabled.
+ ; :immobile-code
+
+ ;; Combine the layout pointer, instance-length, and widetag of INSTANCE
+ ;; into a single machine word. This represents a space savings of anywhere
+ ;; from 4% to 8% in typical applications. (Your mileage may vary).
+ ; :compact-instance-header
 
  ;; Peter Van Eynde's increase-bulletproofness code for CMU CL
  ;;
@@ -265,6 +247,9 @@
  ;; forms, as opposed to the traditional SBCL evaluator which called
  ;; COMPILE for everything complicated.
  :sb-eval
+ ;; Support for a different evaluator (interpreter) with improved performance.
+ ;; You can't have both.
+ ; :sb-fasteval
 
  ;; Record source location information for variables, classes, conditions,
  ;; packages, etc. Gives much better information on M-. in Slime, but
@@ -281,11 +266,6 @@
  ;; believe our API is worth copying to other implementations as well.
  ;; This doesn't affect the build at all, merely declares how things are.
  :package-local-nicknames
-
- ;; This affects the definition of a lot of things in bignum.lisp. It
- ;; doesn't seem to be documented anywhere what systems it might apply
- ;; to. It doesn't seem to be needed for X86 systems anyway.
- ; :32x16-divide
 
  ;; This is set in classic CMU CL, and presumably there it means
  ;; that the floating point arithmetic implementation
@@ -322,12 +302,6 @@
  ;; foreign code that uses a 32-bit off_t.
  ; :largefile
 
- ;; Enabled automatically on platforms that have VOPs to compute the
- ;; high half of a full word-by-word multiplication.  When disabled,
- ;; SB-KERNEL:%MULTIPLY-HIGH is implemented in terms of
- ;; SB-BIGNUM:%MULTIPLY.
- ; :multiply-high-vops
-
  ;; SBCL has optional support for zlib-based compressed core files.  Enable
  ;; this feature to compile it in.  Obviously, doing so adds a dependency
  ;; on zlib.
@@ -352,9 +326,6 @@
  ;; can replace its use of setitimer with a background thread.
  ;; (Replaces use of SIGALRM.)
  ; :sb-wtimer
-
- ;; This platform implements VOPs for %ash/right, variable-width shift right
- ; :ash-right-vops
 
  ;;
  ;; miscellaneous notes on other things which could have special significance
@@ -411,13 +382,24 @@
  ;;      any MIPS CPU (in little-endian mode with :little-endian)
  ;;   :arm
  ;;      an ARM CPU (details yet to be determined)
- ;;
+ ;;   :arm64
+ ;;     an ARMv8 AArch64 CPU
+ ;;   :riscv
+ ;;      A RISC-V CPU.
  ;; (CMU CL also had a :pentium feature, which affected the definition
  ;; of some floating point vops. It was present but not enabled or
  ;; documented in the CMU CL code that SBCL is derived from, and has
  ;; now been moved to the backend-subfeatures mechanism.)
  ;;
  ;; properties derived from the machine architecture
+ ;;
+ ;;   :64-bit
+ ;;     means (= sb-vm:n-word-bits 64) currently true for x86-64 and arm64
+ ;;
+ ;;   :64-bit-registers
+ ;;     means (= sb-vm:n-machine-word-bits 64) currently true for alpha,
+ ;;     arm64, and x86-64.
+ ;;
  ;;   :control-stack-grows-downward-not-upward
  ;;     On the X86, the Lisp control stack grows downward. On the
  ;;     other supported CPU architectures as of sbcl-0.7.1.40, the
@@ -427,7 +409,7 @@
  ;;   stack coincides with the C stack, meaning that on the X86 there's
  ;;   stuff on the control stack that the Lisp-level debugger doesn't
  ;;   understand very well. As of sbcl-0.7.1.40 things like that are
- ;;   just parameterized by #!+X86, but it'd probably be better to
+ ;;   just parameterized by #+X86, but it'd probably be better to
  ;;   use new flags like :CONTROL-STACK-CONTAINS-C-STACK.
  ;;
  ;;   :stack-allocatable-closures
@@ -438,10 +420,6 @@
  ;;
  ;;   :compare-and-swap-vops
  ;;     The backend implements compare-and-swap VOPs.
- ;;
- ;;   :memory-barrier-vops
- ;;     Memory barriers (for multi-threaded synchronization) have been
- ;;     implemented for this platform.
  ;;
  ;; operating system features:
  ;;   :unix       = We're intended to run under some Unix-like OS. (This is not
@@ -459,8 +437,6 @@
  ;;   :sunos      = We're intended to run under Solaris user environment
  ;;                 with the SunOS kernel.
  ;;   :hpux       = We're intended to run under HP-UX 11.11 or later
- ;;   :osf1       = We're intended to run under Tru64 (aka Digital Unix
- ;;                 aka OSF/1).
  ;;   :win32      = We're intended to under some version of Microsoft Windows.
  ;; (No others are supported by SBCL as of 1.0.8, but :hpux or :irix
  ;; support could be ported from CMU CL if anyone is sufficiently

@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; Return the template having the specified name, or die trying.
 (defun template-or-lose (x)
@@ -21,13 +21,13 @@
 ;;; Return the SC structure, SB structure or SC number corresponding
 ;;; to a name, or die trying.
 (defun sc-or-lose (x)
-  (the sc
+  (the storage-class
        (or (gethash x *backend-sc-names*)
            (error "~S is not a defined storage class." x))))
 (defun sb-or-lose (x)
-  (the sb
-       (dolist (sb *backend-sb-list*
-                (error "~S is not a defined storage base." x))
+  (the storage-base
+       (dovector (sb *backend-sbs*
+                     (error "~S is not a defined storage base." x))
          (when (eq (sb-name sb) x)
            (return sb)))))
 
@@ -44,7 +44,7 @@
 ;;; Compute at compiler load time the costs for moving between all SCs that
 ;;; can be loaded from FROM-SC and to TO-SC given a base move cost Cost.
 (defun compute-move-costs (from-sc to-sc cost)
-  (declare (type sc from-sc to-sc) (type index cost))
+  (declare (type storage-class from-sc to-sc) (type index cost))
   (let ((to-scn (sc-number to-sc))
         (from-costs (sc-load-costs from-sc)))
     (dolist (dest-sc (cons to-sc (sc-alternate-scs to-sc)))
@@ -73,7 +73,7 @@
 ;;; Return true if SC is either one of PTYPE's SC's, or one of those
 ;;; SC's alternate or constant SCs.
 (defun sc-allowed-by-primitive-type (sc ptype)
-  (declare (type sc sc) (type primitive-type ptype))
+  (declare (type storage-class sc) (type primitive-type ptype))
   (let ((scn (sc-number sc)))
     (dolist (allowed (primitive-type-scs ptype) nil)
       (when (eql allowed scn)
@@ -91,17 +91,7 @@
   ;; -- AL 20010218
   ;;
   ;; See also the description of VOP-INFO-TARGETS. -- APD, 2002-01-30
-  (def!constant max-vop-tn-refs 256))
-
-;;; FIXME: This is a remarkably eccentric way of implementing what
-;;; would appear to be by nature a closure.  A closure isn't any more
-;;; threadsafe than this special variable implementation, but at least
-;;; it's more idiomatic, and one could imagine closing over an
-;;; extensible pool to make a thread-safe implementation.
-(declaim (type (simple-vector #.max-vop-tn-refs) *vop-tn-refs*))
-(defvar *vop-tn-refs* (make-array max-vop-tn-refs :initial-element nil))
-
-(def!constant sc-bits (integer-length (1- sc-number-limit)))
+  (defconstant max-vop-tn-refs 256))
 
 ;;; Emit a VOP for TEMPLATE. Arguments:
 ;;; NODE Node for source context.
@@ -119,70 +109,78 @@
          (num-results (vop-info-num-results template))
          (num-operands (+ num-args num-results))
          (last-result (1- num-operands))
+         (temps (vop-info-temps template))
+         ;; Can't have more temps than registers in the CPU.
+         ;; 32 is totally reasonable
+         (refs (make-array (+ (* 2 (the (mod 32) (length temps)))
+                              num-operands)))
          (ref-ordering (vop-info-ref-ordering template)))
+    (declare (dynamic-extent refs))
     (declare (type vop vop)
              (type (integer 0 #.max-vop-tn-refs)
                    num-args num-results num-operands)
              (type (integer -1 #.(1- max-vop-tn-refs)) last-arg last-result))
     (setf (vop-codegen-info vop) info)
-    (unwind-protect
-         (let ((refs *vop-tn-refs*))
-           (declare (type (simple-vector #.max-vop-tn-refs) refs))
-           (do ((index 0 (1+ index))
-                (ref args (and ref (tn-ref-across ref))))
-               ((= index num-args))
-             (setf (svref refs index) ref))
-           (do ((index num-args (1+ index))
-                (ref results (and ref (tn-ref-across ref))))
-               ((= index num-operands))
-             (setf (svref refs index) ref))
-           (let ((temps (vop-info-temps template)))
-             (when temps
-               (let ((index num-operands)
-                     (prev nil))
-                 (dotimes (i (length temps))
-                   (let* ((temp (aref temps i))
-                          (tn (if (logbitp 0 temp)
-                                  (make-wired-tn nil
-                                                 (ldb (byte sc-bits 1) temp)
-                                                 (ash temp (- (1+ sc-bits))))
-                                  (make-restricted-tn nil (ash temp -1))))
-                          (write-ref (reference-tn tn t)))
+
+    ;; Inputs
+    (do ((index 0 (1+ index))
+         (ref args (and ref (tn-ref-across ref))))
+        ((= index num-args))
+      (setf (svref refs index) ref))
+    ;; Outputs
+    (do ((index num-args (1+ index))
+         (ref results (and ref (tn-ref-across ref))))
+        ((= index num-operands))
+      (setf (svref refs index) ref))
+    ;; Temporaries
+    (when temps
+      (let ((index num-operands)
+            (prev nil))
+        (dotimes (i (length temps))
+          (let* ((temp (aref temps i))
+                 (tn (if (logbitp 0 temp)
+                         (make-wired-tn
+                          nil
+                          (ldb (byte sb-vm:sc-number-bits 1) temp)
+                          (ash temp (- (1+ sb-vm:sc-number-bits))))
+                         (make-restricted-tn nil (ash temp -1))))
+                 (write-ref (reference-tn tn t)))
                      ;; KLUDGE: These formulas must be consistent with
                      ;; those in COMPUTE-REF-ORDERING, and this is
                      ;; currently maintained by hand. -- WHN
                      ;; 2002-01-30, paraphrasing APD
-                     (setf (aref refs index) (reference-tn tn nil))
-                     (setf (aref refs (1+ index)) write-ref)
-                     (if prev
-                         (setf (tn-ref-across prev) write-ref)
-                         (setf (vop-temps vop) write-ref))
-                     (setf prev write-ref)
-                     (incf index 2))))))
-           (let ((prev nil))
-             (flet ((add-ref (ref)
-                      (setf (tn-ref-vop ref) vop)
-                      (setf (tn-ref-next-ref ref) prev)
-                      (setf prev ref)))
-               (declare (inline add-ref))
-               (dotimes (i (length ref-ordering))
-                 (let* ((index (aref ref-ordering i))
-                        (ref (aref refs index)))
-                   (if (or (= index last-arg) (= index last-result))
-                       (do ((ref ref (tn-ref-across ref)))
-                           ((null ref))
-                         (add-ref ref))
-                       (add-ref ref)))))
-             (setf (vop-refs vop) prev))
-           (let ((targets (vop-info-targets template)))
-             (when targets
-               (dotimes (i (length targets))
-                 (let ((target (aref targets i)))
-                   (sb!regalloc:target-if-desirable
+            (setf (aref refs index) (reference-tn tn nil))
+            (setf (aref refs (1+ index)) write-ref)
+            (if prev
+                (setf (tn-ref-across prev) write-ref)
+                (setf (vop-temps vop) write-ref))
+            (setf prev write-ref)
+            (incf index 2)))))
+
+    (let ((prev nil))
+      (flet ((add-ref (ref)
+               (setf (tn-ref-vop ref) vop)
+               (setf (tn-ref-next-ref ref) prev)
+               (setf prev ref)))
+        (declare (inline add-ref))
+        (dotimes (i (length ref-ordering))
+          (let* ((index (aref ref-ordering i))
+                 (ref (aref refs index)))
+            (if (or (= index last-arg) (= index last-result))
+                (do ((ref ref (tn-ref-across ref)))
+                    ((null ref))
+                  (add-ref ref))
+                (add-ref ref)))))
+      (setf (vop-refs vop) prev))
+
+    (let ((targets (vop-info-targets template)))
+      (when targets
+        (dotimes (i (length targets))
+          (let ((target (aref targets i)))
+            (sb-regalloc:target-if-desirable
                     (aref refs (ldb (byte 8 8) target))
                     (aref refs (ldb (byte 8 0) target)))))))
-           vop)
-      (fill *vop-tn-refs* nil))))
+    vop))
 
 ;;;; function translation stuff
 
@@ -198,7 +196,7 @@
 
 ;;; Return a function type specifier describing TEMPLATE's type computed
 ;;; from the operand type restrictions.
-#!-sb-fluid (declaim (inline template-conditional-p))
+#-sb-fluid (declaim (inline template-conditional-p))
 (defun template-conditional-p (template)
   (declare (type template template))
   (let ((rtypes (template-result-types template)))
@@ -214,7 +212,7 @@
                         (ecase (first x)
                           (:or `(or ,@(mapcar #'primitive-type-specifier
                                               (rest x))))
-                          (:constant `(constant-arg ,(third x)))))))
+                          (:constant `(constant-arg ,(cdr x)))))))
              `(,@(mapcar #'frob types)
                ,@(when more-types
                    `(&rest ,(frob more-types)))))))
@@ -231,3 +229,10 @@
                  ,(if (= (length results) 1)
                       (first results)
                       `(values ,@results))))))
+
+(defun template-translates-arg-p (function argument type)
+  (let ((primitive-type (primitive-type (specifier-type type))))
+    (loop for template in (fun-info-templates (info :function :info function))
+          for arg-type = (nth argument (template-arg-types template))
+          thereis (and (consp arg-type)
+                       (memq primitive-type (cdr arg-type))))))

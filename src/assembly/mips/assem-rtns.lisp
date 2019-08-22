@@ -1,4 +1,4 @@
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; Return-multiple with other than one value
@@ -167,25 +167,25 @@
      (:temp target-uwp any-reg nl2-offset))
   (declare (ignore start count))
 
-  (let ((error (generate-error-code nil invalid-unwind-error)))
+  (let ((error (generate-error-code nil 'invalid-unwind-error)))
     (inst beq block error)
     (inst nop))
 
   (load-symbol-value cur-uwp *current-unwind-protect-block*)
-  (loadw target-uwp block unwind-block-current-uwp-slot)
+  (loadw target-uwp block unwind-block-uwp-slot)
   (inst bne cur-uwp target-uwp DO-UWP)
   (inst nop)
 
   (move cur-uwp block)
 
   DO-EXIT
-  (loadw cfp-tn cur-uwp unwind-block-current-cont-slot)
-  (loadw code-tn cur-uwp unwind-block-current-code-slot)
+  (loadw cfp-tn cur-uwp unwind-block-cfp-slot)
+  (loadw code-tn cur-uwp unwind-block-code-slot)
   (loadw lra cur-uwp unwind-block-entry-pc-slot)
   (lisp-return lra lip :frob-code nil)
 
   DO-UWP
-  (loadw next-uwp cur-uwp unwind-block-current-uwp-slot)
+  (loadw next-uwp cur-uwp unwind-block-uwp-slot)
   (inst b DO-EXIT)
   (store-symbol-value next-uwp *current-unwind-protect-block*))
 
@@ -203,7 +203,7 @@
   (load-symbol-value catch *current-catch-block*)
 
   LOOP
-  (let ((error (generate-error-code nil unseen-throw-tag-error target)))
+  (let ((error (generate-error-code nil 'unseen-throw-tag-error target)))
     (inst beq catch error)
     (inst nop))
 

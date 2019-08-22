@@ -9,48 +9,19 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
-
-#!-(or elf mach-o win32)
-(error "Not an ELF, Mach-O, or Win32 platform?")
-
-(defun extern-alien-name (name)
-  (handler-case
-      (coerce name 'base-string)
-    (error ()
-      (error "invalid external alien name: ~S" name))))
-
-;;; *STATIC-FOREIGN-SYMBOLS* are static as opposed to "dynamic" (not
-;;; as opposed to C's "extern"). The table contains symbols known at
-;;; the time that the program was built, but not symbols defined in
-;;; object files which have been loaded dynamically since then.
-#!-sb-dynamic-core
-(declaim (type hash-table *static-foreign-symbols*))
-#!-sb-dynamic-core
-(defvar *static-foreign-symbols* (make-hash-table :test 'equal))
-
-(declaim
- (ftype (sfunction (string hash-table) (or integer null)) find-foreign-symbol-in-table))
-(defun find-foreign-symbol-in-table (name table)
-  (let ((extern (extern-alien-name name)))
-    (values
-     (or (gethash extern table)
-         (gethash (concatenate 'base-string "ldso_stub__" extern) table)))))
+(in-package "SB-IMPL")
 
 (defun find-foreign-symbol-address (name)
-  #!+sb-doc
   "Returns the address of the foreign symbol NAME, or NIL. Does not enter the
 symbol in the linkage table, and never returns an address in the linkage-table."
-  (or #!-sb-dynamic-core
+  (or #-sb-dynamic-core
       (find-foreign-symbol-in-table name *static-foreign-symbols*)
       (find-dynamic-foreign-symbol-address name)))
 
 (defun foreign-symbol-address (name &optional datap)
-  #!+sb-doc
   "Returns the address of the foreign symbol NAME. DATAP must be true if the
-symbol designates a variable (used only on linkage-table platforms). Returns a
-secondary value that is true if DATAP was true and the symbol is a dynamic
-foreign symbol.
+symbol designates a variable (used only on linkage-table platforms).
+Returns a secondary value T if the symbol is a dynamic foreign symbol.
 
 On linkage-table ports the returned address is always static: either direct
 address of a static symbol, or the linkage-table address of a dynamic one.
@@ -58,38 +29,32 @@ Dynamic symbols are entered into the linkage-table if they aren't there already.
 
 On non-linkage-table ports signals an error if the symbol isn't found."
   (declare (ignorable datap))
-  #!+sb-dynamic-core
+  #+sb-dynamic-core
   (values (ensure-foreign-symbol-linkage name datap) t)
-  #!-sb-dynamic-core
+  #-sb-dynamic-core
   (let ((static (find-foreign-symbol-in-table name *static-foreign-symbols*)))
     (if static
         (values static nil)
-        #!+os-provides-dlopen
-        (progn
-          #-sb-xc-host
-          (values #!-linkage-table
-                  (ensure-dynamic-foreign-symbol-address name)
-                  #!+linkage-table
-                  (ensure-foreign-symbol-linkage name datap)
-                  t)
-          #+sb-xc-host
-          (error 'undefined-alien-error :name name))
-        #!-os-provides-dlopen
+        #+os-provides-dlopen
+        (values #-linkage-table
+                (ensure-dynamic-foreign-symbol-address name)
+                #+linkage-table
+                (ensure-foreign-symbol-linkage name datap)
+                t)
+        #-os-provides-dlopen
         (error 'undefined-alien-error :name name))))
 
 (defun foreign-symbol-sap (symbol &optional datap)
-  #!+sb-doc
   "Returns a SAP corresponding to the foreign symbol. DATAP must be true if the
 symbol designates a variable (used only on linkage-table platforms). May enter
 the symbol into the linkage-table. On non-linkage-table ports signals an error
 if the symbol isn't found."
   (declare (ignorable datap))
-  #!-linkage-table
+  #-linkage-table
   (int-sap (foreign-symbol-address symbol))
-  #!+linkage-table
+  #+linkage-table
   (multiple-value-bind (addr sharedp)
       (foreign-symbol-address symbol datap)
-    #+sb-xc-host #!-sb-dynamic-core (aver (not sharedp)) ()
     ;; If the address is from linkage-table and refers to data
     ;; we need to do a bit of juggling. It is not the address of the
     ;; variable, but the address where the real address is stored.
@@ -97,11 +62,10 @@ if the symbol isn't found."
         (int-sap (sap-ref-word (int-sap addr) 0))
         (int-sap addr))))
 
-#-sb-xc-host
 (defun foreign-reinit ()
-  #!+os-provides-dlopen
+  #+os-provides-dlopen
   (reopen-shared-objects)
-  #!+linkage-table
+  #+linkage-table
   ;; Don't warn about undefined aliens on startup. The same core can
   ;; reasonably be expected to work with different versions of the
   ;; same library.
@@ -109,9 +73,8 @@ if the symbol isn't found."
     (update-linkage-table)))
 
 ;;; Cleanups before saving a core
-#-sb-xc-host
 (defun foreign-deinit ()
-  #!+(and os-provides-dlopen (not linkage-table))
+  #+(and os-provides-dlopen (not linkage-table))
   (when (dynamic-foreign-symbols-p)
     (warn "~@<Saving cores with alien definitions referring to non-static ~
            foreign symbols is unsupported on this platform: references to ~
@@ -120,24 +83,24 @@ if the symbol isn't found."
            foreign definitions and code using them in the restarted core, ~
            but no guarantees.~%~%Dynamic foreign symbols in this core: ~
            ~{~A~^, ~}~:@>" (list-dynamic-foreign-symbols)))
-  #!+os-provides-dlopen
+  #+os-provides-dlopen
   (close-shared-objects))
 
 (declaim (maybe-inline sap-foreign-symbol))
 (defun sap-foreign-symbol (sap)
   (declare (ignorable sap))
-  #-sb-xc-host
   (let ((addr (sap-int sap)))
     (declare (ignorable addr))
-    #!+linkage-table
-    (when (<= sb!vm:linkage-table-space-start
+    #+linkage-table
+    (when (<= sb-vm:linkage-table-space-start
               addr
-              sb!vm:linkage-table-space-end)
-      (dohash ((name-and-datap table-addr) *linkage-info* :locked t)
-        (when (and (<= table-addr addr)
-                   (< addr (+ table-addr sb!vm:linkage-table-entry-size)))
-          (return-from sap-foreign-symbol (car name-and-datap)))))
-    #!+os-provides-dladdr
+              sb-vm:linkage-table-space-end)
+      (dohash ((key table-offset) *linkage-info* :locked t)
+        (let ((table-addr (+ table-offset sb-vm:linkage-table-space-start))
+              (datap (listp key)))
+          (when (<= table-addr addr (+ table-addr (1- sb-vm:linkage-table-entry-size)))
+            (return-from sap-foreign-symbol (if datap (car key) key))))))
+    #+os-provides-dladdr
     (with-alien ((info (struct dl-info
                                (filename c-string)
                                (base unsigned)
@@ -145,10 +108,13 @@ if the symbol isn't found."
                                (symbol-address unsigned)))
                  (dladdr (function unsigned unsigned (* (struct dl-info)))
                          :extern "dladdr"))
-      (let ((err (without-gcing
-                   ;; On eg. Darwin GC can could otherwise interrupt
-                   ;; the call while dladdr is holding a lock.
-                   (alien-funcall dladdr addr (addr info)))))
+      ;; A comment in rev 7143001bbe7d50c6 said: "Darwin GC could otherwise
+      ;; interrupt the call while dladdr is holding a lock." which makes little
+      ;; sense, as GC doesn't acquire locks other than its own allocator locks.
+      ;; How exactly was this deadlocking?  A reductio ad absurdum argument
+      ;; says that every call into a system API could potentially acquire
+      ;; a lock, and therefore every one should inhibit GC. But they don't.
+      (let ((err (alien-funcall dladdr addr (addr info))))
         (if (zerop err)
             nil
             (slot info 'symbol))))
@@ -159,20 +125,35 @@ if the symbol isn't found."
 ;;; How we learn about foreign symbols and dlhandles initially
 (defvar *!initial-foreign-symbols*)
 
-#-sb-xc-host
 (defun !foreign-cold-init ()
-  #!-sb-dynamic-core
-  (dolist (symbol *!initial-foreign-symbols*)
+  (declare (special *runtime-dlhandle* *shared-objects*))
+  #-sb-dynamic-core
+  (dovector (symbol *!initial-foreign-symbols*)
     (setf (gethash (car symbol) *static-foreign-symbols*) (cdr symbol)))
-  #!+sb-dynamic-core
-  (loop for table-address from sb!vm::linkage-table-space-start
-          by sb!vm::linkage-table-entry-size
-          and reference in sb!vm::*required-runtime-c-symbols*
-        do (setf (gethash reference *linkage-info*) table-address))
-  #!+os-provides-dlopen
+  #+sb-dynamic-core
+  (loop for table-offset from 0 by sb-vm::linkage-table-entry-size
+        and reference across (symbol-value 'sb-vm::+required-foreign-symbols+)
+        do (setf (gethash reference *linkage-info*) table-offset))
+  #+os-provides-dlopen
   (setf *runtime-dlhandle* (dlopen-or-lose))
-  #!+os-provides-dlopen
+  #+os-provides-dlopen
   (setf *shared-objects* nil))
 
-#!-os-provides-dlopen
+;;; Helpers for defining error-signalling NOP's for "not supported
+;;; here" operations.
+(defmacro define-unsupported-fun (name &optional
+                                  (doc "Unsupported on this platform.")
+                                  (control
+                                   "~S is unsupported on this platform ~
+                                    (OS, CPU, whatever)."
+                                   controlp)
+                                  arguments)
+  `(defun ,name (&rest args)
+     ,doc
+     (declare (ignore args))
+     (error 'unsupported-operator
+            :format-control ,control
+            :format-arguments (if ,controlp ',arguments (list ',name)))))
+
+#-os-provides-dlopen
 (define-unsupported-fun load-shared-object)

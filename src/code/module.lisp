@@ -13,23 +13,20 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; exported specials
 
 (defvar *modules* ()
-  #!+sb-doc
   "This is a list of module names that have been loaded into Lisp so far.
    It is used by PROVIDE and REQUIRE.")
 
 (defvar *module-provider-functions* (list 'module-provide-contrib)
-  #!+sb-doc
   "See function documentation for REQUIRE.")
 
 ;;;; PROVIDE and REQUIRE
 
 (defun provide (module-name)
-  #!+sb-doc
   "Adds a new module name to *MODULES* indicating that it has been loaded.
    Module-name is a string designator"
   (pushnew (string module-name) *modules* :test #'string=)
@@ -38,6 +35,7 @@
 (defvar *requiring* nil)
 
 (defun require-error (control &rest arguments)
+  (declare (optimize allow-non-returning-tail-call))
   (error 'extension-failure
          :format-control control
          :format-arguments arguments
@@ -47,7 +45,6 @@
           '(:sbcl :function require))))
 
 (defun require (module-name &optional pathnames)
-  #!+sb-doc
   "Loads a module, unless it already has been loaded. PATHNAMES, if supplied,
    is a designator for a list of pathnames to be loaded if the module
    needs to be. If PATHNAMES is not supplied, functions from the list
@@ -63,10 +60,9 @@
           (*requiring* (cons name *requiring*)))
       (unless (member name *modules* :test #'string=)
         (cond (pathnames
-               (unless (listp pathnames) (setf pathnames (list pathnames)))
                ;; ambiguity in standard: should we try all pathnames in the
                ;; list, or should we stop as soon as one of them calls PROVIDE?
-               (dolist (ele pathnames t)
+               (dolist (ele (ensure-list pathnames) t)
                  (load ele)))
               (t
                (unless (some (lambda (p) (funcall p module-name))
@@ -79,10 +75,9 @@
 ;;;; miscellany
 
 (defun module-provide-contrib (name)
-  #!+sb-doc
   "Stringify and downcase NAME, then attempt to load the file
    $SBCL_HOME/name/name"
-  (let* ((filesys-name (string-downcase (string name)))
+  (let* ((filesys-name (string-downcase name))
          (unadorned-path
           (merge-pathnames
            (make-pathname :directory (list :relative "contrib")
@@ -103,6 +98,6 @@
                     (probe-file lisp-path))))
       (when file
         (handler-bind
-            (((or style-warning sb!int:package-at-variance) #'muffle-warning))
+            (((or style-warning package-at-variance) #'muffle-warning))
           (load file))
         t))))

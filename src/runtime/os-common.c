@@ -25,17 +25,22 @@
 #include "thread.h"
 #include "sbcl.h"
 #include "os.h"
+#include "arch.h"
 #include "interr.h"
+#include "immobile-space.h"
 #if defined(LISP_FEATURE_OS_PROVIDES_DLOPEN) && !defined(LISP_FEATURE_WIN32)
 # include <dlfcn.h>
 #endif
 
+/* Expose to Lisp the value of the preprocessor define. Don't touch! */
+int install_sig_memory_fault_handler = INSTALL_SIG_MEMORY_FAULT_HANDLER;
 
 /* Except for os_zero, these routines are only called by Lisp code.
  * These routines may also be replaced by os-dependent versions
  * instead. See hpux-os.c for some useful restrictions on actual
  * usage. */
 
+#ifdef LISP_FEATURE_CHENEYGC
 void
 os_zero(os_vm_address_t addr, os_vm_size_t length)
 {
@@ -61,19 +66,18 @@ os_zero(os_vm_address_t addr, os_vm_size_t length)
          * zero-filled. */
 
         os_invalidate(block_start, block_size);
-        addr = os_validate(block_start, block_size);
+        addr = os_validate(NOT_MOVABLE, block_start, block_size);
 
         if (addr == NULL || addr != block_start)
-            lose("os_zero: block moved! 0x%08x ==> 0x%08x\n",
-                 block_start,
-                 addr);
+            lose("os_zero: block moved! %p ==> %p\n", block_start, addr);
     }
 }
+#endif
 
 os_vm_address_t
 os_allocate(os_vm_size_t len)
 {
-    return os_validate((os_vm_address_t)NULL, len);
+    return os_validate(MOVABLE, (os_vm_address_t)NULL, len);
 }
 
 void
@@ -126,107 +130,120 @@ os_sem_destroy(os_sem_t *sem)
 
 #endif
 
-#if defined(LISP_FEATURE_OS_PROVIDES_DLOPEN) && !defined(LISP_FEATURE_WIN32)
-void* os_dlopen(char* name, int flags) {
-    return dlopen(name,flags);
-}
-#endif
-
-#if defined(LISP_FEATURE_SB_DYNAMIC_CORE)
-/* When this feature is enabled, the special category of /static/ foreign
+/* When :SB-DYNAMIC-CORE is enabled, the special category of /static/ foreign
  * symbols disappears. Foreign fixups are resolved to linkage table locations
  * during genesis, and for each of them a record is added to
- * REQUIRED_RUNTIME_C_SYMBOLS list, of the form (cons name datap).
- *
- * Name is a base-string of a symbol name, and non-nil datap marks data
- * references.
+ * REQUIRED_FOREIGN_SYMBOLS vector, of the form "name" for a function reference,
+ * or ("name") for a data reference. "name" is a base-string.
  *
  * Before any code in lisp image can be called, we have to resolve all
  * references to runtime foreign symbols that used to be static, adding linkage
- * table entry for each element of REQUIRED_RUNTIME_C_SYMBOLS.
+ * table entry for each element of REQUIRED_FOREIGN_SYMBOLS.
  */
 
-/* We start with a little greenspunning to make car, cdr and base-string data
- * accessible. */
-
-/* Object tagged? (dereference (cast (untag (obj)))) */
-#define FOLLOW(obj,lowtagtype,ctype)            \
-    (*(struct ctype*)(obj - lowtagtype##_LOWTAG))
-
-/* For all types sharing OTHER_POINTER_LOWTAG: */
-#define FOTHERPTR(obj,ctype)                    \
-    FOLLOW(obj,OTHER_POINTER,ctype)
-
-static inline lispobj car(lispobj conscell)
-{
-    return FOLLOW(conscell,LIST_POINTER,cons).car;
-}
-
-static inline lispobj cdr(lispobj conscell)
-{
-    return FOLLOW(conscell,LIST_POINTER,cons).cdr;
-}
-
-#ifndef LISP_FEATURE_WIN32
+#if defined(LISP_FEATURE_SB_DYNAMIC_CORE) && !defined(LISP_FEATURE_WIN32)
 void *
 os_dlsym_default(char *name)
 {
     void *frob = dlsym(RTLD_DEFAULT, name);
-    odxprint(misc, "%p", frob);
     return frob;
 }
 #endif
 
+int lisp_linkage_table_n_prelinked;
 void os_link_runtime()
 {
-    lispobj head;
-    void *link_target = (void*)(intptr_t)LINKAGE_TABLE_SPACE_START;
+#ifdef LISP_FEATURE_SB_DYNAMIC_CORE
+    char *link_target = (char*)(intptr_t)LINKAGE_TABLE_SPACE_START;
     void *validated_end = link_target;
     lispobj symbol_name;
     char *namechars;
     boolean datap;
     void* result;
-    int strict /* If in a cold core, fail early and often. */
-      = (SymbolValue(GC_INHIBIT, 0) & WIDETAG_MASK) == UNBOUND_MARKER_WIDETAG;
-    int n = 0, m = 0;
+    int j;
 
-    for (head = SymbolValue(REQUIRED_RUNTIME_C_SYMBOLS,0);
-         head!=NIL; head = cdr(head), n++)
+    if (lisp_linkage_table_n_prelinked)
+        return; // Linkage was already performed by coreparse
+
+    struct vector* symbols = VECTOR(SymbolValue(REQUIRED_FOREIGN_SYMBOLS,0));
+    lisp_linkage_table_n_prelinked = fixnum_value(symbols->length);
+    for (j = 0 ; j < lisp_linkage_table_n_prelinked ; ++j)
     {
-        lispobj item = car(head);
-        symbol_name = car(item);
-        datap = (NIL!=(cdr(item)));
-        namechars = (void*)(intptr_t)FOTHERPTR(symbol_name,vector).data;
+        lispobj item = symbols->data[j];
+        datap = listp(item);
+        symbol_name = datap ? CONS(item)->car : item;
+        namechars = (void*)(intptr_t)(VECTOR(symbol_name)->data);
         result = os_dlsym_default(namechars);
-        odxprint(runtime_link, "linking %s => %p", namechars, result);
 
         if (link_target == validated_end) {
-            validated_end += os_vm_page_size;
+            validated_end = (char*)validated_end + os_vm_page_size;
 #ifdef LISP_FEATURE_WIN32
             os_validate_recommit(link_target,os_vm_page_size);
 #endif
         }
         if (result) {
-            if (datap)
-                arch_write_linkage_table_ref(link_target,result);
-            else
-                arch_write_linkage_table_jmp(link_target,result);
-        } else {
-            m++;
-            if (strict)
-                fprintf(stderr,
-                        "undefined foreign symbol in cold init: %s\n",
-                        namechars);
+            arch_write_linkage_table_entry(link_target, result, datap);
+        } else { // startup might or might not work. ymmv
+            printf("Missing required foreign symbol '%s'\n", namechars);
         }
 
-        link_target = (void*)(((uintptr_t)link_target)+LINKAGE_TABLE_ENTRY_SIZE);
+        link_target += LINKAGE_TABLE_ENTRY_SIZE;
     }
-    odxprint(runtime_link, "%d total symbols linked, %d undefined",
-             n, m);
-    if (strict && m)
-        /* We could proceed, but rather than run into improperly
-         * displayed internal errors, let's make ourselves heard right
-         * here and now. */
-        lose("Undefined aliens in cold init.");
+#endif /* LISP_FEATURE_SB_DYNAMIC_CORE */
 }
-#endif  /* sb-dynamic-core */
+
+boolean
+gc_managed_heap_space_p(lispobj addr)
+{
+    if ((READ_ONLY_SPACE_START <= addr && addr < READ_ONLY_SPACE_END)
+        || (STATIC_SPACE_START <= addr && addr < STATIC_SPACE_END)
+#if defined LISP_FEATURE_GENCGC
+        || (DYNAMIC_SPACE_START <= addr &&
+            addr < (DYNAMIC_SPACE_START + dynamic_space_size))
+        || immobile_space_p(addr)
+#else
+        || (DYNAMIC_0_SPACE_START <= addr &&
+            addr < DYNAMIC_0_SPACE_START + dynamic_space_size)
+        || (DYNAMIC_1_SPACE_START <= addr &&
+            addr < DYNAMIC_1_SPACE_START + dynamic_space_size)
+#endif
+        )
+        return 1;
+    return 0;
+}
+
+#ifndef LISP_FEATURE_WIN32
+
+/* Remap a part of an already existing mapping to a file */
+void os_map(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
+{
+    os_vm_address_t actual;
+
+    actual = mmap(addr, len, OS_VM_PROT_ALL, MAP_PRIVATE | MAP_FIXED,
+                  fd, (off_t) offset);
+    if (actual == MAP_FAILED || (addr && (addr != actual))) {
+        perror("mmap");
+        lose("unexpected mmap(%"OBJ_FMTX", %"OBJ_FMTX") failure\n",
+             (lispobj)addr, (lispobj)len);
+    }
+}
+
+boolean
+gc_managed_addr_p(lispobj addr)
+{
+    struct thread *th;
+
+    if (gc_managed_heap_space_p(addr))
+        return 1;
+    for_each_thread(th) {
+        if(th->control_stack_start <= (lispobj*)addr
+           && (lispobj*)addr < th->control_stack_end)
+            return 1;
+        if(th->binding_stack_start <= (lispobj*)addr
+           && (lispobj*)addr < th->binding_stack_start + BINDING_STACK_SIZE)
+            return 1;
+    }
+    return 0;
+}
+
+#endif

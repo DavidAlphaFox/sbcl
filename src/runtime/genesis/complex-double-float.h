@@ -11,8 +11,8 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_COMPLEX_DOUBLE_FLOAT
-#define SBCL_GENESIS_COMPLEX_DOUBLE_FLOAT 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_COMPLEX_DOUBLE_FLOAT
+#ifndef __ASSEMBLER__
 
 struct complex_double_float {
     lispobj header;
@@ -21,7 +21,7 @@ struct complex_double_float {
     double imag;
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
@@ -29,7 +29,8 @@ struct complex_double_float {
 #define COMPLEX_DOUBLE_FLOAT_FILLER_OFFSET -7
 #define COMPLEX_DOUBLE_FLOAT_REAL_OFFSET 1
 #define COMPLEX_DOUBLE_FLOAT_IMAG_OFFSET 9
+#define COMPLEX_DOUBLE_FLOAT_SIZE 4
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_COMPLEX-DOUBLE-FLOAT */
+#endif

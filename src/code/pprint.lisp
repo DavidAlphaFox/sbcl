@@ -9,97 +9,9 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!PRETTY")
-
-;;;; pretty streams
+(in-package "SB-PRETTY")
 
-;;; There are three different units for measuring character positions:
-;;;  COLUMN - offset (if characters) from the start of the current line
-;;;  INDEX  - index into the output buffer
-;;;  POSN   - some position in the stream of characters cycling through
-;;;           the output buffer
-(deftype column ()
-  '(and fixnum unsigned-byte))
-;;; The INDEX type is picked up from the kernel package.
-(deftype posn ()
-  'fixnum)
-
-(defconstant initial-buffer-size 128)
-
-(defconstant default-line-length 80)
-
-(defstruct (pretty-stream (:include ansi-stream
-                                    (out #'pretty-out)
-                                    (sout #'pretty-sout)
-                                    (misc #'pretty-misc))
-                          (:constructor make-pretty-stream (target))
-                          (:copier nil))
-  ;; Where the output is going to finally go.
-  (target (missing-arg) :type stream :read-only t)
-  ;; Line length we should format to. Cached here so we don't have to keep
-  ;; extracting it from the target stream.
-  (line-length (or *print-right-margin*
-                   (sb!impl::line-length target)
-                   default-line-length)
-               :type column
-               :read-only t)
-  ;; If non-nil, a function to call before performing OUT or SOUT
-  (char-out-oneshot-hook nil :type (or null function))
-  ;; A simple string holding all the text that has been output but not yet
-  ;; printed.
-  (buffer (make-string initial-buffer-size) :type (simple-array character (*)))
-  ;; The index into BUFFER where more text should be put.
-  (buffer-fill-pointer 0 :type index)
-  ;; Whenever we output stuff from the buffer, we shift the remaining noise
-  ;; over. This makes it difficult to keep references to locations in
-  ;; the buffer. Therefore, we have to keep track of the total amount of
-  ;; stuff that has been shifted out of the buffer.
-  (buffer-offset 0 :type posn)
-  ;; The column the first character in the buffer will appear in. Normally
-  ;; zero, but if we end up with a very long line with no breaks in it we
-  ;; might have to output part of it. Then this will no longer be zero.
-  (buffer-start-column (or (sb!impl::charpos target) 0) :type column)
-  ;; The line number we are currently on. Used for *PRINT-LINES*
-  ;; abbreviations and to tell when sections have been split across
-  ;; multiple lines.
-  (line-number 0 :type index)
-  ;; the value of *PRINT-LINES* captured at object creation time. We
-  ;; use this, instead of the dynamic *PRINT-LINES*, to avoid
-  ;; weirdness like
-  ;;   (let ((*print-lines* 50))
-  ;;     (pprint-logical-block ..
-  ;;       (dotimes (i 10)
-  ;;         (let ((*print-lines* 8))
-  ;;           (print (aref possiblybigthings i) prettystream)))))
-  ;; terminating the output of the entire logical blockafter 8 lines.
-  (print-lines *print-lines* :type (or index null) :read-only t)
-  ;; Stack of logical blocks in effect at the buffer start.
-  (blocks (list (make-logical-block)) :type list)
-  ;; Buffer holding the per-line prefix active at the buffer start.
-  ;; Indentation is included in this. The length of this is stored
-  ;; in the logical block stack.
-  (prefix (make-string initial-buffer-size) :type (simple-array character (*)))
-  ;; Buffer holding the total remaining suffix active at the buffer start.
-  ;; The characters are right-justified in the buffer to make it easier
-  ;; to output the buffer. The length is stored in the logical block
-  ;; stack.
-  (suffix (make-string initial-buffer-size) :type (simple-array character (*)))
-  ;; Queue of pending operations. When empty, HEAD=TAIL=NIL. Otherwise,
-  ;; TAIL holds the first (oldest) cons and HEAD holds the last (newest)
-  ;; cons. Adding things to the queue is basically (setf (cdr head) (list
-  ;; new)) and removing them is basically (pop tail) [except that care must
-  ;; be taken to handle the empty queue case correctly.]
-  (queue-tail nil :type list)
-  (queue-head nil :type list)
-  ;; Block-start queue entries in effect at the queue head.
-  (pending-blocks nil :type list))
-(def!method print-object ((pstream pretty-stream) stream)
-  ;; FIXME: CMU CL had #+NIL'ed out this code and done a hand-written
-  ;; FORMAT hack instead. Make sure that this code actually works instead
-  ;; of falling into infinite regress or something.
-  (print-unreadable-object (pstream stream :type t :identity t)))
-
-#!-sb-fluid (declaim (inline index-posn posn-index posn-column))
+#-sb-fluid (declaim (inline index-posn posn-index posn-column))
 (defun index-posn (index stream)
   (declare (type index index) (type pretty-stream stream)
            (values posn))
@@ -111,7 +23,7 @@
 (defun posn-column (posn stream)
   (declare (type posn posn) (type pretty-stream stream)
            (values posn))
-  (index-column (posn-index posn stream) stream))
+  (truly-the posn (index-column (posn-index posn stream) stream)))
 
 ;;; Is it OK to do pretty printing on this stream at this time?
 (defun print-pretty-on-stream-p (stream)
@@ -143,8 +55,8 @@
            (type (or index null) end))
   (let* ((end (or end (length string))))
     (unless (= start end)
-      (sb!impl::string-dispatch (simple-base-string
-                                 #!+sb-unicode
+      (sb-impl::string-dispatch (simple-base-string
+                                 #+sb-unicode
                                  (simple-array character (*)))
           string
         ;; For POSITION transform
@@ -167,6 +79,7 @@
                          (fill-pointer (pretty-stream-buffer-fill-pointer
                                         stream))
                          (new-fill-ptr (+ fill-pointer count)))
+                    (declare (fixnum available count))
                     (if (typep string 'simple-base-string)
                         ;; FIXME: Reimplementing REPLACE, since it
                         ;; can't be inlined and we don't have a
@@ -281,10 +194,6 @@
 
 ;;;; the pending operation queue
 
-(defstruct (queued-op (:constructor nil)
-                      (:copier nil))
-  (posn 0 :type posn))
-
 (defmacro enqueue (stream type &rest args)
   (let ((constructor (symbolicate "MAKE-" type)))
     (once-only ((stream stream)
@@ -302,17 +211,6 @@
              (setf (pretty-stream-queue-tail ,stream) ,op))
          (setf (pretty-stream-queue-head ,stream) ,op)
          ,entry))))
-
-(defstruct (section-start (:include queued-op)
-                          (:constructor nil)
-                          (:copier nil))
-  (depth 0 :type index)
-  (section-end nil :type (or null newline block-end)))
-
-(defstruct (newline (:include section-start)
-                    (:copier nil))
-  (kind (missing-arg)
-        :type (member :linear :fill :miser :literal :mandatory)))
 
 (defun enqueue-newline (stream kind)
   (let* ((depth (length (pretty-stream-pending-blocks stream)))
@@ -360,10 +258,6 @@
                          :depth (length pending-blocks))))
     (setf (pretty-stream-pending-blocks stream)
           (cons start pending-blocks))))
-
-(defstruct (block-end (:include queued-op)
-                      (:copier nil))
-  (suffix nil :type (or null simple-string)))
 
 (defun end-logical-block (stream)
   (let* ((start (pop (pretty-stream-pending-blocks stream)))
@@ -686,7 +580,6 @@
 ;;;; user interface to the pretty printer
 
 (defun pprint-newline (kind &optional stream)
-  #!+sb-doc
   "Output a conditional newline to STREAM (which defaults to
    *STANDARD-OUTPUT*) if it is a pretty-printing stream, and do
    nothing if not. KIND can be one of:
@@ -706,18 +599,14 @@
    from the output and indentation is introduced at the beginning of the
    next line. (See PPRINT-INDENT.)"
   (declare (type (member :linear :miser :fill :mandatory) kind)
-           (type (or stream (member t nil)) stream)
+           (type stream-designator stream)
            (values null))
-  (let ((stream (case stream
-                  ((t) *terminal-io*)
-                  ((nil) *standard-output*)
-                  (t stream))))
+  (let ((stream (out-stream-from-designator stream)))
     (when (print-pretty-on-stream-p stream)
       (enqueue-newline stream kind)))
   nil)
 
 (defun pprint-indent (relative-to n &optional stream)
-  #!+sb-doc
   "Specify the indentation to use in the current logical block if
 STREAM \(which defaults to *STANDARD-OUTPUT*) is a pretty-printing
 stream and do nothing if not. (See PPRINT-LOGICAL-BLOCK.) N is the
@@ -733,18 +622,14 @@ The new indentation value does not take effect until the following
 line break."
   (declare (type (member :block :current) relative-to)
            (type real n)
-           (type (or stream (member t nil)) stream)
+           (type stream-designator stream)
            (values null))
-  (let ((stream (case stream
-                  ((t) *terminal-io*)
-                  ((nil) *standard-output*)
-                  (t stream))))
+  (let ((stream (out-stream-from-designator stream)))
     (when (print-pretty-on-stream-p stream)
       (enqueue-indent stream relative-to (truncate n))))
   nil)
 
 (defun pprint-tab (kind colnum colinc &optional stream)
-  #!+sb-doc
   "If STREAM (which defaults to *STANDARD-OUTPUT*) is a pretty-printing
    stream, perform tabbing based on KIND, otherwise do nothing. KIND can
    be one of:
@@ -758,18 +643,14 @@ line break."
        of the current section, not the start of the line."
   (declare (type (member :line :section :line-relative :section-relative) kind)
            (type unsigned-byte colnum colinc)
-           (type (or stream (member t nil)) stream)
+           (type stream-designator stream)
            (values null))
-  (let ((stream (case stream
-                  ((t) *terminal-io*)
-                  ((nil) *standard-output*)
-                  (t stream))))
+  (let ((stream (out-stream-from-designator stream)))
     (when (print-pretty-on-stream-p stream)
       (enqueue-tab stream kind colnum colinc)))
   nil)
 
 (defun pprint-fill (stream list &optional (colon? t) atsign?)
-  #!+sb-doc
   "Output LIST to STREAM putting :FILL conditional newlines between each
    element. If COLON? is NIL (defaults to T), then no parens are printed
    around the output. ATSIGN? is ignored (but allowed so that PPRINT-FILL
@@ -786,7 +667,6 @@ line break."
       (pprint-newline :fill stream))))
 
 (defun pprint-linear (stream list &optional (colon? t) atsign?)
-  #!+sb-doc
   "Output LIST to STREAM putting :LINEAR conditional newlines between each
    element. If COLON? is NIL (defaults to T), then no parens are printed
    around the output. ATSIGN? is ignored (but allowed so that PPRINT-LINEAR
@@ -803,7 +683,6 @@ line break."
       (pprint-newline :linear stream))))
 
 (defun pprint-tabular (stream list &optional (colon? t) atsign? tabsize)
-  #!+sb-doc
   "Output LIST to STREAM tabbing to the next column that is an even multiple
    of TABSIZE (which defaults to 16) between each element. :FILL style
    conditional newlines are also output between each element. If COLON? is
@@ -824,35 +703,34 @@ line break."
 
 ;;;; pprint-dispatch tables
 
-(defvar *standard-pprint-dispatch-table*)
-(defvar *initial-pprint-dispatch-table*)
+(define-load-time-global *standard-pprint-dispatch-table* nil)
+(define-load-time-global *initial-pprint-dispatch-table* nil)
 
-(defstruct (pprint-dispatch-entry (:copier nil))
+(defstruct (pprint-dispatch-entry
+            (:constructor make-pprint-dispatch-entry (type priority fun test-fn))
+            (:copier nil) (:predicate nil))
   ;; the type specifier for this entry
-  (type (missing-arg) :type t :read-only t)
+  (type nil :type t :read-only t)
   ;; a function to test to see whether an object is of this type,
   ;; either (LAMBDA (OBJ) (TYPEP OBJECT TYPE)) or a builtin predicate.
   ;; We don't bother computing this for entries in the CONS
   ;; hash table, because we don't need it.
-  (test-fn nil :type (or function null) :read-only t)
+  (test-fn nil :type (or function null))
   ;; the priority for this guy
   (priority 0 :type real :read-only t)
   ;; T iff one of the original entries.
-  (initial-p (eq *initial-pprint-dispatch-table* nil)
-             :type (member t nil) :read-only t)
+  (initial-p (null *initial-pprint-dispatch-table*) :type boolean :read-only t)
   ;; and the associated function
-  (fun (missing-arg) :type callable :read-only t))
-(def!method print-object ((entry pprint-dispatch-entry) stream)
+  (fun nil :type callable :read-only t))
+
+(declaim (freeze-type pprint-dispatch-entry))
+
+(defmethod print-object ((entry pprint-dispatch-entry) stream)
   (print-unreadable-object (entry stream :type t)
     (format stream "type=~S, priority=~S~@[ [initial]~]"
             (pprint-dispatch-entry-type entry)
             (pprint-dispatch-entry-priority entry)
             (pprint-dispatch-entry-initial-p entry))))
-
-(defun cons-type-specifier-p (spec)
-  (typep spec '(cons (eql cons)
-                     (cons (cons (member eql member) (cons t null))
-                           null))))
 
 ;; Return T iff E1 is strictly less preferable than E2.
 (defun entry< (e1 e2)
@@ -867,14 +745,13 @@ line break."
           (< (pprint-dispatch-entry-priority e1)
              (pprint-dispatch-entry-priority e2)))))
 
-;; Return the predicate for TYPE. This used to involve rewriting TYPE
-;; into a sexpr due to (CONS <t1> <t2>) not being an official specifier.
-;; Now that it is, there's nothing magical about it.
-(defun compute-test-fn (type function)
-  (declare (special sb!c::*backend-type-predicates*))
+;; Return the predicate for CTYPE, equivalently TYPE-SPEC.
+;; This used to involve rewriting into a sexpr if CONS was involved,
+;; since it was not an official specifier. But now it is.
+(defun compute-test-fn (ctype type-spec function)
   ;; Avoid compiling code for an existing structure predicate
-  (or (and (eq (info :type :kind type) :instance)
-           (let ((layout (info :type :compiler-layout type)))
+  (or (and (eq (info :type :kind type-spec) :instance)
+           (let ((layout (info :type :compiler-layout type-spec)))
              (and layout
                   (let ((info (layout-info layout)))
                     (and info
@@ -882,56 +759,74 @@ line break."
                            (and pred (fboundp pred)
                                 (symbol-function pred))))))))
       ;; avoid compiling code for CONS, ARRAY, VECTOR, etc
-      (awhen (assoc (specifier-type type) sb!c::*backend-type-predicates*
-                    :test #'type=)
-        (symbol-function (cdr it)))
+      (awhen (sb-c::backend-type-predicate ctype)
+        (symbol-function it))
       ;; OK, compile something
       (let ((name
              ;; Keep name as a string, because NAMED-LAMBDA with a symbol
              ;; affects the global environment, when all you want
              ;; is to give the lambda a human-readable label.
              (format nil "~A-P"
-                     (cond ((symbolp type) type)
+                     (cond ((symbolp type-spec) type-spec)
                            ((symbolp function) function)
                            ((%fun-name function))
                            (t
-                            (write-to-string type :pretty nil :escape nil
+                            (write-to-string type-spec :pretty nil :escape nil
                                              :readably nil))))))
-        (compile nil `(named-lambda ,name (object) (typep object ',type))))))
+        (compile nil
+                 `(named-lambda ,(possibly-base-stringize name) (object)
+                    (typep object ',type-spec))))))
 
 (defun copy-pprint-dispatch (&optional (table *print-pprint-dispatch*))
   (declare (type (or pprint-dispatch-table null) table))
   (let* ((orig (or table *initial-pprint-dispatch-table*))
-         (new (make-pprint-dispatch-table
-               :entries (copy-list (pprint-dispatch-table-entries orig)))))
-    (replace/eql-hash-table (pprint-dispatch-table-cons-entries new)
-                            (pprint-dispatch-table-cons-entries orig))
+         (new (make-pprint-dispatch-table (copy-list (pp-dispatch-entries orig)))))
+    (replace/eql-hash-table (pp-dispatch-cons-entries new)
+                            (pp-dispatch-cons-entries orig))
     new))
 
 (defun pprint-dispatch (object &optional (table *print-pprint-dispatch*))
   (declare (type (or pprint-dispatch-table null) table))
   (let* ((table (or table *initial-pprint-dispatch-table*))
-         (cons-entry
-          (and (consp object)
-               (gethash (car object)
-                        (pprint-dispatch-table-cons-entries table))))
          (entry
-          (dolist (entry (pprint-dispatch-table-entries table) cons-entry)
-            (when (and cons-entry
-                       (entry< entry cons-entry))
-              (return cons-entry))
-            (when (funcall (pprint-dispatch-entry-test-fn entry) object)
-              (return entry)))))
+          (when (or (not (numberp object)) (pp-dispatch-number-matchable-p table))
+            (let ((cons-entry
+                   (and (consp object)
+                        (gethash (car object) (pp-dispatch-cons-entries table)))))
+              (if (not cons-entry)
+                  (dolist (entry (pp-dispatch-entries table) nil)
+                    (when (funcall (pprint-dispatch-entry-test-fn entry) object)
+                      (return entry)))
+                  (dolist (entry (pp-dispatch-entries table) cons-entry)
+                    (when (entry< entry cons-entry)
+                      (return cons-entry))
+                    (when (funcall (pprint-dispatch-entry-test-fn entry) object)
+                      (return entry))))))))
     (if entry
         (values (pprint-dispatch-entry-fun entry) t)
-        (values (lambda (stream object)
-                  (output-ugly-object object stream))
-                nil))))
+        (values #'output-ugly-object nil))))
 
 (defun assert-not-standard-pprint-dispatch-table (pprint-dispatch operation)
   (when (eq pprint-dispatch *standard-pprint-dispatch-table*)
     (cerror "Frob it anyway!" 'standard-pprint-dispatch-table-modified-error
             :operation operation)))
+
+(defun defer-type-checker (entry)
+  (let ((saved-nonce sb-c::*type-cache-nonce*))
+    (lambda (obj)
+      (let ((nonce sb-c::*type-cache-nonce*))
+        (if (eq nonce saved-nonce)
+            nil
+            (let ((ctype (specifier-type (pprint-dispatch-entry-type entry))))
+              (setq saved-nonce nonce)
+              (if (testable-type-p ctype)
+                  (funcall (setf (pprint-dispatch-entry-test-fn entry)
+                                 (compute-test-fn
+                                  ctype
+                                  (pprint-dispatch-entry-type entry)
+                                  (pprint-dispatch-entry-fun entry)))
+                           obj)
+                  nil)))))))
 
 ;; The dispatch mechanism is not quite sophisticated enough to have a guard
 ;; condition on CONS entries. One place this would impact is that you could
@@ -945,23 +840,37 @@ line break."
   (declare (type (or null callable) function)
            (type real priority)
            (type pprint-dispatch-table table))
-  (/show0 "entering SET-PPRINT-DISPATCH, TYPE=...")
-  (/hexstr type)
+  (declare (explicit-check))
   (assert-not-standard-pprint-dispatch-table table 'set-pprint-dispatch)
-  (let* ((consp (cons-type-specifier-p type))
+  (let* ((ctype (or (handler-bind
+                        ((parse-unknown-type
+                          (lambda (c)
+                            (warn "~S is not a recognized type specifier"
+                                  (parse-unknown-type-specifier c)))))
+                      (sb-c::careful-specifier-type type))
+                    (error "~S is not a valid type-specifier" type)))
+         (consp (and (cons-type-p ctype)
+                     (eq (cons-type-cdr-type ctype) *universal-type*)
+                     (member-type-p (cons-type-car-type ctype))))
+         (disabled-p (not (testable-type-p ctype)))
          (entry (if function
                     (make-pprint-dispatch-entry
-                     :type type
-                     :test-fn (unless consp (compute-test-fn type function))
-                     :priority priority :fun function))))
+                     type priority function
+                     (unless (or consp disabled-p)
+                       (compute-test-fn ctype type function))))))
+    (when (and function disabled-p)
+      ;; a DISABLED-P test function has to close over the ENTRY
+      (setf (pprint-dispatch-entry-test-fn entry) (defer-type-checker entry)))
+    (when (types-equal-or-intersect ctype (specifier-type 'number))
+      (setf (pp-dispatch-number-matchable-p table) t))
     (if consp
-        (let ((hashtable (pprint-dispatch-table-cons-entries table))
-              (key (second (second type))))
-          (if function
-              (setf (gethash key hashtable) entry)
-              (remhash key hashtable)))
-        (setf (pprint-dispatch-table-entries table)
-              (let ((list (delete type (pprint-dispatch-table-entries table)
+        (let ((hashtable (pp-dispatch-cons-entries table)))
+          (dolist (key (member-type-members (cons-type-car-type ctype)))
+            (if function
+                (setf (gethash key hashtable) entry)
+                (remhash key hashtable))))
+        (setf (pp-dispatch-entries table)
+              (let ((list (delete type (pp-dispatch-entries table)
                                   :key #'pprint-dispatch-entry-type
                                   :test #'equal)))
                 (if function
@@ -971,21 +880,16 @@ line break."
                     ;; (COMPLEMENT #'entry<) is unstable wrt insertion order.
                     (merge 'list list (list entry) (lambda (a b) (entry< b a)))
                     list)))))
-  (/show0 "about to return NIL from SET-PPRINT-DISPATCH")
   nil)
 
 ;;;; standard pretty-printing routines
 
 (defun pprint-array (stream array)
   (cond ((and (null *print-array*) (null *print-readably*))
-         (output-ugly-object array stream))
+         (output-ugly-object stream array))
         ((and *print-readably*
               (not (array-readably-printable-p array)))
-         (if *read-eval*
-             (if (vectorp array)
-                 (sb!impl::output-unreadable-vector-readably array stream)
-                 (sb!impl::output-unreadable-array-readably array stream))
-             (print-not-readable-error array stream)))
+         (sb-impl::output-unreadable-array-readably array stream))
         ((vectorp array)
          (pprint-vector stream array))
         (t
@@ -1034,26 +938,31 @@ line break."
         (pprint-exit-if-list-exhausted)
         (unless first
           (write-char #\space stream))
-        (let ((arg (pprint-pop)))
-          (unless first
-            (case arg
-              (&optional
-               (setf state :optional)
-               (pprint-newline :linear stream))
-              ((&rest &body)
-               (setf state :required)
-               (pprint-newline :linear stream))
-              (&key
-               (setf state :key)
-               (pprint-newline :linear stream))
-              (&aux
-               (setf state :optional)
-               (pprint-newline :linear stream))
-              (t
-               (pprint-newline :fill stream))))
+       (let ((arg (pprint-pop)))
+          (case arg
+            ((&optional &aux)
+             (setf state :optional)
+             (pprint-newline :linear stream))
+            ((&rest &body)
+             (setf state :required)
+             (pprint-newline :linear stream))
+            (&key
+             (setf state :key)
+             (pprint-newline :linear stream))
+            (t
+             (pprint-newline :fill stream)))
           (ecase state
             (:required
-             (pprint-lambda-list stream arg))
+             ;; Make sure method specializers like
+             ;; (function (eql #'foo)) are printed right
+             (pprint-logical-block
+                 (stream arg :prefix "(" :suffix ")")
+               (pprint-exit-if-list-exhausted)
+               (loop
+                (output-object (pprint-pop) stream)
+                (pprint-exit-if-list-exhausted)
+                (write-char #\space stream)
+                (pprint-newline :linear stream))))
             ((:optional :key)
              (pprint-logical-block
                  (stream arg :prefix "(" :suffix ")")
@@ -1066,13 +975,13 @@ line break."
                      (pprint-exit-if-list-exhausted)
                      (write-char #\space stream)
                      (pprint-newline :fill stream)
-                     (pprint-lambda-list stream (pprint-pop))
+                     (output-object (pprint-pop) stream)
                      (loop
                        (pprint-exit-if-list-exhausted)
                        (write-char #\space stream)
                        (pprint-newline :fill stream)
                        (output-object (pprint-pop) stream)))
-                   (pprint-lambda-list stream (pprint-pop)))
+                   (output-object (pprint-pop) stream))
                (loop
                  (pprint-exit-if-list-exhausted)
                  (write-char #\space stream)
@@ -1083,17 +992,21 @@ line break."
 (defun pprint-lambda (stream list &rest noise)
   (declare (ignore noise))
   (funcall (formatter
+            ;; META: I disagree with the claim that we are not ANSI-compliant.
+            ;; The time at which INTERN occurs does not seem to me to lie within
+            ;; the scope of what is meant by "equivalent" with respect to behavior
+            ;; of the format control.
             ;; KLUDGE: This format string, and other format strings which also
-            ;; refer to SB!PRETTY, rely on the current SBCL not-quite-ANSI
+            ;; refer to SB-PRETTY, rely on the current SBCL not-quite-ANSI
             ;; behavior of FORMATTER in order to make code which survives the
-            ;; transition when SB!PRETTY is renamed to SB-PRETTY after cold
-            ;; init. (ANSI says that the FORMATTER functions should be
+            ;; transition when SB-PRETTY is renamed.
+            ;; (ANSI says that the FORMATTER functions should be
             ;; equivalent to the format string, but the SBCL FORMATTER
             ;; functions contain references to package objects, not package
             ;; names, so they keep right on going if the packages are renamed.)
             ;; If our FORMATTER behavior is ever made more compliant, the code
             ;; here will have to change. -- WHN 19991207
-            "~:<~^~W~^~3I ~:_~/SB!PRETTY:PPRINT-LAMBDA-LIST/~1I~@{ ~_~W~}~:>")
+            "~:<~^~W~^~3I ~:_~/SB-PRETTY:PPRINT-LAMBDA-LIST/~1I~@{ ~_~W~}~:>")
            stream
            list))
 
@@ -1110,7 +1023,7 @@ line break."
            (and (consp (cddr list))
                 (not (eq :in (third list)))))
       (funcall (formatter
-                "~:<~^~W~^ ~@_~:<~@{~:<~^~W~^~3I ~:_~/SB!PRETTY:PPRINT-LAMBDA-LIST/~1I~:@_~@{~W~^ ~_~}~:>~^ ~_~}~:>~1I~@:_~@{~W~^ ~_~}~:>")
+                "~:<~^~W~^ ~@_~:<~@{~:<~^~W~^~3I ~:_~/SB-PRETTY:PPRINT-LAMBDA-LIST/~1I~:@_~@{~W~^ ~_~}~:>~^ ~_~}~:>~1I~@:_~@{~W~^ ~_~}~:>")
                stream
                list)
       ;; for printing function names like (flet foo)
@@ -1124,7 +1037,7 @@ line break."
 
 (defun pprint-let (stream list &rest noise)
   (declare (ignore noise))
-  (funcall (formatter "~:<~^~W~^ ~@_~:<~@{~:<~^~W~@{ ~_~W~}~:>~^ ~_~}~:>~1I~:@_~@{~W~^ ~_~}~:>")
+  (funcall (formatter "~:<~^~W~^ ~@_~:<~@{~:<~^~W~@{ ~_~W~}~:>~^ ~_~}~:>~1I~^~:@_~@{~W~^ ~_~}~:>")
            stream
            list))
 
@@ -1162,10 +1075,10 @@ line break."
     (let* ((pretty-p nil)
            (sigil (case (car list)
                     (function "#'")
-                    (quote "'")
                     ;; QUASIQUOTE can't choose not to print prettily.
                     ;; Wrongly nested commas beget unreadable sexprs.
-                    (quasiquote (setq pretty-p t) "`"))))
+                    (quasiquote (setq pretty-p t) "`")
+                    (t "'")))) ; ordinary QUOTE
       (when (or pretty-p *pprint-quote-with-syntactic-sugar*)
         (write-string sigil stream)
         (return-from pprint-quote (output-object (cadr list) stream)))))
@@ -1209,7 +1122,6 @@ line break."
        (write-char #\space stream)
        (pprint-newline :mandatory stream)))))
 
-;;; FIXME: could become SB!XC:DEFMACRO wrapped in EVAL-WHEN (COMPILE EVAL)
 (defmacro pprint-tagbody-guts (stream)
   `(loop
      (pprint-exit-if-list-exhausted)
@@ -1231,14 +1143,14 @@ line break."
 (defun pprint-case (stream list &rest noise)
   (declare (ignore noise))
   (funcall (formatter
-            "~:<~^~W~^ ~3I~:_~W~1I~@{ ~_~:<~^~:/SB!PRETTY:PPRINT-FILL/~^~@{ ~_~W~}~:>~}~:>")
+            "~:<~^~W~^ ~3I~:_~W~1I~@{ ~_~:<~^~:/SB-PRETTY:PPRINT-FILL/~^~@{ ~_~W~}~:>~}~:>")
            stream
            list))
 
 (defun pprint-defun (stream list &rest noise)
   (declare (ignore noise))
   (funcall (formatter
-            "~:<~^~W~^ ~@_~:I~W~^ ~:_~/SB!PRETTY:PPRINT-LAMBDA-LIST/~1I~@{ ~_~W~}~:>")
+            "~:<~^~W~^ ~@_~:I~W~^ ~:_~/SB-PRETTY:PPRINT-LAMBDA-LIST/~1I~@{ ~_~W~}~:>")
            stream
            list))
 
@@ -1249,7 +1161,7 @@ line break."
            (consp (third list)))
       (pprint-defun stream list)
       (funcall (formatter
-                "~:<~^~W~^ ~@_~:I~W~^ ~W~^ ~:_~/SB!PRETTY:PPRINT-LAMBDA-LIST/~1I~@{ ~_~W~}~:>")
+                "~:<~^~W~^ ~@_~:I~W~^ ~W~^ ~:_~/SB-PRETTY:PPRINT-LAMBDA-LIST/~1I~@{ ~_~W~}~:>")
                stream
                list)))
 
@@ -1263,7 +1175,7 @@ line break."
 (defun pprint-destructuring-bind (stream list &rest noise)
   (declare (ignore noise))
   (funcall (formatter
-            "~:<~^~W~^~3I ~_~:/SB!PRETTY:PPRINT-LAMBDA-LIST/~^ ~_~W~^~1I~@{ ~_~W~}~:>")
+            "~:<~^~W~^~3I ~_~:/SB-PRETTY:PPRINT-LAMBDA-LIST/~^ ~_~W~^~1I~@{ ~_~W~}~:>")
            stream list))
 
 (defun pprint-do (stream list &rest noise)
@@ -1320,7 +1232,7 @@ line break."
 ;;;        puts a newline in between INTO and COUNT.
 ;;;        It would be awesome to have code in common with the macro
 ;;;        the properly represents each clauses.
-(defvar *loop-seperating-clauses*
+(defconstant-eqx +loop-separating-clauses+
   '(:and
     :with :for
     :initially :finally
@@ -1334,7 +1246,8 @@ line break."
     :minimize :minimizing
     :if :when :unless :end
     :for :while :until :repeat :always :never :thereis
-    ))
+    )
+  #'equal)
 
 (defun pprint-extended-loop (stream list)
   (pprint-logical-block (stream list :prefix "(" :suffix ")")
@@ -1347,7 +1260,7 @@ line break."
     (write-char #\space stream)
     (loop for thing = (pprint-pop)
           when (and (symbolp thing)
-                    (member thing  *loop-seperating-clauses* :test #'string=))
+                    (member thing +loop-separating-clauses+ :test #'string=))
           do (pprint-newline :mandatory stream)
           do (output-object thing stream)
           do (pprint-exit-if-list-exhausted)
@@ -1386,26 +1299,17 @@ line break."
   (declare (ignore noise))
   (pprint-fill stream list))
 
-;;; Returns an Emacs-style indent spec: an integer N, meaning indent
-;;; the first N arguments specially then indent any further arguments
-;;; like a body.
+;;; Return the number of positional arguments that macro NAME accepts
+;;; by looking for &BODY. A dotted list is indented as it it had &BODY.
+;;; ANSI says that a dotted tail is like &REST, but the pretty-printer
+;;; can do whatever it likes anyway. I happen to think this makes sense.
 (defun macro-indentation (name)
-  (labels ((proper-list-p (list)
-             (not (nth-value 1 (ignore-errors (list-length list)))))
-           (macro-arglist (name)
-             (%simple-fun-arglist (macro-function name)))
-           (clean-arglist (arglist)
-             "Remove &whole, &enviroment, and &aux elements from ARGLIST."
-             (cond ((null arglist) '())
-                   ((member (car arglist) '(&whole &environment))
-                    (clean-arglist (cddr arglist)))
-                   ((eq (car arglist) '&aux)
-                    '())
-                   (t (cons (car arglist) (clean-arglist (cdr arglist)))))))
-    (let ((arglist (macro-arglist name)))
-      (if (proper-list-p arglist)       ; guard against dotted arglists
-          (position '&body (remove '&optional (clean-arglist arglist)))
-          nil))))
+  (do ((n 0)
+       (list (%fun-lambda-list (macro-function name)) (cdr list)))
+      ((or (atom list) (eq (car list) '&body))
+       (if (null list) nil n))
+    (unless (eq (car list) '&optional)
+      (incf n))))
 
 ;;; Pretty-Print macros by looking where &BODY appears in a macro's
 ;;; lambda-list.
@@ -1442,16 +1346,95 @@ line break."
 
 ;;;; the interface seen by regular (ugly) printer and initialization routines
 
-;;; OUTPUT-PRETTY-OBJECT is called by OUTPUT-OBJECT when
-;;; *PRINT-PRETTY* is true.
-(defun output-pretty-object (object stream)
-  (multiple-value-bind (fun pretty) (pprint-dispatch object)
-    (if pretty
-        (with-pretty-stream (stream)
-          (funcall fun stream object))
-        ;; No point in consing up a pretty stream if we are not using pretty
-        ;; printing the object after all.
-        (output-ugly-object object stream))))
+(defmacro with-pretty-stream ((stream-var
+                                     &optional (stream-expression stream-var))
+                                    &body body)
+  (let ((flet-name (sb-xc:gensym "WITH-PRETTY-STREAM")))
+    `(flet ((,flet-name (,stream-var)
+              ,@body))
+       (let ((stream ,stream-expression))
+         (if (pretty-stream-p stream)
+             (,flet-name stream)
+             (catch 'line-limit-abbreviation-happened
+               (let ((stream (make-pretty-stream stream)))
+                 (,flet-name stream)
+                 (force-pretty-output stream)))))
+       nil)))
+
+(defun call-logical-block-printer (proc stream prefix per-line-p suffix
+                                   &optional (object nil obj-supplied-p))
+  ;; PREFIX and SUFFIX will be checked for stringness by START-LOGICAL-BLOCK.
+  ;; Doing it here would be more strict, but I really don't think it's worth
+  ;; an extra check. The only observable difference would occur when you have
+  ;; a non-list object which bypasses START-LOGICAL-BLOCK.
+  ;; Also, START-LOGICAL-BLOCK could become an FLET inside here.
+  (declare (function proc))
+  (with-pretty-stream (stream (out-stream-from-designator stream))
+    (if (or (not (listp object)) ; implies obj-supplied-p
+            (and (eq (car object) 'quasiquote)
+                 ;; We can only bail out from printing this logical block
+                 ;; if the quasiquote printer would *NOT* punt.
+                 ;; If it would punt, then we have to forge ahead.
+                 (singleton-p (cdr object))))
+        ;; the spec says "If object is not a list, it is printed using WRITE"
+        ;; but I guess this is close enough.
+        (output-object object stream)
+        (dx-let ((state (cons 0 stream)))
+          (if obj-supplied-p
+              (with-circularity-detection (object stream)
+                (descend-into (stream)
+                  (start-logical-block stream prefix per-line-p suffix)
+                  (funcall proc object state stream)
+                  ;; Comment preserved for posterity:
+                  ;;   FIXME: Don't we need UNWIND-PROTECT to ensure this
+                  ;;   always gets executed?
+                  ;; I think not because I wouldn't characterize this as
+                  ;; "cleanup" code. If and only if you follow the accepted
+                  ;; protocol for defining and using print functions should
+                  ;; the behavior be expected to be reasonable and predictable.
+                  ;; Throwing to LINE-LIMIT-ABBREVIATION-HAPPENED is designed
+                  ;; to do the right thing, and printing should not generally
+                  ;; continue to have side-effects if the user felt it necessary
+                  ;; to nonlocally exit in an unexpected way for other reasons.
+                  (end-logical-block stream)))
+              (descend-into (stream)
+                (start-logical-block stream prefix per-line-p suffix)
+                (funcall proc state stream)
+                (end-logical-block stream)))))))
+
+;; Return non-nil if we should keep printing within the logical-block,
+;; or NIL to stop printing due to non-list, length cutoff, or circularity.
+(defun pprint-length-check (obj state)
+  (let ((stream (cdr state)))
+    (cond ((or (not (listp obj))
+               ;; Consider (A . `(,B C)) = (A QUASIQUOTE ,B C)
+               ;; We have to detect this and print as the form on the left,
+               ;; since pretty commas with no containing #\` will be unreadable
+               ;; due to a nesting error.
+               (and (eq (car obj) 'quasiquote) (singleton-p (cdr obj))))
+           (write-string ". " stream)
+           (output-object obj stream)
+           nil)
+          ((and (not *print-readably*) (eql (car state) *print-length*))
+           (write-string "..." stream)
+           nil)
+          ((and obj
+                (plusp (car state))
+                (check-for-circularity obj nil :logical-block))
+           (write-string ". " stream)
+           (output-object obj stream)
+           nil)
+          (t
+           (incf (car state))))))
+
+;; As above, but for logical blocks with an unspecific object.
+(defun pprint-length-check* (state)
+  (let ((stream (cdr state)))
+    (cond ((and (not *print-readably*) (eql (car state) *print-length*))
+           (write-string "..." stream)
+           nil)
+          (t
+           (incf (car state))))))
 
 (defun !pprint-cold-init ()
   (/show0 "entering !PPRINT-COLD-INIT")
@@ -1460,118 +1443,76 @@ line break."
   ;; it's used in WITH-STANDARD-IO-SYNTAX, and condition reportery
   ;; possibly performed in the following extent may use W-S-IO-SYNTAX.
   (setf *standard-pprint-dispatch-table* (make-pprint-dispatch-table))
-  (setf *initial-pprint-dispatch-table*  nil)
+  (setf *initial-pprint-dispatch-table* nil)
   (let ((*print-pprint-dispatch* (make-pprint-dispatch-table)))
     (/show0 "doing SET-PPRINT-DISPATCH for regular types")
-    (set-pprint-dispatch '(and array (not (or string bit-vector))) #'pprint-array)
+    (set-pprint-dispatch '(and array (not (or string bit-vector))) 'pprint-array)
     ;; MACRO-FUNCTION must have effectively higher priority than FBOUNDP.
     ;; The implementation happens to check identical priorities in the order added,
     ;; but that's unspecified behavior.  Both must be _strictly_ lower than the
     ;; default cons entries though.
     (set-pprint-dispatch '(cons (and symbol (satisfies macro-function)))
-                         #'pprint-macro-call -1)
+                         'pprint-macro-call -1)
     (set-pprint-dispatch '(cons (and symbol (satisfies fboundp)))
-                         #'pprint-fun-call -1)
+                         'pprint-fun-call -1)
     (set-pprint-dispatch '(cons symbol)
-                         #'pprint-data-list -2)
-    (set-pprint-dispatch 'cons #'pprint-fill -2)
-    (set-pprint-dispatch 'sb!impl::comma #'pprint-unquoting-comma -3)
+                         'pprint-data-list -2)
+    (set-pprint-dispatch 'cons 'pprint-fill -2)
+    (set-pprint-dispatch 'sb-impl::comma 'pprint-unquoting-comma -3)
     ;; cons cells with interesting things for the car
     (/show0 "doing SET-PPRINT-DISPATCH for CONS with interesting CAR")
 
     (dolist (magic-form '((lambda pprint-lambda)
-                          (declare pprint-declare)
+                          ((declare declaim) pprint-declare)
 
                           ;; special forms
-                          (block pprint-block)
-                          (catch pprint-block)
-                          (eval-when pprint-block)
-                          (flet pprint-flet)
-                          (function pprint-quote)
+                          ((block catch return-from throw eval-when
+                            multiple-value-call multiple-value-prog1
+                            unwind-protect) pprint-block)
+                          ((flet labels macrolet dx-flet) pprint-flet)
+                          ((function quasiquote quote) pprint-quote)
                           (if pprint-if)
-                          (labels pprint-flet)
-                          (let pprint-let)
-                          (let* pprint-let)
-                          (locally pprint-progn)
-                          (macrolet pprint-flet)
-                          (multiple-value-call pprint-block)
-                          (multiple-value-prog1 pprint-block)
-                          (progn pprint-progn)
+                          ((let let* symbol-macrolet dx-let) pprint-let)
+                          ((locally progn) pprint-progn)
                           (progv pprint-progv)
-                          (quote pprint-quote)
-                          (return-from pprint-block)
-                          (setq pprint-setq)
-                          (symbol-macrolet pprint-let)
+                          ((setq psetq setf psetf) pprint-setq)
                           (tagbody pprint-tagbody)
-                          (throw pprint-block)
-                          (unwind-protect pprint-block)
 
                           ;; macros
-                          (case pprint-case)
-                          (ccase pprint-case)
-                          (ctypecase pprint-typecase)
-                          (declaim pprint-declare)
-                          (defconstant pprint-block)
-                          (define-modify-macro pprint-defun)
-                          (define-setf-expander pprint-defun)
-                          (defmacro pprint-defun)
+                          ((case ccase ecase) pprint-case)
+                          ((ctypecase etypecase typecase) pprint-typecase)
+                          ((defconstant defparameter defstruct defvar)
+                           pprint-block)
+                          ((define-modify-macro define-setf-expander
+                           defmacro defsetf deftype defun) pprint-defun)
                           (defmethod pprint-defmethod)
                           (defpackage pprint-defpackage)
-                          (defparameter pprint-block)
-                          (defsetf pprint-defun)
-                          (defstruct pprint-block)
-                          (deftype pprint-defun)
-                          (defun pprint-defun)
-                          (defvar pprint-block)
                           (destructuring-bind pprint-destructuring-bind)
-                          (do pprint-do)
-                          (do* pprint-do)
-                          (do-all-symbols pprint-dolist)
-                          (do-external-symbols pprint-dolist)
-                          (do-symbols pprint-dolist)
-                          (dolist pprint-dolist)
-                          (dotimes pprint-dolist)
-                          (ecase pprint-case)
-                          (etypecase pprint-typecase)
+                          ((do do*) pprint-do)
+                          ((do-all-symbols do-external-symbols do-symbols
+                            dolist dotimes) pprint-dolist)
                           #+nil (handler-bind ...)
                           #+nil (handler-case ...)
                           (loop pprint-loop)
-                          (multiple-value-bind pprint-prog2)
-                          (multiple-value-setq pprint-block)
-                          (pprint-logical-block pprint-block)
-                          (print-unreadable-object pprint-block)
-                          (prog pprint-prog)
-                          (prog* pprint-prog)
-                          (prog1 pprint-block)
-                          (prog2 pprint-prog2)
-                          (psetf pprint-setq)
-                          (psetq pprint-setq)
-                          (quasiquote pprint-quote)
+                          ((multiple-value-bind prog2) pprint-prog2)
+                          ((multiple-value-setq prog1 pprint-logical-block
+                            print-unreadable-object prog1) pprint-block)
+                          ((prog prog*) pprint-prog)
                           #+nil (restart-bind ...)
                           #+nil (restart-case ...)
-                          (setf pprint-setq)
-                          (step pprint-progn)
-                          (time pprint-progn)
-                          (typecase pprint-typecase)
-                          (unless pprint-block)
-                          (when pprint-block)
-                          (with-compilation-unit pprint-block)
+                          ((step time) pprint-progn)
+                          ((unless when) pprint-block)
                           #+nil (with-condition-restarts ...)
-                          (with-hash-table-iterator pprint-block)
-                          (with-input-from-string pprint-block)
-                          (with-open-file pprint-block)
-                          (with-open-stream pprint-block)
-                          (with-output-to-string pprint-block)
-                          (with-package-iterator pprint-block)
-                          (with-simple-restart pprint-block)
-                          (with-standard-io-syntax pprint-progn)
+                          ((with-compilation-unit with-simple-restart
+                            with-hash-table-iterator with-package-iterator
+                            with-input-from-string with-output-to-string
+                            with-open-file with-open-stream) pprint-block)
+                          (with-standard-io-syntax pprint-progn)))
 
-                          ;; sbcl specific
-                          (sb!int:dx-flet pprint-flet)
-                          ))
-
-      (set-pprint-dispatch `(cons (eql ,(first magic-form)))
-                           (symbol-function (second magic-form))))
+      ;; Grouping some symbols together in the above list looks pretty.
+      ;; The sharing of dispatch entries is inconsequential.
+      (set-pprint-dispatch `(cons (member ,@(ensure-list (first magic-form))))
+                           (second magic-form)))
     (setf *initial-pprint-dispatch-table* *print-pprint-dispatch*))
 
   (setf *standard-pprint-dispatch-table*

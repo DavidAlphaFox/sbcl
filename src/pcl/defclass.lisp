@@ -25,6 +25,34 @@
 
 ;;;; DEFCLASS macro and close personal friends
 
+(declaim (global  *the-class-t*
+                  *the-class-slot-object*
+                  *the-class-structure-object*
+                  *the-class-standard-object*
+                  *the-class-function*
+                  *the-class-funcallable-standard-object*
+                  *the-class-system-class*
+                  *the-class-slot-class*
+                  *the-class-condition-class*
+                  *the-class-structure-class*
+                  *the-class-standard-class*
+                  *the-class-funcallable-standard-class*
+                  *the-class-forward-referenced-class*
+                  *the-class-method*
+                  *the-class-standard-method*
+                  *the-class-standard-reader-method*
+                  *the-class-standard-writer-method*
+                  *the-class-standard-boundp-method*
+                  *the-class-global-reader-method*
+                  *the-class-global-writer-method*
+                  *the-class-global-boundp-method*
+                  *the-class-standard-generic-function*
+                  *the-class-standard-direct-slot-definition*
+                  *the-class-standard-effective-slot-definition*
+
+                  *the-eslotd-standard-class-slots*
+                  *the-eslotd-funcallable-standard-class-slots*))
+
 ;;; state for the current DEFCLASS expansion
 (defvar *initfunctions-for-this-defclass*)
 (defvar *readers-for-this-defclass*)
@@ -41,6 +69,7 @@
 ;;; classes has been defined, the real definition of LOAD-DEFCLASS is
 ;;; installed by the file std-class.lisp
 (defmacro defclass (&environment env name direct-superclasses direct-slots &rest options)
+  (check-class-name name nil)
   (let (*initfunctions-for-this-defclass*
         *readers-for-this-defclass* ;Truly a crock, but we got
         *writers-for-this-defclass* ;to have it to live nicely.
@@ -49,81 +78,86 @@
     ;; expansion of a defclass and signal them in a single go.
     (multiple-value-bind (metaclass canonical-options)
         (canonize-defclass-options name options)
-    (let ((canonical-slots (canonize-defclass-slots name direct-slots env))
-          ;; DEFSTRUCT-P should be true if the class is defined
-          ;; with a metaclass STRUCTURE-CLASS, so that a DEFSTRUCT
-          ;; is compiled for the class.
-          (defstruct-p (and (eq **boot-state** 'complete)
-                            (let ((mclass (find-class metaclass nil)))
-                              (and mclass
-                                   (*subtypep
-                                    mclass
-                                    *the-class-structure-class*))))))
-      (let* ((defclass-form
-              `(let ,(mapcar #'cdr *initfunctions-for-this-defclass*)
-                 (load-defclass ',name
-                                ',metaclass
-                                ',direct-superclasses
-                                (list ,@canonical-slots)
-                                (list ,@(apply #'append
-                                               (when defstruct-p
-                                                 '(:from-defclass-p t))
-                                                canonical-options))
-                                ',*readers-for-this-defclass*
-                                ',*writers-for-this-defclass*
-                                ',*slot-names-for-this-defclass*
-                                (sb-c:source-location)
-                                ',(safe-code-p env)))))
-        (if defstruct-p
-            (progn
-              ;; FIXME: (YUK!) Why do we do this? Because in order
-              ;; to make the defstruct form, we need to know what
-              ;; the accessors for the slots are, so we need already
-              ;; to have hooked into the CLOS machinery.
-              ;;
-              ;; There may be a better way to do this: it would
-              ;; involve knowing enough about PCL to ask "what will
-              ;; my slot names and accessors be"; failing this, we
-              ;; currently just evaluate the whole kaboodle, and
-              ;; then use CLASS-DIRECT-SLOTS. -- CSR, 2002-06-07
-              (eval defclass-form)
-              (let* ((include (or (and direct-superclasses
-                                       (find-class (car direct-superclasses) nil))
-                                  (and (not (eq name 'structure-object))
-                                       *the-class-structure-object*)))
-                     (defstruct-form (make-structure-class-defstruct-form
-                                      name (class-direct-slots (find-class name))
-                                      include)))
-                `(progn
-                   (eval-when (:compile-toplevel :load-toplevel :execute)
-                     ,defstruct-form) ; really compile the defstruct-form
-                   (eval-when (:compile-toplevel :load-toplevel :execute)
-                     ,defclass-form))))
-            `(progn
-               ;; By telling the type system at compile time about
-               ;; the existence of a class named NAME, we can avoid
-               ;; various bogus warnings about "type isn't defined yet"
-               ;; for code elsewhere in the same file which uses
-               ;; the name of the type.
-               ;;
-               ;; We only need to do this at compile time, because
-               ;; at load and execute time we write the actual
-               ;; full-blown class, so the "a class of this name is
-               ;; coming" note we write here would be irrelevant.
-               (eval-when (:compile-toplevel)
-                 (%compiler-defclass ',name
-                                     ',*readers-for-this-defclass*
-                                     ',*writers-for-this-defclass*
-                                     ',*slot-names-for-this-defclass*))
-               ,defclass-form)))))))
+      ;; Check deprecation status of direct superclasses and
+      ;; metaclass.
+      (mapc #'sb-int:check-deprecated-type direct-superclasses)
+      (sb-int:check-deprecated-type metaclass)
+      (let ((canonical-slots (canonize-defclass-slots name direct-slots env))
+            ;; DEFSTRUCT-P should be true if the class is defined
+            ;; with a metaclass STRUCTURE-CLASS, so that a DEFSTRUCT
+            ;; is compiled for the class.
+            (defstruct-p (and (eq **boot-state** 'complete)
+                              (let ((mclass (find-class metaclass nil)))
+                                (and mclass
+                                     (*subtypep
+                                      mclass
+                                      *the-class-structure-class*))))))
+        (let* ((defclass-form
+                 `(let ,(mapcar #'cdr *initfunctions-for-this-defclass*)
+                    (load-defclass ',name
+                                   ',metaclass
+                                   ',direct-superclasses
+                                   (list ,@canonical-slots)
+                                   (list ,@(apply #'append
+                                                  (when defstruct-p
+                                                    '(:from-defclass-p t))
+                                                  canonical-options))
+                                   ',*readers-for-this-defclass*
+                                   ',*writers-for-this-defclass*
+                                   ',*slot-names-for-this-defclass*
+                                   (sb-c:source-location)
+                                   ,@(and (safe-code-p env)
+                                          '(t))))))
+          (if defstruct-p
+              (progn
+                ;; FIXME: (YUK!) Why do we do this? Because in order
+                ;; to make the defstruct form, we need to know what
+                ;; the accessors for the slots are, so we need already
+                ;; to have hooked into the CLOS machinery.
+                ;;
+                ;; There may be a better way to do this: it would
+                ;; involve knowing enough about PCL to ask "what will
+                ;; my slot names and accessors be"; failing this, we
+                ;; currently just evaluate the whole kaboodle, and
+                ;; then use CLASS-DIRECT-SLOTS. -- CSR, 2002-06-07
+                (eval defclass-form)
+                (let* ((include (or (and direct-superclasses
+                                         (find-class (car direct-superclasses) nil))
+                                    (and (not (eq name 'structure-object))
+                                         *the-class-structure-object*)))
+                       (defstruct-form (make-structure-class-defstruct-form
+                                        name (class-direct-slots (find-class name))
+                                        include)))
+                  `(progn
+                     (eval-when (:compile-toplevel :load-toplevel :execute)
+                       ,defstruct-form) ; really compile the defstruct-form
+                     (eval-when (:compile-toplevel :load-toplevel :execute)
+                       ,defclass-form))))
+              `(progn
+                 ;; By telling the type system at compile time about
+                 ;; the existence of a class named NAME, we can avoid
+                 ;; various bogus warnings about "type isn't defined yet"
+                 ;; for code elsewhere in the same file which uses
+                 ;; the name of the type.
+                 ;;
+                 ;; We only need to do this at compile time, because
+                 ;; at load and execute time we write the actual
+                 ;; full-blown class, so the "a class of this name is
+                 ;; coming" note we write here would be irrelevant.
+                 (eval-when (:compile-toplevel)
+                   (sb-kernel::%compiler-defclass
+                    ',name
+                    ',*readers-for-this-defclass*
+                    ',*writers-for-this-defclass*
+                    ',*slot-names-for-this-defclass*))
+                 ,defclass-form)))))))
 
 (defun canonize-defclass-options (class-name options)
   (maplist (lambda (sublist)
              (let ((option-name (first (pop sublist))))
                (when (member option-name sublist :key #'first :test #'eq)
-                 (error 'simple-program-error
-                        :format-control "Multiple ~S options in DEFCLASS ~S."
-                        :format-arguments (list option-name class-name)))))
+                 (%program-error "Multiple ~S options in DEFCLASS ~S."
+                                 option-name class-name))))
            options)
   (let (metaclass
         default-initargs
@@ -136,20 +170,19 @@
           (:metaclass
            (let ((maybe-metaclass (second option)))
              (unless (and maybe-metaclass (legal-class-name-p maybe-metaclass))
-               (error 'simple-program-error
-                      :format-control "~@<The value of the :metaclass option (~S) ~
-                         is not a legal class name.~:@>"
-                      :format-arguments (list maybe-metaclass)))
+               (%program-error "~@<The value of the :metaclass ~
+                                option (~S) is not a legal class ~
+                                name.~:@>"
+                               maybe-metaclass))
              (setf metaclass maybe-metaclass)))
           (:default-initargs
            (let (initargs arg-names)
              (doplist (key val) (cdr option)
                (when (member key arg-names :test #'eq)
-                 (error 'simple-program-error
-                        :format-control "~@<Duplicate initialization argument ~
-                                           name ~S in :DEFAULT-INITARGS of ~
-                                           DEFCLASS ~S.~:>"
-                        :format-arguments (list key class-name)))
+                 (%program-error "~@<Duplicate initialization argument ~
+                                  name ~S in :DEFAULT-INITARGS of ~
+                                  DEFCLASS ~S.~:>"
+                                 key class-name))
                (push key arg-names)
                (push ``(,',key ,',val ,,(make-initfunction val)) initargs))
              (setf default-initargs t)
@@ -169,84 +202,84 @@
 (defun canonize-defclass-slots (class-name slots env)
   (let (canonized-specs)
     (dolist (spec slots)
-      (when (atom spec)
-        (setf spec (list spec)))
-      (when (and (cdr spec) (null (cddr spec)))
-        (error 'simple-program-error
-               :format-control "~@<in DEFCLASS ~S, the slot specification ~S ~
-                                is invalid; the probable intended meaning may ~
-                                be achieved by specifiying ~S instead.~:>"
-               :format-arguments (list class-name spec
-                                       `(,(car spec) :initform ,(cadr spec)))))
-      (let* ((name (car spec))
-             (plist (cdr spec))
-             (readers ())
-             (writers ())
-             (initargs ())
-             (others ())
-             (unsupplied (list nil))
-             (type t)
-             (initform unsupplied))
-        (check-slot-name-for-defclass name class-name env)
-        (push name *slot-names-for-this-defclass*)
-        (flet ((note-reader (x)
-                 (unless (symbolp x)
-                   (error 'simple-program-error
-                          :format-control "Slot reader name ~S for slot ~S in ~
-                                           DEFCLASS ~S is not a symbol."
-                          :format-arguments (list x name class-name)))
-                 (push x readers)
-                 (push x *readers-for-this-defclass*))
-               (note-writer (x)
-                 (push x writers)
-                 (push x *writers-for-this-defclass*)))
-          (doplist (key val) plist
-            (case key
-              (:accessor (note-reader val) (note-writer `(setf ,val)))
-              (:reader   (note-reader val))
-              (:writer   (note-writer val))
-              (:initarg
-               (unless (symbolp val)
-                 (error 'simple-program-error
-                        :format-control "Slot initarg name ~S for slot ~S in ~
-                                         DEFCLASS ~S is not a symbol."
-                        :format-arguments (list val name class-name)))
-               (push val initargs))
-              (otherwise
-               (when (member key '(:initform :allocation :type :documentation))
-                 (when (eq key :initform)
-                   (setf initform val))
-                 (when (eq key :type)
-                   (setf type val))
-                 (when (get-properties others (list key))
-                   (error 'simple-program-error
-                          :format-control "Duplicate slot option ~S for slot ~
-                                           ~S in DEFCLASS ~S."
-                          :format-arguments (list key name class-name))))
-               ;; For non-standard options multiple entries go in a list
-               (push val (getf others key))))))
-        ;; Unwrap singleton lists (AMOP 5.4.2)
-        (do ((head others (cddr head)))
-            ((null head))
-          (unless (cdr (second head))
-            (setf (second head) (car (second head)))))
-        (let ((canon `(:name ',name :readers ',readers :writers ',writers
-                             :initargs ',initargs ',others)))
-          (push (if (eq initform unsupplied)
-                    `(list* ,@canon)
-                    `(list* :initfunction ,(make-initfunction initform)
-                            ,@canon))
-                canonized-specs))))
+      (let ((location (or (and (boundp 'sb-c::*current-path*)
+                               (boundp 'sb-c::*source-paths*)
+                               (let ((sb-c::*current-path*
+                                       (or (sb-c::get-source-path spec)
+                                           sb-c::*current-path*)))
+                                 (sb-c::make-definition-source-location)))
+                          (sb-c::make-definition-source-location))))
+        (when (atom spec)
+          (setf spec (list spec)))
+       (when (and (cdr spec) (null (cddr spec)))
+         (%program-error "~@<in DEFCLASS ~S, the slot specification ~S ~
+                          is invalid; the probable intended meaning may ~
+                          be achieved by specifiying ~S instead.~:>"
+                         class-name spec `(,(car spec) :initform ,(cadr spec))))
+       (let* ((name (car spec))
+              (plist (cdr spec))
+              (readers ())
+              (writers ())
+              (initargs ())
+              (others ())
+              (unsupplied (list nil))
+              (type t)
+              (initform unsupplied))
+         (check-slot-name-for-defclass name class-name env)
+         (push name *slot-names-for-this-defclass*)
+         (flet ((note-reader (x)
+                  (unless (symbolp x)
+                    (%program-error "Slot reader name ~S for slot ~S in ~
+                                     DEFCLASS ~S is not a symbol."
+                                    x name class-name))
+                  (push x readers)
+                  (push x *readers-for-this-defclass*))
+                (note-writer (x)
+                  (push x writers)
+                  (push x *writers-for-this-defclass*)))
+           (doplist (key val) plist
+             (case key
+               (:accessor (note-reader val) (note-writer `(setf ,val)))
+               (:reader   (note-reader val))
+               (:writer   (note-writer val))
+               (:initarg
+                (unless (symbolp val)
+                  (%program-error "Slot initarg name ~S for slot ~S in ~
+                                   DEFCLASS ~S is not a symbol."
+                                  val name class-name))
+                (push val initargs))
+               (otherwise
+                (when (member key '(:initform :allocation :type :documentation))
+                  (when (eq key :initform)
+                    (setf initform val))
+                  (when (eq key :type)
+                    (setf type val))
+                  (when (get-properties others (list key))
+                    (%program-error "Duplicate slot option ~S for slot ~
+                                     ~S in DEFCLASS ~S."
+                                    key name class-name)))
+                ;; For non-standard options multiple entries go in a list
+                (push val (getf others key))))))
+         ;; Unwrap singleton lists (AMOP 5.4.2)
+         (do ((head others (cddr head)))
+             ((null head))
+           (unless (cdr (second head))
+             (setf (second head) (car (second head)))))
+         (let ((canon `(:name ',name :readers ',readers :writers ',writers
+                        :initargs ',initargs  'source ,location ',others)))
+           (push (if (eq initform unsupplied)
+                     `(list* ,@canon)
+                     `(list* :initfunction ,(make-initfunction initform)
+                             ,@canon))
+                 canonized-specs)))))
     (nreverse canonized-specs)))
 
 
 (defun check-slot-name-for-defclass (name class-name env)
   (flet ((slot-name-illegal (reason)
-           (error 'simple-program-error
-                  :format-control
-                  (format nil "~~@<In DEFCLASS ~~S, the slot name ~~S ~
-                               is ~A.~~@:>" reason)
-                  :format-arguments (list class-name name))))
+           (%program-error "~@<In DEFCLASS ~S, the slot name ~S is ~
+                            ~A.~@:>"
+                           class-name name reason)))
     (cond ((not (symbolp name))
            (slot-name-illegal "not a symbol"))
           ((keywordp name)
@@ -254,9 +287,8 @@
           ((constantp name env)
            (slot-name-illegal "a constant"))
           ((member name *slot-names-for-this-defclass* :test #'eq)
-           (error 'simple-program-error
-                  :format-control "Multiple slots named ~S in DEFCLASS ~S."
-                  :format-arguments (list name class-name))))))
+           (%program-error "Multiple slots named ~S in DEFCLASS ~S."
+                           name class-name)))))
 
 (defun make-initfunction (initform)
   (cond ((or (eq initform t)
@@ -281,57 +313,19 @@
              (push entry *initfunctions-for-this-defclass*))
            (cadr entry)))))
 
-(defun %compiler-defclass (name readers writers slots)
-  ;; ANSI says (Macro DEFCLASS, section 7.7) that DEFCLASS, if it
-  ;; "appears as a top level form, the compiler must make the class
-  ;; name be recognized as a valid type name in subsequent
-  ;; declarations (as for deftype) and be recognized as a valid class
-  ;; name for defmethod parameter specializers and for use as the
-  ;; :metaclass option of a subsequent defclass."
-  (preinform-compiler-about-class-type name)
-  (preinform-compiler-about-accessors readers writers slots))
-
-(defun preinform-compiler-about-class-type (name)
-  ;; Unless the type system already has an actual type attached to
-  ;; NAME (in which case (1) writing a placeholder value over that
-  ;; actual type as a compile-time side-effect would probably be a bad
-  ;; idea and (2) anyway we don't need to modify it in order to make
-  ;; NAME be recognized as a valid type name)
-  (with-single-package-locked-error (:symbol name "proclaiming ~S as a class"))
-  (unless (info :type :kind name)
-    ;; Tell the compiler to expect a class with the given NAME, by
-    ;; writing a kind of minimal placeholder type information. This
-    ;; placeholder will be overwritten later when the class is defined.
-    (setf (info :type :kind name) :forthcoming-defclass-type))
-  (values))
-
-(defun preinform-compiler-about-accessors (readers writers slots)
-  (flet ((inform (names type &key key)
-           (mapc (lambda (name)
-                   (let ((name (if key (funcall key name) name)))
-                     (when (eq (info :function :where-from name) :assumed)
-                       (sb-c:proclaim-ftype name type :defined))))
-                 names)))
-    (let ((rtype (specifier-type '(function (t) t)))
-          (wtype (specifier-type '(function (t t) t))))
-      (inform readers rtype)
-      (inform writers wtype)
-      (inform slots rtype :key #'slot-reader-name)
-      (inform slots rtype :key #'slot-boundp-name)
-      (inform slots wtype :key #'slot-writer-name))))
 
 ;;; This is the early definition of LOAD-DEFCLASS. It just collects up
 ;;; all the class definitions in a list. Later, in braid1.lisp, these
 ;;; are actually defined.
 
 ;;; Each entry in *EARLY-CLASS-DEFINITIONS* is an EARLY-CLASS-DEFINITION.
-(defparameter *early-class-definitions* ())
+(defparameter *!early-class-definitions* ())
 
-(defun early-class-definition (class-name)
-  (or (find class-name *early-class-definitions* :key #'ecd-class-name)
+(defun !early-class-definition (class-name)
+  (or (find class-name *!early-class-definitions* :key #'ecd-class-name)
       (error "~S is not a class in *early-class-definitions*." class-name)))
 
-(defun make-early-class-definition
+(defun !make-early-class-definition
        (name source-location metaclass
         superclass-names canonical-slots other-initargs)
   (list 'early-class-definition
@@ -345,36 +339,36 @@
 (defun ecd-canonical-slots   (ecd) (nth 5 ecd))
 (defun ecd-other-initargs    (ecd) (nth 6 ecd))
 
-(defvar *early-class-slots* nil)
+(defvar *!early-class-slots* nil)
 
 (defun canonical-slot-name (canonical-slot)
   (getf canonical-slot :name))
 
-(defun early-class-slots (class-name)
-  (cdr (or (assoc class-name *early-class-slots*)
+(defun !early-class-slots (class-name)
+  (cdr (or (assoc class-name *!early-class-slots*)
            (let ((a (cons class-name
                           (mapcar #'canonical-slot-name
-                                  (early-collect-inheritance class-name)))))
-             (push a *early-class-slots*)
+                                  (!early-collect-inheritance class-name)))))
+             (push a *!early-class-slots*)
              a))))
 
-(defun early-class-size (class-name)
-  (length (early-class-slots class-name)))
+(defun !early-class-size (class-name)
+  (length (!early-class-slots class-name)))
 
-(defun early-collect-inheritance (class-name)
+(defun !early-collect-inheritance (class-name)
   ;;(declare (values slots cpl default-initargs direct-subclasses))
-  (let ((cpl (early-collect-cpl class-name)))
-    (values (early-collect-slots cpl)
+  (let ((cpl (!early-collect-cpl class-name)))
+    (values (!early-collect-slots cpl)
             cpl
-            (early-collect-default-initargs cpl)
+            (!early-collect-default-initargs cpl)
             (let (collect)
-              (dolist (definition *early-class-definitions*)
+              (dolist (definition *!early-class-definitions*)
                 (when (memq class-name (ecd-superclass-names definition))
                   (push (ecd-class-name definition) collect)))
               (nreverse collect)))))
 
-(defun early-collect-slots (cpl)
-  (let* ((definitions (mapcar #'early-class-definition cpl))
+(defun !early-collect-slots (cpl)
+  (let* ((definitions (mapcar #'!early-class-definition cpl))
          (super-slots (mapcar #'ecd-canonical-slots definitions))
          (slots (apply #'append (reverse super-slots))))
     (dolist (s1 slots)
@@ -388,18 +382,18 @@
                    name1)))))
     slots))
 
-(defun early-collect-cpl (class-name)
+(defun !early-collect-cpl (class-name)
   (labels ((walk (c)
-             (let* ((definition (early-class-definition c))
+             (let* ((definition (!early-class-definition c))
                     (supers (ecd-superclass-names definition)))
                (cons c
-                     (apply #'append (mapcar #'early-collect-cpl supers))))))
+                     (apply #'append (mapcar #'!early-collect-cpl supers))))))
     (remove-duplicates (walk class-name) :from-end nil :test #'eq)))
 
-(defun early-collect-default-initargs (cpl)
+(defun !early-collect-default-initargs (cpl)
   (let ((default-initargs ()))
     (dolist (class-name cpl)
-      (let* ((definition (early-class-definition class-name))
+      (let* ((definition (!early-class-definition class-name))
              (others (ecd-other-initargs definition)))
         (loop (when (null others) (return nil))
               (let ((initarg (pop others)))
@@ -412,7 +406,7 @@
     (reverse default-initargs)))
 
 (defun !bootstrap-slot-index (class-name slot-name)
-  (or (position slot-name (early-class-slots class-name))
+  (or (position slot-name (!early-class-slots class-name))
       (error "~S not found" slot-name)))
 
 ;;; !BOOTSTRAP-GET-SLOT and !BOOTSTRAP-SET-SLOT are used to access and
@@ -436,14 +430,8 @@
 (defun !bootstrap-set-slot (type object slot-name new-value)
   (setf (!bootstrap-get-slot type object slot-name) new-value))
 
-(defun early-class-name (class)
-  (!bootstrap-get-slot 'class class 'name))
-
 (defun early-class-precedence-list (class)
   (!bootstrap-get-slot 'pcl-class class '%class-precedence-list))
-
-(defun early-class-name-of (instance)
-  (early-class-name (class-of instance)))
 
 (defun early-class-slotds (class)
   (!bootstrap-get-slot 'slot-class class 'slots))
@@ -457,36 +445,24 @@
 (defun early-slot-definition-info (slotd)
   (!bootstrap-get-slot 'standard-effective-slot-definition slotd 'info))
 
-(defun early-accessor-method-slot-name (method)
-  (!bootstrap-get-slot 'standard-accessor-method method 'slot-name))
-
-(unless (fboundp 'class-name-of)
-  (setf (symbol-function 'class-name-of)
-        (symbol-function 'early-class-name-of)))
-(unintern 'early-class-name-of)
-
 (defun early-class-direct-subclasses (class)
   (!bootstrap-get-slot 'class class 'direct-subclasses))
 
 (declaim (notinline load-defclass))
 (defun load-defclass (name metaclass supers canonical-slots canonical-options
-                      readers writers slot-names source-location safe-p)
+                      readers writers slot-names source-location &optional safe-p)
   ;; SAFE-P is used by REAL-LOAD-DEFCLASS, but can be ignored here, since
   ;; during the bootstrap we won't have (SAFETY 3).
   (declare (ignore safe-p))
-  (%compiler-defclass name readers writers slot-names)
-  (setq supers  (copy-tree supers)
-        canonical-slots   (copy-tree canonical-slots)
-        canonical-options (copy-tree canonical-options))
-  (let ((ecd
-         (make-early-class-definition name
-                                      source-location
-                                      metaclass
-                                      supers
-                                      canonical-slots
-                                      canonical-options))
+  (sb-kernel::%%compiler-defclass name readers writers slot-names)
+  (let ((ecd (!make-early-class-definition name
+                                          source-location
+                                          metaclass
+                                          (copy-tree supers)
+                                          (copy-tree canonical-slots)
+                                          (copy-tree canonical-options)))
         (existing
-         (find name *early-class-definitions* :key #'ecd-class-name)))
-    (setq *early-class-definitions*
-          (cons ecd (remove existing *early-class-definitions*)))
+         (find name *!early-class-definitions* :key #'ecd-class-name)))
+    (setq *!early-class-definitions*
+          (cons ecd (remove existing *!early-class-definitions*)))
     ecd))

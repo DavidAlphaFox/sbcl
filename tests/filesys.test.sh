@@ -47,7 +47,7 @@ run_sbcl <<EOF
   (in-package :cl-user)
   (let* ((directory (directory "./*.*"))
          (truenames (sort directory #'string< :key #'pathname-name)))
-    (format t "~&TRUENAMES=~S~%" truenames)
+    ;(format t "~&TRUENAMES=~S~%" truenames)
     (finish-output)
     (assert (equal truenames $expected_truenames)))
   (assert (equal (truename "dirlinktest") #p"$testdir/"))
@@ -56,6 +56,7 @@ run_sbcl <<EOF
   (assert (equal (truename "link-1")     #p"$testdir/test-1.tmp"))
   (assert (equal (truename "link-2")     #p"$testdir/test-2.tmp"))
   (assert (equal (truename "link-3")     #p"$testdir/link-3"))
+  (assert (equal (truename "link-3/")    #p"$testdir/link-3"))
   (assert (equal (truename "link-4")     #p"$testdir/link-4"))
   (assert (equal (truename "link-5")     #p"$testdir/link-5"))
   (assert (equal (truename "link-6")     #p"$testdir/link-6"))
@@ -68,7 +69,7 @@ run_sbcl <<EOF
   (in-package :cl-user)
   (let* ((directory (directory "$testdir/*.*"))
          (truenames (sort directory #'string< :key #'pathname-name)))
-    (format t "~&TRUENAMES=~S~%" truenames)
+    ;(format t "~&TRUENAMES=~S~%" truenames)
     (finish-output)
     (assert (equal truenames $expected_truenames)))
   (assert (equal (truename "$testdir/test-1.tmp") #p"$testdir/test-1.tmp"))
@@ -335,7 +336,7 @@ run_sbcl --eval '(sb-ext:delete-directory "simple_test_subdir1")' \
                    (delete-directory "one" :recursive t))' \
          --eval '(handler-case (delete-directory "will_fail")
                    (file-error ())
-                   (:no-error (x) (sb-ext:exit :code 1)))' \
+                   (:no-error (x) (declare (ignore x)) (sb-ext:exit :code 1)))' \
          --eval '(sb-ext:exit)'
 check_status_maybe_lose "delete-directory symlink" $? \
   0 "ok"

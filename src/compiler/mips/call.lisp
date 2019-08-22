@@ -9,21 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
-
-;;;; Interfaces to IR2 conversion:
+(in-package "SB-VM")
 
-;;; Return a wired TN describing the N'th full call argument passing
-;;; location.
-(defun standard-arg-location (n)
-  (declare (type unsigned-byte n))
-  (if (< n register-arg-count)
-      (make-wired-tn *backend-t-primitive-type*
-                     register-arg-scn
-                     (elt *register-arg-offsets* n))
-      (make-wired-tn *backend-t-primitive-type*
-                     control-stack-arg-scn n)))
-
+(defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
+(defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
 ;;; Make a passing location TN for a local call return PC.  If standard is
 ;;; true, then use the standard (full call) location, otherwise use any legal
@@ -31,18 +20,19 @@
 ;;; desire to use a subroutine call instruction.
 (defun make-return-pc-passing-location (standard)
   (if standard
-      (make-wired-tn *backend-t-primitive-type* register-arg-scn lra-offset)
-      (make-restricted-tn *backend-t-primitive-type* register-arg-scn)))
+      (make-wired-tn *backend-t-primitive-type* descriptor-reg-sc-number lra-offset)
+      (make-restricted-tn *backend-t-primitive-type* descriptor-reg-sc-number)))
 
 ;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
 ;;; location to pass OLD-FP in. This is (obviously) wired in the
 ;;; standard convention, but is totally unrestricted in non-standard
 ;;; conventions, since we can always fetch it off of the stack using
 ;;; the arg pointer.
-(defun make-old-fp-passing-location (standard)
-  (if standard
-      (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset)
-      (make-normal-tn *fixnum-primitive-type*)))
+(defun make-old-fp-passing-location ()
+  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset))
+
+(defconstant old-fp-passing-offset
+  (make-sc+offset descriptor-reg-sc-number ocfp-offset))
 
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
@@ -65,38 +55,6 @@
 ;;; are using non-standard conventions.
 (defun make-arg-count-location ()
   (make-wired-tn *fixnum-primitive-type* immediate-arg-scn nargs-offset))
-
-
-;;; Make a TN to hold the number-stack frame pointer.  This is allocated
-;;; once per component, and is component-live.
-(defun make-nfp-tn ()
-  (component-live-tn
-   (make-wired-tn *fixnum-primitive-type* immediate-arg-scn nfp-offset)))
-
-(defun make-stack-pointer-tn ()
-  (make-normal-tn *fixnum-primitive-type*))
-
-(defun make-number-stack-pointer-tn ()
-  (make-normal-tn *fixnum-primitive-type*))
-
-;;; Return a list of TNs that can be used to represent an unknown-values
-;;; continuation within a function.
-(defun make-unknown-values-locations ()
-  (list (make-stack-pointer-tn)
-        (make-normal-tn *fixnum-primitive-type*)))
-
-
-;;; This function is called by the ENTRY-ANALYZE phase, allowing
-;;; VM-dependent initialization of the IR2-COMPONENT structure.  We push
-;;; placeholder entries in the Constants to leave room for additional
-;;; noise in the code object header.
-(defun select-component-format (component)
-  (declare (type component component))
-  (dotimes (i code-constants-offset)
-    (vector-push-extend nil
-                        (ir2-component-constants (component-info component))))
-  (values))
-
 
 ;;;; Frame hackery:
 
@@ -147,10 +105,13 @@
     (storew value frame-pointer (tn-offset variable-home-tn))))
 
 (define-vop (xep-allocate-frame)
-  (:info start-lab copy-more-arg-follows)
-  (:ignore copy-more-arg-follows)
-  (:vop-var vop)
-  (:temporary (:scs (non-descriptor-reg)) temp)
+  (:info start-lab)
+  ;; KLUDGE: Specify an explicit offset for TEMP because NARGS is a
+  ;; non-descriptor-reg, but is also live, yet the register allocator
+  ;; does not know that it is, and if TEMP collides NARGS and
+  ;; COMPUTE-CODE-FROM-LIP needs TEMP then we run into trouble very
+  ;; quickly.
+  (:temporary (:scs (non-descriptor-reg) :offset nl4-offset) temp)
   (:generator 1
     ;; Make sure the function is aligned, and drop a label pointing to this
     ;; function header.
@@ -158,8 +119,7 @@
     (emit-label start-lab)
     ;; Allocate function header.
     (inst simple-fun-header-word)
-    (dotimes (i (1- simple-fun-code-offset))
-      (inst word 0))
+    (inst .skip (* (1- simple-fun-insts-offset) n-word-bytes))
     ;; The start of the actual code.
     ;; Compute CODE from the address of this entry point.
     (let ((entry-point (gen-label)))
@@ -167,8 +127,11 @@
       (inst compute-code-from-lip code-tn lip-tn entry-point temp)
       ;; ### We should also save it on the stack so that the garbage collector
       ;; won't forget about us if we call anyone else.
-      )
-    ;; Build our stack frames.
+      )))
+
+(define-vop (xep-setup-sp)
+  (:vop-var vop)
+  (:generator 1
     (inst addu csp-tn cfp-tn
           (* n-word-bytes (sb-allocated-size 'control-stack)))
     (let ((nfp (current-nfp-tn vop)))
@@ -334,7 +297,7 @@ default-value-8
 
             (let ((defaults (defaults)))
               (aver defaults)
-              (assemble (*elsewhere*)
+              (assemble (:elsewhere)
                 (emit-label default-stack-vals)
                 (do ((remaining defaults (cdr remaining)))
                     ((null remaining))
@@ -385,7 +348,7 @@ default-value-8
 
     (emit-label done)
 
-    (assemble (*elsewhere*)
+    (assemble (:elsewhere)
       (emit-label variable-values)
       (when lra-label
         (inst compute-code-from-lra code-tn code-tn lra-label temp))
@@ -640,10 +603,13 @@ default-value-8
      (:args
       ,@(unless (eq return :tail)
           '((new-fp :scs (any-reg) :to :eval)))
+      ,@(case named
+          ((nil)
+           '((arg-fun :target lexenv)))
+          (:direct)
+          (t
+           '((name :target name-pass))))
 
-      ,(if named
-           '(name :target name-pass)
-           '(arg-fun :target lexenv))
 
       ,@(when (eq return :tail)
           '((ocfp :target ocfp-pass)
@@ -662,6 +628,7 @@ default-value-8
      (:vop-var vop)
      (:info ,@(unless (or variable (eq return :tail)) '(arg-locs))
             ,@(unless variable '(nargs))
+            ,@(when (eq named :direct) '(fun))
             ,@(when (eq return :fixed) '(nvals))
             step-instrumenting)
 
@@ -681,18 +648,19 @@ default-value-8
                   :to :eval)
                  return-pc-pass)
 
-     ,@(if named
-         `((:temporary (:sc descriptor-reg :offset fdefn-offset
-                        :from (:argument ,(if (eq return :tail) 0 1))
-                        :to :eval)
-                       name-pass))
-
-         `((:temporary (:sc descriptor-reg :offset lexenv-offset
-                        :from (:argument ,(if (eq return :tail) 0 1))
-                        :to :eval)
-                       lexenv)
-           (:temporary (:scs (descriptor-reg) :from (:argument 0) :to :eval)
-                       function)))
+     ,@(case named
+         ((t)
+          `((:temporary (:sc descriptor-reg :offset fdefn-offset
+                         :from (:argument ,(if (eq return :tail) 0 1))
+                         :to :eval)
+                        name-pass)))
+         ((nil)
+          `((:temporary (:sc descriptor-reg :offset lexenv-offset
+                         :from (:argument ,(if (eq return :tail) 0 1))
+                         :to :eval)
+                        lexenv)
+            (:temporary (:scs (descriptor-reg) :from (:argument 0) :to :eval)
+                        function))))
 
      (:temporary (:sc any-reg :offset nargs-offset :to :eval)
                  nargs-pass)
@@ -792,63 +760,63 @@ default-value-8
                 (insert-step-instrumenting (callable-tn)
                   ;; Conditionally insert a conditional trap:
                   (when step-instrumenting
-                    (load-symbol-value stepping sb!impl::*stepping*)
-                    ;; If it's not NIL, trap.
-                    (inst beq stepping null-tn step-done-label)
+                    (load-symbol-value stepping sb-impl::*stepping*)
+                    ;; If it's not 0, trap.
+                    (inst beq stepping STEP-DONE-LABEL)
                     (inst nop)
                     ;; CONTEXT-PC will be pointing here when the
                     ;; interrupt is handled, not after the BREAK.
-                    (note-this-location vop :step-before-vop)
-                    ;; Construct a trap code with the low bits from
-                    ;; SINGLE-STEP-AROUND-TRAP and the high bits from
-                    ;; the register number of CALLABLE-TN.
-                    (inst break 0 (logior single-step-around-trap
-                                          (ash (reg-tn-encoding callable-tn)
-                                               5)))
+                    (note-this-location vop :internal-error)
+                    (inst break (reg-tn-encoding callable-tn)
+                          single-step-around-trap)
                     (emit-label step-done-label))))
-
-           ,@(if named
-                 `((sc-case name
-                     (descriptor-reg (move name-pass name))
-                     (control-stack
-                      (inst lw name-pass cfp-tn
-                            (ash (tn-offset name) word-shift))
-                      (do-next-filler))
-                     (constant
-                      (inst lw name-pass code-tn
-                            (- (ash (tn-offset name) word-shift)
-                               other-pointer-lowtag))
-                      (do-next-filler)))
-                   ;; The step instrumenting must be done after
-                   ;; FUNCTION is loaded, but before ENTRY-POINT is
-                   ;; calculated.
-                   (insert-step-instrumenting name-pass)
-                   (inst lw entry-point name-pass
-                         (- (ash fdefn-raw-addr-slot word-shift)
-                            other-pointer-lowtag))
-                   (do-next-filler))
-                 `((sc-case arg-fun
-                     (descriptor-reg (move lexenv arg-fun))
-                     (control-stack
-                      (inst lw lexenv cfp-tn
-                            (ash (tn-offset arg-fun) word-shift))
-                      (do-next-filler))
-                     (constant
-                      (inst lw lexenv code-tn
-                            (- (ash (tn-offset arg-fun) word-shift)
-                               other-pointer-lowtag))
-                      (do-next-filler)))
-                   (inst lw function lexenv
-                         (- (ash closure-fun-slot word-shift)
-                            fun-pointer-lowtag))
-                   (do-next-filler)
-                   ;; The step instrumenting must be done before
-                   ;; after FUNCTION is loaded, but before ENTRY-POINT
-                   ;; is calculated.
-                   (insert-step-instrumenting function)
-                   (inst addu entry-point function
-                         (- (ash simple-fun-code-offset word-shift)
-                            fun-pointer-lowtag))))
+           (declare (ignorable #'insert-step-instrumenting))
+           ,@(case named
+               ((t)
+                `((sc-case name
+                    (descriptor-reg (move name-pass name))
+                    (control-stack
+                     (inst lw name-pass cfp-tn
+                           (tn-byte-offset name))
+                     (do-next-filler))
+                    (constant
+                     (inst lw name-pass code-tn
+                           (- (tn-byte-offset name)
+                              other-pointer-lowtag))
+                     (do-next-filler)))
+                  ;; The step instrumenting must be done after
+                  ;; FUNCTION is loaded, but before ENTRY-POINT is
+                  ;; calculated.
+                  (insert-step-instrumenting name-pass)
+                  (inst lw entry-point name-pass
+                        (- (ash fdefn-raw-addr-slot word-shift)
+                           other-pointer-lowtag))
+                  (do-next-filler)))
+               ((nil)
+                `((sc-case arg-fun
+                    (descriptor-reg (move lexenv arg-fun))
+                    (control-stack
+                     (inst lw lexenv cfp-tn
+                           (tn-byte-offset arg-fun))
+                     (do-next-filler))
+                    (constant
+                     (inst lw lexenv code-tn
+                           (- (tn-byte-offset arg-fun)
+                              other-pointer-lowtag))
+                     (do-next-filler)))
+                  (inst lw function lexenv
+                        (- (ash closure-fun-slot word-shift)
+                           fun-pointer-lowtag))
+                  (do-next-filler)
+                  ;; The step instrumenting must be done before
+                  ;; after FUNCTION is loaded, but before ENTRY-POINT
+                  ;; is calculated.
+                  (insert-step-instrumenting function)
+                  (inst addu entry-point function
+                        (- (ash simple-fun-insts-offset word-shift)
+                           fun-pointer-lowtag))))
+               (:direct
+                `((inst lw entry-point null-tn (static-fun-offset fun)))))
            (loop
              (if (cdr filler)
                  (do-next-filler)
@@ -878,10 +846,13 @@ default-value-8
 
 (define-full-call call nil :fixed nil)
 (define-full-call call-named t :fixed nil)
+(define-full-call static-call-named :direct :fixed nil)
 (define-full-call multiple-call nil :unknown nil)
 (define-full-call multiple-call-named t :unknown nil)
+(define-full-call static-multiple-call-named :direct :unknown nil)
 (define-full-call tail-call nil :tail nil)
 (define-full-call tail-call-named t :tail nil)
+(define-full-call static-tail-call-named :direct :tail nil)
 
 (define-full-call call-variable nil :fixed t)
 (define-full-call multiple-call-variable nil :unknown t)
@@ -1051,16 +1022,6 @@ default-value-8
 
 ;;;; XEP hackery:
 
-
-;;; We don't need to do anything special for regular functions.
-;;;
-(define-vop (setup-environment)
-  (:info label)
-  (:ignore label)
-  (:generator 0
-    ;; Don't bother doing anything.
-    ))
-
 ;;; Get the lexical environment from its passing location.
 ;;;
 (define-vop (setup-closure-environment)
@@ -1141,7 +1102,28 @@ default-value-8
 ;;; More args are stored consecutively on the stack, starting
 ;;; immediately at the context pointer.  The context pointer is not
 ;;; typed, so the lowtag is 0.
-(define-full-reffer more-arg * 0 0 (descriptor-reg any-reg) * %more-arg)
+(define-vop (more-arg)
+  (:translate %more-arg)
+  (:policy :fast-safe)
+  (:args (context :scs (descriptor-reg)) (index :scs (any-reg)))
+  (:arg-types * tagged-num)
+  (:temporary (:scs (any-reg)) temp)
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:result-types *)
+  (:generator 5
+   (inst addu temp context index)
+   (loadw value temp)))
+(define-vop (more-arg-c)
+  (:translate %more-arg)
+  (:policy :fast-safe)
+  (:args (context :scs (descriptor-reg)))
+  (:info index)
+  (:arg-types * (:constant (load/store-index 8 0 0)))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:result-types *)
+  (:generator 4
+    (loadw value context index)))
+
 
 ;;; Turn more arg (context, count) into a list.
 (define-vop (listify-rest-args)
@@ -1214,7 +1196,7 @@ default-value-8
 ;;;
 (define-vop (more-arg-context)
   (:policy :fast-safe)
-  (:translate sb!c::%more-arg-context)
+  (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg)))
   (:arg-types tagged-num (:constant fixnum))
   (:info fixed)
@@ -1226,54 +1208,39 @@ default-value-8
     (inst addu count supplied (fixnumize (- fixed)))
     (inst subu context csp-tn count)))
 
-
-;;; Signal wrong argument count error if Nargs isn't = to Count.
-;;;
 (define-vop (verify-arg-count)
   (:policy :fast-safe)
-  (:translate sb!c::%verify-arg-count)
   (:args (nargs :scs (any-reg)))
-  (:arg-types positive-fixnum (:constant t))
-  (:temporary (:scs (any-reg) :type fixnum) temp)
-  (:info count)
+  (:temporary (:scs (unsigned-reg)) temp)
+  (:arg-types positive-fixnum (:constant t) (:constant t))
+  (:info min max)
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 3
     (let ((err-lab
-           (generate-error-code vop invalid-arg-count-error nargs)))
-      (cond ((zerop count)
-             (inst bne nargs err-lab)
+            (generate-error-code vop 'invalid-arg-count-error nargs)))
+      (cond ((not min)
+             (cond ((zerop max)
+                    (inst bne nargs err-lab))
+                   (t
+                    (inst li temp (fixnumize max))
+                    (inst bne nargs temp err-lab)))
              (inst nop))
-            (t
-             (inst li temp (fixnumize count))
-             (inst bne nargs temp err-lab)
+            (max
+             (when (plusp min)
+               (inst li temp (fixnumize min))
+               (inst sltu temp nargs temp)
+               (inst bne temp err-lab)
+               (inst nop))
+             (inst li temp (fixnumize max))
+             (inst sltu temp temp nargs)
+             (inst bne temp err-lab)
+             (inst nop))
+            ((plusp min)
+             (inst li temp (fixnumize min))
+             (inst sltu temp nargs temp)
+             (inst bne temp err-lab)
              (inst nop))))))
-
-;;; Various other error signalers.
-;;;
-(macrolet ((frob (name error translate &rest args)
-             `(define-vop (,name)
-                ,@(when translate
-                    `((:policy :fast-safe)
-                      (:translate ,translate)))
-                (:args ,@(mapcar #'(lambda (arg)
-                                     `(,arg :scs (any-reg descriptor-reg)))
-                                 args))
-                (:vop-var vop)
-                (:save-p :compute-only)
-                (:generator 1000
-                  (error-call vop ,error ,@args)))))
-  (frob arg-count-error invalid-arg-count-error
-    sb!c::%arg-count-error nargs fname)
-  (frob type-check-error object-not-type-error sb!c::%type-check-error
-    object type)
-  (frob layout-invalid-error layout-invalid-error sb!c::%layout-invalid-error
-    object layout)
-  (frob odd-key-args-error odd-key-args-error
-    sb!c::%odd-key-args-error)
-  (frob unknown-key-arg-error unknown-key-arg-error
-    sb!c::%unknown-key-arg-error key)
-  (frob nil-fun-returned-error nil-fun-returned-error nil fun))
 
 ;;; Single-stepping
 
@@ -1282,13 +1249,13 @@ default-value-8
   (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
-    (load-symbol-value stepping sb!impl::*stepping*)
-    ;; If it's not NIL, trap.
-    (inst beq stepping null-tn DONE)
+    (load-symbol-value stepping sb-impl::*stepping*)
+    ;; If it's not 0, trap.
+    (inst beq stepping DONE)
     (inst nop)
     ;; CONTEXT-PC will be pointing here when the interrupt is handled,
     ;; not after the BREAK.
-    (note-this-location vop :step-before-vop)
+    (note-this-location vop :internal-error)
     ;; CALLEE-REGISTER-OFFSET isn't needed for before-traps, so we
     ;; can just use a bare SINGLE-STEP-BEFORE-TRAP as the code.
     (inst break 0 single-step-before-trap)

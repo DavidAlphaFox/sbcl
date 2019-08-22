@@ -3,7 +3,7 @@
 @cindex Read-Eval-Print Loop
 @cindex REPL
 
-@c FIXME: I wanted to use @registeredsymbol{}, but that's 
+@c FIXME: I wanted to use @registeredsymbol{}, but that's
 @c only available in Texinfo 4.7.  sigh.
 The @code{sb-aclrepl} module offers an Allegro CL-style
 Read-Eval-Print Loop for SBCL, with integrated inspector.  Adding a
@@ -18,6 +18,16 @@ To start @code{sb-aclrepl} as your read-eval-print loop, put the form
 
 in your @file{~/.sbclrc} initialization file.
 
+@subsection Customization
+
+The following customization variables are available:
+
+@include var-sb-aclrepl-star-command-char-star.texinfo
+@include var-sb-aclrepl-star-prompt-star.texinfo
+@include var-sb-aclrepl-star-exit-on-eof-star.texinfo
+@include var-sb-aclrepl-star-use-short-package-name-star.texinfo
+@include var-sb-aclrepl-star-max-history-star.texinfo
+
 @subsection Example Initialization
 
 Here's a longer example of a @file{~/.sbclrc} file that shows off
@@ -31,7 +41,7 @@ some of the features of @code{sb-aclrepl}:
 #+aclrepl
 (progn
   (setq sb-aclrepl:*max-history* 100)
-  (setf (sb-aclrepl:alias "asdc") 
+  (setf (sb-aclrepl:alias "asdc")
        #'(lambda (sys) (asdf:operate 'asdf:compile-op sys)))
   (sb-aclrepl:alias "l" (sys) (asdf:operate 'asdf:load-op sys))
   (sb-aclrepl:alias "t" (sys) (asdf:operate 'asdf:test-op sys))

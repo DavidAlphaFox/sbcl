@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-assembly-routine (generic-+
                           (:cost 10)
@@ -225,7 +225,7 @@
                           (:temp rem-sign signed-reg nargs-offset)
                           (:temp temp1 non-descriptor-reg nl4-offset))
 
-  (let ((error (generate-error-code nil division-by-zero-error
+  (let ((error (generate-error-code nil 'division-by-zero-error
                                     dividend divisor)))
     (inst beq divisor error))
 

@@ -9,11 +9,20 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-SPARC-ASM")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (setf sb!assem:*assem-scheduler-p* t)
-  (setf sb!assem:*assem-max-locations* 100))
+  ;; Imports from this package into SB-VM
+  (import '(reg-tn-encoding) "SB-VM")
+  ;; Imports from SB-VM into this package
+  (import '(;; SBs and SCs
+            sb-vm::zero sb-vm::immediate-constant
+            sb-vm::registers sb-vm::float-registers
+            sb-vm::control-registers
+            sb-vm::single-reg sb-vm::double-reg
+            ;; TNs and offsets
+            sb-vm::zero-tn
+            sb-vm::zero-offset sb-vm::null-offset sb-vm::alloc-offset)))
 
 ;;; Constants, types, conversion functions, some disassembler stuff.
 (defun reg-tn-encoding (tn)
@@ -41,7 +50,6 @@
            (tn-offset tn)))))
 
 (defvar *disassem-use-lisp-reg-names* t
-  #!+sb-doc
   "If non-NIL, print registers using the Lisp register names.
 Otherwise, use the Sparc register names")
 
@@ -63,7 +71,7 @@ Otherwise, use the Sparc register names")
            (let ((offset (tn-offset loc)))
              (aver (zerop (mod offset 2)))
              (values (+ offset 32) 2)))
-          #!+long-float
+          #+long-float
           (long-reg
            (let ((offset (tn-offset loc)))
              (aver (zerop (mod offset 4)))
@@ -85,21 +93,22 @@ Otherwise, use the Sparc register names")
        (lambda (name)
            (cond ((null name) nil)
                  (t (make-symbol (concatenate 'string "%" name)))))
-       *register-names*)
-  #!+sb-doc "The Lisp names for the Sparc integer registers")
+       sb-vm::*register-names*)
+  "The Lisp names for the Sparc integer registers")
 
 (defparameter sparc-reg-symbols
   #("%G0" "%G1" "%G2" "%G3" "%G4" "%G5" NIL NIL
     "%O0" "%O1" "%O2" "%O3" "%O4" "%O5" "%O6" "%O7"
     "%L0" "%L1" "%L2" "%L3" "%L4" "%L5" "%L6" "%L7"
     "%I0" "%I1" "%I2" "%I3" "%I4" "%I5" NIL "%I7")
-  #!+sb-doc "The standard names for the Sparc integer registers")
+  "The standard names for the Sparc integer registers")
 
 (defun get-reg-name (index)
   (if *disassem-use-lisp-reg-names*
       (aref reg-symbols index)
       (aref sparc-reg-symbols index)))
 
+;; FIXME: pathetic. DSTATE-PROPERTIES is the perfect place for this list.
 (defvar *note-sethi-inst* nil
   "An alist for the disassembler indicating the target register and
 value used in a SETHI instruction.  This is used to make annotations
@@ -107,151 +116,19 @@ about function addresses and register values.")
 
 (defvar *pseudo-atomic-set* nil)
 
-(defun sign-extend-immed-value (val)
+(defun sign-extend-immed-value (val) ; FIXME: why reinvent SIGN-EXTEND ?
   ;; val is a 13-bit signed number.  Extend the sign appropriately.
   (if (logbitp 12 val)
       (- val (ash 1 13))
       val))
 
-;; Look at the current instruction and see if we can't add some notes
-;; about what's happening.
-
-(defun maybe-add-notes (reg dstate)
-  (let* ((word (sb!disassem::sap-ref-int (sb!disassem::dstate-segment-sap dstate)
-                                      (sb!disassem::dstate-cur-offs dstate)
-                                      n-word-bytes
-                                      (sb!disassem::dstate-byte-order dstate)))
-         (format (ldb (byte 2 30) word))
-         (op3 (ldb (byte 6 19) word))
-         (rs1 (ldb (byte 5 14) word))
-         (rd (ldb (byte 5 25) word))
-         (immed-p (not (zerop (ldb (byte 1 13) word))))
-         (immed-val (sign-extend-immed-value (ldb (byte 13 0) word))))
-    (declare (ignore immed-p))
-    ;; Only the value of format and rd are guaranteed to be correct
-    ;; because the disassembler is trying to print out the value of a
-    ;; register.  The other values may not be right.
-    (case format
-      (2
-       (case op3
-         (#b000000
-          (when (= reg rs1)
-            (handle-add-inst rs1 immed-val rd dstate)))
-         (#b111000
-          (when (= reg rs1)
-            (handle-jmpl-inst rs1 immed-val rd dstate)))
-         (#b010001
-          (when (= reg rs1)
-            (handle-andcc-inst rs1 immed-val rd dstate)))))
-      (3
-       (case op3
-         ((#b000000 #b000100)
-          (when (= reg rs1)
-            (handle-ld/st-inst rs1 immed-val rd dstate))))))
-    ;; If this is not a SETHI instruction, and RD is the same as some
-    ;; register used by SETHI, we delete the entry.  (In case we have
-    ;; a SETHI without any additional instruction because the low bits
-    ;; were zero.)
-    (unless (and (zerop format) (= #b100 (ldb (byte 3 22) word)))
-      (let ((sethi (assoc rd *note-sethi-inst*)))
-        (when sethi
-          (setf *note-sethi-inst* (delete sethi *note-sethi-inst*)))))))
-
-(defun handle-add-inst (rs1 immed-val rd dstate)
-  (let* ((sethi (assoc rs1 *note-sethi-inst*)))
-    (cond
-      (sethi
-       ;; RS1 was used in a SETHI instruction.  Assume that
-       ;; this is the offset part of the SETHI instruction for
-       ;; a full 32-bit address of something.  Make a note
-       ;; about this usage as a Lisp assembly routine or
-       ;; foreign routine, if possible.  If not, just note the
-       ;; final value.
-       (let ((addr (+ immed-val (ash (cdr sethi) 10))))
-         (or (sb!disassem::note-code-constant-absolute addr dstate)
-             (sb!disassem:maybe-note-assembler-routine addr t dstate)
-             (sb!disassem:note (format nil "~A = #x~8,'0X"
-                                     (get-reg-name rd) addr)
-                             dstate)))
-       (setf *note-sethi-inst* (delete sethi *note-sethi-inst*)))
-      ((= rs1 null-offset)
-       ;; We have an ADD %NULL, <n>, RD instruction.  This is a
-       ;; reference to a static symbol.
-       (sb!disassem:maybe-note-nil-indexed-object immed-val
-                                               dstate))
-      ((= rs1 alloc-offset)
-       ;; ADD %ALLOC, n.  This must be some allocation or
-       ;; pseudo-atomic stuff
-       (cond ((and (= immed-val 4) (= rd alloc-offset)
-                   (not *pseudo-atomic-set*))
-              ;; "ADD 4, %ALLOC" sets the flag
-              (sb!disassem::note "Set pseudo-atomic flag" dstate)
-              (setf *pseudo-atomic-set* t))
-             ((= rd alloc-offset)
-              ;; "ADD n, %ALLOC" is reseting the flag, with extra
-              ;; allocation.
-              (sb!disassem:note
-               (format nil "Reset pseudo-atomic, allocated ~D bytes"
-                       (+ immed-val 4)) dstate)
-              (setf *pseudo-atomic-set* nil))))
-      #+nil ((and (= rs1 zero-offset) *pseudo-atomic-set*)
-       ;; "ADD %ZERO, num, RD" inside a pseudo-atomic is very
-       ;; likely loading up a header word.  Make a note to that
-       ;; effect.
-       (let ((type (second (assoc (logand immed-val #xff) header-word-type-alist)))
-             (size (ldb (byte 24 8) immed-val)))
-         (when type
-           (sb!disassem:note (format nil "Header word ~A, size ~D?" type size)
-                          dstate)))))))
-
-(defun handle-jmpl-inst (rs1 immed-val rd dstate)
-  (declare (ignore rd))
-  (let* ((sethi (assoc rs1 *note-sethi-inst*)))
-    (when sethi
-      ;; RS1 was used in a SETHI instruction.  Assume that
-      ;; this is the offset part of the SETHI instruction for
-      ;; a full 32-bit address of something.  Make a note
-      ;; about this usage as a Lisp assembly routine or
-      ;; foreign routine, if possible.  If not, just note the
-      ;; final value.
-      (let ((addr (+ immed-val (ash (cdr sethi) 10))))
-        (sb!disassem:maybe-note-assembler-routine addr t dstate)
-        (setf *note-sethi-inst* (delete sethi *note-sethi-inst*))))))
-
-(defun handle-ld/st-inst (rs1 immed-val rd dstate)
-  (declare (ignore rd))
-  ;; Got an LDUW/LD or STW instruction, with immediate offset.
-  (case rs1
-    (29
-     ;; A reference to a code constant (reg = %CODE)
-     (sb!disassem:note-code-constant immed-val dstate))
-    (2
-     ;; A reference to a static symbol or static function (reg =
-     ;; %NULL)
-     (or (sb!disassem:maybe-note-nil-indexed-symbol-slot-ref immed-val
-                                                      dstate)
-         #+nil (sb!disassem::maybe-note-static-function immed-val dstate)))
-    (t
-     (let ((sethi (assoc rs1 *note-sethi-inst*)))
-       (when sethi
-         (let ((addr (+ immed-val (ash (cdr sethi) 10))))
-           (sb!disassem:maybe-note-assembler-routine addr nil dstate)
-           (setf *note-sethi-inst* (delete sethi *note-sethi-inst*))))))))
-
-(defun handle-andcc-inst (rs1 immed-val rd dstate)
-  ;; ANDCC %ALLOC, 3, %ZERO instruction
-  (when (and (= rs1 alloc-offset) (= rd zero-offset) (= immed-val 3))
-    (sb!disassem:note "pseudo-atomic interrupted?" dstate)))
-
-(sb!disassem:define-arg-type reg
+(define-arg-type reg
   :printer (lambda (value stream dstate)
                (declare (stream stream) (fixnum value))
                (let ((regname (get-reg-name value)))
                  (princ regname stream)
-                 (sb!disassem:maybe-note-associated-storage-ref value
-                                                                'registers
-                                                                regname
-                                                                dstate)
+                 (maybe-note-associated-storage-ref
+                  value 'registers regname dstate)
                  (maybe-add-notes value dstate))))
 
 (defparameter float-reg-symbols
@@ -259,38 +136,32 @@ about function addresses and register values.")
      (loop for n from 0 to 63 collect (make-symbol (format nil "%F~d" n)))
      'vector))
 
-(sb!disassem:define-arg-type fp-reg
+(define-arg-type fp-reg
   :printer (lambda (value stream dstate)
                (declare (stream stream) (fixnum value))
                (let ((regname (aref float-reg-symbols value)))
                  (princ regname stream)
-                 (sb!disassem:maybe-note-associated-storage-ref
-                  value
-                  'float-registers
-                  regname
-                  dstate))))
+                 (maybe-note-associated-storage-ref
+                  value 'float-registers regname dstate))))
 
 ;;; The extended 6 bit floating point register encoding for the double
 ;;; and long instructions of the sparc v9.
-(sb!disassem:define-arg-type fp-ext-reg
+(define-arg-type fp-ext-reg
   :printer (lambda (value stream dstate)
                (declare (stream stream) (fixnum value))
                (let* (;; Decode the register number.
                       (value (if (oddp value) (+ value 31) value))
                       (regname (aref float-reg-symbols value)))
                  (princ regname stream)
-                 (sb!disassem:maybe-note-associated-storage-ref
-                  value
-                  'float-registers
-                  regname
-                  dstate))))
+                 (maybe-note-associated-storage-ref
+                  value 'float-registers regname dstate))))
 
-(sb!disassem:define-arg-type relative-label
+(define-arg-type relative-label
   :sign-extend t
   :use-label (lambda (value dstate)
                (declare (type (signed-byte 22) value)
-                        (type sb!disassem:disassem-state dstate))
-               (+ (ash value 2) (sb!disassem:dstate-cur-addr dstate))))
+                        (type disassem-state dstate))
+               (+ (ash value 2) (dstate-cur-addr dstate))))
 
 (defconstant-eqx branch-conditions
   '(:f :eq :le :lt :leu :ltu :n :vs :t :ne :gt :ge :gtu :geu :p :vc)
@@ -300,8 +171,7 @@ about function addresses and register values.")
 ;;; think they're a bit more readable (e.g., "eq" instead of "e").
 ;;; You could just put a vector of the normal ones here too.
 
-(sb!disassem:define-arg-type branch-condition
-  :printer (coerce branch-conditions 'vector))
+(define-arg-type branch-condition :printer (coerce branch-conditions 'vector))
 
 (deftype branch-condition ()
   `(member ,@branch-conditions))
@@ -311,17 +181,17 @@ about function addresses and register values.")
       (error "Unknown branch condition: ~S~%Must be one of: ~S"
              condition branch-conditions)))
 
-(def!constant branch-cond-true
+(defconstant branch-cond-true
   #b1000)
 
 (defconstant-eqx branch-fp-conditions
   '(:f :ne :lg :ul :l :ug :g :u :t :eq :ue :ge :uge :le :ule :o)
   #'equalp)
 
-(sb!disassem:define-arg-type branch-fp-condition
+(define-arg-type branch-fp-condition
   :printer (coerce branch-fp-conditions 'vector))
 
-(sb!disassem:define-arg-type call-fixup :use-label t)
+(define-arg-type call-fixup :use-label t)
 
 (deftype fp-branch-condition ()
   `(member ,@branch-fp-conditions))
@@ -334,12 +204,12 @@ about function addresses and register values.")
 
 ;;;; dissassem:define-instruction-formats
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-1 32 :default-printer '(:name :tab disp))
   (op   :field (byte 2 30) :value 1)
   (disp :field (byte 30 0)))
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-2-immed 32 :default-printer '(:name :tab immed ", " rd))
   (op    :field (byte 2 30) :value 0)
   (rd    :field (byte 5 25) :type 'reg)
@@ -348,7 +218,7 @@ about function addresses and register values.")
 
 
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-2-branch 32 :default-printer `(:name (:unless (:constant ,branch-cond-true) cond)
                                            (:unless (a :constant 0) "," 'A)
                                            :tab
@@ -380,7 +250,7 @@ about function addresses and register values.")
            (make-symbol (concatenate 'string "%" (string name))))
        integer-condition-registers))
 
-(sb!disassem:define-arg-type integer-condition-register
+(define-arg-type integer-condition-register
     :printer (lambda (value stream dstate)
                  (declare (stream stream) (fixnum value) (ignore dstate))
                  (let ((regname (aref integer-condition-reg-symbols value)))
@@ -390,7 +260,7 @@ about function addresses and register values.")
   '(:pn :pt)
   #'equalp)
 
-(sb!disassem:define-arg-type branch-prediction
+(define-arg-type branch-prediction
     :printer (coerce branch-predictions 'vector))
 
 (defun integer-condition (condition-reg)
@@ -414,7 +284,7 @@ about function addresses and register values.")
           disp)
   #'equalp)
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-2-branch-pred 32 :default-printer branch-pred-printer)
   (op   :field (byte 2 30) :value 0)
   (a    :field (byte 1 29) :value 0)
@@ -438,13 +308,13 @@ about function addresses and register values.")
            (make-symbol (concatenate 'string "%" (string name))))
        fp-condition-registers))
 
-(sb!disassem:define-arg-type fp-condition-register
+(define-arg-type fp-condition-register
     :printer (lambda (value stream dstate)
                  (declare (stream stream) (fixnum value) (ignore dstate))
                  (let ((regname (aref fp-condition-reg-symbols value)))
                    (princ regname stream))))
 
-(sb!disassem:define-arg-type fp-condition-register-shifted
+(define-arg-type fp-condition-register-shifted
     :printer (lambda (value stream dstate)
                  (declare (stream stream) (fixnum value) (ignore dstate))
                  (let ((regname (aref fp-condition-reg-symbols (ash value -1))))
@@ -465,7 +335,7 @@ about function addresses and register values.")
           disp)
   #'equalp)
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-2-fp-branch-pred 32 :default-printer fp-branch-pred-printer)
   (op   :field (byte 2 30) :value 0)
   (a    :field (byte 1 29) :value 0)
@@ -477,7 +347,7 @@ about function addresses and register values.")
 
 
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-2-unimp 32 :default-printer '(:name :tab data))
   (op     :field (byte 2 30) :value 0)
   (ignore :field (byte 5 25) :value 0)
@@ -491,7 +361,7 @@ about function addresses and register values.")
           rd)
   #'equalp)
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-3-reg 32 :default-printer f3-printer)
   (op  :field (byte 2 30))
   (rd  :field (byte 5 25) :type 'reg)
@@ -501,7 +371,7 @@ about function addresses and register values.")
   (asi :field (byte 8 5)  :value 0)
   (rs2 :field (byte 5 0)  :type 'reg))
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-3-immed 32 :default-printer f3-printer)
   (op    :field (byte 2 30))
   (rd    :field (byte 5 25) :type 'reg)
@@ -510,7 +380,7 @@ about function addresses and register values.")
   (i     :field (byte 1 13) :value 1)
   (immed :field (byte 13 0) :sign-extend t))    ; usually sign extended
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-binary-fpop 32
      :default-printer '(:name :tab rs1 ", " rs2 ", " rd))
   (op   :field (byte 2 30))
@@ -521,7 +391,7 @@ about function addresses and register values.")
   (rs2  :field (byte 5 0) :type 'fp-reg))
 
 ;;; Floating point load/save instructions encoding.
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-unary-fpop 32 :default-printer '(:name :tab rs2 ", " rd))
   (op   :field (byte 2 30))
   (rd   :field (byte 5 25) :type 'fp-reg)
@@ -552,10 +422,10 @@ about function addresses and register values.")
 ;; FCMP and the rest.  Also note that the nn field overlaps with the
 ;; ccc.  We need to take this into account as well.
 ;;
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-fpop2 32
-                  :default-printer #!-sparc-v9 '(:name :tab rs1 ", " rs2)
-                                   #!+sparc-v9 '(:name :tab rd ", " rs1 ", " rs2))
+                  :default-printer #-sparc-v9 '(:name :tab rs1 ", " rs2)
+                                   #+sparc-v9 '(:name :tab rd ", " rs1 ", " rs2))
   (op   :field (byte 2 30))
   (rd   :field (byte 5 25) :value 0)
   (op3  :field (byte 6 19))
@@ -567,7 +437,7 @@ about function addresses and register values.")
   (rs2  :field (byte 5 0) :type 'fp-reg))
 
 ;;; Shift instructions
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-3-shift-reg 32 :default-printer f3-printer)
   (op   :field (byte 2 30))
   (rd    :field (byte 5 25) :type 'reg)
@@ -578,7 +448,7 @@ about function addresses and register values.")
   (asi   :field (byte 7 5) :value 0)
   (rs2   :field (byte 5 0) :type 'reg))
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-3-shift-immed 32 :default-printer f3-printer)
   (op   :field (byte 2 30))
   (rd    :field (byte 5 25) :type 'reg)
@@ -612,7 +482,7 @@ about function addresses and register values.")
            (make-symbol (concatenate 'string "%" (string name))))
        cond-move-condition-registers))
 
-(sb!disassem:define-arg-type cond-move-condition-register
+(define-arg-type cond-move-condition-register
     :printer (lambda (value stream dstate)
                  (declare (stream stream) (fixnum value) (ignore dstate))
                  (let ((regname (aref cond-move-condition-reg-symbols value)))
@@ -638,7 +508,7 @@ about function addresses and register values.")
   #'equalp)
 
 ;; Conditional move integer register on integer or FP condition code
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-4-cond-move 32 :default-printer cond-move-printer)
   (op   :field (byte 2 30))
   (rd    :field (byte 5 25) :type 'reg)
@@ -650,7 +520,7 @@ about function addresses and register values.")
   (empty :field (byte 6 5) :value 0)
   (rs2   :field (byte 5 0) :type 'reg))
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-4-cond-move-immed 32 :default-printer cond-move-printer)
   (op    :field (byte 2 30))
   (rd    :field (byte 5 25) :type 'reg)
@@ -674,14 +544,20 @@ about function addresses and register values.")
   '(:reserved :z :lez :lz :reserved :nz :gz :gez)
   #'equalp)
 
+;;; Why "#.(coerce)" instead of just coerce: as a consequence of revision
+;;; c7791afe76, cross-compiled DEFCONSTANT-EQX requires that the assigned
+;;; value be "constant per se" - only an expression for which CONSTANTP
+;;; returns T. Uses of the constant symbol in cold-load will read its value
+;;; from the cold symbol, therefore a literal value must be dumped for it.
+;;; A lambda computing the value is no good - it would be target machine code.
 (defconstant-eqx cond-move-integer-condition-vec
-  (coerce cond-move-integer-conditions 'vector)
+  #.(coerce cond-move-integer-conditions 'vector)
   #'equalp)
 
 (deftype cond-move-integer-condition ()
   `(member ,@(remove :reserved cond-move-integer-conditions)))
 
-(sb!disassem:define-arg-type register-condition
+(define-arg-type register-condition
     :printer (lambda (value stream dstate)
                  (declare (stream stream) (fixnum value) (ignore dstate))
                  (let ((regname (aref cond-move-integer-condition-vec value)))
@@ -695,7 +571,7 @@ about function addresses and register values.")
   (or (position rcond cond-move-integer-conditions)
       (error "Unknown register condition:  ~S~%" rcond)))
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-4-cond-move-integer 32 :default-printer cond-move-integer-printer)
   (op    :field (byte 2 30))
   (rd    :field (byte 5 25) :type 'reg)
@@ -706,7 +582,7 @@ about function addresses and register values.")
   (opf   :field (byte 5 5))
   (rs2   :field (byte 5 0) :type 'reg))
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-4-cond-move-integer-immed 32 :default-printer cond-move-integer-printer)
   (op    :field (byte 2 30))
   (rd    :field (byte 5 25) :type 'reg)
@@ -720,7 +596,7 @@ about function addresses and register values.")
   `(:name rd :tab cc ", " immed)
   #'equalp)
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (format-4-trap 32 :default-printer trap-printer)
   (op    :field (byte 2 30))
   (rd    :field (byte 5 25) :type 'reg)
@@ -740,9 +616,6 @@ about function addresses and register values.")
 
 (define-bitfield-emitter emit-word 32
   (byte 32 0))
-
-(define-bitfield-emitter emit-short 16
-  (byte 16 0))
 
 (define-bitfield-emitter emit-format-1 32
   (byte 2 30) (byte 30 0))
@@ -857,10 +730,6 @@ about function addresses and register values.")
                                 op3 (reg-tn-encoding src1) 1
                                 (if extended 1 0) src2))))
 
-
-(eval-when (:compile-toplevel :execute)
-
-;;; have to do this because def!constant is evalutated in the null lex env.
 (defmacro with-ref-format (printer)
   `(let* ((addend
            '(:choose (:plus-integer immed) ("+" rs2)))
@@ -870,14 +739,12 @@ about function addresses and register values.")
      ,printer))
 
 (defconstant-eqx load-printer
-  (with-ref-format `(:NAME :TAB ,ref-format ", " rd))
+  '#.(with-ref-format `(:NAME :TAB ,ref-format ", " rd))
   #'equalp)
 
 (defconstant-eqx store-printer
-  (with-ref-format `(:NAME :TAB rd ", " ,ref-format))
+  '#.(with-ref-format `(:NAME :TAB rd ", " ,ref-format))
   #'equalp)
-
-) ; EVAL-WHEN
 
 (macrolet ((define-f3-inst (name op op3 &key fixup load-store (dest-kind 'reg)
                                  (printer :default) reads writes flushable print-name)
@@ -968,7 +835,7 @@ about function addresses and register values.")
   ;; This instruction is called lduw for V9 , but looks exactly like ld
   ;; on previous architectures.
   (define-f3-inst ld #b11 #b000000 :load-store :load
-                  #!+sparc-v9 :print-name #!+sparc-v9 'lduw)
+                  #+sparc-v9 :print-name #+sparc-v9 'lduw)
 
   (define-f3-inst ldsw #b11 #b001000 :load-store :load) ; v9
 
@@ -1004,8 +871,7 @@ about function addresses and register values.")
   (define-f3-inst taddcc #b10 #b100000 :writes :psr)
 
   ;; taddcctv is deprecated on the Sparc V9.  Use taddcc and bpvs or
-  ;; taddcc and trap to get a similar effect.  (Requires changing the C
-  ;; code though!)
+  ;; taddcc and trap to get a similar effect.
   ;;(define-f3-inst taddcctv #b10 #b100010 :writes :psr)
 
   (define-f3-inst sub #b10 #b000100)
@@ -1015,8 +881,7 @@ about function addresses and register values.")
   (define-f3-inst tsubcc #b10 #b100001 :writes :psr)
 
   ;; tsubcctv is deprecated on the Sparc V9.  Use tsubcc and bpvs or
-  ;; tsubcc and trap to get a similar effect.  (Requires changing the C
-  ;; code though!)
+  ;; tsubcc and trap to get a similar effect.
   ;;(define-f3-inst tsubcctv #b10 #b100011 :writes :psr)
 
   (define-f3-inst mulscc #b10 #b100100 :reads :y :writes (:psr :y))
@@ -1074,7 +939,7 @@ about function addresses and register values.")
   (:emitter (emit-format-3-immed segment #b11 0 #b100001
                                  (reg-tn-encoding src1) 1 src2)))
 
-#!+sparc-64
+#+sparc-64
 (define-instruction ldxfsr (segment src1 src2)
   (:declare (type tn src1) (type (signed-byte 13) src2))
   (:printer format-3-immed ((op #b11) (op3 #b100001) (rd 1))
@@ -1094,7 +959,7 @@ about function addresses and register values.")
   (:emitter (emit-format-3-immed segment #b11 0 #b100101
                                  (reg-tn-encoding src1) 1 src2)))
 
-#!+sparc-64
+#+sparc-64
 (define-instruction stxfsr (segment src1 src2)
   (:declare (type tn src1) (type (signed-byte 13) src2))
   (:printer format-3-immed ((op #b11) (op3 #b100101) (rd 1))
@@ -1104,22 +969,6 @@ about function addresses and register values.")
   (:delay 0)
   (:emitter (emit-format-3-immed segment #b11 1 #b100101
                                  (reg-tn-encoding src1) 1 src2)))
-
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (defun sethi-arg-printer (value stream dstate)
-    (format stream "%hi(#x~8,'0x)" (ash value 10))
-    ;; Save the immediate value and the destination register from this
-    ;; sethi instruction.  This is used later to print some possible
-    ;; notes about the value loaded by sethi.
-    (let* ((word (sb!disassem::sap-ref-int (sb!disassem::dstate-segment-sap dstate)
-                                           (sb!disassem::dstate-cur-offs dstate)
-                                           n-word-bytes
-                                           (sb!disassem::dstate-byte-order dstate)))
-           (imm22 (ldb (byte 22 0) word))
-           (rd (ldb (byte 5 25) word)))
-      (push (cons rd imm22) *note-sethi-inst*)))
-) ; EVAL-WHEN
-
 
 (define-instruction sethi (segment dst src1)
   (:declare (type tn dst)
@@ -1171,61 +1020,10 @@ about function addresses and register values.")
       (emit-format-3-immed segment #b10 0 #b110000 (reg-tn-encoding src1) 1
                            src2)))))
 
-(defun snarf-error-junk (sap offset &optional length-only)
-  (let* ((length (sap-ref-8 sap offset))
-         (vector (make-array length :element-type '(unsigned-byte 8))))
-    (declare (type system-area-pointer sap)
-             (type (unsigned-byte 8) length)
-             (type (simple-array (unsigned-byte 8) (*)) vector))
-    (cond (length-only
-           (values 0 (1+ length) nil nil))
-          (t
-           (copy-ub8-from-system-area sap (1+ offset) vector 0 length)
-           (collect ((sc-offsets)
-                     (lengths))
-             (lengths 1)                ; the length byte
-             (let* ((index 0)
-                    (error-number (read-var-integer vector index)))
-               (lengths index)
-               (loop
-                 (when (>= index length)
-                   (return))
-                 (let ((old-index index))
-                   (sc-offsets (read-var-integer vector index))
-                   (lengths (- index old-index))))
-               (values error-number
-                       (1+ length)
-                       (sc-offsets)
-                       (lengths))))))))
-
-(defun unimp-control (chunk inst stream dstate)
-  (declare (ignore inst))
-  (flet ((nt (x) (if stream (sb!disassem:note x dstate))))
-    (case (format-2-unimp-data chunk dstate)
-      (#.error-trap
-       (nt "Error trap")
-       (sb!disassem:handle-break-args #'snarf-error-junk stream dstate))
-      (#.cerror-trap
-       (nt "Cerror trap")
-       (sb!disassem:handle-break-args #'snarf-error-junk stream dstate))
-      (#.object-not-list-trap
-       (nt "Object not list trap"))
-      (#.breakpoint-trap
-       (nt "Breakpoint trap"))
-      (#.pending-interrupt-trap
-       (nt "Pending interrupt trap"))
-      (#.halt-trap
-       (nt "Halt trap"))
-      (#.fun-end-breakpoint-trap
-       (nt "Function end breakpoint trap"))
-      (#.object-not-instance-trap
-       (nt "Object not instance trap"))
-    )))
-
 (define-instruction unimp (segment data)
   (:declare (type (unsigned-byte 22) data))
   (:printer format-2-unimp () :default :control #'unimp-control
-            :print-name #!-sparc-v9 'unimp #!+sparc-v9 'illtrap)
+            :print-name #-sparc-v9 'unimp #+sparc-v9 'illtrap)
   (:delay 0)
   (:emitter (emit-format-2-unimp segment 0 0 0 data)))
 
@@ -1365,7 +1163,7 @@ about function addresses and register values.")
   (:declare (type branch-condition condition)
             ;; KLUDGE: see comments in vm.lisp regarding
             ;; pseudo-atomic-trap.
-            #!-linux
+            #-linux
             (type (integer 16 31) target))
   (:printer format-3-immed ((op #b10)
                             (rd nil :type 'branch-condition)
@@ -1396,10 +1194,10 @@ about function addresses and register values.")
 ;;; breaking the disassembler if these are left in. The printer isn't
 ;;; terribly smart, but the emitted code is right. - CSR, 2002-08-04
 #+nil
-(define-instruction tcc (segment condition target &optional (cc #!-sparc-64 :icc #!+sparc-64 :xcc))
+(define-instruction tcc (segment condition target &optional (cc #-sparc-64 :icc #+sparc-64 :xcc))
   (:declare (type branch-condition condition)
             ;; KLUDGE: see above.
-            #!-linux
+            #-linux
             (type (integer 16 31) target)
             (type integer-condition-register cc))
   (:printer format-4-trap ((op #b10)
@@ -1570,9 +1368,9 @@ about function addresses and register values.")
                   (opf3 ,opf)
                   (rs1 nil :type ',(if extended 'fp-ext-reg 'fp-reg))
                   (rs2 nil :type ',(if extended 'fp-ext-reg 'fp-reg))
-                  #!-sparc-v9
+                  #-sparc-v9
                   (rd 0)
-                  #!+sparc-v9
+                  #+sparc-v9
                   (rd nil :type 'fp-condition-register))
         )
      (:dependencies
@@ -1791,18 +1589,16 @@ about function addresses and register values.")
 ;;;; Instructions for dumping data and header objects.
 
 (define-instruction word (segment word)
-  (:declare (type (or (unsigned-byte 32) (signed-byte 32)) word))
+  (:declare (type (or (unsigned-byte 32) (signed-byte 32) fixup) word))
   :pinned
   (:delay 0)
   (:emitter
-   (emit-word segment word)))
-
-(define-instruction short (segment short)
-  (:declare (type (or (unsigned-byte 16) (signed-byte 16)) short))
-  :pinned
-  (:delay 0)
-  (:emitter
-   (emit-short segment short)))
+   (etypecase word
+     (fixup
+      (note-fixup segment :absolute word)
+      (emit-word segment 0))
+     (integer
+      (emit-word segment word)))))
 
 (define-instruction byte (segment byte)
   (:declare (type (or (unsigned-byte 8) (signed-byte 8)) byte))
@@ -1810,9 +1606,6 @@ about function addresses and register values.")
   (:delay 0)
   (:emitter
    (emit-byte segment byte)))
-
-(define-bitfield-emitter emit-header-object 32
-  (byte 24 8) (byte 8 0))
 
 (defun emit-header-data (segment type)
   (emit-back-patch
@@ -1827,13 +1620,13 @@ about function addresses and register values.")
   :pinned
   (:delay 0)
   (:emitter
-   (emit-header-data segment simple-fun-header-widetag)))
+   (emit-header-data segment simple-fun-widetag)))
 
 (define-instruction lra-header-word (segment)
   :pinned
   (:delay 0)
   (:emitter
-   (emit-header-data segment return-pc-header-widetag)))
+   (emit-header-data segment return-pc-widetag)))
 
 
 ;;;; Instructions for converting between code objects, functions, and lras.
@@ -1842,7 +1635,8 @@ about function addresses and register values.")
   (emit-chooser
    ;; We emit either 12 or 4 bytes, so we maintain 8 byte alignments.
    segment 12 3
-   (lambda (segment posn delta-if-after)
+   (lambda (segment chooser posn delta-if-after)
+       (declare (ignore chooser))
        (let ((delta (funcall calc label posn delta-if-after)))
          (when (<= (- (ash 1 12)) delta (1- (ash 1 12)))
            (emit-back-patch segment 4

@@ -13,8 +13,8 @@
 #define SBCL_INCLUDED_WIN32_OS_H
 
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
 #include <winsock2.h>
+#include <windows.h>
 
 #include <stdlib.h>
 #include <stdint.h>
@@ -35,6 +35,7 @@
 typedef sem_t os_sem_t;
 #else
 typedef void *siginfo_t;
+typedef int sigset_t;
 #endif
 
 typedef LPVOID os_vm_address_t;
@@ -66,8 +67,6 @@ extern FILE* win32_fopen_runtime();
 #define SIG_DEQUEUE (SIGRTMIN+2)
 #define SIG_THREAD_EXIT (SIGRTMIN+3)
 
-#define FPU_STATE_SIZE 27
-
 struct lisp_exception_frame {
     struct lisp_exception_frame *next_frame;
     void *handler;
@@ -80,8 +79,6 @@ char *dirname(char *path);
 void os_invalidate_free(os_vm_address_t addr, os_vm_size_t len);
 
 boolean win32_maybe_interrupt_io(void* thread);
-
-#define bcopy(src,dest,n) memmove(dest,src,n)
 
 struct thread;
 void** os_get_csp(struct thread* th);

@@ -8,50 +8,6 @@
 
 (in-package "SB-PCL")
 
-;;;; class predicates
-
-(defgeneric class-eq-specializer-p (object))
-
-(defgeneric classp (object))
-
-(defgeneric condition-class-p (object))
-
-(defgeneric eql-specializer-p (object))
-
-(defgeneric exact-class-specializer-p (object))
-
-(defgeneric forward-referenced-class-p (object))
-
-(defgeneric funcallable-standard-class-p (object))
-
-(defgeneric generic-function-p (object))
-
-(defgeneric method-combination-p (object))
-
-(defgeneric method-p (object))
-
-(defgeneric short-method-combination-p (object))
-
-(defgeneric slot-class-p (object))
-
-(defgeneric specializerp (object))
-
-(defgeneric standard-accessor-method-p (object))
-
-(defgeneric standard-boundp-method-p (object))
-
-(defgeneric standard-class-p (object))
-
-(defgeneric standard-generic-function-p (object))
-
-(defgeneric standard-method-p (object))
-
-(defgeneric standard-reader-method-p (object))
-
-(defgeneric standard-writer-method-p (object))
-
-(defgeneric structure-class-p (object))
-
 ;;;; readers
 
 (defgeneric accessor-method-slot-definition (standard-accessor-method))
@@ -80,15 +36,15 @@
 
 (defgeneric eql-specializer-object (eql-specializer))
 
-(defgeneric generic-function-declarations (standard-generic-function))
+(defgeneric generic-function-declarations (generic-function))
 
-(defgeneric generic-function-method-class (standard-generic-function))
+(defgeneric generic-function-method-class (generic-function))
 
-(defgeneric generic-function-method-combination (standard-generic-function))
+(defgeneric generic-function-method-combination (generic-function))
 
-(defgeneric generic-function-methods (standard-generic-function))
+(defgeneric generic-function-methods (generic-function))
 
-(defgeneric generic-function-name (standard-generic-function))
+(defgeneric generic-function-name (generic-function))
 
 (defgeneric gf-arg-info (standard-generic-function))
 
@@ -251,11 +207,9 @@
 
 (defgeneric function-keywords (method))
 
-(defgeneric function-keyword-parameters (method))
+(defgeneric generic-function-argument-precedence-order (generic-function))
 
-(defgeneric generic-function-argument-precedence-order (gf))
-
-(defgeneric generic-function-lambda-list (gf))
+(defgeneric generic-function-lambda-list (generic-function))
 
 (defgeneric generic-function-pretty-arglist (generic-function))
 
@@ -286,6 +240,8 @@
 (defgeneric specializer-direct-methods (specializer))
 
 (defgeneric specializer-method-table (specializer))
+
+(defgeneric specializer-method-holder (specializer &optional create))
 
 (defgeneric update-constructors (class))
 
@@ -328,7 +284,27 @@
 
 (defgeneric map-dependents (metaobject function))
 
-(defgeneric parse-specializer-using-class (generic-function specializer-name))
+(defgeneric parse-specializer-using-class (generic-function specializer-name)
+  (:documentation
+   "Parse SPECIALIZER-NAME into a specializer object suitable for GENERIC-FUNCTION.
+
+If SPECIALIZER-NAME is not well-formed with respect to the specializer
+syntax of GENERIC-FUNCTION, an error of type
+SB-PCL:SPECIALIZER-NAME-SYNTAX-ERROR is signaled.
+
+If GENERIC-FUNCTION is a STANDARD-GENERIC-FUNCTION and
+SPECIALIZER-NAME is a symbol that does not name an existing class, an
+error of type SB-PCL:CLASS-NOT-FOUND-ERROR is signaled.
+
+Other errors may be signaled for generic function classes other than
+STANDARD-GENERIC-FUNCTION.
+
+If GENERIC-FUNCTION is a STANDARD-GENERIC-FUNCTION and
+SPECIALIZER-NAME is of the form (eql OBJECT), OBJECT is not
+evaluated (in contrast to DEFMETHOD's behavior).
+
+NOTE: This generic function is part of an SBCL-specific experimental
+protocol. Interface subject to change."))
 
 (defgeneric remove-boundp-method (class generic-function))
 
@@ -359,11 +335,6 @@
 
 (defgeneric invalid-superclass (class superclass))
 
-(defgeneric (setf documentation) (new-value slotd doc-type)
-  (:argument-precedence-order doc-type slotd new-value))
-
-(defgeneric documentation (slotd doc-type)
-  (:argument-precedence-order doc-type slotd))
 
 ;;;; 3 arguments
 
@@ -400,6 +371,30 @@
 (defgeneric slot-unbound (class instance slot-name))
 
 (defgeneric slot-value-using-class (class object slotd))
+
+(defgeneric specializer-type-specifier
+    (proto-generic-function proto-method specializer)
+  (:documentation
+   "Return a type specifier for SPECIALIZER, a non-parsed specializer
+form or a SPECIALIZER instance.
+
+More specifically, SPECIALIZER can be
+* a non-parsed specializer form such as
+  * a symbol naming a class
+  * a list of the form (eql OBJECT)
+  * a list of the form (SPECIALIZER-KIND &rest SPECIFIC-SYNTAX)
+* an instance of a subclass of SPECIALIZER
+
+When SPECIALIZER cannot be parsed/used as a specializer for
+PROTO-GENERIC-FUNCTION and PROTO-METHOD, a STYLE-WARNING is signaled
+and NIL is returned. No type declaration will be generated in this
+case.
+
+NIL can also be returned if SPECIALIZER is valid but its type should
+not be declared, for example for efficiency reasons.
+
+NOTE: This generic function is part of an SBCL-specific experimental
+protocol. Interface subject to change."))
 
 ;;;; 4 arguments
 
@@ -408,6 +403,50 @@
 
 (defgeneric make-method-specializers-form
     (proto-generic-function proto-method specializer-names environment))
+
+;;; MAKE-SPECIALIZER-FORM-USING-CLASS
+;;;
+;;; To free every new custom generic function class from having to
+;;; implement iteration over specializers in
+;;; MAKE-METHOD-SPECIALIZERS-FORM, we provide a default method
+;;;
+;;;   make-method-specializers-form standard-g-f standard-method
+;;;
+;;; which performs this iteration and calls the generic function
+;;;
+;;;   make-specializer-form-using-class proto-g-f proto-m specializer-name env
+;;;
+;;; on which custom generic function classes can install methods to
+;;; handle their custom specializers. The generic function uses OR
+;;; method combination to allow the following idiom:
+;;;
+;;;   (defmethod make-specializer-form-using-class or
+;;;       (proto-generic-function MY-GENERIC-FUNCTION)
+;;;       (proto-method standard-method)
+;;;       (specializer-name cons)
+;;;       (environment t))
+;;;     (when (typep specializer-name '(cons (eql MY-SPECIALIZER)))
+;;;       MY-SPECIALIZER-FORM))
+;;;
+;;; The OR method combination lets everything but (my-specializer ...)
+;;; fall through to the next methods which will, at some point, handle
+;;; class and eql specializers and eventually reach an error signaling
+;;; method for invalid specializers.
+
+(defgeneric make-specializer-form-using-class
+    (proto-generic-function proto-method specializer-name environment)
+  (:method-combination or)
+  (:documentation
+   "Return a form which, when evaluated in the lexical environment
+described by ENVIRONMENT, parses the specializer SPECIALIZER-NAME and
+yields the appropriate specializer object.
+
+Both PROTO-GENERIC-FUNCTION and PROTO-METHOD may be
+uninitialized. However their classes and prototypes can be
+inspected.
+
+NOTE: This generic function is part of an SBCL-specific experimental
+protocol. Interface subject to change."))
 
 (defgeneric (setf slot-value-using-class) (new-value class object slotd))
 
@@ -424,6 +463,31 @@
 (defgeneric make-method-initargs-form
     (proto-generic-function proto-method lambda-expression lambda-list
      environment))
+
+;;;; 6 arguments
+
+(defgeneric make-method-lambda-using-specializers
+    (proto-generic-function proto-method qualifiers specializers
+     method-lambda environment)
+  (:documentation
+   "Compute a method lambda form based on METHOD-LAMBDA, possibly
+taking into account PROTO-GENERIC-FUNCTION, PROTO-METHOD, QUALIFIERS,
+SPECIALIZERS and ENVIRONMENT.
+
+Both PROTO-GENERIC-FUNCTION and PROTO-METHOD may be
+uninitialized. However, their classes and prototypes can be inspected.
+
+SPECIALIZERS is a list of specializer objects (i.e. parsed).
+
+Return three values:
+1. the created method lambda form
+2. initargs for the method instance
+3. a (possibly modified) unspecialized method lambda list or nil if
+   the unspecialized lambda list contained in METHOD-LAMBDA should be
+   used
+
+NOTE: This generic function is part of an SBCL-specific experimental
+protocol. Interface subject to change."))
 
 ;;;; optional arguments
 

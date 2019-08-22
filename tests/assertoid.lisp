@@ -16,7 +16,9 @@
   (:use "CL")
   (:export "GRAB-CONDITION" "ASSERT-ERROR"
            "HAS-ERROR?" "IS" "ASSERTOID"
-           "ASSERT-SIGNAL" "ASSERT-NO-SIGNAL"))
+           "ASSERT-SIGNAL" "ASSERT-NO-SIGNAL"
+           "LEGACY-EVAL-P"
+           "EQUAL-MOD-GENSYMS" "CHECK-FUNCTION-EVALUATION-ORDER"))
 
 (cl:in-package "ASSERTOID")
 
@@ -28,23 +30,50 @@
   `(typep (nth-value 1 (ignore-errors ,form)) ',error-subtype-spec))
 
 (defmacro assert-error (form &optional (error-subtype-spec 'error))
-  `(assert (typep (nth-value 1 (ignore-errors ,form)) ',error-subtype-spec)))
+  `(let ((result (multiple-value-list (ignore-errors ,form))))
+     (assert (typep (second result) ',error-subtype-spec)
+             ()  "~s returned ~s without signalling ~s"
+             ',form
+             result
+             ',error-subtype-spec)))
 
-(defmacro assert-signal (form &optional (signal-type 'condition))
-  (let ((signal (gensym)))
-    `(let (,signal)
-       (handler-bind ((,signal-type (lambda (c)
-                                      (setf ,signal c))))
-         ,form)
-       (assert ,signal))))
+(defun %assert-signal (thunk condition-type
+                       expected-min-count expected-max-count)
+  (declare (ignore condition-type))
+  (let ((count 0))
+    (prog1
+        (funcall thunk (lambda (condition)
+                         (incf count)
+                         (when (typep condition 'warning)
+                           (muffle-warning condition))))
+      (assert (<= expected-min-count count expected-max-count)))))
 
-(defmacro assert-no-signal (form &optional (signal-type 'condition))
-  (let ((signal (gensym)))
-    `(let (,signal)
-       (handler-bind ((,signal-type (lambda (c)
-                                      (setf ,signal c))))
-         ,form)
-       (assert (not ,signal)))))
+(defmacro assert-signal (form &optional
+                              (condition-type 'condition)
+                              (expected-min-count 1)
+                              (expected-max-count expected-min-count))
+  (let ((handle (gensym)))
+    `(%assert-signal
+      (lambda (,handle)
+        (handler-bind ((,condition-type ,handle)) ,form))
+      ',condition-type ,expected-min-count ,expected-max-count)))
+
+(defun %assert-no-signal (thunk condition-type)
+  (declare (ignore condition-type))
+  (let ((signaled-condition))
+    (prog1
+        (funcall thunk (lambda (condition)
+                         (setf signaled-condition condition)
+                         (when (typep condition 'warning)
+                           (muffle-warning condition))))
+      (assert (not signaled-condition)))))
+
+(defmacro assert-no-signal (form &optional (condition-type 'condition))
+  (let ((handle (gensym)))
+    `(%assert-no-signal
+      (lambda (,handle)
+        (handler-bind ((,condition-type ,handle)) ,form))
+      ',condition-type)))
 
 ;;; EXPR is an expression to evaluate (both with EVAL and with
 ;;; COMPILE/FUNCALL). EXTRA-OPTIMIZATIONS is a list of lists of
@@ -145,3 +174,49 @@
                     expected-value real-value ',form))))
       `(unless ,form
          (error "~S evaluated to NIL" ',form))))
+
+;; Return T if two sexprs are EQUAL, considering uninterned symbols
+;; in expression A as EQ to one in B provided that there exists a
+;; mapping that makes the forms EQUAL.
+;; This is helpful when testing complicated macroexpanders.
+;; Note that this is much simpler than unification,
+;; because symbols can only be replaced by other symbols.
+(defun equal-mod-gensyms (a b &optional (pred #'equal))
+  (let ((subst-table (make-hash-table :test 'eq)))
+    (labels ((recurse (a b)
+               (cond ((and (consp a) (consp b))
+                      (and (recurse (car a) (car b))
+                           (recurse (cdr a) (cdr b))))
+                     ((and (symbolp a) (symbolp b))
+                      (multiple-value-bind (replacement found)
+                          (gethash a subst-table a)
+                        (or (eq replacement b)
+                            (and (not found)
+                                 (not (symbol-package a))
+                                 (setf (gethash a subst-table) b)))))
+                     (t ; strings, numbers
+                      (funcall pred a b)))))
+      (recurse a b))))
+
+(defun legacy-eval-p ()
+  (and (eq sb-ext:*evaluator-mode* :interpret)
+       (find-package "SB-EVAL")))
+
+(defmacro check-function-evaluation-order (form)
+  (let ((evals (gensym "EVALS"))
+        expected)
+    `(let ((,evals))
+       (multiple-value-prog1
+           (,(car form)
+            ,@(loop for i from 0
+                    for arg in (cdr form)
+                    collect `(progn
+                               (push ,i ,evals)
+                               ,arg)
+                    do
+                    (push i expected)))
+         (assert (equal ,evals ',expected)
+                 () 'simple-error
+                 :format-control "Bad evaluation order of ~s:~% ~s"
+                 :format-arguments (list ',form
+                                         (reverse ,evals)))))))

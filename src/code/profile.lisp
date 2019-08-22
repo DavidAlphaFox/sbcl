@@ -7,7 +7,15 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB-PROFILE") ; (SB-, not SB!, since we're built in warm load.)
+;;;; Due to a feature of genesis, symbols created as external in package-data-list
+;;;; that are not referenced when cross-compiling do not make it into the core.
+;;;; The benefit is that we automatically weed out junk. The drawback is that
+;;;; symbols which want to be external might have to be exported "again".
+;;;; On the whole, the benefit outweights the drawback, imho.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (export 'sb-kernel::profile-deinit "SB-KERNEL"))
+
+(in-package "SB-PROFILE")
 
 
 ;;;; COUNTER object
@@ -154,6 +162,7 @@
 ;;; counts built into the lexical environment, is that we hope this
 ;;; will minimize profiling overhead.)
 (defun profile-encapsulation-lambdas ()
+  (declare (muffle-conditions compiler-note))
   (let* ((count (make-counter))
          (ticks (make-counter))
          (consing (make-counter))
@@ -291,7 +300,6 @@
   (values))
 
 (defmacro profile (&rest names)
-  #+sb-doc
   "PROFILE Name*
 
    If no names are supplied, return the list of profiled functions.
@@ -309,7 +317,6 @@
       `(mapc-on-named-funs #'profile-1-fun ',names)))
 
 (defmacro unprofile (&rest names)
-  #+sb-doc
   "Unwrap any profiling code around the named functions, or if no names
   are given, unprofile all profiled functions. A symbol names
   a function. A string names all the functions named by symbols in the
@@ -326,7 +333,6 @@
     (unprofile-1-fun name)))
 
 (defun reset ()
-  #+sb-doc
   "Reset the counters for all profiled functions."
   (dohash ((name profile-info) *profiled-fun-name->info* :locked t)
     (declare (ignore name))
@@ -363,7 +369,6 @@
     (max raw-compensated 0.0)))
 
 (defun report (&key limit (print-no-call-list t))
-  #+sb-doc
   "Report results from profiling. The results are approximately
 adjusted for profiling overhead. The compensation may be rather
 inaccurate when bignums are involved in runtime calculation, as in a
@@ -378,11 +383,6 @@ uncalled profiled functions are listed."
   (let ((time-info-list ())
         (no-call-name-list ()))
     (dohash ((name pinfo) *profiled-fun-name->info* :locked t)
-      (unless (eq (fdefinition name)
-                  (profile-info-encapsulation-fun pinfo))
-        (warn "Function ~S has been redefined, so times may be inaccurate.~@
-               PROFILE it again to record calls to the new definition."
-              name))
       (multiple-value-bind (calls ticks consing profile gc-run-time)
           (funcall (profile-info-read-stats-fun pinfo))
         (if (zerop calls)

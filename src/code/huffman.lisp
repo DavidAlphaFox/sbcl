@@ -10,13 +10,15 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
-(defstruct (huffman-node (:constructor make-huffman-node (key weight)))
+(defstruct (huffman-node (:constructor make-huffman-node (key weight))
+                         (:copier nil))
   key weight)
 
 (defstruct (huffman-pair
              (:include huffman-node)
+             (:copier nil)
              (:constructor make-huffman-pair
                            (left right &aux
                                  (key   (concatenate 'string

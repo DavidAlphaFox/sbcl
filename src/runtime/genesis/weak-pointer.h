@@ -11,25 +11,24 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_WEAK_POINTER
-#define SBCL_GENESIS_WEAK_POINTER 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_WEAK_POINTER
+#ifndef __ASSEMBLER__
 
 struct weak_pointer {
     lispobj header;
     lispobj value;
-    lispobj broken;
     struct weak_pointer * next;
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
 #define WEAK_POINTER_VALUE_OFFSET -7
-#define WEAK_POINTER_BROKEN_OFFSET 1
-#define WEAK_POINTER_NEXT_OFFSET 9
+#define WEAK_POINTER_NEXT_OFFSET 1
+#define WEAK_POINTER_SIZE 3
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_WEAK-POINTER */
+#endif

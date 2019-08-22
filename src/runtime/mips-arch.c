@@ -24,12 +24,6 @@
 
 #define INSN_LEN sizeof(unsigned int)
 
-void
-arch_init(void)
-{
-    return;
-}
-
 os_vm_address_t
 arch_get_bad_addr(int signam, siginfo_t *siginfo, os_context_t *context)
 {
@@ -390,7 +384,7 @@ void
 arch_handle_single_step_trap(os_context_t *context, int trap)
 {
     unsigned int code = *((u32 *)(os_context_pc(context)));
-    int register_offset = code >> 11 & 0x1f;
+    int register_offset = code >> 16 & 0x1f;
     handle_single_step_trap(context, trap, register_offset);
     arch_skip_instruction(context);
 }
@@ -398,77 +392,18 @@ arch_handle_single_step_trap(os_context_t *context, int trap)
 static void
 sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
 {
-    unsigned int code = (os_context_insn(context) >> 6) & 0xfffff;
-    /* FIXME: This magic number is pseudo-atomic-trap from parms.lisp.
-     * Genesis should provide the proper #define, but it specialcases
-     * pseudo-atomic-trap to work around some oddity on SPARC.
-     * Eventually this should go into handle_trap. */
-    if (code==0x10) {
+    unsigned int code = (os_context_insn(context) >> 6) & 0xff;
+    if (code == trap_PendingInterrupt) {
+        /* KLUDGE: is this neccessary or will handle_trap do the same? */
         arch_clear_pseudo_atomic_interrupted(context);
-        arch_skip_instruction(context);
-        interrupt_handle_pending(context);
-    } else
-        handle_trap(context,code & 0x1f);
+    }
+    handle_trap(context, code);
 }
-
-#define FIXNUM_VALUE(lispobj) (((int)lispobj) >> N_FIXNUM_TAG_BITS)
 
 static void
 sigfpe_handler(int signal, siginfo_t *info, os_context_t *context)
 {
-    unsigned int bad_inst = os_context_insn(context);
-    unsigned int op, rs, rt, rd, funct, dest = 32;
-    int immed;
-    int result;
-
-    op = (bad_inst >> 26) & 0x3f;
-    rs = (bad_inst >> 21) & 0x1f;
-    rt = (bad_inst >> 16) & 0x1f;
-    rd = (bad_inst >> 11) & 0x1f;
-    funct = bad_inst & 0x3f;
-    immed = (((int)(bad_inst & 0xffff)) << 16) >> 16;
-
-    switch (op) {
-    case 0x0: /* SPECIAL */
-        switch (funct) {
-        case 0x20: /* ADD */
-            result = FIXNUM_VALUE(os_context_register(context, rs))
-                + FIXNUM_VALUE(os_context_register(context, rt));
-            dest = rd;
-            break;
-
-        case 0x22: /* SUB */
-            result = FIXNUM_VALUE(os_context_register(context, rs))
-                - FIXNUM_VALUE(os_context_register(context, rt));
-            dest = rd;
-            break;
-
-        default:
-            interrupt_handle_now(signal, info, context);
-            return;
-        }
-        break;
-
-    case 0x8: /* ADDI */
-        result = FIXNUM_VALUE(os_context_register(context,rs))
-                    + (immed >> N_FIXNUM_TAG_BITS);
-        dest = rt;
-        break;
-
-    default:
-        interrupt_handle_now(signal, info, context);
-        return;
-    }
-
-    dynamic_space_free_pointer =
-        (lispobj *)(unsigned int)*os_context_register_addr(context,reg_ALLOC);
-
-    *os_context_register_addr(context,dest) = alloc_number(result);
-
-    *os_context_register_addr(context, reg_ALLOC) =
-        (unsigned int) dynamic_space_free_pointer;
-
-    arch_skip_instruction(context);
+    interrupt_handle_now(signal, info, context);
 }
 
 unsigned int
@@ -491,7 +426,6 @@ void
 arch_install_interrupt_handlers(void)
 {
     undoably_install_low_level_interrupt_handler(SIGTRAP,sigtrap_handler);
-    undoably_install_low_level_interrupt_handler(SIGFPE,sigfpe_handler);
 }
 
 #ifdef LISP_FEATURE_LINKAGE_TABLE
@@ -507,8 +441,12 @@ arch_install_interrupt_handlers(void)
 
 /* Insert the necessary jump instructions at the given address. */
 void
-arch_write_linkage_table_jmp(void* reloc_addr, void *target_addr)
+arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
 {
+  if (datap) {
+    *(unsigned int *)reloc_addr = (unsigned int)target_addr;
+    return;
+  }
   /* Make JMP to function entry. The instruction sequence is:
        lui    $25, 0, %hi(addr)
        addiu  $25, $25, %lo(addr)
@@ -527,11 +465,4 @@ arch_write_linkage_table_jmp(void* reloc_addr, void *target_addr)
 
   os_flush_icache((os_vm_address_t)reloc_addr, LINKAGE_TABLE_ENTRY_SIZE);
 }
-
-void
-arch_write_linkage_table_ref(void *reloc_addr, void *target_addr)
-{
-    *(unsigned int *)reloc_addr = (unsigned int)target_addr;
-}
-
 #endif

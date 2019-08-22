@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; HOW THE ANSI-STREAM STRUCTURE IS USED
 ;;;
@@ -78,11 +78,9 @@
 
 ;;; the size of a stream in-buffer
 ;;;
-;;; KLUDGE: The EVAL-WHEN wrapper isn't needed except when using CMU
-;;; CL as a cross-compilation host. Without it, cmucl-2.4.19 issues
-;;; full WARNINGs (not just STYLE-WARNINGs!) when processing this
-;;; file, and when processing other files which use ANSI-STREAM.
-;;; -- WHN 2000-12-13
+;;; This constant it is used in a read-time-eval, and some implementations
+;;; draw a sharp distinction between a constant being known only to
+;;; the file-compiler during compilation, and known also to the evaluator.
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defconstant +ansi-stream-in-buffer-length+ 512))
 
@@ -104,11 +102,15 @@
   ;; +ANSI-STREAM-IN-BUFFER-LENGTH+.)
   (in-buffer nil :type (or ansi-stream-in-buffer null))
   (cin-buffer nil :type (or ansi-stream-cin-buffer null))
-  (in-index +ansi-stream-in-buffer-length+ :type index)
+  (in-index +ansi-stream-in-buffer-length+
+            :type (integer 0 #.+ansi-stream-in-buffer-length+))
 
   ;; buffered input functions
   (in #'ill-in :type function)                  ; READ-CHAR function
   (bin #'ill-bin :type function)                ; byte input function
+  ;; 'n-bin' might not transfer bytes to the consumer.
+  ;; A character FD-STREAM uses this method to transfer octets from the
+  ;; source buffer into characters of the destination buffer.
   (n-bin #'ill-bin :type function)              ; n-byte input function
 
   ;; output functions
@@ -117,7 +119,62 @@
   (sout #'ill-out :type function)               ; string output function
 
   ;; other, less-used methods
-  (misc #'no-op-placeholder :type function))
+  (misc #'no-op-placeholder :type function)
 
-(def!method print-object ((x ansi-stream) stream)
+  ;; Absolute character position, acting also as a generalized boolean
+  ;; in lieu of testing FORM-TRACKING-STREAM-P to see if we must
+  ;; maintain correctness of the slot in ANSI-STREAM-UNREAD-CHAR.
+  (input-char-pos nil))
+
+;;; SYNONYM-STREAM type is needed by ANSI-STREAM-{INPUT,OUTPUT}-STREAM-P
+;;; and also needed by OPEN (though not obviously), which is compiled
+;;; prior to some of the stream type definitions in src/code/stream,
+;;; so let's define that one here as soon as we can.
+(defstruct (synonym-stream (:include ansi-stream
+                                     (in #'synonym-in)
+                                     (bin #'synonym-bin)
+                                     (n-bin #'synonym-n-bin)
+                                     (out #'synonym-out)
+                                     (bout #'synonym-bout)
+                                     (sout #'synonym-sout)
+                                     (misc #'synonym-misc))
+                           (:constructor make-synonym-stream (symbol))
+                           (:copier nil))
+  ;; This is the symbol, the value of which is the stream we are synonym to.
+  (symbol nil :type symbol :read-only t))
+(declaim (freeze-type synonym-stream))
+
+(defmethod print-object ((x stream) stream)
   (print-unreadable-object (x stream :type t :identity t)))
+
+(defmacro with-standard-io-syntax (&body body)
+  "Bind the reader and printer control variables to values that enable READ
+   to reliably read the results of PRINT. These values are:
+
+         *PACKAGE*                        the COMMON-LISP-USER package
+         *PRINT-ARRAY*                    T
+         *PRINT-BASE*                     10
+         *PRINT-CASE*                     :UPCASE
+         *PRINT-CIRCLE*                   NIL
+         *PRINT-ESCAPE*                   T
+         *PRINT-GENSYM*                   T
+         *PRINT-LENGTH*                   NIL
+         *PRINT-LEVEL*                    NIL
+         *PRINT-LINES*                    NIL
+         *PRINT-MISER-WIDTH*              NIL
+         *PRINT-PPRINT-DISPATCH*          the standard pprint dispatch table
+         *PRINT-PRETTY*                   NIL
+         *PRINT-RADIX*                    NIL
+         *PRINT-READABLY*                 T
+         *PRINT-RIGHT-MARGIN*             NIL
+         *READ-BASE*                      10
+         *READ-DEFAULT-FLOAT-FORMAT*      SINGLE-FLOAT
+         *READ-EVAL*                      T
+         *READ-SUPPRESS*                  NIL
+         *READTABLE*                      the standard readtable
+  SB-EXT:*SUPPRESS-PRINT-ERRORS*          NIL
+  SB-EXT:*PRINT-VECTOR-LENGTH*            NIL
+"
+  (let ((name (make-symbol "THUNK")))
+    `(dx-flet ((,name () ,@body))
+       (%with-standard-io-syntax #',name))))

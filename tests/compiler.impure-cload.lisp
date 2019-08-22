@@ -1,8 +1,5 @@
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (load "assertoid.lisp")
-  (load "compiler-test-util.lisp")
-  (load "test-util.lisp")
-  (use-package "ASSERTOID"))
+  (load "compiler-test-util.lisp"))
 
 ;;; bug 254: compiler falure
 (defpackage :bug254 (:use :cl))
@@ -11,6 +8,7 @@
 (defstruct foo
   (uhw2 nil :type (or package null)))
 (macrolet ((defprojection (variant &key lexpr eexpr)
+             (declare (ignore variant eexpr))
              (let ()
                `(defmethod uu ((foo foo))
                   (let ((uhw2 (foo.uhw2 bar)))
@@ -48,8 +46,9 @@
 (declaim (ftype (function ((or w bad) (or w bad)) (values)) %ufm))
 (defun %ufm (base bound) (froj base bound *1*) (values))
 (declaim (ftype (function ((vector t)) (or w bad)) %pu))
-(defun %pu (pds) *2*)
+(defun %pu (pds) (declare (ignore pds)) *2*)
 (defun uu (yam)
+  (declare (ignore yam))
   (let ((v (yam-v az)))
     (%ufm v
           (flet ((project (x) (frob x 0)))
@@ -69,6 +68,7 @@
 (defstruct foo bar bletch)
 (defun %zeep ()
   (labels ((kidify1 (kid)
+             (declare (ignore kid))
              )
            (kid-frob (kid)
              (if *thing*
@@ -102,9 +102,11 @@
   (declare (optimize (safety 3) (speed 2) (space 1)))
   (labels ((c.frob ())
            (ad.frob (ad)
+             (declare (ignorable ad))
              (if *foo*
                  (mapc #'ad.frob *bar*)
                  (dolist (b *bar*)
+                   (declare (ignore b))
                    (c.frob)))))
     (declare (inline c.frob ad.frob))
     (ad.frob ad0)))
@@ -389,6 +391,7 @@
 ;;; during inline expansion. Bug report by Peter Denno, simplified
 ;;; test case by David Wragg.
 (defun bug262-return-from (x &aux (y nil))
+  (declare (ignore y))
   (labels ((foo-a (z) (return-from bug262-return-from z))
            (foo-b (z) (foo-a z)))
     (declare (inline foo-a))
@@ -525,21 +528,16 @@
   (ctu:compiler-derived-type (load-time-value (cons 'foo 0))))
 (defun load-time-value-type-derivation-test-2 ()
   (ctu:compiler-derived-type (load-time-value (+ (or *print-length* 0) 10))))
-(defun load-time-value-auto-read-only-p ()
-  (load-time-value (random most-positive-fixnum)))
-(defun load-time-value-boring ()
-  (load-time-value (cons t t)))
-(test-util:with-test (:name (load-time-value :type-smartness/cload))
+
+(with-test (:name (load-time-value :type-smartness/cload))
   (assert (eq 'cons (load-time-value-type-derivation-test-1)))
-  (assert (equal '(integer 10) (load-time-value-type-derivation-test-2)))
-  (assert (not (ctu:find-value-cell-values #'load-time-value-auto-read-only-p)))
-  (assert (ctu:find-value-cell-values #'load-time-value-boring)))
+  (assert (equal '(integer 10) (load-time-value-type-derivation-test-2))))
 
 (defun regression-1.0.29.54 ()
   (logior (1+ most-positive-fixnum)
           (load-time-value (the fixnum (eval 1)) t)))
 
-(test-util:with-test (:name :regression-1.0.29.54)
+(with-test (:name :regression-1.0.29.54)
   (assert (= (+ most-positive-fixnum 2) (regression-1.0.29.54)))
   (assert (eq 42
               (funcall (compile nil
@@ -555,7 +553,7 @@
   (multiple-value-call #'mv-call-regression-1.0.43.57-foo
     (mv-call-regression-1.0.43.57-bar sxx sxy sxy syy)
     a))
-(test-util:with-test (:name :mv-call-regression-1.0.43.57)
+(with-test (:name :mv-call-regression-1.0.43.57)
   ;; This used to signal a bogus argument-count error.
   (mv-call-regression-1.0.43.57-quux 1s0 10s0 1s0 10s0))
 
@@ -569,7 +567,7 @@
   (defun ecase-failure-test (x)
     (ecase x ((a b c) 1) ((b c d) 2) ((e d f) 3) ((c g h i) 4))))
 
-(test-util:with-test (:name :case-failures)
+(with-test (:name :case-failures)
   (assert (equal (handler-case (etypecase-failure-test 'hi)
                    (sb-kernel:case-failure (c)
                      (sb-kernel::case-failure-possibilities c)))
@@ -580,3 +578,24 @@
                      (sb-kernel::case-failure-possibilities c)))
                  ;; In order as originally written, and no dups.
                  '(a b c d e f g h i))))
+
+(defparameter *circular-cons-with-a-vector-cdr*
+  #1=#((a .  #1#)))
+
+(sb-int:defconstant-eqx foo-vector #(a b c d "hi") #'equalp)
+(defun f (&optional (v foo-vector)) (list v))
+(with-test (:name :optional-default-hairy-defconstant)
+  (assert (eq (first (f)) foo-vector)))
+
+(defun non-top-level-type-clobbering ()
+  99)
+
+(when nil
+  (defun non-top-level-type-clobbering ()
+    93))
+
+(defun non-top-level-type-clobbering2 ()
+  (eq (non-top-level-type-clobbering) 99))
+
+(with-test (:name :non-top-level-type-clobbering)
+  (assert (non-top-level-type-clobbering2)))

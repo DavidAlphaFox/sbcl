@@ -9,9 +9,7 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package "CL-USER")
-
-(use-package :test-util)
+#+interpreter (sb-ext:exit :code 104)
 
 (with-test (:name :heap)
   (let* ((size 1000)
@@ -88,7 +86,7 @@
     (sb-ext:timeout () t)))
 
 (with-test (:name (:timer :relative)
-            :fails-on '(and :sparc :linux)
+            :fails-on (and :sparc :linux)
             :skipped-on :win32)
   (let* ((has-run-p nil)
          (timer (make-timer (lambda () (setq has-run-p t))
@@ -101,7 +99,7 @@
     (assert (zerop (length (sb-impl::%pqueue-contents sb-impl::*schedule*))))))
 
 (with-test (:name (:timer :absolute)
-            :fails-on '(and :sparc :linux)
+            :fails-on (and :sparc :linux)
             :skipped-on :win32)
   (let* ((has-run-p nil)
          (timer (make-timer (lambda () (setq has-run-p t))
@@ -113,14 +111,17 @@
     (assert has-run-p)
     (assert (zerop (length (sb-impl::%pqueue-contents sb-impl::*schedule*))))))
 
-(with-test (:name (:timer :other-thread) :skipped-on '(not :sb-thread))
-  (let* ((thread (make-kill-thread (lambda () (sleep 2))))
+(with-test (:name (:timer :other-thread) :skipped-on (not :sb-thread))
+  (let* ((sem (sb-thread:make-semaphore))
+         (thread (sb-thread:make-thread (lambda () (sb-thread:wait-on-semaphore sem))))
          (timer (make-timer (lambda ()
                               (assert (eq thread sb-thread:*current-thread*)))
                             :thread thread)))
-    (schedule-timer timer 0.1)))
+    (schedule-timer timer 0.1)
+    (sb-thread:signal-semaphore sem)
+    (assert (sb-thread:join-thread thread))))
 
-(with-test (:name (:timer :new-thread) :skipped-on '(not :sb-thread))
+(with-test (:name (:timer :new-thread) :skipped-on (not :sb-thread))
   (let* ((original-thread sb-thread:*current-thread*)
          (timer (make-timer
                  (lambda ()
@@ -130,7 +131,7 @@
     (schedule-timer timer 0.1)))
 
 (with-test (:name (:timer :repeat-and-unschedule)
-            :fails-on '(and :sparc :linux)
+            :fails-on (and :sparc :linux)
             :skipped-on :win32)
   (let* ((run-count 0)
          timer)
@@ -197,7 +198,8 @@
   (loop while (some #'sb-thread:thread-alive-p threads) do (sleep 0.01)))
 
 (with-test (:name (:with-timeout :many-at-the-same-time)
-                  :skipped-on '(not :sb-thread))
+                  :skipped-on (not :sb-thread)
+                  :broken-on :win32)
   (let ((ok t))
     (let ((threads (loop repeat 10 collect
                          (sb-thread:make-thread
@@ -213,19 +215,6 @@
                     (sb-ext:with-timeout 20
                       (wait-for-threads threads)))))
       (assert ok))))
-
-(with-test (:name (:with-timeout :dead-thread) :skipped-on '(not :sb-thread))
-  (make-join-thread
-   (lambda ()
-     (let ((timer (make-timer (lambda ()))))
-       (schedule-timer timer 3)
-       (assert t))))
-  (sleep 6)
-  (assert t))
-
-
-(defun random-type (n)
-  `(integer ,(random n) ,(+ n (random n))))
 
 ;;; FIXME: Since timeouts do not work on Windows this would loop
 ;;; forever.
@@ -247,8 +236,8 @@
 ;;; running out of stack (due to repeating timers being rescheduled
 ;;; before they ran) and dying threads were open interrupts.
 (with-test (:name (:timer :parallel-unschedule)
-            :skipped-on '(not :sb-thread)
-            :broken-on ':ppc)
+            :skipped-on (not :sb-thread)
+            :broken-on (or :ppc :win32))
   (let ((timer (sb-ext:make-timer (lambda () 42) :name "parallel schedulers"))
         (other nil))
     (flet ((flop ()
@@ -258,16 +247,17 @@
       (sb-sys:with-deadline (:seconds 30)
         (loop repeat 5
               do (mapcar #'sb-thread:join-thread
-                           (loop for i from 1 upto 10
-                                 collect (let* ((thread (sb-thread:make-thread #'flop
-                                                                               :name (format nil "scheduler ~A" i)))
-                                                (ticker (make-limited-timer (lambda () 13)
-                                                                            1000
-                                                                            :thread (or other thread)
-                                                                            :name (format nil "ticker ~A" i))))
-                                           (setf other thread)
-                                           (sb-ext:schedule-timer ticker 0 :repeat-interval 0.00001)
-                                           thread))))))))
+                         (loop for i from 1 upto 10
+                               collect (let* ((thread (sb-thread:make-thread #'flop
+                                                                             :name (format nil "scheduler ~A" i)))
+                                              (ticker (make-limited-timer (lambda () 13)
+                                                                          1000
+                                                                          :thread (or other thread)
+                                                                          :name (format nil "ticker ~A" i))))
+                                         (setf other thread)
+                                         (sb-ext:schedule-timer ticker 0 :repeat-interval 0.00001)
+                                         thread)))))
+      (sb-ext:unschedule-timer timer))))
 
 ;;;; FIXME: OS X 10.4 doesn't like these being at all, and gives us a SIGSEGV
 ;;;; instead of using the Mach expection system! 10.5 on the other tends to
@@ -275,7 +265,8 @@
 ;;;;
 ;;;; Used to have problems in genereal, see comment on (:TIMER
 ;;;; :PARALLEL-UNSCHEDULE).
-(with-test (:name (:timer :schedule-stress) :skipped-on :win32)
+(with-test (:name (:timer :schedule-stress)
+            :broken-on :win32)
   (flet ((test ()
          (let* ((slow-timers
                  (loop for i from 1 upto 1
@@ -299,8 +290,9 @@
   (loop repeat 10 do (test))))
 
 (with-test (:name (:timer :threaded-stress)
-                  :skipped-on '(not :sb-thread)
-                  :fails-on :win32)
+            :skipped-on (not :sb-thread)
+            :broken-on :x86
+            :fails-on :win32)
   #+win32
   (error "fixme")
   (let ((barrier (sb-thread:make-semaphore))
@@ -325,30 +317,19 @@
                                                 do (sb-ext:schedule-timer (make-timer #'one :thread thread) 0.001))))))
           (dolist (thread threads)
             (sched thread)))
-        (mapcar #'sb-thread:join-thread threads)))))
+        (loop for thread in threads
+              do (sb-thread:join-thread thread :timeout 20))))))
 
-;; SB-THREAD:MAKE-THREAD used to lock SB-THREAD:*MAKE-THREAD-LOCK*
-;; before entering WITHOUT-INTERRUPTS. When a thread which was
-;; executing SB-THREAD:MAKE-THREAD was interrupted with code which
-;; also called SB-THREAD:MAKE-THREAD, it could happen that the first
-;; thread already owned SB-THREAD:*MAKE-THREAD-LOCK* and the
-;; interrupting code thus made a recursive lock attempt. A timer with
-;; :THREAD T or :THREAD <some thread spawning child threads> could
-;; also trigger this problem.
-;;
-;; See (MAKE-THREAD :INTERRUPT-WITH MAKE-THREAD :BUG-1180102) in
-;; threads.pure.lisp.
-(with-test (:name (:timer :dispatch-thread :make-thread :bug-1180102)
-            :skipped-on '(not :sb-thread))
-  (flet ((test (thread)
-           (let ((timer (make-timer (lambda ()) :thread thread)))
-             (schedule-timer timer .01 :repeat-interval 0.1)
-             (dotimes (i 100)
-               (let ((threads '()))
-                 (dotimes (i 100)
-                   (push (sb-thread:make-thread (lambda () (sleep .01)))
-                         threads))
-                 (mapc #'sb-thread:join-thread threads)))
+;; A timer with a repeat interval can be configured to "catch up" in
+;; case of missed calls.
+(with-test (:name (:timer :catch-up))
+  (flet ((test (&rest args)
+           (let ((timer (make-timer (lambda ()))))
+             (apply #'schedule-timer timer .01 args)
              (unschedule-timer timer))))
-    (test t)
-    (test sb-thread:*current-thread*)))
+    ;; :CATCH-UP does not make sense without :REPEAT-INTERVAL.
+    (assert-error (test :catch-up nil))
+    (assert-error (test :catch-up t))
+    ;; These combinations are allowed.
+    (test :repeat-interval .01 :catch-up nil)
+    (test :repeat-interval .01 :catch-up t)))

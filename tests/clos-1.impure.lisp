@@ -13,11 +13,6 @@
 
 ;;; clos.impure.lisp was getting too big and confusing
 
-(load "assertoid.lisp")
-
-(defpackage "CLOS-1"
-  (:use "CL" "ASSERTOID" "TEST-UTIL"))
-
 ;;; tests that various optimization paths for slot-valuish things
 ;;; respect class redefinitions.
 (defclass foo ()
@@ -32,7 +27,7 @@
 (defmethod c-of ((x foo))
   (slot-value x 'c))
 
-(let ((fun (compile nil '(lambda (x) (slot-value x 'a)))))
+(let ((fun (checked-compile '(lambda (x) (slot-value x 'a)))))
   (dotimes (i 4)                        ; KLUDGE: get caches warm
     (assert (= 1 (slot-value *foo* 'a)))
     (assert (= 1 (a-of *foo*)))
@@ -43,7 +38,7 @@
 (defclass foo ()
   ((b :initarg :b :initform 3) (a :initarg :a)))
 
-(let ((fun (compile nil '(lambda (x) (slot-value x 'a)))))
+(let ((fun (checked-compile '(lambda (x) (slot-value x 'a)))))
   (dotimes (i 4)                        ; KLUDGE: get caches warm
     (assert (= 1 (slot-value *foo* 'a)))
     (assert (= 1 (a-of *foo*)))
@@ -56,7 +51,7 @@
    (b :initarg :b :initform 3)
    (a :initarg :a)))
 
-(let ((fun (compile nil '(lambda (x) (slot-value x 'a)))))
+(let ((fun (checked-compile '(lambda (x) (slot-value x 'a)))))
   (dotimes (i 4) ; KLUDGE: get caches warm
     (assert (= 1 (slot-value *foo* 'a)))
     (assert (= 1 (a-of *foo*)))
@@ -69,7 +64,7 @@
    (b :initarg :b :initform 3)
    (c :initarg :c :initform t)))
 
-(let ((fun (compile nil '(lambda (x) (slot-value x 'a)))))
+(let ((fun (checked-compile '(lambda (x) (slot-value x 'a)))))
   (dotimes (i 4) ; KLUDGE: get caches warm
     (assert (= 1 (slot-value *foo* 'a)))
     (assert (= 1 (a-of *foo*)))
@@ -80,7 +75,7 @@
 (defclass foo ()
   ((b :initarg :b :initform 3)))
 
-(let ((fun (compile nil '(lambda (x) (slot-value x 'a)))))
+(let ((fun (checked-compile '(lambda (x) (slot-value x 'a)))))
   (dotimes (i 4)                        ; KLUDGE: get caches warm
     (assert-error (slot-value *foo* 'a))
     (assert-error (a-of *foo*))
@@ -109,6 +104,7 @@
   (setq *method-with-no-next-method* (defmethod nnm-tester ((y (eql x))) (call-next-method))))
 (make-nnm-tester 1)
 (defmethod no-next-method ((gf (eql #'nnm-tester)) method &rest args)
+  (declare (ignore args))
   (assert (eql method *method-with-no-next-method*))
   (incf *nnm-count*))
 (with-test (:name (no-next-method :unknown-specializer))
@@ -124,26 +120,21 @@
 ;;; Tests the compiler's incremental rejiggering of GF types.
 (fmakunbound 'foo)
 (with-test (:name :keywords-supplied-in-methods-ok-1)
-  (assert
-   (null
-    (nth-value
-     1
-     (progn
-       (defgeneric foo (x &key))
-       (defmethod foo ((x integer) &key bar) (list x bar))
-       (compile nil '(lambda () (foo (read) :bar 10))))))))
+  (defgeneric foo (x &key))
+  (defmethod foo ((x integer) &key bar) (list x bar))
+  (checked-compile '(lambda () (foo (read) :bar 10))))
 
 (fmakunbound 'foo)
 (with-test (:name :keywords-supplied-in-methods-ok-2)
-  (assert
-   (nth-value
-    1
-    (progn
-      (defgeneric foo (x &key))
-      (defmethod foo ((x integer) &key bar) (list x bar))
-      ;; On second thought...
-      (remove-method #'foo (find-method #'foo () '(integer)))
-      (compile nil '(lambda () (foo (read) :bar 10)))))))
+  (defgeneric foo (x &key))
+  (defmethod foo ((x integer) &key bar) (list x bar))
+  ;; On second thought...
+  (remove-method #'foo (find-method #'foo () '(integer)))
+  (multiple-value-bind  (fun failure-p warnings style-warnings)
+      (checked-compile '(lambda () (foo (read) :bar 10))
+                       :allow-style-warnings t)
+    (declare (ignore fun failure-p warnings))
+    (assert (= (length style-warnings) 1))))
 
 ;; If the GF has &REST with no &KEY, not all methods are required to
 ;; parse the tail of the arglist as keywords, so we don't treat the
@@ -153,10 +144,9 @@
   (defgeneric foo (x &rest y))
   (defmethod foo ((i integer) &key w) (list i w))
   ;; 1.0.20.30 failed here.
+  (checked-compile '(lambda () (foo 5 :w 10 :foo 15)))
   (assert
-   (null (nth-value 1 (compile nil '(lambda () (foo 5 :w 10 :foo 15))))))
-  (assert
-   (not (sb-kernel::args-type-keyp (sb-c::info :function :type 'foo)))))
+   (not (sb-kernel::args-type-keyp (sb-int:global-ftype 'foo)))))
 
 ;; If the GF has &KEY and &ALLOW-OTHER-KEYS, the methods' keys can be
 ;; anything, and we don't warn about unrecognized keys.
@@ -164,14 +154,20 @@
 (with-test (:name :gf-allow-other-keys)
   (defgeneric foo (x &key &allow-other-keys))
   (defmethod foo ((i integer) &key y z) (list i y z))
+  ;; Correctness of a GF's ftype was previously ensured by the compiler,
+  ;; and only if a lambda was compiled that referenced the GF, in a way
+  ;; that was just barely non-broken enough to make the compiler happy.
+  ;; Now the FTYPE is computed the instant anyone asks for it.
+  (assert (equal (mapcar 'sb-kernel:key-info-name
+                         (sb-kernel:fun-type-keywords
+                          (sb-int:global-ftype 'foo)))
+                 '(:y :z)))
+  (checked-compile '(lambda () (foo 5 :z 10 :y 15)))
+  (checked-compile '(lambda () (foo 5 :z 10 :foo 15)))
   (assert
-   (null (nth-value 1 (compile nil '(lambda () (foo 5 :z 10 :y 15))))))
+   (sb-kernel::args-type-keyp (sb-int:global-ftype 'foo)))
   (assert
-   (null (nth-value 1 (compile nil '(lambda () (foo 5 :z 10 :foo 15))))))
-  (assert
-   (sb-kernel::args-type-keyp (sb-c::info :function :type 'foo)))
-  (assert
-   (sb-kernel::args-type-allowp (sb-c::info :function :type 'foo))))
+   (sb-kernel::args-type-allowp (sb-int:global-ftype 'foo))))
 
 ;; If any method has &ALLOW-OTHER-KEYS, 7.6.4 point 5 seems to say the
 ;; GF should be construed to have &ALLOW-OTHER-KEYS.
@@ -179,9 +175,9 @@
 (with-test (:name :method-allow-other-keys)
   (defgeneric foo (x &key))
   (defmethod foo ((x integer) &rest y &key &allow-other-keys) (list x y))
-  (assert (null (nth-value 1 (compile nil '(lambda () (foo 10 :foo 20))))))
-  (assert (sb-kernel::args-type-keyp (sb-c::info :function :type 'foo)))
-  (assert (sb-kernel::args-type-allowp (sb-c::info :function :type 'foo))))
+  (checked-compile '(lambda () (foo 10 :foo 20)))
+  (assert (sb-kernel::args-type-keyp (sb-int:global-ftype 'foo)))
+  (assert (sb-kernel::args-type-allowp (sb-int:global-ftype 'foo))))
 
 (fmakunbound 'foo)
 (with-test (:name (defmethod symbol-macrolet))
@@ -198,3 +194,64 @@
   (defmethod foo ((x t)) 3)
   (assert (= (foo t) 3))
   (assert (= (foo 3) 2)))
+
+(with-test (:name :bug-309084-a-i)
+  (assert-error (eval '(define-method-combination bug-309084-a-i :documentation :operator))
+                program-error))
+(with-test (:name :bug-309084-a-ii)
+  (assert-error (eval '(define-method-combination bug-309084-a-ii :documentation nil))
+                program-error))
+(with-test (:name :bug-309084-a-iii)
+  (assert-error (eval '(define-method-combination bug-309084-a-iii nil))
+                program-error))
+(with-test (:name :bug-309084-a-vi)
+  (assert-error (eval '(define-method-combination bug-309084-a-vi nil nil
+                        (:generic-function)))
+                program-error))
+(with-test (:name :bug-309084-a-vii)
+  (assert-error (eval '(define-method-combination bug-309084-a-vii nil nil
+                        (:generic-function bar baz)))
+                program-error))
+(with-test (:name :bug-309084-a-viii)
+  (assert-error (eval '(define-method-combination bug-309084-a-viii nil nil
+                        (:generic-function (bar))))
+                program-error))
+(with-test (:name :bug-309084-a-ix)
+  (assert-error (eval '(define-method-combination bug-309084-a-ix nil ((3))))
+                program-error))
+(with-test (:name :bug-309084-a-x)
+  (assert-error (eval '(define-method-combination bug-309084-a-x nil ((a))))
+                program-error))
+(with-test (:name :bug-309084-a-iv)
+  (assert-error (eval '(define-method-combination bug-309084-a-iv nil nil
+                        (:arguments order &aux &key)))
+                program-error))
+(with-test (:name :bug-309084-a-v)
+  (assert-error (eval '(define-method-combination bug-309084-a-v nil nil
+                        (:arguments &whole)))
+                program-error))
+
+(define-method-combination bug-309084-b/mc nil
+  ((all *))
+  (:arguments x &optional (y 'a yp) &key (z 'b zp) &aux (w (list y z)))
+  `(list ,x ,y ,yp ,z ,zp ,w))
+
+(defgeneric bug-309084-b/gf (a &optional b &key &allow-other-keys)
+  (:method-combination bug-309084-b/mc)
+  (:method (m &optional n &key) (list m n)))
+
+(with-test (:name :bug-309084-b)
+  (assert (equal (bug-309084-b/gf 1) '(1 a nil b nil (a b))))
+  (assert (equal (bug-309084-b/gf 1 2) '(1 2 t b nil (2 b))))
+  (assert (equal (bug-309084-b/gf 1 2 :z 3) '(1 2 t 3 t (2 3)))))
+
+(defgeneric bug-309084-b/gf2 (a b &optional c d &key &allow-other-keys)
+  (:method-combination bug-309084-b/mc)
+  (:method (m n &optional o p &key) (list m n o p)))
+
+(with-test (:name :bug-309084-b2)
+  (assert (equal (bug-309084-b/gf2 1 2) '(1 a nil b nil (a b))))
+  (assert (equal (bug-309084-b/gf2 1 2 3) '(1 3 t b nil (3 b))))
+  (assert (equal (bug-309084-b/gf2 1 2 3 4) '(1 3 t b nil (3 b))))
+  (assert (equal (bug-309084-b/gf2 1 2 :z t) '(1 :z t b nil (:z b))))
+  (assert (equal (bug-309084-b/gf2 1 2 3 4 :z 5) '(1 3 t 5 t (3 5)))))

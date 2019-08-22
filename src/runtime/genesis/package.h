@@ -11,12 +11,11 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_PACKAGE
-#define SBCL_GENESIS_PACKAGE 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_PACKAGE
+#ifndef __ASSEMBLER__
 
 struct package {
-    lispobj header;
-    lispobj _layout;
+    lispobj header; // = word_0_
     lispobj _name;
     lispobj _nicknames;
     lispobj _use_list;
@@ -27,14 +26,12 @@ struct package {
     lispobj external_symbols;
     lispobj _shadowing_symbols;
     lispobj doc_string;
-    lispobj lock;
+    lispobj _bits;
     lispobj _implementation_packages;
-    lispobj source_location;
     lispobj _local_nicknames;
-    lispobj _locally_nicknamed_by;
-    lispobj end_padding;
+    lispobj source_location;
 };
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_PACKAGE */
+#endif

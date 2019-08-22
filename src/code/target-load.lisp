@@ -11,55 +11,81 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!FASL")
+(in-package "SB-FASL")
 
 (defvar *load-source-default-type* "lisp"
-  #!+sb-doc
   "The source file types which LOAD looks for by default.")
 
-(declaim (type (or pathname null) *load-truename* *load-pathname*))
 (defvar *load-truename* nil
-  #!+sb-doc
   "the TRUENAME of the file that LOAD is currently loading")
 (defvar *load-pathname* nil
-  #!+sb-doc
   "the defaulted pathname that LOAD is currently loading")
 
 ;;;; LOAD-AS-SOURCE
 
+;;; something not EQ to anything we might legitimately READ
+(define-load-time-global *eof-object* (make-symbol "EOF-OBJECT"))
+
 ;;; Load a text stream.  (Note that load-as-fasl is in another file.)
+;; We'd like, when entering the debugger as a result of an EVAL error,
+;; that the condition be annotated with the stream position.
+;; One way to do it is catch all conditions and encapsulate them in
+;; something new such as a LOADER-EVAL-ERROR and re-signal.
+;; The printer for the encapsulated condition has the data it needs to
+;; show the original condition and the line/col. That would unfortunately
+;; interfere with handlers that were bound around LOAD, since they would
+;; only receive the encapsulated condition, and not be able to test for
+;; things they're interested in, such as which redefinition warnings to ignore.
+;; Instead, printing a herald for any SERIOUS-CONDITION approximates
+;; the desired behavior closely enough without printing something for warnings.
+;; TODO: It would be supremely cool if, for toplevel PROGN, we could
+;; indicate the position of the specific subform that failed
 (defun load-as-source (stream &key verbose print (context "loading"))
   (maybe-announce-load stream verbose)
   (let* ((pathname (ignore-errors (translate-logical-pathname stream)))
          (native (when pathname (native-namestring pathname))))
     (with-simple-restart (abort "Abort ~A file ~S." context native)
-      (flet ((eval-form (form index)
+     (labels ((condition-herald (c)
+                (declare (ignore c)) ; propagates up
+                (when (form-tracking-stream-p stream)
+                  (let* ((startpos
+                          (form-tracking-stream-form-start-char-pos stream))
+                         (point (line/col-from-charpos stream startpos)))
+                    (format *error-output* "~&While evaluating the form ~
+ starting at line ~D, column ~D~%  of ~S:"
+                            (car point) (cdr point)
+                            (or pathname stream)))))
+              (eval-form (form index)
                (with-simple-restart (continue "Ignore error and continue ~A file ~S."
                                               context native)
                  (loop
+                  (handler-bind ((serious-condition #'condition-herald))
                    (with-simple-restart (retry "Retry EVAL of current toplevel form.")
                      (if print
                          (let ((results (multiple-value-list (eval-tlf form index))))
                            (load-fresh-line)
                            (format t "~{~S~^, ~}~%" results))
                          (eval-tlf form index)))
-                   (return)))))
+                   (return))))))
         (if pathname
-            (let* ((info (sb!c::make-file-source-info
+            (let* ((info (sb-c::make-file-source-info
                           pathname (stream-external-format stream)))
-                   (sb!c::*source-info* info))
-              (setf (sb!c::source-info-stream info) stream)
-              (sb!c::do-forms-from-info ((form current-index) info
-                                         'sb!c::input-error-in-load)
-                (sb!c::with-source-paths
-                  (sb!c::find-source-paths form current-index)
+                   (sb-c::*source-info* info))
+              (setf (sb-c::source-info-stream info) stream)
+              (sb-c::do-forms-from-info ((form current-index) info
+                                         'sb-c::input-error-in-load)
+                (sb-c::with-source-paths
+                  (sb-c::find-source-paths form current-index)
                   (eval-form form current-index))))
-            (let ((sb!c::*source-info* nil))
-              (do ((form (read stream nil *eof-object*)
-                         (read stream nil *eof-object*)))
-                  ((eq form *eof-object*))
-                (sb!c::with-source-paths
-                  (eval-form form nil))))))))
+            (let ((sb-c::*source-info* nil))
+              (loop for form =
+                    (handler-case (read stream nil *eof-object*)
+                      ((or reader-error end-of-file) (c)
+                        (error 'sb-c::input-error-in-load :stream stream
+                                                          :condition c)))
+                    until (eq form *eof-object*)
+                    do (sb-c::with-source-paths
+                         (eval-form form nil))))))))
   t)
 
 ;;;; LOAD itself
@@ -84,23 +110,8 @@
 ;; LOADing a non-compiled file. Check whether this bug exists in SBCL
 ;; and fix it if so.
 
-(defun load (pathspec &key (verbose *load-verbose*) (print *load-print*)
-             (if-does-not-exist t) (external-format :default))
-  #!+sb-doc
-  "Load the file given by FILESPEC into the Lisp environment, returning
-   T on success."
-  (flet ((load-stream (stream faslp)
-           (when (and (fd-stream-p stream)
-                      (eq (sb!impl::fd-stream-fd-type stream) :directory))
-             (error 'simple-file-error
-                    :pathname (pathname stream)
-                    :format-control
-                    "Can't LOAD a directory: ~s."
-                    :format-arguments (list (pathname stream))))
-           (let* (;; Bindings required by ANSI.
-                  (*readtable* *readtable*)
-                  (*package* (sane-package))
-                  ;; FIXME: we should probably document the circumstances
+(defun call-with-load-bindings (function stream)
+           (let* (;; FIXME: we should probably document the circumstances
                   ;; where *LOAD-PATHNAME* and *LOAD-TRUENAME* aren't
                   ;; pathnames during LOAD.  ANSI makes no exceptions here.
                   (*load-pathname* (handler-case (pathname stream)
@@ -113,33 +124,92 @@
                                      (handler-case (truename stream)
                                        (file-error () nil))))
                   ;; Bindings used internally.
-                  (*load-depth* (1+ *load-depth*))
-                  ;; KLUDGE: I can't find in the ANSI spec where it says
-                  ;; that DECLAIM/PROCLAIM of optimization policy should
-                  ;; have file scope. CMU CL did this, and it seems
-                  ;; reasonable, but it might not be right; after all,
-                  ;; things like (PROCLAIM '(TYPE ..)) don't have file
-                  ;; scope, and I can't find anything under PROCLAIM or
-                  ;; COMPILE-FILE or LOAD or OPTIMIZE which justifies this
-                  ;; behavior. Hmm. -- WHN 2001-04-06
-                  (sb!c::*policy* sb!c::*policy*))
-             (return-from load
-               (if faslp
-                   (load-as-fasl stream verbose print)
-                   (sb!c:with-compiler-error-resignalling
-                     (load-as-source stream :verbose verbose
-                                            :print print)))))))
+                  (*load-depth* (1+ *load-depth*)))
+             (funcall function)))
+
+;;; Returns T if the stream is a binary input stream with a FASL header.
+(defun fasl-header-p (stream &key errorp)
+  (unless (and (member (stream-element-type stream) '(character base-char))
+               ;; give up if it's not a file stream, or it's an
+               ;; fd-stream but it's either not bivalent or not
+               ;; seekable (doesn't really have a file)
+               (or (not (typep stream 'file-stream))
+                   (and (typep stream 'fd-stream)
+                        (or (not (sb-impl::fd-stream-bivalent-p stream))
+                            (not (sb-impl::fd-stream-file stream))
+                            (neq (sb-impl::fd-stream-fd-type stream) :regular)))))
+    (let ((p (file-position stream)))
+      (when p ; Can't do it non-destructively on non-seekable streams.
+        (unwind-protect
+             (let* ((header *fasl-header-string-start-string*)
+                    (buffer (make-array (length header) :element-type '(unsigned-byte 8)))
+                    (n 0))
+               (flet ((scan ()
+                        (maybe-skip-shebang-line stream)
+                        (setf n (read-sequence buffer stream))))
+                 (if errorp
+                     (scan)
+                     (or (ignore-errors (scan))
+                         ;; no a binary input stream
+                         (return-from fasl-header-p nil))))
+               (cond ((not (mismatch buffer header
+                                     :test #'(lambda (code char) (= code (char-code char))))))
+                     ((zerop n)
+                      ;; Immediate EOF is valid -- we want to match what
+                      ;; CHECK-FASL-HEADER does...
+                      nil)
+                     (errorp
+                      (error 'fasl-header-missing
+                             :stream stream
+                             :fhsss buffer
+                             :expected header))))
+          (file-position stream p))))))
+
+(defun load (pathspec &key (verbose *load-verbose*) (print *load-print*)
+                           (if-does-not-exist t) (external-format :default))
+  "Load the file given by FILESPEC into the Lisp environment, returning
+   T on success."
+  (flet ((load-stream (stream faslp)
+           (when (and (fd-stream-p stream)
+                      (eq (sb-impl::fd-stream-fd-type stream) :directory))
+             (error 'simple-file-error
+                    :pathname (pathname stream)
+                    :format-control
+                    "Can't LOAD a directory: ~s."
+                    :format-arguments (list (pathname stream))))
+           (dx-flet ((thunk ()
+                            (let (;; Bindings required by ANSI.
+                                  (*readtable* *readtable*)
+                                  (*package* (sane-package))
+                                  ;; KLUDGE: I can't find in the ANSI spec where it says
+                                  ;; that DECLAIM/PROCLAIM of optimization policy should
+                                  ;; have file scope. CMU CL did this, and it seems
+                                  ;; reasonable, but it might not be right; after all,
+                                  ;; things like (PROCLAIM '(TYPE ..)) don't have file
+                                  ;; scope, and I can't find anything under PROCLAIM or
+                                  ;; COMPILE-FILE or LOAD or OPTIMIZE which justifies this
+                                  ;; behavior. Hmm. -- WHN 2001-04-06
+                                  (sb-c::*policy* sb-c::*policy*)
+                                  (sb-c::*handled-conditions* sb-c::*handled-conditions*))
+                              (if faslp
+                                  (load-as-fasl stream verbose print)
+                                  (sb-c:with-compiler-error-resignalling
+                                    (load-as-source stream :verbose verbose
+                                                           :print print))))))
+             (call-with-load-bindings #'thunk stream))))
+
     ;; Case 1: stream.
     (when (streamp pathspec)
       (return-from load (load-stream pathspec (fasl-header-p pathspec))))
+
     (let ((pathname (pathname pathspec)))
       ;; Case 2: Open as binary, try to process as a fasl.
       (with-open-stream
           (stream (or (open pathspec :element-type '(unsigned-byte 8)
-                            :if-does-not-exist nil)
+                                     :if-does-not-exist nil)
                       (when (null (pathname-type pathspec))
                         (let ((defaulted-pathname
-                               (probe-load-defaults pathspec)))
+                                (probe-load-defaults pathspec)))
                           (if defaulted-pathname
                               (progn (setq pathname defaulted-pathname)
                                      (open pathname
@@ -151,20 +221,21 @@
                                  :pathname pathspec
                                  :format-control
                                  "~@<Couldn't load ~S: file does not exist.~@:>"
-                                 :format-arguments (list pathspec)))))
-        (unless stream
-          (return-from load nil))
+                                 :format-arguments (list pathspec))
+                          (return-from load nil))))
         (let* ((real (probe-file stream))
                (should-be-fasl-p
-                (and real (string-equal (pathname-type real) *fasl-file-type*))))
+                 (and real (string-equal (pathname-type real) *fasl-file-type*))))
           ;; Don't allow empty .fasls, and assume other empty files
           ;; are source files.
-          (when (and (or should-be-fasl-p (not (eql 0 (file-length stream))))
+          (cond ((or (and should-be-fasl-p (eql 0 (file-length stream)))
                      (fasl-header-p stream :errorp should-be-fasl-p))
-            (return-from load (load-stream stream t)))))
-      ;; Case 3: Open using the gived external format, process as source.
-      (with-open-file (stream pathname :external-format external-format)
-        (load-stream stream nil)))))
+                 (load-stream stream t))
+                (t
+                 ;; Case 3: Open using the given external format, process as source.
+                 (with-open-file (stream pathname :external-format external-format
+                                                  :class 'form-tracking-stream)
+                   (load-stream stream nil)))))))))
 
 ;; This implements the defaulting SBCL seems to have inherited from
 ;; CMU.  This routine does not try to perform any loading; all it does
@@ -204,74 +275,57 @@
           (defaulted-fasl-truename defaulted-fasl-pathname)
           (defaulted-source-truename defaulted-source-pathname))))
 
-;;; Load a code object. BOX-NUM objects are popped off the stack for
-;;; the boxed storage section, then SIZE bytes of code are read in.
-#!-x86
-(defun load-code (box-num code-length)
-  (declare (fixnum box-num code-length))
-  (let ((code (sb!c:allocate-code-object box-num code-length)))
-    (with-fop-stack (stack ptr (1+ box-num))
-      (setf (%code-debug-info code) (fop-stack-ref (+ ptr box-num)))
-      (loop for i of-type index from sb!vm:code-constants-offset
-            for j of-type index from ptr below (+ ptr box-num)
-            do (setf (code-header-ref code i) (fop-stack-ref j)))
-      (without-gcing
-        (read-n-bytes *fasl-input-stream*
-                      (code-instructions code)
-                      0
-                      code-length))
-      code)))
-
-;;; Moving native code during a GC or purify is not so trivial on the
-;;; x86 port.
-;;;
-;;; Our strategy for allowing the loading of x86 native code into the
-;;; dynamic heap requires that the addresses of fixups be saved for
-;;; all these code objects. After a purify these fixups can be
-;;; dropped. In CMU CL, this policy was enabled with
-;;; *ENABLE-DYNAMIC-SPACE-CODE*; in SBCL it's always used.
-#!+x86
-(defun load-code (box-num code-length)
-  (declare (fixnum box-num code-length))
-  (with-fop-stack (stack ptr (1+ box-num))
-    (let* ((dbi (fop-stack-ref (+ ptr box-num))) ; debug-info
-           (stuff (cons dbi (loop for i of-type index
-                                  downfrom (+ ptr box-num -1) to ptr
-                                  collect (fop-stack-ref i)))))
-        ;; FIXME: *LOAD-CODE-VERBOSE* should probably be #!+SB-SHOW.
-        (when *load-code-verbose*
-          (format t "stuff: ~S~%" stuff)
-          (format t
-                  "   : ~S ~S ~S~%"
-                  (sb!c::compiled-debug-info-p dbi)
-                  (sb!c::debug-info-p dbi)
-                  (sb!c::compiled-debug-info-name dbi))
-          (format t "   loading to the dynamic space~%"))
-
-        (let ((code (sb!c:allocate-code-object box-num code-length))
-              (index (+ sb!vm:code-constants-offset box-num)))
-          (declare (type index index))
-          (when *load-code-verbose*
-            (format t
-                    "  obj addr=~X~%"
-                    (get-lisp-obj-address code)))
-          (setf (%code-debug-info code) (pop stuff))
-          (dotimes (i box-num)
-            (declare (fixnum i))
-            (setf (code-header-ref code (decf index)) (pop stuff)))
-          (without-gcing
-            (read-n-bytes *fasl-input-stream*
-                          (code-instructions code)
-                          0
-                          code-length))
-          code))))
-
 ;;;; linkage fixups
+
+;;; Lisp assembler routines are named by Lisp symbols, not strings,
+;;; and so can be compared by EQ.
+(define-load-time-global *assembler-routines* nil)
+(declaim (code-component *assembler-routines*))
+
+(defun calc-asm-routine-bounds ()
+  (loop for v being each hash-value of (car (%code-debug-info *assembler-routines*))
+        minimize (car v) into min
+        maximize (cadr v) into max
+        ;; min/max are inclusive byte ranges, but return the answer
+        ;; using standard convention of exclusive upper bound.
+        finally (return (values min (1+ max)))))
 
 ;;; how we learn about assembler routines at startup
 (defvar *!initial-assembler-routines*)
 
+(defun get-asm-routine (name &optional indirect &aux (code *assembler-routines*))
+  (awhen (the list (gethash (the symbol name) (car (%code-debug-info code))))
+    (sap-int (sap+ (code-instructions code)
+                   (if indirect
+                       ;; Return the address containing the routine address
+                       (ash (cddr it) sb-vm:word-shift)
+                       ;; Return the routine address itself
+                       (car it))))))
+
 (defun !loader-cold-init ()
-  (/show0 "/!loader-cold-init")
-  (dolist (routine *!initial-assembler-routines*)
-    (setf (gethash (car routine) *assembler-routines*) (cdr routine))))
+  (let* ((code *assembler-routines*)
+         (size (%code-text-size code))
+         (vector (the simple-vector *!initial-assembler-routines*))
+         (count (length vector))
+         (ht (make-hash-table :test 'eq)))
+    (rplaca (%code-debug-info code) ht)
+    (dotimes (i count)
+      (destructuring-bind (name . offset) (svref vector i)
+        (let ((next-offset (if (< (1+ i) count) (cdr (svref vector (1+ i))) size)))
+          (aver (> next-offset offset))
+          ;; store inclusive bounds on PC offset range and the function index
+          (setf (gethash name ht) (list* offset (1- next-offset) i)))))))
+
+(defun !warm-load (file)
+  (restart-case (let ((sb-c::*source-namestring*
+                       (format nil "SYS:~A" (substitute #\; #\/ file))))
+                  (load file))
+    (abort-build ()
+      :report "Abort building SBCL."
+      (sb-ext:exit :code 1))))
+
+;;; Remember where cold artifacts went, and put the warm ones there too
+;;; because it looks nicer not to scatter them throughout the source tree.
+;;; *t-o-prefix* isn't known to the compiler, and we need it to be
+;;; initialized from a constant, so use read-time eval.
+(defvar *!target-obj-prefix* #.sb-cold::*target-obj-prefix*)

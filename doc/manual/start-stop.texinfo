@@ -3,11 +3,11 @@
 @chapter Starting and Stopping
 
 @menu
-* Starting SBCL::               
-* Stopping SBCL::               
-* Command Line Options::        
-* Initialization Files::        
-* Initialization and Exit Hooks::  
+* Starting SBCL::
+* Stopping SBCL::
+* Command Line Options::
+* Initialization Files::
+* Initialization and Exit Hooks::
 @end menu
 
 @node Starting SBCL
@@ -15,9 +15,9 @@
 @section Starting SBCL
 
 @menu
-* Running from Shell::          
-* Running from Emacs::          
-* Shebang Scripts::             
+* Running from Shell::
+* Running from Emacs::
+* Shebang Scripts::
 @end menu
 
 @node Running from Shell
@@ -97,9 +97,9 @@ Hello, World!
 
 @menu
 * Exit::
-* End of File::                 
-* Saving a Core Image::         
-* Exit on Errors::              
+* End of File::
+* Saving a Core Image::
+* Exit on Errors::
 @end menu
 
 @node Exit
@@ -189,8 +189,8 @@ passed on to the user program even if they was intended for the
 runtime system or the Lisp system.
 
 @menu
-* Runtime Options::             
-* Toplevel Options::            
+* Runtime Options::
+* Toplevel Options::
 @end menu
 
 @node Runtime Options
@@ -241,7 +241,7 @@ As a runtime option this is equivalent to @code{--noinform}
 @code{--disable-ldb} @code{--lose-on-corruption}
 @code{--end-runtime-options} @code{--script} @var{filename}. See the
 description of @code{--script} as a toplevel option below. If there
-are no other commandline arguments following @code{--script}, the
+are no other command line arguments following @code{--script}, the
 filename argument can be omitted.
 
 
@@ -251,18 +251,10 @@ that identical pages may be shared between processes until they are
 written to.  This can be useful to reduce the memory usage on systems
 with multiple SBCL processes started from similar but differently-named
 core files, or from compressed cores.  Without platform support, do
-nothing.
-
+nothing. By default only compressed cores trigger hinting.
 
 @item --no-merge-core-pages
 Ensures that no sharing hint is provided to the operating system.
-
-
-@item --default-merge-core-pages
-Reverts the sharing hint policy to the default: only compressed cores
-trigger hinting.  Uncompressed cores are mapped directly from the core
-file, which is usually enough to ensure sharing.
-
 
 @item --help
 Print some basic information about SBCL, then exit.
@@ -357,30 +349,28 @@ not @code{load}; hence initialization files can be used to set startup
 @code{*package*} and @code{*readtable*}, and for proclaiming a global
 optimization policy.
 
-@itemize @w{}
-@item
-@strong{System Initialization File}
+@table @strong
 
+@item System Initialization File
 Defaults to @file{@env{$SBCL_HOME}/sbclrc}, or if that doesn't exist to
 @file{/etc/sbclrc}. Can be overridden with the command line option
-@code{--sysinit} or @code{--no-sysinit}.
+@code{--sysinit} or @code{--no-sysinit} (@pxref{Toplevel Options}).
 
 The system initialization file is intended for system administrators
 and software packagers to configure locations of installed third party
 modules, etc.
 
-@item
-@strong{User Initialization File}
-
+@item User Initialization File
 Defaults to @file{@env{$HOME}/.sbclrc}. Can be overridden with the
-command line option @code{--userinit} or @code{--no-userinit}.
+command line option @code{--userinit} or @code{--no-userinit}
+(@pxref{Toplevel Options}).
 
 The user initialization file is intended for personal customizations,
 such as loading certain modules at startup, defining convenience
 functions to use in the REPL, handling automatic recompilation
 of FASLs (@pxref{FASL Format}), etc.
 
-@end itemize
+@end table
 
 Neither initialization file is required.
 
@@ -392,4 +382,3 @@ SBCL provides hooks into the system initialization and exit.
 
 @include var-sb-ext-star-init-hooks-star.texinfo
 @include var-sb-ext-star-exit-hooks-star.texinfo
-

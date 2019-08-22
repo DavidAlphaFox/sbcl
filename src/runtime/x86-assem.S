@@ -13,7 +13,11 @@
  * files for more information.
  */
 
-#define LANGUAGE_ASSEMBLY
+#ifdef __ELF__
+// Mark the object as not requiring an executable stack.
+.section .note.GNU-stack,"",%progbits
+#endif
+
 #include "sbcl.h"
 #include "validate.h"
 #include "genesis/closure.h"
@@ -133,10 +137,22 @@
 # define LoadCurrentThreadSlot(offset,reg);     \
 	movl	SBCL_THREAD_BASE_EA, reg ;      \
 	movl	offset(reg), reg ;
+#elif !defined(LISP_FEATURE_SB_THREAD)
+  /* so that we don't have to rewrite the safepoint logic */
+# define SBCL_THREAD_BASE_EA GNAME(all_threads)
+# define MAYBE_FS(addr) addr
 #elif defined(LISP_FEATURE_LINUX) || defined(LISP_FEATURE_SUNOS) || defined(LISP_FEATURE_FREEBSD) || \
         defined(LISP_FEATURE_DRAGONFLY)
-  /* see comment in arch_os_thread_init */
-# define SBCL_THREAD_BASE_EA %fs:THREAD_SELFPTR_OFFSET
+    /* %fs:0 refers to the current thread.  Useful!  Less usefully,
+     * Linux/x86 isn't capable of reporting a faulting si_addr on a
+     * segment as defined above (whereas faults on the segment that %gs
+     * usually points are reported just fine...).
+     * But we have the thread's address stored in the THIS slot,
+     * so that within the thread
+     *   movl %fs:THIS_OFFSET,x
+     * stores the absolute address of %fs:0 into x.
+     */
+# define SBCL_THREAD_BASE_EA %fs:THREAD_THIS_OFFSET
 # define MAYBE_FS(addr) addr
 #else
   /* perhaps there's an OS out there that actually supports %fs without
@@ -145,22 +161,9 @@
 # define MAYBE_FS(addr) %fs:addr
 #endif
 
-/* gas can't parse 4096LU; redefine */
-#if BACKEND_PAGE_BYTES == 4096
-# undef BACKEND_PAGE_BYTES
-# define BACKEND_PAGE_BYTES 4096
-#elif BACKEND_PAGE_BYTES == 32768
-# undef BACKEND_PAGE_BYTES
-# define BACKEND_PAGE_BYTES 32768
-#else
-# error BACKEND_PAGE_BYTES mismatch
-#endif
-
-/* OAOOM because we don't have the C headers here */
-#define THREAD_CSP_PAGE_SIZE BACKEND_PAGE_BYTES
 
 /* the CSP page sits right before the thread */
-#define THREAD_SAVED_CSP_OFFSET (-THREAD_CSP_PAGE_SIZE)
+#define THREAD_SAVED_CSP_OFFSET (-N_WORD_BYTES)
 
 /*
  * x86/darwin (as of MacOS X 10.4.5) doesn't reliably file signal
@@ -226,21 +229,20 @@
  *   Both versions need to take special care with the return PC:
  *   - In the inline version of the code (if it existed), the two stores
  *     would be done directly in the CALL-OUT vop.  In that theoretical
- *     implementation, there is a time interval between return of the
- *     actual C call and a second SP store during which the return
- *     address might not be on the stack anymore.
+ *     implementation, even though the CALL instruction pushes the return
+ *     address to the stack, it is outside of the range preserved by the
+ *     GC as possible heap pointers.
  *   - In this out-of-line version, the stores are done during
  *     call_into_c's frame, but an equivalent problem arises: In order
  *     to present the stack of arguments as our foreign function expects
  *     them, call_into_c has to pop the Lisp return address into a
- *     register first; this register has to be preserved by GENCGC
- *     separately: our return address is not in the stack anymore.
- *   In both case, stack scanning alone is not sufficient to pin
- *   the return address, and we communicate it to GC explicitly
- *   in addition to the SP.
+ *     register.
+ *   In both cases, stack scanning would not normally find the return
+ *   address, so we arrange to store it in a slot within our calling
+ *   frame.  The address of this slot is passed to us in EDI.
  *
  * Note on look-alike accessor macros with vastly different behaviour:
- *   THREAD_PC_AROUND_FOREIGN_CALL_OFFSET is an "ordinary" field of the
+ *   THREAD_PC_AROUND_FOREIGN_CALL_OFFSET was an "ordinary" field of the
  *   struct thread, whereas THREAD_SAVED_CSP_OFFSET is a synchronization
  *   point on a potentially write-protected page.
 */
@@ -269,10 +271,11 @@ GNAME(call_into_c):
 	fstp	%st(0)
 
 #ifdef LISP_FEATURE_SB_SAFEPOINT
-        /* enter safe region: store SP and return PC */
+        /* Save our return PC in the allocated slot (address passed in EDI) */
+        movl    %ebx,(%edi)
+        /* enter safe region: store SP */
 	movl	SBCL_THREAD_BASE_EA,%edi
 	movl	%esp,MAYBE_FS(THREAD_SAVED_CSP_OFFSET(%edi))
-	movl	%ebx,MAYBE_FS(THREAD_PC_AROUND_FOREIGN_CALL_OFFSET(%edi))
 #endif
 
 	/* foreign call, preserving ESI, EDI, and EBX */
@@ -280,10 +283,9 @@ GNAME(call_into_c):
         /* return values now in eax/edx OR st(0) */
 
 #ifdef LISP_FEATURE_SB_SAFEPOINT
-        /* leave region: clear the SP!  (Also unpin the return PC.) */
+        /* leave region: clear the SP! */
 	xorl	%ecx,%ecx
 	movl	%ecx,MAYBE_FS(THREAD_SAVED_CSP_OFFSET(%edi))
-	movl	%ecx,MAYBE_FS(THREAD_PC_AROUND_FOREIGN_CALL_OFFSET(%edi))
 #endif
 
         movl	%eax,%ecx	  # remember integer return value
@@ -332,6 +334,32 @@ Lfp_rtn_value:
 	SIZE(GNAME(call_into_c))
 
 
+#ifdef OS_THREAD_STACK
+        .text
+	.globl  GNAME(funcall1_switching_stack)
+	TYPE(GNAME(funcall1_switching_stack))
+	.align	align_16byte,0x90
+GNAME(funcall1_switching_stack):
+        /* The arguments are switched, funcall1_switching_stack(arg, function)
+           to avoid shuffling registers on x86-64
+        */
+        push    %ebp
+        mov     %esp,%ebp
+
+        movl	8(%ebp),%eax	# arg
+	movl	12(%ebp),%edx	# function
+
+        mov     THREAD_CONTROL_STACK_END_OFFSET(%eax),%esp
+        push    %edx
+        push    %eax
+        call    *%edx
+        
+        mov     %ebp, %esp
+        pop     %ebp
+        ret
+        SIZE(GNAME(funcall1_switching_stack))
+#endif
+
 	.text	
 	.globl GNAME(call_into_lisp_first_time)
 	TYPE(GNAME(call_into_lisp_first_time))
@@ -401,10 +429,6 @@ Lstack:
 	xorl	%edi,%edi	# second arg
 	xorl	%esi,%esi	# third arg
 
-/* no longer in function call */
-	movl	%esp,%ebx	# remember current stack
-	pushl	%ebx		# Save entry stack on (maybe) new stack.
-
 	/* Establish Lisp args. */
 	movl	 8(%ebp),%eax	# lexenv?
 	movl	12(%ebp),%ebx	# address of arg vec
@@ -462,9 +486,6 @@ LsingleValue:
 	add	$8, %esp
 #endif
 
-/* Restore the stack, in case there was a stack change. */
-	popl	%esp		# c-sp
-
 /* Restore C regs: ebx esi edi. */
 	popl	%edi
 	popl	%esi
@@ -499,58 +520,6 @@ GNAME(fpu_restore):
 	ret
 	SIZE(GNAME(fpu_restore))
 
-/*
- * the undefined-function trampoline
- */
-	.text
-	.align	align_16byte,0x90
-	.globl GNAME(undefined_tramp)
-	TYPE(GNAME(undefined_tramp))
-        .byte   0, 0, 0, SIMPLE_FUN_HEADER_WIDETAG
-GNAME(undefined_tramp):
-	pop	4(%ebp)         # Save return PC for backtrace.
-	TRAP
-	.byte	trap_Error
-        .byte   2
-        .byte   UNDEFINED_FUN_ERROR
-        .byte   sc_DescriptorReg # eax in the Descriptor-reg SC
-	ret
-	SIZE(GNAME(undefined_tramp))
-
-/* KLUDGE: FIND-ESCAPED-FRAME (SYS:SRC;CODE;DEBUG-INT.LISP) needs
- * to know the name of the function immediately following the
- * undefined-function trampoline. */
-
-/*
- * the closure trampoline
- */
-	.text
-	.align	align_16byte,0x90
-	.globl GNAME(closure_tramp)
-	TYPE(GNAME(closure_tramp))
-        .byte   0, 0, 0, SIMPLE_FUN_HEADER_WIDETAG
-GNAME(closure_tramp):
-	movl	FDEFN_FUN_OFFSET(%eax),%eax
-	/* FIXME: The '*' after "jmp" in the next line is from PVE's
-	 * patch posted to the CMU CL mailing list Oct 6, 1999. It looks
-	 * reasonable, and it certainly seems as though if CMU CL needs it,
-	 * SBCL needs it too, but I haven't actually verified that it's
-	 * right. It would be good to find a way to force the flow of
-	 * control through here to test it. */
-	jmp	*CLOSURE_FUN_OFFSET(%eax)
-	SIZE(GNAME(closure_tramp))
-
-	.text
-	.align	align_16byte,0x90
-	.globl GNAME(funcallable_instance_tramp)
-	TYPE(GNAME(funcallable_instance_tramp))
-GNAME(funcallable_instance_tramp):
-	movl	FUNCALLABLE_INSTANCE_FUNCTION_OFFSET(%eax),%eax	
-	/* KLUDGE: on this platform, whatever kind of function is in %rax
-	 * now, the first word of it contains the address to jump to. */
-	jmp	*CLOSURE_FUN_OFFSET(%eax)
-	SIZE(GNAME(funcallable_instance_tramp))
-	
 /*
  * fun-end breakpoint magic
  */
@@ -596,6 +565,34 @@ GNAME(do_pending_interrupt):
 	ret
 	SIZE(GNAME(do_pending_interrupt))
 
+#ifdef LISP_FEATURE_SB_SAFEPOINT
+	.globl 	GNAME(handle_global_safepoint_violation)
+	TYPE(GNAME(handle_global_safepoint_violation))
+	.align	align_16byte,0x90
+GNAME(handle_global_safepoint_violation):
+	TRAP
+	.byte 	trap_GlobalSafepoint
+	ret
+	SIZE(GNAME(handle_global_safepoint_violation))
+
+	.globl 	GNAME(handle_csp_safepoint_violation)
+	TYPE(GNAME(handle_csp_safepoint_violation))
+	.align	align_16byte,0x90
+GNAME(handle_csp_safepoint_violation):
+	TRAP
+	.byte 	trap_CspSafepoint
+	ret
+	SIZE(GNAME(handle_csp_safepoint_violation))
+#endif /* SB-SAFEPOINT */
+
+	.globl 	GNAME(memory_fault_emulation_trap)
+	TYPE(GNAME(memory_fault_emulation_trap))
+	.align	align_16byte,0x90
+GNAME(memory_fault_emulation_trap):
+	TRAP
+	.byte 	trap_MemoryFaultEmulation
+	SIZE(GNAME(memory_fault_emulation_trap))
+
 /* Allocate bytes and return the start of the allocated space
  * in the specified destination register.
  *
@@ -610,7 +607,6 @@ GNAME(do_pending_interrupt):
  * DEFINE_ALLOC_TO_FOO defines an alloction routine.
  */
 
-#ifdef LISP_FEATURE_DARWIN
 #define ALLOC(size)                                             \
         pushl   %ebp;              /* Save EBP               */ \
         movl    %esp,%ebp;         /* Save ESP to EBP        */ \
@@ -620,12 +616,6 @@ GNAME(do_pending_interrupt):
         call    GNAME(alloc);                                   \
         movl    %ebp,%esp;         /* Restore ESP from EBP   */ \
         popl    %ebp;              /* Restore EBP            */
-#else
-#define ALLOC(size)                                             \
-        pushl   size;              /* Argument to alloc      */ \
-        call    GNAME(alloc);                                   \
-        addl    $4,%esp;           /* Pop argument           */
-#endif
 
 #define DEFINE_ALLOC_TO_EAX(name,size)                          \
         .globl  GNAME(name);                                    \
@@ -716,7 +706,7 @@ DEFINE_ALLOC_TO_REG(alloc_16_to_edi,%edi,$16)
 #ifdef LISP_FEATURE_SB_THREAD
 #define START_REGION %fs:THREAD_ALLOC_REGION_OFFSET
 #else
-#define START_REGION GNAME(boxed_region)
+#define START_REGION GNAME(gc_alloc_region)
 #endif
 
 #if defined(LISP_FEATURE_SB_THREAD) && defined(LISP_FEATURE_WIN32)

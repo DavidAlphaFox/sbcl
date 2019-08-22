@@ -1,16 +1,21 @@
+#ifdef __ELF__
+// Mark the object as not requiring an executable stack.
+.section .note.GNU-stack,"",%progbits
+#endif
+
 #define _ASM
 
 #include "sparc-funcdef.h"
 
-#define LANGUAGE_ASSEMBLY
 #include "lispregs.h"
 #include "globals.h"
 #include "sbcl.h"
 #include "genesis/closure.h"
+#include "genesis/code.h"
 #include "genesis/funcallable-instance.h"
 #include "genesis/fdefn.h"
 #include "genesis/static-symbols.h"
-#include "genesis/simple-fun.h"	
+#include "genesis/simple-fun.h"
 
 #define load(sym, reg) \
         sethi %hi(sym), reg; ld [reg+%lo(sym)], reg
@@ -44,7 +49,7 @@ call_into_lisp:
         mov     reg_ZERO, reg_CODE
 
         /* Establish NIL */
-        set     NIL, reg_NIL
+        set     NIL, reg_NULL
 
 	/* Set the pseudo-atomic flag. */
 	set	4, reg_ALLOC
@@ -82,12 +87,12 @@ call_into_lisp:
         /* Indirect closure */
         ld      [reg_LEXENV+CLOSURE_FUN_OFFSET], reg_CODE
 
-        jmp     reg_CODE+SIMPLE_FUN_CODE_OFFSET
+        jmp     reg_CODE+SIMPLE_FUN_INSTS_OFFSET
         nop
 
         .align  8
 lra:
-        .word   RETURN_PC_HEADER_WIDETAG
+        .word   RETURN_PC_WIDETAG
 
         /* Blow off any extra values. */
         mov     reg_OCFP, reg_CSP
@@ -165,7 +170,7 @@ call_into_c:
 	 */
 	
         /* Re-establish NIL */
-        set     NIL, reg_NIL
+        set     NIL, reg_NULL
 
 	/* Atomic. */
 	set	4, reg_ALLOC
@@ -201,66 +206,6 @@ call_into_c:
         ret
         nop
 
-/* Lisp calling convention. notice the first .byte line.
- */		
-        .global undefined_tramp
-	FUNCDEF(undefined_tramp)
-        .align  8
-        .byte   0, 0, 0, SIMPLE_FUN_HEADER_WIDETAG
-undefined_tramp = . + 1
-	.word	undefined_tramp
-        .word   NIL
-        .word   NIL
-        .word   NIL
-        .word   NIL
-        .word   NIL
-
-	b	1f
-        unimp   trap_Cerror
-	.byte	4
-        .byte   UNDEFINED_FUN_ERROR
-	.byte	254, sc_DescriptorReg, 6
-	.align	4
-1:
-	ld	[reg_FDEFN+FDEFN_RAW_ADDR_OFFSET], reg_CODE
-	jmp	reg_CODE+SIMPLE_FUN_CODE_OFFSET
-	nop
-
-/* Lisp calling convention. Notice the first .byte line.
- */		
-	.global	closure_tramp
-	FUNCDEF(closure_tramp)
-	.align	8
-	.byte	0, 0, 0, SIMPLE_FUN_HEADER_WIDETAG
-closure_tramp = . + 1
-	.word	closure_tramp
-	.word	NIL
-        .word   NIL
-	.word	NIL
-	.word	NIL
-	.word	NIL
-
-	ld	[reg_FDEFN+FDEFN_FUN_OFFSET], reg_LEXENV
-	ld	[reg_LEXENV+CLOSURE_FUN_OFFSET], reg_CODE
-	jmp	reg_CODE+SIMPLE_FUN_CODE_OFFSET
-	nop
-
-	.global funcallable_instance_tramp
-	FUNCDEF(funcallable_instance_tramp)
-	.align 8
-	.word SIMPLE_FUN_HEADER_WIDETAG
-funcallable_instance_tramp = . + 1
-	.word funcallable_instance_tramp
-	.word NIL
-	.word NIL
-	.word NIL
-	.word NIL
-	.word NIL
-
-	ld	[reg_LEXENV+FUNCALLABLE_INSTANCE_FUNCTION_OFFSET], reg_LEXENV
-	ld	[reg_LEXENV+CLOSURE_FUN_OFFSET], reg_CODE
-	jmp	reg_CODE+SIMPLE_FUN_CODE_OFFSET
-	nop
 /*
  * Function-end breakpoint magic.
  */
@@ -274,17 +219,17 @@ funcallable_instance_tramp = . + 1
 	.align	8
 	.global	fun_end_breakpoint_guts
 fun_end_breakpoint_guts:
-	.word	RETURN_PC_HEADER_WIDETAG + 0x600
+	.word	(((CODE_SIZE+1)&~1)<<N_WIDETAG_BITS)|RETURN_PC_WIDETAG
 	b	1f
 	nop
 	mov	reg_CSP, reg_OCFP
 	add	4, reg_CSP, reg_CSP
 	mov	4, reg_NARGS
-	mov	reg_NIL, reg_A1
-	mov	reg_NIL, reg_A2
-	mov	reg_NIL, reg_A3
-	mov	reg_NIL, reg_A4
-	mov	reg_NIL, reg_A5
+	mov	reg_NULL, reg_A1
+	mov	reg_NULL, reg_A2
+	mov	reg_NULL, reg_A3
+	mov	reg_NULL, reg_A4
+	mov	reg_NULL, reg_A5
 1:
 
 	.global	fun_end_breakpoint_trap
@@ -314,103 +259,6 @@ do_pending_interrupt:
         unimp	trap_PendingInterrupt
         retl
         nop
-
-/*
- * Save the FPU state.  %o0 contains a pointer to where we can
- * store our state.
- */
-
-/*
- * Note we only save the 16 double-float registers (which saves
- * the 32 single-float values too, I think).  If we're compiling for
- * a sparc v9, the Lisp code can actually use all 32 double-float
- * registers.  For later.
- */
-	.global fpu_save
-	FUNCDEF(fpu_save)
-fpu_save:
-	std	%f0, [%o0 + 4*0]
-	std	%f2, [%o0 + 4*2]
-	std	%f4, [%o0 + 4*4]
-	std	%f6, [%o0 + 4*6]
-	std	%f8, [%o0 + 4*8]
-	std	%f10, [%o0 + 4*10]
-	std	%f12, [%o0 + 4*12]
-	std	%f14, [%o0 + 4*14]
-	std	%f16, [%o0 + 4*16]
-	std	%f18, [%o0 + 4*18]
-	std	%f20, [%o0 + 4*20]
-	std	%f22, [%o0 + 4*22]
-	std	%f24, [%o0 + 4*24]
-	std	%f26, [%o0 + 4*26]
-	std	%f28, [%o0 + 4*28]
-	std	%f30, [%o0 + 4*30]
-#ifdef FEATURE_SPARC_V9
-	std	%f32, [%o0 + 4*32]
-	std	%f34, [%o0 + 4*34]
-	std	%f36, [%o0 + 4*36]
-	std	%f38, [%o0 + 4*38]
-	std	%f40, [%o0 + 4*40]
-	std	%f42, [%o0 + 4*42]
-	std	%f44, [%o0 + 4*44]
-	std	%f46, [%o0 + 4*46]
-	std	%f48, [%o0 + 4*48]
-	std	%f50, [%o0 + 4*50]
-	std	%f52, [%o0 + 4*52]
-	std	%f54, [%o0 + 4*54]
-	std	%f56, [%o0 + 4*56]
-	std	%f58, [%o0 + 4*58]
-	std	%f60, [%o0 + 4*60]
-	std	%f62, [%o0 + 4*62]
-	st	%fsr, [%o0 + 4*64]
-#else
-	st	%fsr, [%o0 + 4*32]
-#endif
-	retl
-	nop
-
-	.global fpu_restore
-	FUNCDEF(fpu_restore)
-fpu_restore:
-	ldd	[%o0 + 4*0], %f0
-	ldd	[%o0 + 4*2], %f2
-	ldd	[%o0 + 4*4], %f4
-	ldd	[%o0 + 4*6], %f6
-	ldd	[%o0 + 4*8], %f8
-	ldd	[%o0 + 4*10], %f10
-	ldd	[%o0 + 4*12], %f12
-	ldd	[%o0 + 4*14], %f14
-	ldd	[%o0 + 4*16], %f16
-	ldd	[%o0 + 4*18], %f18
-	ldd	[%o0 + 4*20], %f20
-	ldd	[%o0 + 4*22], %f22
-	ldd	[%o0 + 4*24], %f24
-	ldd	[%o0 + 4*26], %f26
-	ldd	[%o0 + 4*28], %f28
-	ldd	[%o0 + 4*30], %f30
-#ifdef FEATURE_SPARC_V9
-	ldd	[%o0 + 4*32], %f32
-	ldd	[%o0 + 4*34], %f34
-	ldd	[%o0 + 4*36], %f36
-	ldd	[%o0 + 4*38], %f38
-	ldd	[%o0 + 4*40], %f40
-	ldd	[%o0 + 4*42], %f42
-	ldd	[%o0 + 4*44], %f44
-	ldd	[%o0 + 4*46], %f46
-	ldd	[%o0 + 4*48], %f48
-	ldd	[%o0 + 4*50], %f50
-	ldd	[%o0 + 4*52], %f52
-	ldd	[%o0 + 4*54], %f54
-	ldd	[%o0 + 4*56], %f56
-	ldd	[%o0 + 4*58], %f58
-	ldd	[%o0 + 4*60], %f60
-	ldd	[%o0 + 4*62], %f62
-	ld	[%o0 + 4*64], %fsr
-#else
-	ld	[%o0 + 4*32], %fsr
-#endif
-	retl
-	nop
 
 	.global save_context
 	FUNCDEF(save_context)

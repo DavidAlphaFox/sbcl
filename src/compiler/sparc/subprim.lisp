@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; LENGTH
 (define-vop (length/list)
@@ -18,7 +18,7 @@
   (:arg-types list)
   (:temporary (:scs (descriptor-reg) :from (:argument 0)) ptr)
   (:temporary (:scs (non-descriptor-reg)) temp)
-  (:temporary (:scs (any-reg) :type fixnum :to (:result 0) :target result)
+  (:temporary (:scs (any-reg) :to (:result 0) :target result)
               count)
   (:results (result :scs (any-reg descriptor-reg)))
   (:policy :fast-safe)
@@ -36,7 +36,7 @@
 
       (emit-label loop)
 
-      (test-type ptr not-list t (list-pointer-lowtag) :temp temp)
+      (test-type ptr temp not-list t (list-pointer-lowtag))
 
       (loadw ptr ptr cons-cdr-slot list-pointer-lowtag)
 
@@ -46,7 +46,3 @@
 
       (emit-label done)
       (move result count))))
-
-
-(define-static-fun length (object) :translate length)
-

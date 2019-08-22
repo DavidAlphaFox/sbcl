@@ -11,93 +11,100 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(cl:in-package :cl-user)
-
-(dolist (ifnis (list (cons single-float-positive-infinity
-                           single-float-negative-infinity)
-                     (cons double-float-positive-infinity
-                           double-float-negative-infinity)))
-  (destructuring-bind (+ifni . -ifni) ifnis
-    (assert (= (* +ifni 1) +ifni))
-    (assert (= (* +ifni -0.1) -ifni))
-    (assert (= (+ +ifni -0.1) +ifni))
-    (assert (= (- +ifni -0.1) +ifni))
-    (assert (= (sqrt +ifni) +ifni))
-    (assert (= (* -ifni -14) +ifni))
-    (assert (= (/ -ifni 0.1) -ifni))
-    (assert (= (/ -ifni 100/3) -ifni))
-    (assert (not (= +ifni -ifni)))
-    (assert (= -ifni -ifni))
-    (assert (not (= +ifni 100/3)))
-    (assert (not (= -ifni -1.0 -ifni)))
-    (assert (not (= -ifni -17/02 -ifni)))
-    (assert (< -ifni +ifni))
-    (assert (not (< +ifni 100)))
-    (assert (not (< +ifni 100.0)))
-    (assert (not (< +ifni -ifni)))
-    (assert (< 100 +ifni))
-    (assert (< 100.0 +ifni))
-    (assert (>= 100 -ifni))
-    (assert (not (<= 6/7 (* 3 -ifni))))
-    (assert (not (> +ifni +ifni)))))
+(with-test (:name (:infinities :comparison))
+  (dolist (ifnis (list (cons single-float-positive-infinity
+                             single-float-negative-infinity)
+                       (cons double-float-positive-infinity
+                             double-float-negative-infinity)))
+    (destructuring-bind (+ifni . -ifni) ifnis
+      (assert (= (* +ifni 1) +ifni))
+      (assert (= (* +ifni -0.1) -ifni))
+      (assert (= (+ +ifni -0.1) +ifni))
+      (assert (= (- +ifni -0.1) +ifni))
+      (assert (= (sqrt +ifni) +ifni))
+      (assert (= (* -ifni -14) +ifni))
+      (assert (= (/ -ifni 0.1) -ifni))
+      (assert (= (/ -ifni 100/3) -ifni))
+      (assert (not (= +ifni -ifni)))
+      (assert (= -ifni -ifni))
+      (assert (not (= +ifni 100/3)))
+      (assert (not (= -ifni -1.0 -ifni)))
+      (assert (not (= -ifni -17/02 -ifni)))
+      (assert (< -ifni +ifni))
+      (assert (not (< +ifni 100)))
+      (assert (not (< +ifni 100.0)))
+      (assert (not (< +ifni -ifni)))
+      (assert (< 100 +ifni))
+      (assert (< 100.0 +ifni))
+      (assert (>= 100 -ifni))
+      (assert (not (<= 6/7 (* 3 -ifni))))
+      (assert (not (> +ifni +ifni))))))
 
 ;;; ANSI: FLOAT-RADIX should signal an error if its argument is not a
 ;;; float.
 ;;;
 ;;; (Peter Van Eynde's ansi-test suite caught this, and Eric Marsden
 ;;; reported a fix for CMU CL, which was ported to sbcl-0.6.12.35.)
-(assert (typep (nth-value 1 (ignore-errors (float-radix "notfloat")))
-               'type-error))
-
-(assert (typep (nth-value 1 (ignore-errors
-                              (funcall (fdefinition 'float-radix) "notfloat")))
-               'type-error))
+(with-test (:name (float-radix simple-type-error))
+  (multiple-value-bind  (fun failure-p warnings)
+      (checked-compile '(lambda () (float-radix "notfloat")) :allow-warnings t)
+    (assert failure-p)
+    (assert (= 1 (length warnings)))
+    (assert-error (funcall fun) type-error))
+  (assert-error (funcall (fdefinition 'float-radix) "notfloat") type-error))
 
 ;;; Before 0.8.2.14 the cross compiler failed to work with
 ;;; denormalized numbers
-(when (subtypep 'single-float 'short-float)
-  (assert (eql least-positive-single-float least-positive-short-float)))
+(with-test (:name (:denormalized float))
+  (when (subtypep 'single-float 'short-float)
+    (assert (eql least-positive-single-float least-positive-short-float))))
 
 ;;; bug found by Paul Dietz: FFLOOR and similar did not work for integers
-(let ((tests '(((ffloor -8 3) (-3.0 1))
-               ((fround -8 3) (-3.0 1))
-               ((ftruncate -8 3) (-2.0 -2))
-               ((fceiling -8 3) (-2.0 -2)))))
-  (loop for (exp res) in tests
-        for real-res = (multiple-value-list (eval exp))
-        do (assert (equal real-res res))))
+(with-test (:name (ffloor integer))
+  (let ((tests '(((ffloor -8 3) (-3.0 1))
+                 ((fround -8 3) (-3.0 1))
+                 ((ftruncate -8 3) (-2.0 -2))
+                 ((fceiling -8 3) (-2.0 -2)))))
+    (loop for (exp res) in tests
+       for real-res = (multiple-value-list (eval exp))
+       do (assert (equal real-res res)))))
 
 ;;; bug 45b reported by PVE
-(dolist (type '(short single double long))
-  (dolist (sign '(positive negative))
-    (let* ((name (find-symbol (format nil "LEAST-~A-~A-FLOAT"
-                                      sign type)
-                              :cl))
-           (value (symbol-value name)))
-      (assert (zerop (/ value 2))))))
+(with-test (:name (:least-*-*-float :bug-45b))
+  (dolist (type '(short single double long))
+    (dolist (sign '(positive negative))
+      (let* ((name (find-symbol (format nil "LEAST-~A-~A-FLOAT"
+                                        sign type)
+                                :cl))
+             (value (symbol-value name)))
+        (assert (zerop (/ value 2)))))))
 
 ;;; bug found by Paul Dietz: bad rounding on small floats
-(assert (= (fround least-positive-short-float least-positive-short-float) 1.0))
+(with-test (:name (fround least-positive-short-float))
+  (assert (= (fround least-positive-short-float least-positive-short-float) 1.0)))
 
 ;;; bug found by Peter Seibel: scale-float was only accepting float
 ;;; exponents, when it should accept all integers.  (also bug #269)
-(assert (= (multiple-value-bind (significand expt sign)
-               (integer-decode-float least-positive-double-float)
-             (* (scale-float (float significand 0.0d0) expt) sign))
-           least-positive-double-float))
-(assert (= (multiple-value-bind (significand expt sign)
-               (decode-float least-positive-double-float)
-             (* (scale-float significand expt) sign))
-           least-positive-double-float))
-(assert (= 0.0 (scale-float 1.0 most-negative-fixnum)))
-(assert (= 0.0d0 (scale-float 1.0d0 (1- most-negative-fixnum))))
+(with-test (:name (scale-float :bug-269))
+  (assert (= (multiple-value-bind (significand expt sign)
+                 (integer-decode-float least-positive-double-float)
+               (* (scale-float (float significand 0.0d0) expt) sign))
+             least-positive-double-float))
+  (assert (= (multiple-value-bind (significand expt sign)
+                 (decode-float least-positive-double-float)
+               (* (scale-float significand expt) sign))
+             least-positive-double-float))
+  (assert (= 0.0 (scale-float 1.0 most-negative-fixnum)))
+  (assert (= 0.0d0 (scale-float 1.0d0 (1- most-negative-fixnum)))))
 
 (with-test (:name (:scale-float-overflow :bug-372)
-            :fails-on '(and :darwin :ppc)) ;; bug 372
-  (assert-error (scale-float 1.0 most-positive-fixnum)
-                floating-point-overflow)
-  (assert-error (scale-float 1.0d0 (1+ most-positive-fixnum))
-                floating-point-overflow))
+            :fails-on (or :arm64 (and :darwin :ppc)))
+  (flet ((test (form)
+           (assert-error (funcall (checked-compile `(lambda () ,form)
+                                                   :allow-style-warnings t))
+                         floating-point-overflow)))
+    (test '(scale-float 1.0 most-positive-fixnum))
+    (test '(scale-float 1.0d0 (1+ most-positive-fixnum)))))
 
 ;;; bug found by jsnell when nfroyd tried to implement better LOGAND
 ;;; type derivation.
@@ -106,36 +113,37 @@
            12780299))
 
 ;;; MISC.564: no out-of-line %ATAN2 for constant folding
-(assert (typep
-  (funcall
-   (compile
-    nil
-    '(lambda (p1)
-      (declare (optimize (speed 3) (safety 2) (debug 3) (space 0))
-       (type complex p1))
-      (phase (the (eql #c(1.0d0 2.0d0)) p1))))
-   #c(1.0d0 2.0d0))
-    'double-float))
+(with-test (:name (:%atan2 :constant-folding))
+  (assert (typep
+           (funcall
+            (checked-compile
+             '(lambda (p1)
+               (declare (optimize (speed 3) (safety 2) (debug 3) (space 0))
+                        (type complex p1))
+               (phase (the (eql #c(1.0d0 2.0d0)) p1))))
+            #c(1.0d0 2.0d0))
+           'double-float)))
 
 ;;; More out of line functions (%COS, %SIN, %TAN) for constant folding,
 ;;; reported by Mika Pihlajamäki
-(funcall (compile nil '(lambda () (cos (tan (round 0))))))
-(funcall (compile nil '(lambda () (sin (tan (round 0))))))
-(funcall (compile nil '(lambda () (tan (tan (round 0))))))
+(with-test (:name (sin cos tan :constant-folding))
+  (flet ((test (function)
+           (funcall (checked-compile
+                     `(lambda () (,function (tan (round 0))))))))
+    (mapc #'test '(sin cos tan))))
 
 (with-test (:name (:addition-overflow :bug-372)
-            :fails-on '(or (and :ppc :openbsd)
-                           (and :ppc :darwin)
-                           (and :x86 :netbsd)))
-  (assert (typep (nth-value
-                  1
-                  (ignore-errors
-                    (sb-sys:without-interrupts
-                     (sb-int:set-floating-point-modes :current-exceptions nil
-                                                      :accrued-exceptions nil)
-                     (loop repeat 2 summing most-positive-double-float)
-                     (sleep 2))))
-                 'floating-point-overflow)))
+            :fails-on (or :arm64
+                        (and :ppc :openbsd)
+                        (and :ppc :darwin)
+                        (and :x86 :netbsd)))
+  (assert-error
+   (sb-sys:without-interrupts
+     (sb-int:set-floating-point-modes :current-exceptions nil
+                                      :accrued-exceptions nil)
+     (loop repeat 2 summing most-positive-double-float)
+     (sleep 2))
+   floating-point-overflow))
 
 ;; This is the same test as above.  Even if the above copy passes,
 ;; this copy will fail if SIGFPE handling ends up clearing the FPU
@@ -146,18 +154,17 @@
 ;; the preceeding "pure" test files aren't as free of side effects as
 ;; we might like.
 (with-test (:name (:addition-overflow :bug-372 :take-2)
-            :fails-on '(or (and :ppc :openbsd)
-                           (and :ppc :darwin)
-                           (and :x86 :netbsd)))
-  (assert (typep (nth-value
-                  1
-                  (ignore-errors
-                    (sb-sys:without-interrupts
-                     (sb-int:set-floating-point-modes :current-exceptions nil
-                                                      :accrued-exceptions nil)
-                     (loop repeat 2 summing most-positive-double-float)
-                     (sleep 2))))
-                 'floating-point-overflow)))
+            :fails-on (or :arm64
+                        (and :ppc :openbsd)
+                        (and :ppc :darwin)
+                        (and :x86 :netbsd)))
+  (assert-error
+   (sb-sys:without-interrupts
+     (sb-int:set-floating-point-modes :current-exceptions nil
+                                      :accrued-exceptions nil)
+     (loop repeat 2 summing most-positive-double-float)
+     (sleep 2))
+   floating-point-overflow))
 
 ;;; On x86-64 generating complex floats on the stack failed an aver in
 ;;; the compiler if the stack slot was the same as the one containing
@@ -166,25 +173,23 @@
 (with-test (:name :complex-float-stack)
   (dolist (type '((complex double-float)
                   (complex single-float)))
-    (compile nil
-             `(lambda (x0 x1 x2 x3 x4 x5 x6 x7)
-                (declare (type ,type x0 x1 x2 x3 x4 x5 x6 x7))
-                (let ((x0 (+ x0 x0))
-                      (x1 (+ x1 x1))
-                      (x2 (+ x2 x2))
-                      (x3 (+ x3 x3))
-                      (x4 (+ x4 x4))
-                      (x5 (+ x5 x5))
-                      (x6 (+ x6 x6))
-                      (x7 (+ x7 x7)))
-                  (* (+ x0 x1 x2 x3) (+ x4 x5 x6 x7)
-                     (+ x0 x2 x4 x6) (+ x1 x3 x5 x7)
-                     (+ x0 x3 x4 x7) (+ x1 x2 x5 x6)
-                     (+ x0 x1 x6 x7) (+ x2 x3 x4 x5)))))))
+    (checked-compile `(lambda (x0 x1 x2 x3 x4 x5 x6 x7)
+                        (declare (type ,type x0 x1 x2 x3 x4 x5 x6 x7))
+                        (let ((x0 (+ x0 x0))
+                              (x1 (+ x1 x1))
+                              (x2 (+ x2 x2))
+                              (x3 (+ x3 x3))
+                              (x4 (+ x4 x4))
+                              (x5 (+ x5 x5))
+                              (x6 (+ x6 x6))
+                              (x7 (+ x7 x7)))
+                          (* (+ x0 x1 x2 x3) (+ x4 x5 x6 x7)
+                             (+ x0 x2 x4 x6) (+ x1 x3 x5 x7)
+                             (+ x0 x3 x4 x7) (+ x1 x2 x5 x6)
+                             (+ x0 x1 x6 x7) (+ x2 x3 x4 x5)))))))
 
-
-(with-test (:name :nan-comparisons
-            :fails-on '(or :sparc :mips))
+(with-test (:name (:nan :comparison)
+            :fails-on (or :sparc))
   (sb-int:with-float-traps-masked (:invalid)
     (macrolet ((test (form)
                  (let ((nform (subst '(/ 0.0 0.0) 'nan form)))
@@ -193,10 +198,12 @@
                       (assert (eval `(let ((nan (/ 0.0 0.0)))
                                        ,',form)))
                       (assert (funcall
-                               (compile nil `(lambda () ,',nform))))
+                               (checked-compile `(lambda () ,',nform))))
                       (assert (funcall
-                               (compile nil `(lambda (nan) ,',form))
-                               (/ 0.0 0.0)))))))
+                               (checked-compile `(lambda (nan) ,',form))
+                               (locally
+                                   (declare (muffle-conditions style-warning))
+                                 (/ 0.0 0.0))))))))
       (test (/= nan nan))
       (test (/= nan nan nan))
       (test (/= 1.0 nan 2.0 nan))
@@ -241,17 +248,17 @@
   (assert (eql 0.0f0 (log 123 (eval 0))))
   (assert (eql 0.0d0 (log 123.0d0 (eval 0))))
   (assert (eql 0.0d0 (log 123 (eval 0.0d0))))
-  (let ((f (compile nil '(lambda (x y)
-                          (declare (optimize speed))
-                          (etypecase x
-                            (single-float
-                             (etypecase y
-                               (single-float (log x y))
-                               (double-float (log x y))))
-                            (double-float
-                             (etypecase y
-                               (single-float (log x y))
-                               (double-float (log x y)))))))))
+  (let ((f (checked-compile '(lambda (x y)
+                              (declare (optimize speed))
+                              (etypecase x
+                                (single-float
+                                 (etypecase y
+                                   (single-float (log x y))
+                                   (double-float (log x y))))
+                                (double-float
+                                 (etypecase y
+                                   (single-float (log x y))
+                                   (double-float (log x y)))))))))
     (assert (eql 0.0f0 (funcall f 123.0 0.0)))
     (assert (eql 0.0d0 (funcall f 123.0d0 0.0)))
     (assert (eql 0.0d0 (funcall f 123.0d0 0.0d0)))
@@ -287,6 +294,7 @@
 ;; in mind at all times when working with SSE or similar instruction sets.
 ;;
 ;; Run only on x86/x86-64m as no other platforms have SB-VM::TOUCH-OBJECT.
+#-interpreter
 (macrolet ((with-pinned-floats ((count type &rest names) &body body)
              "Force COUNT float values to be kept live (and hopefully in registers),
               fill a temporary register with noise, and execute BODY."
@@ -317,7 +325,7 @@
                         (locally ,@body))
                     ,@(loop for var in dummy
                             collect `(sb-vm::touch-object ,var)))))))
-  (with-test (:name :clear-sqrtsd :skipped-on '(not (or :x86 :x86-64)))
+  (with-test (:name :clear-sqrtsd :skipped-on (not (or :x86 :x86-64)))
     (flet ((test-sqrtsd (float)
              (declare (optimize speed (safety 1))
                       (type (double-float (0d0)) float))
@@ -327,7 +335,7 @@
       (declare (notinline test-sqrtsd))
       (assert (zerop (imagpart (test-sqrtsd 4d0))))))
 
-  (with-test (:name :clear-sqrtsd-single :skipped-on '(not (or :x86 :x86-64)))
+  (with-test (:name :clear-sqrtsd-single :skipped-on (not (or :x86 :x86-64)))
     (flet ((test-sqrtsd-float (float)
              (declare (optimize speed (safety 1))
                       (type (single-float (0f0)) float))
@@ -337,7 +345,7 @@
       (declare (notinline test-sqrtsd-float))
       (assert (zerop (imagpart (test-sqrtsd-float 4f0))))))
 
-  (with-test (:name :clear-cvtss2sd :skipped-on '(not (or :x86 :x86-64)))
+  (with-test (:name :clear-cvtss2sd :skipped-on (not (or :x86 :x86-64)))
     (flet ((test-cvtss2sd (float)
              (declare (optimize speed (safety 1))
                       (type single-float float))
@@ -347,7 +355,7 @@
       (declare (notinline test-cvtss2sd))
       (assert (zerop (imagpart (test-cvtss2sd 1f0))))))
 
-  (with-test (:name :clear-cvtsd2ss :skipped-on '(not (or :x86 :x86-64)))
+  (with-test (:name :clear-cvtsd2ss :skipped-on (not (or :x86 :x86-64)))
     (flet ((test-cvtsd2ss (float)
              (declare (optimize speed (safety 1))
                       (type double-float float))
@@ -357,7 +365,7 @@
       (declare (notinline test-cvtsd2ss))
       (assert (zerop (imagpart (test-cvtsd2ss 4d0))))))
 
-  (with-test (:name :clear-cvtsi2sd :skipped-on '(not (or :x86 :x86-64)))
+  (with-test (:name :clear-cvtsi2sd :skipped-on (not (or :x86 :x86-64)))
     (flet ((test-cvtsi2sd (int)
              (declare (optimize speed (safety 0))
                       (type (unsigned-byte 10) int))
@@ -366,7 +374,7 @@
       (declare (notinline test-cvtsi2sd))
       (assert (zerop (imagpart (test-cvtsi2sd 4))))))
 
-  (with-test (:name :clear-cvtsi2ss :skipped-on '(not (or :x86 :x86-64)))
+  (with-test (:name :clear-cvtsi2ss :skipped-on (not (or :x86 :x86-64)))
     (flet ((test-cvtsi2ss (int)
              (declare (optimize speed (safety 0))
                       (type (unsigned-byte 10) int))
@@ -397,12 +405,142 @@
 ;; visible as a QNaN in the imaginary part when next using the register
 ;; in a (COMPLEX SINGLE-FLOAT) operation.
 (with-test (:name :make-single-float-clear-imagpart)
-  (let ((f (compile nil
-                    '(lambda (x)
-                       (declare (optimize speed))
-                       (= #c(1.0f0 2.0f0)
-                          (+ #c(3.0f0 2.0f0)
-                             (sb-kernel:make-single-float x))))))
+  (let ((f (checked-compile
+            '(lambda (x)
+              (declare (optimize speed))
+              (= #c(1.0f0 2.0f0)
+               (+ #c(3.0f0 2.0f0)
+                (sb-kernel:make-single-float x))))))
         (bits (sb-kernel:single-float-bits -2.0f0)))
     (assert (< bits 0))         ; Make sure the test is fit for purpose.
     (assert (funcall f bits))))
+
+(with-test (:name :negative-zero-derivation)
+  (assert (not
+           (funcall (checked-compile
+                     '(lambda (exponent)
+                       (declare ((integer 0 1) exponent))
+                       (eql 0d0 (scale-float -0.0d0 exponent))))
+                    0))))
+
+(with-test (:name :complex-eql-all-constants)
+  (assert (funcall (checked-compile
+                    '(lambda ()
+                      (declare (optimize (debug 2)))
+                      (typep #c(1.0 1.0) '(member #c(1.0 1.0))))))))
+
+(with-test (:name (truncate float :no-consing)
+                  :skipped-on :interpreter)
+  (let ((f (checked-compile
+            '(lambda (x)
+              (values (truncate (the double-float x)))))))
+    (ctu:assert-no-consing (funcall f 1d0))
+    (ctu:assert-no-consing (funcall f (float most-negative-fixnum 1d0))))
+  (let ((f (checked-compile
+            '(lambda (x)
+              (values (truncate (the single-float x)))))))
+    (ctu:assert-no-consing (funcall f 1f0))
+    (ctu:assert-no-consing (funcall f (float most-negative-fixnum 1f0)))))
+
+(with-test (:name :trig-derive-type-complex-rational)
+  (macrolet ((test (fun type)
+               `(checked-compile-and-assert
+                 ()
+                 '(lambda (a)
+                   (declare ((complex ,type) a))
+                   (,fun a))
+                 ((#C(1 2)) (eval '(,fun #C(1 2)))))))
+    (test sin integer)
+    (test cos integer)
+    (test tan integer)
+    (test sin rational)
+    (test cos rational)
+    (test tan rational)))
+
+(defun exercise-float-decoder (type exponent-bits mantissa-bits &optional print)
+  (let* ((exp-max (1- (ash 1 (1- exponent-bits))))
+         (exp-min (- (1- exp-max)))
+         (exp-bias exp-max)
+         ;; mantissa-bits excludes the hidden bit
+         (total-bits (+ mantissa-bits exponent-bits 1)))
+    (labels ((try (sign-bit exponent mantissa)
+               (let* ((bit-pattern
+                       (logior (ash sign-bit (+ exponent-bits mantissa-bits))
+                               (ash (+ exp-bias exponent) mantissa-bits)
+                               mantissa))
+                      (signed-bits
+                       (sb-disassem:sign-extend bit-pattern total-bits))
+                      (x (ecase type
+                          (single-float
+                           (sb-kernel:make-single-float signed-bits))
+                          (double-float
+                           (sb-kernel:make-double-float (ash signed-bits -32)
+                                                        (ldb (byte 32 0) signed-bits))))))
+                 (when print
+                   (format t "~v,'0b -> ~f~%" total-bits bit-pattern x))
+                 (multiple-value-bind (significand exponent sign) (decode-float x)
+                   (let ((reconstructed (* significand (expt 2 exponent) sign)))
+                     (unless (= reconstructed x)
+                       (error "DF -> ~s ~s ~s -> ~f~%" significand exponent sign
+                              reconstructed))))
+                 (multiple-value-bind (significand exponent sign) (integer-decode-float x)
+                   (let ((reconstructed (* significand (expt 2 exponent) sign)))
+                     (unless (= reconstructed x)
+                       (error "IDF -> ~s ~s ~s -> ~f~%" significand exponent sign
+                              reconstructed)))))))
+      ;; walking 1 bit
+      (loop for exp from exp-min to (1- exp-max)
+            do (let ((bit (ash 1 mantissa-bits)))
+                 (loop while (/= bit 0)
+                       do (try 0 exp (ldb (byte mantissa-bits 0) bit))
+                          (setq bit (ash bit -1))))))))
+
+(with-test (:name :test-float-decoders)
+  (flet ((test-df (input expect-sig expect-exp expect-sign)
+           (multiple-value-bind (significand exponent sign)
+               (decode-float input)
+             (assert (and (= significand expect-sig)
+                          (= exponent expect-exp)
+                          (= sign expect-sign)))))
+         (test-idf (input expect-sig expect-exp expect-sign)
+           (multiple-value-bind (significand exponent sign)
+               (integer-decode-float input)
+             (assert (and (= significand expect-sig)
+                          (= exponent expect-exp)
+                          (= sign expect-sign))))))
+    (test-df +0s0 0.0s0 0 1.0)
+    (test-df -0s0 0.0s0 0 -1.0)
+    (test-df +0d0 0.0d0 0 1.0d0)
+    (test-df -0d0 0.0d0 0 -1.0d0)
+    (test-idf +0s0 0 0 1)
+    (test-idf -0s0 0 0 -1)
+    (test-idf +0d0 0 0 1)
+    (test-idf -0d0 0 0 -1)
+    (test-idf least-positive-normalized-single-float 8388608 -149 1)
+    (test-idf least-negative-normalized-single-float 8388608 -149 -1)
+    (test-idf least-positive-normalized-double-float 4503599627370496 -1074 1)
+    (test-idf least-negative-normalized-double-float 4503599627370496 -1074 -1))
+  (exercise-float-decoder 'single-float  8 23)
+  (exercise-float-decoder 'double-float 11 52)
+  ;; TODO: test denormals
+  )
+
+
+(with-test (:name :conservative-floor-bounds)
+  (assert
+   (equal (sb-kernel:%simple-fun-type
+           (checked-compile
+            `(lambda (x)
+               (declare (unsigned-byte x))
+               (values (truncate 1.0 x)))))
+          '(function (unsigned-byte) (values unsigned-byte &optional)))))
+
+(with-test (:name :single-float-sign-stubs)
+  (checked-compile-and-assert
+   ()
+   '(lambda (p1)
+     (declare (type (eql -96088.234) p1))
+     (float-sign
+      (the single-float
+       (labels ((%f () (the real p1))) (%f)))))
+   ((-96088.234) -1.0)))

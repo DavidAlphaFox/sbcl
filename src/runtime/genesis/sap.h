@@ -11,21 +11,22 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_SAP
-#define SBCL_GENESIS_SAP 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_SAP
+#ifndef __ASSEMBLER__
 
 struct sap {
     lispobj header;
     char * pointer;
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
 #define SAP_POINTER_OFFSET -7
+#define SAP_SIZE 2
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_SAP */
+#endif

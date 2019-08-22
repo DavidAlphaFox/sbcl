@@ -12,18 +12,17 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 ;;; FIXME: Perhaps this belongs in the %SYS package like some other
 ;;; cold load stuff.
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defvar *cold-init-forms*))
+(defvar *!cold-init-forms*)
 
 (defmacro !begin-collecting-cold-init-forms ()
   #+sb-xc '(eval-when (:compile-toplevel :execute)
-             (when (boundp '*cold-init-forms*)
-               (warn "discarding old *COLD-INIT-FORMS* value"))
-             (setf *cold-init-forms* nil))
+             (when (boundp '*!cold-init-forms*)
+               (warn "discarding old *!COLD-INIT-FORMS* value"))
+             (setf *!cold-init-forms* nil))
   #-sb-xc nil)
 
 ;;; Note: Unlike the analogous COLD-INIT macro in CMU CL, this macro
@@ -33,57 +32,95 @@
   ;; In the target Lisp, stuff the forms into a named function which
   ;; will presumably be executed at the appropriate stage of cold load
   ;; (i.e. basically as soon as possible).
-  #+sb-xc (progn
-            (setf *cold-init-forms*
-                  (nconc *cold-init-forms* (copy-list forms)))
-            nil)
-  ;; In the cross-compilation host Lisp, cold load might not be a
-  ;; meaningful concept and in any case would have happened long ago,
-  ;; so just execute the forms at load time (i.e. basically as soon as
-  ;; possible).
+  #+sb-xc `(eval-when (:compile-toplevel)
+             ,@(mapcar (lambda (form) `(push ',form *!cold-init-forms*))
+                       forms))
+  ;; In the cross-compilation host Lisp, cold load is not a
+  ;; meaningful concept. Just execute the forms at load time.
   #-sb-xc `(progn ,@forms))
 
 (defmacro !defun-from-collected-cold-init-forms (name)
   #+sb-xc `(progn
              (defun ,name ()
-               ,@*cold-init-forms*
+               ,@(reverse *!cold-init-forms*)
                (values))
              (eval-when (:compile-toplevel :execute)
-               (makunbound '*cold-init-forms*)))
+               (makunbound '*!cold-init-forms*)))
   #-sb-xc (declare (ignore name)))
 
-;;; !DEFGLOBAL, !DEFPARAMETER and !DEFVAR are named by analogy
-;;; with !COLD-INIT-FORMS and (not DEF!FOO) because they are
-;;; basically additional cold-init-helpers to avoid the tedious sequence:
+;;; !DEFINE-LOAD-TIME-GLOBAL avoids this anti-pattern:
 ;;;    (!begin-collecting-cold-init-forms)
-;;;    (defvar *foo*)
+;;;    (define-load-time-global *foo* nil)
 ;;;    (!cold-init-forms (setq *foo* nil))
 ;;;    (!defun-from-cold-init-forms !some-cold-init-fun)
-;;; or the less respectable (defvar *foo*) and a random SETQ in !COLD-INIT.
-;;; Each is like its namesake, but also arranges so that genesis knows
-;;; the initial toplevel value, which must be a constant of a restricted type.
-(macrolet ((def (wrapper real-name)
-             `(defmacro ,wrapper (sym value &optional (doc nil doc-p))
-                `(progn (eval-when (:compile-toplevel)
-                          (!delayed-cold-set-symbol-value ',sym ',value))
-                        (,',real-name ,sym ,value ,@(if doc-p (list doc)))))))
-  (def !defglobal defglobal)
-  (def !defparameter defparameter)
-  (def !defvar defvar))
+(defmacro !define-load-time-global (sym value &optional (doc nil doc-p))
+  `(progn (define-load-time-global ,sym ,value ,@(if doc-p (list doc)))
+          ;; The expansion of the DEFINE-L-T-G is too hairy to fopcompile,
+          ;; but SETQ is ok provided that the value form is ok.
+          #-sb-xc-host (setq ,sym ,value)))
 
-(defun !delayed-cold-set-symbol-value (symbol value)
-  (assert (or (typep value '(or (member t nil) keyword number string
-                                (cons (eql quote) (cons t null))))))
-  ;; Obfuscate the reference into SB-COLD to avoid "bad package for target"
-  (let ((list (find-symbol "*SYMBOL-VALUES-FOR-GENESIS*" "SB-COLD")))
-    (set list (acons symbol (if (consp value) (second value) value)
-                     (delete symbol (symbol-value list) :key #'car)))))
+(defmacro !set-load-form-method (class-name usable-by &optional method)
+  ;; If USABLE-BY is:
+  ;;  :host   - the host compiler can execute this M-L-F method
+  ;;  :xc     - the cross-compiler can execute this M-L-F method
+  ;;  :target - the target compiler can execute this M-L-F method
+  (assert (and usable-by
+               (every (lambda (x) (member x '(:host :xc :target)))
+                      usable-by)))
+  (multiple-value-bind (host-expr target-expr)
+      (case method
+        ((nil) ; default
+         (values '(cl:make-load-form-saving-slots obj :environment env)
+                 '(sb-xc:make-load-form-saving-slots obj :environment env)))
+        (t
+         (assert (not (member :host usable-by)))
+         (values nil `(funcall ,method obj env))))
+    `(progn
+       ,@(when (or #+sb-xc-host (member :host usable-by))
+           `((defmethod make-load-form ((obj ,class-name) &optional env)
+               ,host-expr)))
+       ,@(when (or #+sb-xc-host (member :xc usable-by))
+           ;; Use the host's CLOS implementation to select the target's method.
+           `((defmethod sb-xc:make-load-form ((obj ,class-name) &optional env)
+               (declare (ignorable obj env))
+               ,target-expr)))
+       ,@(when (or #-sb-xc-host (member :target usable-by))
+           ;; Use the target's CLOS implementation
+           `((defmethod make-load-form ((obj ,class-name) &optional env)
+               (declare (ignorable obj env))
+               ,target-expr))))))
 
-;;; FIXME: Consider renaming this file asap.lisp,
-;;; and the renaming the various things
-;;;   *ASAP-FORMS* or *REVERSED-ASAP-FORMS*
-;;;   WITH-ASAP-FORMS
-;;;   ASAP or EVAL-WHEN-COLD-LOAD
-;;;   DEFUN-FROM-ASAP-FORMS
-;;; If so, add a comment explaining that ASAP is colloquial English for "as
-;;; soon as possible", and has nothing to do with "system area pointer".
+;;; Define a variable that is initialized in create_thread_struct() before any
+;;; Lisp code can execute. In particular, *RESTART-CLUSTERS* and *HANDLER-CLUSTERS*
+;;; should have a value before anything else happens.
+;;; While thread-local vars are generally useful, this is not the implementation
+;;; that would exist in the target system, if exposed more generally.
+;;; (Among the issues is the very restricted initialization form)
+(defmacro !define-thread-local (name initform &optional docstring)
+  (check-type initform (or fixnum symbol))
+  #-sb-thread `(progn
+                  (eval-when (:compile-toplevel :load-toplevel :execute)
+                    (setf (info :variable :always-bound ',name) :always-bound))
+                  ;; DEFPARAMETER, not DEFVAR, because genesis can do it
+                  (defparameter ,name ,initform ,docstring))
+  #+sb-thread `(progn
+                  ;; Genesis can handle !%DEFINE-THREAD-LOCAL
+                  #-sb-xc-host (!%define-thread-local ',name ',initform)
+                  (eval-when (:compile-toplevel :load-toplevel :execute)
+                    (setf (info :variable :wired-tls ',name) :always-thread-local)
+                    (setf (info :variable :always-bound ',name) :always-bound))
+                  (defvar ,name ,initform ,docstring)))
+
+;;; Note that this mechanism for creation of thread-locals complements the
+;;; mechanism for initializing variables that affect GC and interrupts.
+;;; Those other thread-locals are defined with an ordinary DEFVAR, but the
+;;; full list of such symbols is enumerated by !PER-THREAD-C-INTERFACE-SYMBOLS
+;;; which specifies both the list and the initial value of each symbol.
+(defvar *!thread-initial-bindings* nil)
+#+sb-xc-host
+(setf (get '!%define-thread-local :sb-cold-funcall-handler/for-effect)
+      (lambda (name initsym)
+        (push `(,name . ,initsym) *!thread-initial-bindings*)))
+#-sb-xc-host
+(defun !%define-thread-local (dummy1 dummy2) ; to avoid warning
+  (declare (ignore dummy1 dummy2)))

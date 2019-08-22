@@ -27,7 +27,16 @@
 ;;;; warranty about the software, its performance or its conformity to any
 ;;;; specification.
 
-(in-package "SB!WALKER")
+(defpackage "SB-WALKER"
+  (:use "CL" "SB-INT" "SB-EXT")
+  (:documentation "internal: a code walker used by PCL")
+  (:export "DEFINE-WALKER-TEMPLATE"
+           "WALK-FORM"
+           "*WALK-FORM-EXPAND-MACROS-P*"
+           "VAR-LEXICAL-P" "VAR-SPECIAL-P"
+           "VAR-GLOBALLY-SPECIAL-P"
+           "VAR-DECLARATION"))
+(in-package "SB-WALKER")
 
 ;;;; forward references
 
@@ -80,7 +89,7 @@
 ;;; In SBCL, as in CMU CL before it, the environment is represented
 ;;; with a structure that holds alists for the functional things,
 ;;; variables, blocks, etc. Except for SYMBOL-MACROLET, only the
-;;; SB!C::LEXENV-FUNS slot is relevant. It holds: Alist (Name . What),
+;;; SB-C::LEXENV-FUNS slot is relevant. It holds: Alist (Name . What),
 ;;; where What is either a functional (a local function) or a list
 ;;; (MACRO . <function>) (a local macro, with the specifier expander.)
 ;;; Note that Name may be a (SETF <name>) function. Accessors are
@@ -88,7 +97,7 @@
 ;;;
 ;;; If WITH-AUGMENTED-ENVIRONMENT is called from WALKER-ENVIRONMENT-BIND
 ;;; this code hides the WALKER version of an environment
-;;; inside the SB!C::LEXENV structure.
+;;; inside the SB-C::LEXENV structure.
 ;;;
 ;;; In CMUCL (and former SBCL), This used to be a list of lists of form
 ;;; (<gensym-name> MACRO . #<interpreted-function>) in the :functions slot
@@ -100,12 +109,12 @@
 ;;; Instead this list was COERCEd to a #<FUNCTION ...>!
 ;;;
 ;;; Instead, we now use a special sort of "function"-type for that
-;;; information, because the functions slot in SB!C::LEXENV is
+;;; information, because the functions slot in SB-C::LEXENV is
 ;;; supposed to have a list of <Name MACRO . #<function> elements.
 ;;; So, now we hide our bits of interest in the walker-info slot in
 ;;; our new BOGO-FUN.
 ;;;
-;;; MACROEXPAND-1 and SB!INT:EVAL-IN-LEXENV are the only SBCL
+;;; MACROEXPAND-1 and SB-INT:EVAL-IN-LEXENV are the only SBCL
 ;;; functions that get called with the constructed environment
 ;;; argument.
 
@@ -151,8 +160,8 @@
   ;; would be wrong. But we still have to make an entry so we can tell
   ;; functions from macros -- same for telling variables apart from
   ;; symbol macros.
-  (let ((lexenv (sb!kernel:coerce-to-lexenv env)))
-    (sb!c::make-lexenv
+  (let ((lexenv (sb-kernel:coerce-to-lexenv env)))
+    (sb-c::make-lexenv
      :default lexenv
      :vars (when (eql (caar macros) *key-to-walker-environment*)
              (copy-tree (mapcar (lambda (b)
@@ -161,20 +170,20 @@
                                     (if (eq info :lexical-var)
                                         (cons name
                                               (if (var-special-p name env)
-                                                  (sb!c::make-global-var
+                                                  (sb-c::make-global-var
                                                    :kind :special
                                                    :%source-name name)
-                                                  (sb!c::make-lambda-var
+                                                  (sb-c::make-lambda-var
                                                    :%source-name name)))
                                         b)))
                                 (fourth (cadar macros)))))
      :funs (append (mapcar (lambda (f)
                              (cons (car f)
-                                   (sb!c::make-functional :lexenv lexenv)))
+                                   (sb-c::make-functional :lexenv lexenv)))
                            funs)
                    (mapcar (lambda (m)
                              (list* (car m)
-                                    'sb!c::macro
+                                    'sb-sys:macro
                                     (if (eq (car m)
                                             *key-to-walker-environment*)
                                         (walker-info-to-bogo-fun (cadr m))
@@ -183,16 +192,16 @@
 
 (defun environment-function (env fn)
   (when env
-    (let ((entry (assoc fn (sb!c::lexenv-funs env) :test #'equal)))
+    (let ((entry (assoc fn (sb-c::lexenv-funs env) :test #'equal)))
       (and entry
-           (sb!c::functional-p (cdr entry))
+           (sb-c::functional-p (cdr entry))
            (cdr entry)))))
 
 (defun environment-macro (env macro)
   (when env
-    (let ((entry (assoc macro (sb!c::lexenv-funs env) :test #'eq)))
+    (let ((entry (assoc macro (sb-c::lexenv-funs env) :test #'eq)))
       (and entry
-           (eq (cadr entry) 'sb!c::macro)
+           (eq (cadr entry) 'sb-sys:macro)
            (if (eq macro *key-to-walker-environment*)
                (values (bogo-fun-to-walker-info (cddr entry)))
                (values (function-lambda-expression (cddr entry))))))))
@@ -223,9 +232,12 @@
          ,@body))))
 
 (defun convert-macro-to-lambda (llist body env &optional (name "dummy macro"))
+  (declare (ignorable llist body env name))
+  #+sb-xc-host (error "CONVERT-MACRO-TO-LAMBDA called") ; no EVAL-IN-LEXENV
+  #-sb-xc-host
   (let ((gensym (make-symbol name)))
     (eval-in-lexenv `(defmacro ,gensym ,llist ,@body)
-                    (sb!c::make-restricted-lexenv env))
+                    (sb-c::make-restricted-lexenv env))
     (macro-function gensym)))
 
 ;;;; the actual walker
@@ -289,23 +301,25 @@
   ;; if we're finding something in the real lexenv, we don't have a
   ;; bound declaration and so we specifically don't want to return
   ;; a special object that declarations can attach to, just the name.
-  (and env (find var (mapcar #'car (sb!c::lexenv-vars env)))))
+  (and env (find var (mapcar #'car (sb-c::lexenv-vars env)))))
 
 (defun variable-symbol-macro-p (var env)
   ;; FIXME: crufty return convention
   (let ((entry (or (member var (env-lexical-variables env) :key #'car :test #'eq)
-                   (and env (member var (sb!c::lexenv-vars env) :key #'car :test #'eq)))))
-    (when (and (consp (cdar entry)) (eq (cadar entry) 'sb!sys:macro))
+                   (and env (member var (sb-c::lexenv-vars env) :key #'car :test #'eq)))))
+    (when (and (consp (cdar entry)) (eq (cadar entry) 'sb-sys:macro))
       (return-from variable-symbol-macro-p entry))
     (unless entry
       (when (var-globally-symbol-macro-p var)
-        (list (list* var 'sb!sys:macro (info :variable :macro-expansion var)))))))
+        (list (list* var 'sb-sys:macro (info :variable :macro-expansion var)))))))
 
 (defun var-globally-symbol-macro-p (var)
   (eq (info :variable :kind var) :macro))
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
 (defun walked-var-declaration-p (declaration)
-  (member declaration '(sb!pcl::%class sb!pcl::%variable-rebinding special)))
+  (member declaration '(sb-pcl::%class sb-pcl::%parameter
+                        sb-pcl::%variable-rebinding special))))
 
 (defun %var-declaration (declaration var env)
   (let ((id (or (var-lexical-p var env) var)))
@@ -325,10 +339,9 @@
       (%var-declaration declaration var env)
       (error "Not a variable declaration the walker cares about: ~S" declaration)))
 
-#-sb-xc-host
 (define-compiler-macro var-declaration (&whole form declaration var env
                                         &environment lexenv)
-  (if (sb!xc:constantp declaration lexenv)
+  (if (constantp declaration lexenv)
       (let ((decl (constant-form-value declaration lexenv)))
         (if (walked-var-declaration-p decl)
             `(%var-declaration ,declaration ,var ,env)
@@ -456,11 +469,16 @@
 
 ;;; SBCL-only special forms
 (define-walker-template truly-the (nil quote eval))
+(define-walker-template sb-kernel:the* (nil quote eval))
 ;;; FIXME: maybe we don't need this one any more, given that
 ;;; NAMED-LAMBDA now expands into (FUNCTION (NAMED-LAMBDA ...))?
 (define-walker-template named-lambda walk-named-lambda)
 
 (defvar *walk-form-expand-macros-p* nil)
+
+#+sb-fasteval
+(declaim (ftype (sfunction (sb-interpreter:basic-env &optional t) sb-kernel:lexenv)
+                sb-interpreter:lexenv-from-env environment))
 
 (defun walk-form (form
                   &optional environment
@@ -468,6 +486,9 @@
                              (lambda (subform context env)
                                (declare (ignore context env))
                                subform)))
+  #+sb-fasteval
+  (when (typep environment 'sb-interpreter:basic-env)
+    (setq environment (sb-interpreter:lexenv-from-env environment)))
   (walker-environment-bind (new-env environment :walk-function walk-function)
     (walk-form-internal form :eval new-env)))
 
@@ -490,63 +511,64 @@
   ;; the user wants to this form. If the second value returned
   ;; by walk-function is T then we don't recurse...
   (catch form
-    (multiple-value-bind (newform walk-no-more-p)
-        (funcall (env-walk-function env) form context env)
-      (catch newform
-        (cond
-         (walk-no-more-p newform)
-         ((not (eq form newform))
-          (walk-form-internal newform context env))
-         ((and (not (consp newform))
-               (or (eql context :eval)
-                   (eql context :set)))
-          (let ((symmac (car (variable-symbol-macro-p newform env))))
-            (if symmac
-                (let* ((newnewform (walk-form-internal (cddr symmac)
-                                                       context
-                                                       env))
-                       (resultform
-                        (if (eq newnewform (cddr symmac))
-                            (if *walk-form-expand-macros-p* newnewform newform)
-                            newnewform))
-                       (type (env-var-type newform env)))
-                  (if (eq t type)
-                      resultform
-                      `(the ,type ,resultform)))
-                newform)))
-         ((eql context :set) newform)
-         (t
-          (let* ((fn (car newform))
-                 (template (get-walker-template fn newform)))
-            (if template
-                (if (symbolp template)
-                    (funcall template newform context env)
-                    (walk-template newform template context env))
-                (multiple-value-bind (newnewform macrop)
-                    (walker-environment-bind
-                        (new-env env :walk-form newform)
-                      (%macroexpand-1 newform new-env))
-                  (cond
-                   (macrop
-                    (let ((newnewnewform (walk-form-internal newnewform
-                                                             context
-                                                             env)))
-                      (if (eq newnewnewform newnewform)
-                          (if *walk-form-expand-macros-p* newnewform newform)
-                          newnewnewform)))
-                   ((and (symbolp fn)
-                         (special-operator-p fn))
-                    ;; This shouldn't happen, since this walker is now
-                    ;; maintained as part of SBCL, so it should know
-                    ;; about all the special forms that SBCL knows
-                    ;; about.
-                    (bug "unexpected special form ~S" fn))
-                   (t
-                    ;; Otherwise, walk the form as if it's just a
-                    ;; standard function call using a template for
-                    ;; standard function call.
-                    (walk-template
-                     newnewform '(call repeat (eval)) context env))))))))))))
+    (with-current-source-form (form)
+      (multiple-value-bind (newform walk-no-more-p)
+          (funcall (env-walk-function env) form context env)
+        (catch newform
+          (cond
+            (walk-no-more-p newform)
+            ((not (eq form newform))
+             (walk-form-internal newform context env))
+            ((and (not (consp newform))
+                  (or (eql context :eval)
+                      (eql context :set)))
+             (let ((symmac (car (variable-symbol-macro-p newform env))))
+               (if symmac
+                   (let* ((newnewform (walk-form-internal (cddr symmac)
+                                                          context
+                                                          env))
+                          (resultform
+                           (if (eq newnewform (cddr symmac))
+                               (if *walk-form-expand-macros-p* newnewform newform)
+                               newnewform))
+                          (type (env-var-type newform env)))
+                     (if (eq t type)
+                         resultform
+                         `(the ,type ,resultform)))
+                   newform)))
+            ((eql context :set) newform)
+            (t
+             (let* ((fn (car newform))
+                    (template (get-walker-template fn newform)))
+               (if template
+                   (if (symbolp template)
+                       (funcall template newform context env)
+                       (walk-template newform template context env))
+                   (multiple-value-bind (newnewform macrop)
+                       (walker-environment-bind
+                           (new-env env :walk-form newform)
+                         (%macroexpand-1 newform new-env))
+                     (cond
+                       (macrop
+                        (let ((newnewnewform (walk-form-internal newnewform
+                                                                 context
+                                                                 env)))
+                          (if (eq newnewnewform newnewform)
+                              (if *walk-form-expand-macros-p* newnewform newform)
+                              newnewnewform)))
+                       ((and (symbolp fn)
+                             (special-operator-p fn))
+                        ;; This shouldn't happen, since this walker is now
+                        ;; maintained as part of SBCL, so it should know
+                        ;; about all the special forms that SBCL knows
+                        ;; about.
+                        (bug "unexpected special form ~S" fn))
+                       (t
+                        ;; Otherwise, walk the form as if it's just a
+                        ;; standard function call using a template for
+                        ;; standard function call.
+                        (walk-template
+                         newnewform '(call repeat (eval)) context env)))))))))))))
 
 (defun walk-template (form template context env)
   (if (atom template)
@@ -628,12 +650,6 @@
                (walk-form-internal (car form) :eval env)
                (walk-repeat-eval (cdr form) env))))
 
-(defun recons (x car cdr)
-  (if (or (not (eq (car x) car))
-          (not (eq (cdr x) cdr)))
-      (cons car cdr)
-      x))
-
 (defun relist (x &rest args)
   (if (null args)
       nil
@@ -655,10 +671,11 @@
 
 (defun walk-declarations (body fn env
                                &optional doc-string-p declarations old-body
-                               &aux (form (car body)) macrop new-form)
+                               &aux (form (car body)))
   (cond ((and (stringp form)                    ;might be a doc string
               (cdr body)                        ;isn't the returned value
               (null doc-string-p)               ;no doc string yet
+              ;; FIXME: {decl}+ doc {decl}+ is supposed to be valid.
               (null declarations))              ;no declarations yet
          (recons body
                  form
@@ -675,24 +692,12 @@
                                      ,(or (var-lexical-p name env) name)
                                      ,.args)
                                    env)
-                 (note-declaration (sb!c::canonized-decl-spec declaration) env))
+                 (note-declaration (sb-c::canonized-decl-spec declaration) env))
              (push declaration declarations)))
          (recons body
                  form
                  (walk-declarations
                    (cdr body) fn env doc-string-p declarations)))
-        ((and form
-              (listp form)
-              (null (get-walker-template (car form) form))
-              (progn
-                (multiple-value-setq (new-form macrop)
-                                     (%macroexpand-1 form env))
-                macrop))
-         ;; This form was a call to a macro. Maybe it expanded
-         ;; into a declare?  Recurse to find out.
-         (walk-declarations (recons body new-form (cdr body))
-                            fn env doc-string-p declarations
-                            (or old-body body)))
         (t
          ;; Now that we have walked and recorded the declarations,
          ;; call the function our caller provided to expand the body.
@@ -710,7 +715,7 @@
                                          &aux arg)
   (cond ((null arglist) ())
         ((symbolp (setq arg (car arglist)))
-         (or (member arg sb!xc:lambda-list-keywords :test #'eq)
+         (or (member arg lambda-list-keywords :test #'eq)
              (note-var-binding arg env))
          (recons arglist
                  arg
@@ -718,7 +723,7 @@
                                context
                                env
                                (and destructuringp
-                                    (not (member arg sb!xc:lambda-list-keywords))))))
+                                    (not (member arg lambda-list-keywords))))))
         ((consp arg)
          (prog1 (recons arglist
                         (if destructuringp
@@ -764,7 +769,7 @@
       'no-init
       (cadr binding)))
 
-(defun let*-bindings (bindings &aux names inits (seen (make-hash-table)))
+(defun let*-bindings (bindings &aux names inits (seen (make-hash-table :test #'eq)))
   (dolist (binding (reverse bindings) (values names inits))
     (let ((name (let*-binding-name binding)))
       (push (cons name (gethash name seen)) names)
@@ -777,7 +782,7 @@
           (bindings (cadr form))
           (body (cddr form)))
       (multiple-value-bind (names inits) (let*-bindings bindings)
-        (multiple-value-bind (newbody decls doc) (parse-body body :doc-string-allowed nil)
+        (multiple-value-bind (newbody decls doc) (parse-body body nil)
           (declare (ignore newbody))
           (aver (null doc))
           (labels ((maybe-process-and-munge-declaration (name declaration env)
@@ -959,7 +964,7 @@
                  :lexical-vars
                  (append (mapcar (lambda (binding)
                                    `(,(car binding)
-                                     sb!sys:macro . ,(cadr binding)))
+                                     sb-sys:macro . ,(cadr binding)))
                                  bindings)
                          (env-lexical-variables old-env)))
       (relist* form 'symbol-macrolet bindings

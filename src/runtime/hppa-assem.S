@@ -1,8 +1,12 @@
-#define LANGUAGE_ASSEMBLY
+#ifdef __ELF__
+// Mark the object as not requiring an executable stack.
+.section .note.GNU-stack,"",%progbits
+#endif
 
 #include "sbcl.h"
 #include "lispregs.h"
 #include "genesis/closure.h"
+#include "genesis/code.h"
 #include "genesis/fdefn.h"
 #include "genesis/simple-fun.h"
 #include "genesis/return-pc.h"
@@ -108,15 +112,15 @@ call_into_lisp:
 
 	/* Indirect the closure */
 	ldw	CLOSURE_FUN_OFFSET(0,reg_LEXENV),reg_CODE
-  addi  SIMPLE_FUN_CODE_OFFSET,reg_CODE,reg_LIP
+  addi  SIMPLE_FUN_INSTS_OFFSET,reg_CODE,reg_LIP
 
 #ifdef LISP_FEATURE_HPUX
   /*  Get the stub address, ie assembly-routine return-from-lisp */
   addil   L%return_from_lisp_stub-$global$,%dp
   ldw     R%return_from_lisp_stub-$global$(0,%r1),reg_NL0
   be,n  0(%sr5,reg_NL0)
-#else                 
-  be,n  0(%sr5,reg_NL0)
+#else
+  be,n  0(%sr5,reg_LIP)
 #endif
 
 	break	0,0
@@ -278,12 +282,7 @@ call_into_c_return:
 
 /*
  * Stuff to sanctify a block of memory for execution.
- * FIX why does this code work: parisc2.0 guide tells
- * us that we should add an sync after fdc and fic and
- * then let seven nops be executed before executing the
- * sanctified code.
  */
-
 
 	.EXPORT sanctify_for_execution
 sanctify_for_execution:
@@ -292,16 +291,24 @@ sanctify_for_execution:
 	.entry
 	/* %arg0=start addr, %arg1=length in bytes */
 	add	%arg0,%arg1,%arg1
+        copy	%arg0,%arg2
 	ldo	-1(%arg1),%arg1
 	depi	0,31,5,%arg0
 	depi	0,31,5,%arg1
 	ldsid	(%arg0),%r1
 	mtsp	%r1,%sr1
 	ldi	32,%r1			; bytes per cache line
+        /* parisc 1.1 and 2.0 manuals say to flush the dcache, SYNC,
+	 * flush the icache, SYNC again, and burn seven instructions
+	 * before executing modified code. */
 sanctify_loop:
-	fdc	0(%sr1,%arg0)
 	comb,<	%arg0,%arg1,sanctify_loop
-	fic,m	%r1(%sr1,%arg0)
+	fdc,m	%r1(%sr1,%arg0)
+        sync
+sanctify_loop_2:
+	comb,<	%arg2,%arg1,sanctify_loop_2
+	fic,m	%r1(%sr1,%arg2)
+        sync
 
 	bv	%r0(%rp)
 	nop
@@ -444,7 +451,7 @@ SingleStepTraps:
 	.align	8
 	.export fun_end_breakpoint_guts
 fun_end_breakpoint_guts:
-	.word	RETURN_PC_HEADER_WIDETAG + 0x600
+	.word	(((CODE_SIZE+1)&~1)<<N_WIDETAG_BITS)|RETURN_PC_WIDETAG
 	/* multiple value return point -- just jump to trap. */
 	b,n	fun_end_breakpoint_trap
 	/* single value return point -- convert to multiple w/ n=1 */
@@ -464,30 +471,3 @@ fun_end_breakpoint_trap:
 
 	.export	fun_end_breakpoint_end
 fun_end_breakpoint_end:
-
-/* FIX-lav: these are found in assem-rtns.lisp too, but
-   genesis.lisp has problem referencing them, so we keep
-   these old versions too.  Lisp code cant jump to them
-   because it is an inter space jump but lisp do intra
-   space jumps */
-
-	.align	8
-        .EXPORT closure_tramp
-closure_tramp:
-        /* reg_FDEFN holds the fdefn object. */
-        ldw     FDEFN_FUN_OFFSET(0,reg_FDEFN),reg_LEXENV
-        ldw     CLOSURE_FUN_OFFSET(0,reg_LEXENV),reg_L0
-        addi    SIMPLE_FUN_CODE_OFFSET, reg_L0, reg_LIP
-        bv,n    0(reg_LIP)
-
-	.align	8
-        .EXPORT undefined_tramp
-undefined_tramp:
-        break   trap_Error,0
-        .byte   4
-        .byte   UNDEFINED_FUN_ERROR
-        .byte   254
-        .byte   (0x20 + sc_DescriptorReg)
-        .byte   1
-        .align  4
-

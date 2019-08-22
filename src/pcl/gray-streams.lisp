@@ -20,19 +20,20 @@
 ;;; implementation generic functions.  All of them could (maybe
 ;;; should?) have two default methods: one on STREAM calling
 ;;; BUG-OR-ERROR, and one on T signalling a TYPE-ERROR.
-(defmacro bug-or-error (stream fun)
-  `(error
-    "~@<The stream ~S has no suitable method for ~S, ~
+(declaim (ftype (function * nil) bug-or-error))
+(defun bug-or-error (stream fun)
+  (declare (optimize allow-non-returning-tail-call))
+  (error
+   "~@<The stream ~S has no suitable method for ~S, ~
      and so has fallen through to this method.  If you think that this is ~
      a bug, please report it to the applicable authority (bugs in SBCL itself ~
      should go to the mailing lists referenced from ~
      <http://www.sbcl.org/>).~@:>"
-    ,stream ,fun))
+   stream fun))
 
 (fmakunbound 'stream-element-type)
 
 (defgeneric stream-element-type (stream)
-  #+sb-doc
   (:documentation
    "Return a type specifier for the kind of object returned by the
   STREAM. The class FUNDAMENTAL-CHARACTER-STREAM provides a default method
@@ -50,57 +51,46 @@
 (defmethod stream-element-type ((non-stream t))
   (error 'type-error :datum non-stream :expected-type 'stream))
 
-(defgeneric pcl-open-stream-p (stream)
-  #+sb-doc
+(fmakunbound 'open-stream-p)
+
+(defgeneric open-stream-p (stream)
   (:documentation
    "Return true if STREAM is not closed. A default method is provided
   by class FUNDAMENTAL-STREAM which returns true if CLOSE has not been
   called on the stream."))
 
-(defmethod pcl-open-stream-p ((stream ansi-stream))
+(defmethod open-stream-p ((stream ansi-stream))
   (ansi-stream-open-stream-p stream))
 
-(defmethod pcl-open-stream-p ((stream fundamental-stream))
+(defmethod open-stream-p ((stream fundamental-stream))
   (stream-open-p stream))
 
-(defmethod pcl-open-stream-p ((stream stream))
+(defmethod open-stream-p ((stream stream))
   (bug-or-error stream 'open-stream-p))
 
-(defmethod pcl-open-stream-p ((non-stream t))
+(defmethod open-stream-p ((non-stream t))
   (error 'type-error :datum non-stream :expected-type 'stream))
-
-;;; bootstrapping hack
-(pcl-open-stream-p (make-string-output-stream))
-(setf (fdefinition 'open-stream-p) #'pcl-open-stream-p)
 
-(defgeneric pcl-close (stream &key abort)
-  #+sb-doc
+(fmakunbound 'close)
+
+(defgeneric close (stream &key abort)
   (:documentation
    "Close the given STREAM. No more I/O may be performed, but
   inquiries may still be made. If :ABORT is true, an attempt is made
   to clean up the side effects of having created the stream."))
 
-(defmethod pcl-close ((stream ansi-stream) &key abort)
+(defmethod close ((stream ansi-stream) &key abort)
   (ansi-stream-close stream abort))
 
-(defmethod pcl-close ((stream fundamental-stream) &key abort)
+(defmethod close ((stream fundamental-stream) &key abort)
   (declare (ignore abort))
   (setf (stream-open-p stream) nil)
   t)
-
-(progn
-  ;; KLUDGE: Get in a call to PCL-CLOSE with a string-output-stream before
-  ;; setting it as CLOSE. Otherwise using NAMED-LAMBDAs as DFUNs causes a
-  ;; vicious metacircle from FORMAT NIL somewhere in the compiler. This is
-  ;; enough to get the dispatch settled down before we need it.
-  (pcl-close (make-string-output-stream))
-  (setf (fdefinition 'close) #'pcl-close))
 
 (let ()
   (fmakunbound 'input-stream-p)
 
   (defgeneric input-stream-p (stream)
-    #+sb-doc
     (:documentation "Can STREAM perform input operations?"))
 
   (defmethod input-stream-p ((stream ansi-stream))
@@ -122,7 +112,6 @@
   (fmakunbound 'interactive-stream-p)
 
   (defgeneric interactive-stream-p (stream)
-    #+sb-doc
     (:documentation "Is STREAM an interactive stream?"))
 
   (defmethod interactive-stream-p ((stream ansi-stream))
@@ -141,7 +130,6 @@
   (fmakunbound 'output-stream-p)
 
   (defgeneric output-stream-p (stream)
-    #+sb-doc
     (:documentation "Can STREAM perform output operations?"))
 
   (defmethod output-stream-p ((stream ansi-stream))
@@ -166,7 +154,6 @@
 ;;; for the generic functions below.
 
 (defgeneric stream-read-char (stream)
-  #+sb-doc
   (:documentation
    "Read one character from the stream. Return either a
   character object, or the symbol :EOF if the stream is at end-of-file.
@@ -174,14 +161,12 @@
   method for this function."))
 
 (defgeneric stream-unread-char (stream character)
-  #+sb-doc
   (:documentation
    "Undo the last call to STREAM-READ-CHAR, as in UNREAD-CHAR.
   Return NIL. Every subclass of FUNDAMENTAL-CHARACTER-INPUT-STREAM
   must define a method for this function."))
 
 (defgeneric stream-read-char-no-hang (stream)
-  #+sb-doc
   (:documentation
    "This is used to implement READ-CHAR-NO-HANG. It returns either a
   character, or NIL if no input is currently available, or :EOF if
@@ -194,7 +179,6 @@
   (stream-read-char stream))
 
 (defgeneric stream-peek-char (stream)
-  #+sb-doc
   (:documentation
    "This is used to implement PEEK-CHAR; this corresponds to PEEK-TYPE of NIL.
   It returns either a character or :EOF. The default method calls
@@ -207,7 +191,6 @@
     char))
 
 (defgeneric stream-listen (stream)
-  #+sb-doc
   (:documentation
    "This is used by LISTEN. It returns true or false. The default method uses
   STREAM-READ-CHAR-NO-HANG and STREAM-UNREAD-CHAR. Most streams should
@@ -221,7 +204,6 @@
       t)))
 
 (defgeneric stream-read-line (stream)
-  #+sb-doc
   (:documentation
    "This is used by READ-LINE. A string is returned as the first value. The
   second value is true if the string was terminated by end-of-file
@@ -248,7 +230,6 @@
               (incf index)))))))
 
 (defgeneric stream-clear-input (stream)
-  #+sb-doc
   (:documentation
    "This is like CL:CLEAR-INPUT, but for Gray streams, returning NIL.
   The default method does nothing."))
@@ -261,57 +242,34 @@
   (error 'type-error :datum non-stream :expected-type 'stream))
 
 (defgeneric stream-read-sequence (stream seq &optional start end)
-  #+sb-doc
   (:documentation
    "This is like CL:READ-SEQUENCE, but for Gray streams."))
-
-;;; Destructively modify SEQ by reading elements from STREAM. That
-;;; part of SEQ bounded by START and END is destructively modified by
-;;; copying successive elements into it from STREAM. If the end of
-;;; file for STREAM is reached before copying all elements of the
-;;; subsequence, then the extra elements near the end of sequence are
-;;; not updated, and the index of the next element is returned.
-(defun basic-io-type-stream-read-sequence (stream seq start end read-fun)
-  (declare (type sequence seq)
-           (type stream stream)
-           (type index start)
-           (type sequence-end end)
-           (type function read-fun)
-           (values index))
-  (let ((end (or end (length seq))))
-    (declare (type index end))
-    (etypecase seq
-      (list
-        (do ((rem (nthcdr start seq) (rest rem))
-             (i start (1+ i)))
-            ((or (endp rem) (>= i end)) i)
-          (declare (type list rem)
-                   (type index i))
-          (let ((el (funcall read-fun stream)))
-            (when (eq el :eof)
-              (return i))
-            (setf (first rem) el))))
-      (vector
-        (with-array-data ((data seq) (offset-start start) (offset-end end))
-          (do ((i offset-start (1+ i)))
-              ((>= i offset-end) end)
-            (declare (type index i))
-            (let ((el (funcall read-fun stream)))
-              (when (eq el :eof)
-                (return (+ start (- i offset-start))))
-              (setf (aref data i) el))))))))
 
 (defmethod stream-read-sequence ((stream fundamental-character-input-stream)
                                  (seq sequence)
                                  &optional (start 0) (end nil))
-  (basic-io-type-stream-read-sequence stream seq start end
-                                      #'stream-read-char))
+  (sb-impl::read-sequence/read-function
+   seq stream start end 'character
+   (lambda (stream eof-error-p eof-value recursive-p)
+     (aver (null eof-error-p))
+     (aver (eq :eof eof-value))
+     (aver (not recursive-p))
+     (stream-read-char stream))
+   #'ill-bin))
 
 (defmethod stream-read-sequence ((stream fundamental-binary-input-stream)
                                  (seq sequence)
                                  &optional (start 0) (end nil))
-  (basic-io-type-stream-read-sequence stream seq start end
-                                      #'stream-read-byte))
+  (let ((stream-element-mode (sb-impl::stream-element-type-stream-element-mode
+                              (stream-element-type stream))))
+    (sb-impl::read-sequence/read-function
+     seq stream start end stream-element-mode
+     #'ill-in
+     (lambda (stream eof-error-p eof-value recursive-p)
+       (aver (null eof-error-p))
+       (aver (eq :eof eof-value))
+       (aver (not recursive-p))
+       (stream-read-byte stream)))))
 
 
 ;;; character output streams
@@ -321,14 +279,14 @@
 ;;; for the generic functions below.
 
 (defgeneric stream-write-char (stream character)
-  #+sb-doc
   (:documentation
    "Write CHARACTER to STREAM and return CHARACTER. Every
   subclass of FUNDAMENTAL-CHARACTER-OUTPUT-STREAM must have a method
   defined for this function."))
 
 (defgeneric stream-line-column (stream)
-  #+sb-doc
+  (:method ((stream sb-int:form-tracking-stream))
+    (cdr (sb-int:line/col-from-charpos stream)))
   (:documentation
    "Return the column number where the next character
   will be written, or NIL if that is not meaningful for this stream.
@@ -344,14 +302,12 @@
 ;;; STREAM-LINE-LENGTH is a CMU CL extension to Gray streams.
 ;;; FIXME: Should we support it? Probably not..
 (defgeneric stream-line-length (stream)
-  #+sb-doc
   (:documentation "Return the stream line length or NIL."))
 
 (defmethod stream-line-length ((stream fundamental-character-output-stream))
   nil)
 
 (defgeneric stream-start-line-p (stream)
-  #+sb-doc
   (:documentation
    "Is STREAM known to be positioned at the beginning of a line?
   It is permissible for an implementation to always return
@@ -370,7 +326,6 @@
   (eql (stream-line-column stream) 0))
 
 (defgeneric stream-write-string (stream string &optional start end)
-  #+sb-doc
   (:documentation
    "This is used by WRITE-STRING. It writes the string to the stream,
   optionally delimited by start and end, which default to 0 and NIL.
@@ -380,18 +335,13 @@
 
 (defmethod stream-write-string ((stream fundamental-character-output-stream)
                                 string &optional (start 0) end)
-  (declare (string string)
-           (fixnum start))
-  (let ((end (or end (length string))))
-    (declare (fixnum end))
-    (do ((pos start (1+ pos)))
-        ((>= pos end))
-      (declare (type index pos))
-      (stream-write-char stream (aref string pos))))
+  (with-array-data ((data string) (offset-start start) (offset-end end)
+                    :check-fill-pointer t)
+    (sb-impl::write-sequence/vector
+     (data simple-string) stream offset-start offset-end #'stream-write-char))
   string)
 
 (defgeneric stream-terpri (stream)
-  #+sb-doc
   (:documentation
    "Writes an end of line, as for TERPRI. Returns NIL. The default
   method does (STREAM-WRITE-CHAR stream #\NEWLINE)."))
@@ -400,7 +350,6 @@
   (stream-write-char stream #\Newline))
 
 (defgeneric stream-fresh-line (stream)
-  #+sb-doc
   (:documentation
    "Outputs a new line to the Stream if it is not positioned at the
   beginning of a line. Returns T if it output a new line, nil
@@ -413,7 +362,6 @@
     t))
 
 (defgeneric stream-finish-output (stream)
-  #+sb-doc
   (:documentation
    "Attempts to ensure that all output sent to the Stream has reached
   its destination, and only then returns false. Implements
@@ -427,7 +375,6 @@
   (error 'type-error :datum non-stream :expected-type 'stream))
 
 (defgeneric stream-force-output (stream)
-  #+sb-doc
   (:documentation
    "Attempts to force any buffered output to be sent. Implements
   FORCE-OUTPUT. The default method does nothing."))
@@ -440,7 +387,6 @@
   (error 'type-error :datum non-stream :expected-type 'stream))
 
 (defgeneric stream-clear-output (stream)
-  #+sb-doc
   (:documentation
    "This is like CL:CLEAR-OUTPUT, but for Gray streams: clear the given
   output STREAM. The default method does nothing."))
@@ -453,7 +399,6 @@
   (error 'type-error :datum non-stream :expected-type 'stream))
 
 (defgeneric stream-advance-to-column (stream column)
-  #+sb-doc
   (:documentation
    "Write enough blank space so that the next character will be
   written at the specified column. Returns true if the operation is
@@ -472,43 +417,26 @@
       T)))
 
 (defgeneric stream-write-sequence (stream seq &optional start end)
-  #+sb-doc
   (:documentation
    "This is like CL:WRITE-SEQUENCE, but for Gray streams."))
-
-;;; Write the elements of SEQ bounded by START and END to STREAM.
-(defun basic-io-type-stream-write-sequence (stream seq start end write-fun)
-  (declare (type sequence seq)
-           (type stream stream)
-           (type index start)
-           (type sequence-end end)
-           (type function write-fun)
-           (values sequence))
-  (let ((end (or end (length seq))))
-    (declare (type index start end))
-    (etypecase seq
-      (list
-        (do ((rem (nthcdr start seq) (rest rem))
-             (i start (1+ i)))
-            ((or (endp rem) (>= i end)) seq)
-          (declare (type list rem)
-                   (type index i))
-          (funcall write-fun stream (first rem))))
-      (vector
-        (do ((i start (1+ i)))
-            ((>= i end) seq)
-          (declare (type index i))
-          (funcall write-fun stream (aref seq i)))))))
 
 (defmethod stream-write-sequence ((stream fundamental-character-output-stream)
                                   (seq sequence)
                                   &optional (start 0) (end nil))
-  (typecase seq
-    (string
-      (stream-write-string stream seq start end))
-    (t
-      (basic-io-type-stream-write-sequence stream seq start end
-                                           #'stream-write-char))))
+  (sb-impl::write-sequence/write-function
+   seq stream start end 'character #'stream-write-char #'ill-bout))
+
+;; Provide a reasonable default for binary Gray streams.  We might be
+;; able to do better by specializing on the sequence type, but at
+;; least the behaviour is reasonable. --tony 2003/05/08.
+(defmethod stream-write-sequence ((stream fundamental-binary-output-stream)
+                                  (seq sequence)
+                                  &optional (start 0) (end nil))
+  (let ((stream-element-mode (sb-impl::stream-element-type-stream-element-mode
+                              (stream-element-type stream))))
+    (sb-impl::write-sequence/write-function
+     seq stream start end stream-element-mode
+     #'ill-out #'stream-write-byte)))
 
 
 ;;; binary streams
@@ -520,7 +448,6 @@
 ;;; generic functions.
 
 (defgeneric stream-read-byte (stream)
-  #+sb-doc
   (:documentation
    "Used by READ-BYTE; returns either an integer, or the symbol :EOF
   if the stream is at end-of-file."))
@@ -531,7 +458,6 @@
   (error 'type-error :datum non-stream :expected-type 'stream))
 
 (defgeneric stream-write-byte (stream integer)
-  #+sb-doc
   (:documentation
    "Implements WRITE-BYTE; writes the integer to the stream and
   returns the integer as the result."))
@@ -541,17 +467,7 @@
 (defmethod stream-write-byte ((non-stream t) integer)
   (error 'type-error :datum non-stream :expected-type 'stream))
 
-;; Provide a reasonable default for binary Gray streams.  We might be
-;; able to do better by specializing on the sequence type, but at
-;; least the behaviour is reasonable. --tony 2003/05/08.
-(defmethod stream-write-sequence ((stream fundamental-binary-output-stream)
-                                  (seq sequence)
-                                  &optional (start 0) (end nil))
-  (basic-io-type-stream-write-sequence stream seq start end
-                                       #'stream-write-byte))
-
 (defgeneric stream-file-position (stream &optional position-spec)
-  #+sb-doc
   (:documentation
    "Used by FILE-POSITION. Returns or changes the current position within STREAM."))
 

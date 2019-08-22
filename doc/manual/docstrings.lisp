@@ -86,7 +86,7 @@ you deserve to lose.")
 (defparameter *symbol-characters* "ABCDEFGHIJKLMNOPQRSTUVWXYZ*:-+&#'"
   "List of characters that make up symbols in a docstring.")
 
-(defparameter *symbol-delimiters* " ,.!?;")
+(defparameter *symbol-delimiters* " ,.!?;()")
 
 (defparameter *ordered-documentation-kinds*
   '(package type structure condition class macro))
@@ -124,7 +124,7 @@ you deserve to lose.")
   (class-precedence-list class))
 
 (defun specialized-lambda-list (method)
-  ;; courtecy of AMOP p. 61
+  ;; courtesy of AMOP p. 61
   (let* ((specializers (method-specializers method))
          (lambda-list (method-lambda-list method))
          (n-required (length specializers)))
@@ -208,18 +208,26 @@ symbols or lists of symbols."))
 
 (defmethod name-using-kind/name (kind (name symbol) doc)
   (declare (ignore kind))
-  (format nil "~A:~A" (package-name (get-package doc)) name))
+  (format nil "~A ~A" (package-name (get-package doc)) name))
 
 (defmethod name-using-kind/name (kind (name list) doc)
   (declare (ignore kind))
   (assert (setf-name-p name))
-  (format nil "(setf ~A:~A)" (package-name (get-package doc)) (second name)))
+  (format nil "(setf ~A ~A)" (package-name (get-package doc)) (second name)))
 
 (defmethod name-using-kind/name ((kind (eql 'method)) name doc)
-  (format nil "~A~{ ~A~} ~A"
-          (name-using-kind/name nil (first name) doc)
-          (second name)
-          (third name)))
+  (flet ((specializers (ll)
+           (let (result)
+             (dolist (arg ll)
+               (cond
+                 ((member arg lambda-list-keywords) (return))
+                 ((atom arg) (push t result))
+                 (t (push (second arg) result))))
+             (nreverse result))))
+    (format nil "~A~{ ~A~} ~A"
+            (name-using-kind/name nil (first name) doc)
+            (second name)
+            (specializers (third name)))))
 
 (defun node-name (doc)
   "Returns TexInfo node name as a string for a DOCUMENTATION instance."
@@ -575,7 +583,7 @@ an item in an itemization."
                (when sub-lines-consumed
                  (incf line-number (1- sub-lines-consumed)) ; +1 on next loop
                  (incf lines-consumed sub-lines-consumed)
-                 (setf result (nconc (nreverse sub-itemization) result)))))
+                 (setf result (append (reverse sub-itemization) result)))))
             ((and offset (= indentation this-offset))
              ;; start of new item
              (push (format nil "@item ~A"
@@ -725,7 +733,7 @@ followed another tabulation label or a tabulation body."
   (not (and (typep (find-class symbol nil) 'standard-class)
             (docstring slot t))))
 
-(defun texinfo-anchor (doc)
+(defun texinfo-anchor (doc &aux *print-pretty*)
   (format *texinfo-output* "@anchor{~A}~%" (node-name doc)))
 
 ;;; KLUDGE: &AUX *PRINT-PRETTY* here means "no linebreaks please"
@@ -754,7 +762,7 @@ followed another tabulation label or a tabulation body."
   (when (member (get-kind doc) '(class structure condition))
     (let ((name (get-name doc)))
       ;; class precedence list
-      (format *texinfo-output* "Class precedence list: @code{~(~{@lw{~A}~^, ~}~)}~%~%"
+      (format *texinfo-output* "@raggedright~%Class precedence list: ~(~{@code{@w{~A}}~^, ~}~)~%@end raggedright~%~%"
               (remove-if (lambda (class)  (hide-superclass-p name class))
                          (mapcar #'class-name (ensure-class-precedence-list (find-class name)))))
       ;; slots

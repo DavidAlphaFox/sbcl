@@ -9,14 +9,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; unary operations.
 
 (define-vop (fast-safe-arith-op)
-  (:policy :fast-safe)
-  (:effects)
-  (:affected))
+  (:policy :fast-safe))
 
 (define-vop (fixnum-unop fast-safe-arith-op)
   (:args (x :scs (any-reg)))
@@ -180,47 +178,6 @@
          (y :scs (unsigned-reg) :target r))
   (:arg-types signed-num unsigned-num)
   (:translate logand))
-
-;;; Special case fixnum + and - that trap on overflow.  Useful when we
-;;; don't know that the output type is a fixnum.
-
-;;; I (Raymond Toy) took these out. They don't seem to be used
-;;; anywhere at all.
-#+nil
-(progn
-(define-vop (+/fixnum fast-+/fixnum=>fixnum)
-  (:policy :safe)
-  (:results (r :scs (any-reg descriptor-reg)))
-  (:result-types tagged-num)
-  (:note "safe inline fixnum arithmetic")
-  (:generator 4
-    (inst taddcctv r x y)))
-
-(define-vop (+-c/fixnum fast-+-c/fixnum=>fixnum)
-  (:policy :safe)
-  (:results (r :scs (any-reg descriptor-reg)))
-  (:result-types tagged-num)
-  (:note "safe inline fixnum arithmetic")
-  (:generator 3
-    (inst taddcctv r x (fixnumize y))))
-
-(define-vop (-/fixnum fast--/fixnum=>fixnum)
-  (:policy :safe)
-  (:results (r :scs (any-reg descriptor-reg)))
-  (:result-types tagged-num)
-  (:note "safe inline fixnum arithmetic")
-  (:generator 4
-    (inst tsubcctv r x y)))
-
-(define-vop (--c/fixnum fast---c/fixnum=>fixnum)
-  (:policy :safe)
-  (:results (r :scs (any-reg descriptor-reg)))
-  (:result-types tagged-num)
-  (:note "safe inline fixnum arithmetic")
-  (:generator 3
-    (inst tsubcctv r x (fixnumize y))))
-
-)
 
 ;;; Truncate
 
@@ -693,8 +650,8 @@
              fast-ash-left/unsigned=>unsigned))
 (deftransform ash-left-mod32 ((integer count)
                               ((unsigned-byte 32) (unsigned-byte 5)))
-  (when (sb!c::constant-lvar-p count)
-    (sb!c::give-up-ir1-transform))
+  (when (sb-c::constant-lvar-p count)
+    (sb-c::give-up-ir1-transform))
   '(%primitive fast-ash-left-mod32/unsigned=>unsigned integer count))
 
 ;;;; Binary conditional VOPs:
@@ -702,8 +659,6 @@
 (define-vop (fast-conditional)
   (:conditional)
   (:info target not-p)
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-conditional/fixnum fast-conditional)
@@ -836,22 +791,22 @@
 
 ;;;; Bignum stuff.
 (define-vop (bignum-length get-header-data)
-  (:translate sb!bignum:%bignum-length)
+  (:translate sb-bignum:%bignum-length)
   (:policy :fast-safe))
 
 (define-vop (bignum-set-length set-header-data)
-  (:translate sb!bignum:%bignum-set-length)
+  (:translate sb-bignum:%bignum-set-length)
   (:policy :fast-safe))
 
 (define-vop (bignum-ref word-index-ref)
   (:variant bignum-digits-offset other-pointer-lowtag)
-  (:translate sb!bignum:%bignum-ref)
+  (:translate sb-bignum:%bignum-ref)
   (:results (value :scs (unsigned-reg)))
   (:result-types unsigned-num))
 
 (define-vop (bignum-set word-index-set)
   (:variant bignum-digits-offset other-pointer-lowtag)
-  (:translate sb!bignum:%bignum-set)
+  (:translate sb-bignum:%bignum-set)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg immediate zero))
          (value :scs (unsigned-reg)))
@@ -860,7 +815,7 @@
   (:result-types unsigned-num))
 
 (define-vop (digit-0-or-plus)
-  (:translate sb!bignum:%digit-0-or-plusp)
+  (:translate sb-bignum:%digit-0-or-plusp)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg)))
   (:arg-types unsigned-num)
@@ -875,7 +830,7 @@
       (emit-label done))))
 
 (define-vop (v9-digit-0-or-plus-cmove)
-  (:translate sb!bignum:%digit-0-or-plusp)
+  (:translate sb-bignum:%digit-0-or-plusp)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg)))
   (:arg-types unsigned-num)
@@ -889,20 +844,20 @@
 ;; This doesn't work?
 #+nil
 (define-vop (v9-digit-0-or-plus-movr)
-  (:translate sb!bignum:%digit-0-or-plusp)
+  (:translate sb-bignum:%digit-0-or-plusp)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg)))
   (:arg-types unsigned-num)
   (:results (result :scs (descriptor-reg)))
   (:temporary (:scs (descriptor-reg)) temp)
-  (:guard #!+:sparc-v9 t #!-:sparc-v9 nil)
+  (:guard #+:sparc-v9 t #-:sparc-v9 nil)
   (:generator 2
     (load-symbol temp t)
     (inst movr result null-tn digit :lz)
     (inst movr result temp digit :gez)))
 
 (define-vop (add-w/carry)
-  (:translate sb!bignum:%add-with-carry)
+  (:translate sb-bignum:%add-with-carry)
   (:policy :fast-safe)
   (:args (a :scs (unsigned-reg))
          (b :scs (unsigned-reg))
@@ -917,7 +872,7 @@
     (inst addx carry zero-tn zero-tn)))
 
 (define-vop (sub-w/borrow)
-  (:translate sb!bignum:%subtract-with-borrow)
+  (:translate sb-bignum:%subtract-with-borrow)
   (:policy :fast-safe)
   (:args (a :scs (unsigned-reg))
          (b :scs (unsigned-reg))
@@ -985,7 +940,7 @@
        (inst rdy result-low)))))
 
 (define-vop (bignum-mult-and-add-3-arg)
-  (:translate sb!bignum:%multiply-and-add)
+  (:translate sb-bignum:%multiply-and-add)
   (:policy :fast-safe)
   (:args (x :scs (unsigned-reg) :to (:eval 1))
          (y :scs (unsigned-reg) :to (:eval 1))
@@ -1000,7 +955,7 @@
     (inst addx hi zero-tn)))
 
 (define-vop (bignum-mult-and-add-4-arg)
-  (:translate sb!bignum:%multiply-and-add)
+  (:translate sb-bignum:%multiply-and-add)
   (:policy :fast-safe)
   (:args (x :scs (unsigned-reg) :to (:eval 1))
          (y :scs (unsigned-reg) :to (:eval 1))
@@ -1018,7 +973,7 @@
     (inst addx hi zero-tn)))
 
 (define-vop (bignum-mult)
-  (:translate sb!bignum:%multiply)
+  (:translate sb-bignum:%multiply)
   (:policy :fast-safe)
   (:args (x :scs (unsigned-reg) :to (:result 1))
          (y :scs (unsigned-reg) :to (:result 1)))
@@ -1030,10 +985,10 @@
     (emit-multiply x y hi lo)))
 
 (define-vop (bignum-lognot lognot-mod32/unsigned=>unsigned)
-  (:translate sb!bignum:%lognot))
+  (:translate sb-bignum:%lognot))
 
 (define-vop (fixnum-to-digit)
-  (:translate sb!bignum:%fixnum-to-digit)
+  (:translate sb-bignum:%fixnum-to-digit)
   (:policy :fast-safe)
   (:args (fixnum :scs (any-reg)))
   (:arg-types tagged-num)
@@ -1043,7 +998,7 @@
     (inst sra digit fixnum n-fixnum-tag-bits)))
 
 (define-vop (bignum-floor)
-  (:translate sb!bignum:%bigfloor)
+  (:translate sb-bignum:%bigfloor)
   (:policy :fast-safe)
   (:args (div-high :scs (unsigned-reg) :target rem)
          (div-low :scs (unsigned-reg) :target quo)
@@ -1067,7 +1022,7 @@
     (inst not quo)))
 
 (define-vop (bignum-floor-v8)
-  (:translate sb!bignum:%bigfloor)
+  (:translate sb-bignum:%bigfloor)
   (:policy :fast-safe)
   (:args (div-high :scs (unsigned-reg) :target rem)
          (div-low :scs (unsigned-reg) :target quo)
@@ -1096,7 +1051,7 @@
       (move quo q))))
 
 (define-vop (bignum-floor-v9)
-  (:translate sb!bignum:%bigfloor)
+  (:translate sb-bignum:%bigfloor)
   (:policy :fast-safe)
   (:args (div-high :scs (unsigned-reg))
          (div-low :scs (unsigned-reg))
@@ -1118,7 +1073,7 @@
     (inst sub rem dividend rem)))
 
 (define-vop (signify-digit)
-  (:translate sb!bignum:%fixnum-digit-with-correct-sign)
+  (:translate sb-bignum:%fixnum-digit-with-correct-sign)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg) :target res))
   (:arg-types unsigned-num)
@@ -1132,7 +1087,7 @@
        (move res digit)))))
 
 (define-vop (digit-ashr)
-  (:translate sb!bignum:%ashr)
+  (:translate sb-bignum:%ashr)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg))
          (count :scs (unsigned-reg)))
@@ -1143,42 +1098,16 @@
     (inst sra result digit count)))
 
 (define-vop (digit-lshr digit-ashr)
-  (:translate sb!bignum:%digit-logical-shift-right)
+  (:translate sb-bignum:%digit-logical-shift-right)
   (:generator 1
     (inst srl result digit count)))
 
 (define-vop (digit-ashl digit-ashr)
-  (:translate sb!bignum:%ashl)
+  (:translate sb-bignum:%ashl)
   (:generator 1
     (inst sll result digit count)))
-
 
-;;;; Static functions.
-
-(define-static-fun two-arg-gcd (x y) :translate gcd)
-(define-static-fun two-arg-lcm (x y) :translate lcm)
-
-(define-static-fun two-arg-+ (x y) :translate +)
-(define-static-fun two-arg-- (x y) :translate -)
-(define-static-fun two-arg-* (x y) :translate *)
-(define-static-fun two-arg-/ (x y) :translate /)
-
-(define-static-fun two-arg-< (x y) :translate <)
-(define-static-fun two-arg-<= (x y) :translate <=)
-(define-static-fun two-arg-> (x y) :translate >)
-(define-static-fun two-arg->= (x y) :translate >=)
-(define-static-fun two-arg-= (x y) :translate =)
-(define-static-fun two-arg-/= (x y) :translate /=)
-
-(define-static-fun %negate (x) :translate %negate)
-
-(define-static-fun two-arg-and (x y) :translate logand)
-(define-static-fun two-arg-ior (x y) :translate logior)
-(define-static-fun two-arg-xor (x y) :translate logxor)
-(define-static-fun two-arg-eqv (x y) :translate logeqv)
-
-
-(in-package "SB!C")
+(in-package "SB-C")
 
 (deftransform * ((x y)
                  ((unsigned-byte 32) (constant-arg (unsigned-byte 32)))

@@ -9,11 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defun ea-for-sse-stack (tn &optional (base rbp-tn))
-  (make-ea :qword :base base
-           :disp (frame-byte-offset (1+ (tn-offset tn)))))
+  (ea (frame-byte-offset (1+ (tn-offset tn))) base))
 
 (defun float-sse-p (tn)
   (sc-is tn single-sse-reg single-sse-stack single-sse-immediate
@@ -21,6 +20,11 @@
 (defun int-sse-p (tn)
   (sc-is tn int-sse-reg int-sse-stack int-sse-immediate))
 
+#+sb-xc-host
+(progn ; the host compiler will complain about absence of these
+  (defun %simd-pack-low (x) (error "Called %SIMD-PACK-LOW ~S" x))
+  (defun %simd-pack-high (x) (error "Called %SIMD-PACK-HIGH ~S" x)))
+
 (define-move-fun (load-int-sse-immediate 1) (vop x y)
   ((int-sse-immediate) (int-sse-reg))
   (let* ((x  (tn-value x))
@@ -82,23 +86,20 @@
   (:node-var node)
   (:note "SSE to pointer coercion")
   (:generator 13
-     (with-fixed-allocation (y
-                             simd-pack-widetag
-                             simd-pack-size
-                             node)
+     (alloc-other y simd-pack-widetag simd-pack-size node)
        ;; see *simd-pack-element-types*
-       (storew (fixnumize
-                (sc-case x
-                  (single-sse-reg 1)
-                  (double-sse-reg 2)
-                  (int-sse-reg 0)
-                  (t 0)))
-           y simd-pack-tag-slot other-pointer-lowtag)
-       (let ((ea (make-ea-for-object-slot
-                  y simd-pack-lo-value-slot other-pointer-lowtag)))
-         (if (float-sse-p x)
-             (inst movaps ea x)
-             (inst movdqa ea x))))))
+     (storew (fixnumize
+              (sc-case x
+                (single-sse-reg 1)
+                (double-sse-reg 2)
+                (int-sse-reg 0)
+                (t 0)))
+         y simd-pack-tag-slot other-pointer-lowtag)
+     (let ((ea (make-ea-for-object-slot
+                y simd-pack-lo-value-slot other-pointer-lowtag)))
+       (if (float-sse-p x)
+           (inst movaps ea x)
+           (inst movdqa ea x)))))
 (define-move-vop move-from-sse :move
   (int-sse-reg single-sse-reg double-sse-reg) (descriptor-reg))
 
@@ -151,11 +152,7 @@
   (:result-types unsigned-num)
   (:policy :fast-safe)
   (:generator 3
-    (inst movd dst x)))
-
-(defun %simd-pack-low (x)
-  (declare (type simd-pack x))
-  (%simd-pack-low x))
+    (inst movq dst x)))
 
 (define-vop (%simd-pack-high)
   (:translate %simd-pack-high)
@@ -169,11 +166,17 @@
   (:generator 3
     (move tmp x)
     (inst psrldq tmp 8)
-    (inst movd dst tmp)))
-
-(defun %simd-pack-high (x)
-  (declare (type simd-pack x))
-  (%simd-pack-high x))
+    (inst movq dst tmp)))
+(define-vop (%simd-pack-high/sse4) ; 1 instruction and no temp
+  (:translate %simd-pack-high)
+  (:args (x :scs (int-sse-reg double-sse-reg single-sse-reg)))
+  (:arg-types simd-pack)
+  (:results (dst :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:policy :fast-safe)
+  (:guard (member :sse4 *backend-subfeatures*))
+  (:generator 1
+    (inst pextrq dst x 1)))
 
 (define-vop (%make-simd-pack)
   (:translate %make-simd-pack)
@@ -186,22 +189,11 @@
   (:result-types t)
   (:node-var node)
   (:generator 13
-    (with-fixed-allocation (dst
-                            simd-pack-widetag
-                            simd-pack-size
-                            node)
+    (alloc-other dst simd-pack-widetag simd-pack-size node)
       ;; see *simd-pack-element-types*
-      (storew tag
-          dst simd-pack-tag-slot other-pointer-lowtag)
-      (storew lo
-          dst simd-pack-lo-value-slot other-pointer-lowtag)
-      (storew hi
-          dst simd-pack-hi-value-slot other-pointer-lowtag))))
-
-(defun %make-simd-pack (tag low high)
-  (declare (type fixnum tag)
-           (type (unsigned-byte 64) low high))
-  (%make-simd-pack tag low high))
+    (storew tag dst simd-pack-tag-slot other-pointer-lowtag)
+    (storew lo dst simd-pack-lo-value-slot other-pointer-lowtag)
+    (storew hi dst simd-pack-hi-value-slot other-pointer-lowtag)))
 
 (define-vop (%make-simd-pack-ub64)
   (:translate %make-simd-pack-ub64)
@@ -213,24 +205,18 @@
   (:results (dst :scs (int-sse-reg)))
   (:result-types simd-pack-int)
   (:generator 5
-    (inst movd dst lo)
-    (inst movd tmp hi)
+    (inst movq dst lo)
+    (inst movq tmp hi)
     (inst punpcklqdq dst tmp)))
-
-(defun %make-simd-pack-ub64 (low high)
-  (declare (type (unsigned-byte 64) low high))
-  (%make-simd-pack-ub64 low high))
-
-#-sb-xc-host
-(declaim (inline %make-simd-pack-ub64))
-#-sb-xc-host
-(defun %make-simd-pack-ub32 (w x y z)
-  (declare (type (unsigned-byte 32) w x y z))
-  (%make-simd-pack-ub64 (logior w (ash x 32))
-                        (logior y (ash z 32))))
 
 #-sb-xc-host
 (progn
+  (declaim (inline %make-simd-pack-ub32))
+  (defun %make-simd-pack-ub32 (w x y z)
+    (declare (type (unsigned-byte 32) w x y z))
+    (%make-simd-pack-ub64 (logior w (ash x 32))
+                          (logior y (ash z 32))))
+
   (declaim (inline %simd-pack-ub32s %simd-pack-ub64s))
   (defun %simd-pack-ub32s (pack)
     (declare (type simd-pack pack))
@@ -260,10 +246,6 @@
     (move tmp hi)
     (inst unpcklpd dst tmp)))
 
-(defun %make-simd-pack-double (low high)
-  (declare (type double-float low high))
-  (%make-simd-pack-double low high))
-
 (define-vop (%make-simd-pack-single)
   (:translate %make-simd-pack-single)
   (:policy :fast-safe)
@@ -282,49 +264,50 @@
     (inst unpcklps tmp w)
     (inst unpcklps dst tmp)))
 
-(defun %make-simd-pack-single (x y z w)
-  (declare (type single-float x y z w))
-  (%make-simd-pack-single x y z w))
-
-(defun %simd-pack-tag (pack)
-  (%simd-pack-tag pack))
+(defknown %simd-pack-single-item
+  (simd-pack (integer 0 3)) single-float (flushable))
 
 (define-vop (%simd-pack-single-item)
   (:args (x :scs (int-sse-reg double-sse-reg single-sse-reg)
             :target tmp))
-  (:arg-types simd-pack)
+  (:translate %simd-pack-single-item)
+  (:arg-types simd-pack (:constant t))
   (:info index)
   (:results (dst :scs (single-reg)))
   (:result-types single-float)
   (:temporary (:sc single-sse-reg :from (:argument 0)) tmp)
   (:policy :fast-safe)
   (:generator 3
-    (cond ((and (zerop index)
-                (not (location= x dst)))
-           (inst xorps dst dst)
-           (inst movss dst x))
-          (t
-           (move tmp x)
-           (when (plusp index)
-             (inst psrldq tmp (* 4 index)))
-           (inst xorps dst dst)
-           (inst movss dst tmp)))))
+              (cond ((and (zerop index)
+                          (not (location= x dst)))
+                     (inst xorps dst dst)
+                     (inst movss dst x))
+                    (t
+                     (move tmp x)
+                     (when (plusp index)
+                       (inst psrldq tmp (* 4 index)))
+                     (inst xorps dst dst)
+                     (inst movss dst tmp)))))
 
 #-sb-xc-host
+(progn
 (declaim (inline %simd-pack-singles))
-#-sb-xc-host
 (defun %simd-pack-singles (pack)
   (declare (type simd-pack pack))
-  (values (%primitive %simd-pack-single-item pack 0)
-          (%primitive %simd-pack-single-item pack 1)
-          (%primitive %simd-pack-single-item pack 2)
-          (%primitive %simd-pack-single-item pack 3)))
+  (values (%simd-pack-single-item pack 0)
+          (%simd-pack-single-item pack 1)
+          (%simd-pack-single-item pack 2)
+          (%simd-pack-single-item pack 3))))
+
+(defknown %simd-pack-double-item
+  (simd-pack (integer 0 1)) double-float (flushable))
 
 (define-vop (%simd-pack-double-item)
+  (:translate %simd-pack-double-item)
   (:args (x :scs (int-sse-reg double-sse-reg single-sse-reg)
             :target tmp))
   (:info index)
-  (:arg-types simd-pack)
+  (:arg-types simd-pack (:constant t))
   (:results (dst :scs (double-reg)))
   (:result-types double-float)
   (:temporary (:sc double-sse-reg :from (:argument 0)) tmp)
@@ -342,9 +325,9 @@
            (inst movsd dst tmp)))))
 
 #-sb-xc-host
+(progn
 (declaim (inline %simd-pack-doubles))
-#-sb-xc-host
 (defun %simd-pack-doubles (pack)
   (declare (type simd-pack pack))
-  (values (%primitive %simd-pack-double-item pack 0)
-          (%primitive %simd-pack-double-item pack 1)))
+  (values (%simd-pack-double-item pack 0)
+          (%simd-pack-double-item pack 1))))

@@ -138,6 +138,51 @@ The commands are:
 (defun redisplay (stream &optional (skip 0))
   (display-current stream *inspect-length* skip))
 
+;;; INSPECTED-PARTS
+;;;
+;;; Accepts the arguments OBJECT LENGTH SKIP and returns,
+;;;   (LIST COMPONENTS SEQ-TYPE COUNT SEQ-HINT)
+;;; where..
+;;;
+;;;   COMPONENTS are the component parts of OBJECT (whose
+;;;   representation is determined by SEQ-TYPE). Except for the
+;;;   SEQ-TYPE :named and :array, components is just the OBJECT itself
+;;;
+;;;   SEQ-TYPE determines what representation is used for components
+;;;   of COMPONENTS.
+;;;      If SEQ-TYPE is :named, then each element is (CONS NAME VALUE)
+;;;      If SEQ-TYPE is :dotted-list, then each element is just value,
+;;;        but the last element must be retrieved by
+;;;        (cdr (last components))
+;;;      If SEQ-TYPE is :cylic-list, then each element is just value,
+;;;      If SEQ-TYPE is :list, then each element is a value of an array
+;;;      If SEQ-TYPE is :vector, then each element is a value of an vector
+;;;      If SEQ-TYPE is :array, then each element is a value of an array
+;;;        with rank >= 2. The
+;;;      If SEQ-TYPE is :bignum, then object is just a bignum and not a
+;;;        a sequence
+;;;
+;;;   COUNT is the total number of components in the OBJECT
+;;;
+;;; SEQ-HINT is a seq-type dependent hint. Used by SEQ-TYPE :array
+;;; to hold the reverse-dimensions of the orignal array.
+
+(declaim (inline parts-components))
+(defun parts-components (parts)
+  (first parts))
+
+(declaim (inline parts-count))
+(defun parts-count (parts)
+  (second parts))
+
+(declaim (inline parts-seq-type))
+(defun parts-seq-type (parts)
+  (third parts))
+
+(declaim (inline parts-seq-hint))
+(defun parts-seq-hint (parts)
+  (fourth parts))
+
 ;;;
 ;;; istep command processing
 ;;;
@@ -326,7 +371,7 @@ The commands are:
     (format stream "~A" (inspected-description object))
     (unless (or *skip-address-display*
                 (eq object *inspect-unbound-object-marker*)
-                (and (= sb-vm::n-word-bits 64) (typep object 'single-float))
+                (and (= sb-vm:n-word-bits 64) (typep object 'single-float))
                 (characterp object) (typep object 'fixnum))
       (write-string " at #x" stream)
       (format stream (n-word-bits-hex-format)
@@ -437,7 +482,7 @@ POSITION is NIL if the id is invalid or not found."
         (:array
          (aref (the array components) position))
         (:bignum
-         (bignum-component-at components position))
+         (sb-bignum:%bignum-ref components position))
         (t
          (elt components position))))))
 
@@ -631,16 +676,6 @@ cons cells and LIST-TYPE is :normal, :dotted, or :cyclic"
     (32 "~8,'0X")
     (t  "~X")))
 
-(defun ref32-hexstr (obj &optional (offset 0))
-  (format nil "~8,'0X" (ref32 obj offset)))
-
-(defun ref32 (obj &optional (offset 0))
-  (sb-sys::without-gcing
-   (sb-sys:sap-ref-32
-    (sb-sys:int-sap
-     (logand (sb-kernel:get-lisp-obj-address obj) (lognot sb-vm:lowtag-mask)))
-    offset)))
-
 (defun description-maybe-internals (fmt objects internal-fmt &rest args)
   (let ((base (apply #'format nil fmt objects)))
     (if *skip-address-display*
@@ -649,29 +684,25 @@ cons cells and LIST-TYPE is :normal, :dotted, or :cyclic"
                      base " " (apply #'format nil internal-fmt args)))))
 
 (defmethod inspected-description ((object double-float))
-  (let ((start (round (* 2 sb-vm::n-word-bits) 8)))
-    (description-maybe-internals "double-float ~W" (list object)
-                                 "[#~A ~A]"
-                                 (ref32-hexstr object (+ start 4))
-                                 (ref32-hexstr object start))))
+  (description-maybe-internals "double-float ~W" (list object)
+                               "[#x~16,'0x]"
+                               (ldb (byte 64 0)
+                                    #-64-bit
+                                    (logior (ash (sb-kernel:double-float-high-bits object) 32)
+                                            (sb-kernel:double-float-low-bits object))
+                                    #+64-bit (sb-kernel:double-float-bits object))))
 
 (defmethod inspected-description ((object single-float))
-  (ecase sb-vm::n-word-bits
-    (32
-     (description-maybe-internals "single-float ~W" (list object)
-                                  "[#x~A]"
-                                  (ref32-hexstr object (round sb-vm::n-word-bits 8))))
-    (64
-     ;; on 64-bit platform, single-floats are not boxed
-     (description-maybe-internals "single-float ~W" (list object)
-                                  "[#x~8,'0X]"
-                                  (ash (sb-kernel:get-lisp-obj-address object) -32)))))
+  (description-maybe-internals "single-float ~W" (list object)
+                               "[#x~8,'0x]"
+                               (ldb (byte 32 0)
+                                    (sb-kernel:single-float-bits object))))
 
 (defmethod inspected-description ((object fixnum))
   (description-maybe-internals
    "fixnum ~W" (list object)
    (concatenate 'string "[#x" (n-word-bits-hex-format) "]")
-   (ash object (1- sb-vm:n-lowtag-bits))))
+   (sb-kernel:get-lisp-obj-address object)))
 
 (defmethod inspected-description ((object complex))
   (format nil "complex number ~W" object))
@@ -679,25 +710,10 @@ cons cells and LIST-TYPE is :normal, :dotted, or :cyclic"
 (defmethod inspected-description ((object simple-string))
   (format nil "a simple-string (~W) ~W" (length object) object))
 
-(defun bignum-words (bignum)
-  "Return the number of words in a bignum"
-  (ash
-   (logand (ref32 bignum) (lognot sb-vm:widetag-mask))
-   (- sb-vm:n-widetag-bits)))
-
-(defun bignum-component-at (bignum offset)
-  "Return the word at offset"
-  (case sb-vm::n-word-bits
-        (32
-         (ref32 bignum (* 4 (1+ offset))))
-        (64
-         (let ((start (* 8 (1+ offset))))
-           (+ (ref32 bignum start)
-              (ash (ref32 bignum (+ 4 start)) 32))))))
-
 (defmethod inspected-description ((object bignum))
   (format nil  "bignum ~W with ~D ~A-bit word~P" object
-          (bignum-words object) sb-vm::n-word-bits (bignum-words object)))
+          (sb-bignum:%bignum-length object) sb-vm:n-word-bits
+          (sb-bignum:%bignum-length object)))
 
 (defmethod inspected-description ((object ratio))
   (format nil "ratio ~W" object))
@@ -719,51 +735,6 @@ cons cells and LIST-TYPE is :normal, :dotted, or :cyclic"
   "..unbound..")
 
 
-;;; INSPECTED-PARTS
-;;;
-;;; Accepts the arguments OBJECT LENGTH SKIP and returns,
-;;;   (LIST COMPONENTS SEQ-TYPE COUNT SEQ-HINT)
-;;; where..
-;;;
-;;;   COMPONENTS are the component parts of OBJECT (whose
-;;;   representation is determined by SEQ-TYPE). Except for the
-;;;   SEQ-TYPE :named and :array, components is just the OBJECT itself
-;;;
-;;;   SEQ-TYPE determines what representation is used for components
-;;;   of COMPONENTS.
-;;;      If SEQ-TYPE is :named, then each element is (CONS NAME VALUE)
-;;;      If SEQ-TYPE is :dotted-list, then each element is just value,
-;;;        but the last element must be retrieved by
-;;;        (cdr (last components))
-;;;      If SEQ-TYPE is :cylic-list, then each element is just value,
-;;;      If SEQ-TYPE is :list, then each element is a value of an array
-;;;      If SEQ-TYPE is :vector, then each element is a value of an vector
-;;;      If SEQ-TYPE is :array, then each element is a value of an array
-;;;        with rank >= 2. The
-;;;      If SEQ-TYPE is :bignum, then object is just a bignum and not a
-;;;        a sequence
-;;;
-;;;   COUNT is the total number of components in the OBJECT
-;;;
-;;; SEQ-HINT is a seq-type dependent hint. Used by SEQ-TYPE :array
-;;; to hold the reverse-dimensions of the orignal array.
-
-(declaim (inline parts-components)) ; FIXME: out-of-order
-(defun parts-components (parts)
-  (first parts))
-
-(declaim (inline parts-count)) ; FIXME: out-of-order
-(defun parts-count (parts)
-  (second parts))
-
-(declaim (inline parts-seq-type)) ; FIXME: out-of-order
-(defun parts-seq-type (parts)
-  (third parts))
-
-(declaim (inline parts-seq-hint)) ; FIXME: out-of-order
-(defun parts-seq-hint (parts)
-  (fourth parts))
-
 ;;; FIXME: Most of this should be refactored to share the code
 ;;; with the vanilla inspector. Also, we should check what the
 ;;; Slime inspector does, and provide a an interface for it to
@@ -864,7 +835,7 @@ cons cells and LIST-TYPE is :normal, :dotted, or :cyclic"
     (list components (length components) :named nil)))
 
 (defmethod inspected-parts ((object bignum))
-    (list object (bignum-words object) :bignum nil))
+    (list object (sb-bignum:%bignum-length object) :bignum nil))
 
 (defmethod inspected-parts ((object t))
   (list nil 0 nil nil))

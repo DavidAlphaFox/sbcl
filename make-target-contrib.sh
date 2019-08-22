@@ -22,12 +22,14 @@ LC_ALL=C
 # Just doing CC=${CC:-cc} may be enough, but it needs to be checked
 # that cc is available on all platforms.
 if [ -z $CC ]; then
-    if [ -x "`which cc`" ]; then
+    if [ -x "`command -v cc`" ]; then
         CC=cc
     else
         CC=gcc
     fi
 fi
+
+unset EXTRA_CFLAGS # avoid any potential interference 
 export CC LANG LC_ALL
 
 # Load our build configuration
@@ -110,7 +112,7 @@ done
 # Sometimes people used to see the "No tests failed." output from the last
 # DEFTEST in contrib self-tests and think that's all that is. So...
 HEADER_HAS_BEEN_PRINTED=false
-for dir in `cd contrib ; echo *`
+for dir in $contribs_to_build
 do
   if [ -d "contrib/$dir" -a -f "contrib/$dir/Makefile" -a ! -f "obj/asdf-cache/$dir/test-passed.test-report" ]; then
       if $HEADER_HAS_BEEN_PRINTED; then

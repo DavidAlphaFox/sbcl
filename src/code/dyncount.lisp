@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!DYNCOUNT")
+(in-package "SB-DYNCOUNT")
 
 #|
 comments from CMU CL:
@@ -27,13 +27,11 @@ comments from CMU CL:
 ;;;; hash utilities
 
 (defun make-hash-table-like (table)
-  #!+sb-doc
   "Make a hash-table with the same test as table."
   (declare (type hash-table table))
-  (make-hash-table :test (sb!impl::hash-table-kind table)))
+  (make-hash-table :test (sb-impl::hash-table-kind table)))
 
 (defun hash-difference (table1 table2)
-  #!+sb-doc
   "Return a hash-table containing only the entries in Table1 whose key is not
    also a key in Table2." (declare (type hash-table table1 table2))
   (let ((res (make-hash-table-like table1)))
@@ -44,7 +42,6 @@ comments from CMU CL:
     res))
 
 (defun hash-list (table)
-  #!+sb-doc
   "Return a list of the values in Table."
   (declare (type hash-table table))
   (collect ((res))
@@ -112,7 +109,7 @@ comments from CMU CL:
     (setf (vop-stats-cost res) cost)
     res))
 
-#!-sb-fluid (declaim (freeze-type dyncount-info vop-stats))
+#-sb-fluid (declaim (freeze-type dyncount-info vop-stats))
 
 ;;;    Add the Info into the cumulative result on the VOP name plist. We use
 ;;; plists so that we will touch minimal system code outside of this file
@@ -160,46 +157,33 @@ comments from CMU CL:
 ;;; Clear any VOP-COUNTS properties and the counts vectors for all code
 ;;; objects. The latter loop must not call any random functions.
 (defun clear-vop-counts (&optional (spaces '(:dynamic)))
-  #!+sb-doc
   "Clear all dynamic VOP counts for code objects in the specified spaces."
   (dohash ((k v) *backend-template-names* :locked t)
     (declare (ignore v))
     (remprop k 'vop-stats))
-
-  (locally
-      (declare (optimize (speed 3) (safety 0))
-               (inline sb!vm::map-allocated-objects))
-    (without-gcing
-      (dolist (space spaces)
-        (sb!vm::map-allocated-objects
+  (sb-vm::map-allocated-objects
          (lambda (object type-code size)
            (declare (ignore type-code size))
            (when (dyncount-info-p object)
              (clear-dyncount-info object)))
-         space)))))
+         spaces))
 
 ;;; Call NOTE-DYNCOUNT-INFO on all DYNCOUNT-INFO structure allocated in the
 ;;; specified spaces. Return a hashtable describing the counts. The initial
 ;;; loop must avoid calling any functions outside this file to prevent adding
 ;;; noise to the data, since other files may be compiled with profiling.
 (defun get-vop-counts (&optional (spaces '(:dynamic)) &key (clear nil))
-  #!+sb-doc
   "Return a hash-table mapping string VOP names to VOP-STATS structures
    describing the VOPs executed. If clear is true, then reset all counts to
    zero as a side effect."
-  (locally
-      (declare (optimize (speed 3) (safety 0))
-               (inline sb!vm::map-allocated-objects))
-    (without-gcing
-      (dolist (space spaces)
-        (sb!vm::map-allocated-objects
+  (sb-vm::map-allocated-objects
          (lambda (object type-code size)
            (declare (ignore type-code size))
            (when (dyncount-info-p object)
              (note-dyncount-info object)
              (when clear
                (clear-dyncount-info object))))
-         space))))
+         spaces)
 
   (let ((counts (make-hash-table :test 'equal)))
     (dohash ((k v) *backend-template-names* :locked t)
@@ -215,16 +199,15 @@ comments from CMU CL:
 (defun find-info-for (function)
   (declare (type function function))
   (let* ((function (%primitive closure-fun function))
-         (component (sb!di::fun-code-header function)))
-    (do ((end (get-header-data component))
-         (i sb!vm:code-constants-offset (1+ i)))
+         (component (sb-di::fun-code-header function)))
+    (do ((end (code-header-words component))
+         (i sb-vm:code-constants-offset (1+ i)))
         ((= end i))
       (let ((constant (code-header-ref component i)))
         (when (dyncount-info-p constant)
           (return constant))))))
 
 (defun vop-counts-apply (function args &key (spaces '(:dynamic)) by-space)
-  #!+sb-doc
   "Apply Function to Args, collecting dynamic statistics on the running.
    Spaces are the spaces to scan for counts. If By-Space is true, we return a
    list of result tables, instead of a single table. In this case, specify
@@ -240,11 +223,10 @@ comments from CMU CL:
 ;;;; adjustments
 
 (defun get-vop-costs ()
-  #!+sb-doc
   "Return a hash-table mapping string VOP names to the cost recorded in the
    generator for all VOPs which are also the names of assembly routines."
   (let ((res (make-hash-table :test 'equal)))
-     (dohash ((name v) *assembler-routines* :locked t)
+     (dohash ((name v) (car (%code-debug-info *assembler-routines*)))
        (declare (ignore v))
        (let ((vop (gethash name *backend-template-names*)))
          (when vop
@@ -253,7 +235,6 @@ comments from CMU CL:
     res))
 
 (defvar *native-costs* (get-vop-costs)
-  #!+sb-doc
   "Costs of assember routines on this machine.")
 
 ;;;; classification
@@ -299,7 +280,7 @@ comments from CMU CL:
 (defun matches-pattern (name pattern)
   (declare (simple-string name))
   (let ((name (concatenate 'string "$" name "$")))
-    (dolist (pat (if (listp pattern) pattern (list pattern)) nil)
+    (dolist (pat (ensure-list pattern) nil)
       (when (search (the simple-string (string pat))
                     name :test #'char=)
         (return t)))))
@@ -330,9 +311,7 @@ comments from CMU CL:
                      (when (matches-pattern key (rest class))
                        (return (first class))))))
         (if class
-            (let ((found (or (gethash class res)
-                             (setf (gethash class res)
-                                   (%make-vop-stats class)))))
+            (let ((found (ensure-gethash class res (%make-vop-stats class))))
               (incf (vop-stats-count found) (vop-stats-count value))
               (incf (vop-stats-cost found) (vop-stats-cost value)))
             (setf (gethash key res) value))))
@@ -387,14 +366,12 @@ comments from CMU CL:
     res))
 
 (defun combine-stats (&rest tables)
-  #!+sb-doc
   "Sum the VOP stats for the specified tables, returning a new table with the
    combined results."
   (let ((res (make-hash-table-like (first tables))))
     (dolist (table tables)
       (dohash ((k v) table :locked t)
-        (let ((found (or (gethash k res)
-                         (setf (gethash k res) (%make-vop-stats k)))))
+        (let ((found (ensure-gethash k res (%make-vop-stats k))))
           (incf (vop-stats-count found) (vop-stats-count v))
           (incf (vop-stats-cost found) (vop-stats-cost v)))))
     res))
@@ -412,7 +389,7 @@ comments from CMU CL:
 (defun entry-report (entries cut-off compensated compare total-cost)
   (let ((counter (if (and cut-off (> (length entries) cut-off))
                      cut-off
-                     most-positive-fixnum)))
+                     sb-xc:most-positive-fixnum)))
   (dolist (entry entries)
     (let* ((cost (vop-stats-cost entry))
            (name (vop-stats-name entry))

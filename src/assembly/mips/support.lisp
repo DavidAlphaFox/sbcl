@@ -9,9 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(defun generate-call-sequence (name style vop)
+(defun generate-call-sequence (name style vop options)
+  (declare (ignore options))
   (ecase style
     ((:raw :none)
      (values
@@ -62,5 +63,6 @@
                     lip-tn :offset 2)))
     (:none)))
 
+#-sb-xc-host ; CONTEXT-REGISTER is not defined at xc-time
 (defun return-machine-address (scp)
   (context-register scp lip-offset))

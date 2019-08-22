@@ -9,9 +9,19 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (define-condition simple-style-warning (simple-condition style-warning) ())
+(defun style-warn (datum &rest arguments)
+  ;; Cross-compiler needs a special-case for DATUM being a string,
+  ;; because it needs to produce a SIMPLE-STYLE-WARNING, not SIMPLE-WARNING.
+  ;; The SBCL-specific %WARN function - which allows specifying the default
+  ;; condition class when handed a string - exists only on the target lisp.
+  (if (stringp datum)
+      (warn 'simple-style-warning
+            :format-control datum :format-arguments arguments)
+      (apply #'warn datum arguments)))
+
 (define-condition format-too-few-args-warning (simple-warning) ())
 ;;; in the cross-compiler, this is a full warning.  In the target
 ;;; compiler, it will only be a style-warning.
@@ -38,10 +48,10 @@
 ;;; and replace these.
 (define-condition type-warning (reference-condition simple-warning)
   ()
-  (:default-initargs :references (list '(:sbcl :node "Handling of Types"))))
+  (:default-initargs :references '((:sbcl :node "Handling of Types"))))
 (define-condition type-style-warning (reference-condition simple-style-warning)
   ()
-  (:default-initargs :references (list '(:sbcl :node "Handling of Types"))))
+  (:default-initargs :references '((:sbcl :node "Handling of Types"))))
 
 (define-condition bug (simple-error)
   ()
@@ -76,19 +86,15 @@ which can be found at <http://sbcl.sourceforge.net/>.~:@>"
              (format s "~@<Duplicate definition for ~S found in ~
                         one file.~@:>"
                      (duplicate-definition-name c))))
-  (:default-initargs :references (list '(:ansi-cl :section (3 2 2 3)))))
+  (:default-initargs :references '((:ansi-cl :section (3 2 2 3)))))
 
-;;; These are should never be instantiated before the real definitions
+;;; These should never be instantiated before the real definitions
 ;;; come in.
 (deftype package-lock-violation () nil)
 (deftype package-locked-error () nil)
 (deftype symbol-package-locked-error () nil)
 
-;; It goes without saying that SBCL's self-compile has cyclic dependencies,
-;; so naturally the cross-compiler needs to signal this warning.
-;; However, there is an inconsequential difference between this and the
-;; regular definition: SIMPLE-STYLE-WARNING is not ansi ANSI-specified class,
-;; so this one inherits from SIMPLE-CONDITION and STYLE-WARNING,
-;; both of which are specified to exist.
-(define-condition sb!c:inlining-dependency-failure
-    (simple-condition style-warning) ())
+(define-condition sb-c:inlining-dependency-failure
+    ;; By inheriting from WARNING, not STYLE-WARNING,
+    ;; we hold ourselves to a higher standard.
+    (simple-warning) ())

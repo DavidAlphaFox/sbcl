@@ -14,7 +14,12 @@ TARGET=sbcl.exe
 ASSEM_SRC = x86-assem.S
 ARCH_SRC = x86-arch.c
 
-OS_SRC = win32-os.c x86-win32-os.c os-common.c pthreads_win32.c
+OS_SRC = win32-os.c x86-win32-os.c pthreads_win32.c
+
+ifdef LISP_FEATURE_SB_LINKABLE_RUNTIME
+  LIBSBCL = libsbcl.a
+  USE_LIBSBCL = -Wl,--whole-archive libsbcl.a -Wl,--no-whole-archive
+endif
 
 # The "--Wl,--export-dynamic" flags are here to help people
 # experimenting with callbacks from C to SBCL, by allowing linkage to
@@ -28,13 +33,17 @@ OS_SRC = win32-os.c x86-win32-os.c os-common.c pthreads_win32.c
 # (You *are* encouraged to design and implement a coherent stable
 # interface, though.:-| As far as I (WHN 2002-05-19) know, no one is
 # working on one and it would be a nice thing to have.)
-LINKFLAGS = -Wl,-export-all-symbols -Wl,mswin.def
+LINKFLAGS = -Wl,-export-all-symbols
+LIBSBCL += mswin64.def mswin.def
+USE_LIBSBCL += -Wl,mswin64.def -Wl,mswin.def
+__LDFLAGS__ =
+
 OS_LIBS = -l ws2_32 -ladvapi32
 ifdef LISP_FEATURE_SB_CORE_COMPRESSION
   OS_LIBS += -lz
 endif
 
-GC_SRC = gencgc.c
+GC_SRC = fullcgc.c gencgc.c traceroot.c
 
 CFLAGS = -g -Wall -O3 \
         -fno-omit-frame-pointer -march=i686 -DWINVER=0x0501 \
@@ -43,18 +52,7 @@ CFLAGS = -g -Wall -O3 \
 # We assume Windows ABI 4-byte alignment, but GCC decided to change to
 # 16-byte alignment
 
-ASFLAGS = $(CFLAGS)
-
-CPP = cpp
 CC = gcc
-LD = ld
-NM = nm
-
-ifneq ($(findstring cygwin,$(shell $(CC) -dumpmachine)),)
-LINK_FLAGS := $(LINK_FLAGS) -Wl,-mno-cygwin
-OS_LIBS := $(OS_LIBS) -mno-cygwin
-CFLAGS := $(CFLAGS) -mno-cygwin
-endif
 
 # Nothing to do for after-grovel-headers.
 .PHONY: after-grovel-headers

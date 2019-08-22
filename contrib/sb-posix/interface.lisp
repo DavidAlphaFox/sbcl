@@ -100,7 +100,8 @@
 ;;; variable.
 (eval-when (:compile-toplevel :load-toplevel)
   (setf *c-functions-in-runtime*
-        '`(#+netbsd ,@("stat" "lstat" "fstat" "readdir" "opendir"))))
+        #+netbsd '("stat" "lstat" "fstat" "readdir" "opendir")
+        #-netbsd '()))
 
 
 ;;; filesystem access
@@ -136,29 +137,26 @@
                        (open-with-mode pathname flags mode)
                        (open-without-mode pathname flags))))))
     (def #-win32 "open" #+win32 "_open"))
-(define-call* "read" int minusp
-    (fd file-descriptor) (buf (* t)) (count int))
 (define-call "rename" int minusp (oldpath filename) (newpath filename))
 (define-call* "rmdir" int minusp (pathname filename))
 (define-call* "unlink" int minusp (pathname filename))
 (define-call #-netbsd "opendir" #+netbsd "_opendir"
     (* t) null-alien (pathname filename))
-(define-call* "write" int minusp
-    (fd file-descriptor) (buf (* t)) (count int))
+(define-call* "read" ssize-t minusp
+    (fd file-descriptor) (buf (* t)) (count size-t))
+(define-call* "write" ssize-t minusp
+  (fd file-descriptor) (buf (* t)) (count size-t))
+
+;;; FIXME: to detect errors in readdir errno needs to be set to 0 and
+;;; then checked, like it's done in sb-unix:readdir.
 #+inode64
 (define-call ("readdir" :c-name "readdir$INODE64" :options :largefile)
   (* dirent)
-  ;; readdir() has the worst error convention in the world.  It's just
-  ;; too painful to support.  (return is NULL _and_ errno "unchanged"
-  ;; is not an error, it's EOF).
   not
   (dir (* t)))
 #-inode64
 (define-call (#-netbsd "readdir" #+netbsd "_readdir" :options :largefile)
   (* dirent)
-  ;; readdir() has the worst error convention in the world.  It's just
-  ;; too painful to support.  (return is NULL _and_ errno "unchanged"
-  ;; is not an error, it's EOF).
   not
   (dir (* t)))
 (define-call "closedir" int minusp (dir (* t)))
@@ -188,7 +186,6 @@
   (define-call "sync" void never-fails)
   (define-call ("truncate" :options :largefile)
       int minusp (pathname filename) (length off-t))
-  #-win32
   (macrolet ((def-mk*temp (lisp-name c-name result-type errorp dirp values)
                (declare (ignore dirp))
                (if (sb-sys:find-foreign-symbol-address c-name)
@@ -233,11 +230,11 @@
     ;; FIXME: What about Windows?
     (def-mk*temp mkdtemp "mkdtemp" (* char) null-alien t nil))
   (define-call-internally ioctl-without-arg "ioctl" int minusp
-                          (fd file-descriptor) (cmd int))
+                          (fd file-descriptor) (cmd unsigned-long))
   (define-call-internally ioctl-with-int-arg "ioctl" int minusp
-                          (fd file-descriptor) (cmd int) (arg int))
+                          (fd file-descriptor) (cmd unsigned-long) (arg int))
   (define-call-internally ioctl-with-pointer-arg "ioctl" int minusp
-                          (fd file-descriptor) (cmd int)
+                          (fd file-descriptor) (cmd unsigned-long)
                           (arg alien-pointer-to-anything-or-nil))
   (define-entry-point "ioctl" (fd cmd &optional (arg nil argp))
     (if argp
@@ -282,8 +279,6 @@
 
   ;; uid, gid
   (define-call "geteuid" uid-t never-fails) ; "always successful", it says
-  #-sunos
-  (define-call "getresuid" uid-t never-fails)
   (define-call "getuid" uid-t never-fails)
   (define-call "seteuid" int minusp (uid uid-t))
   #-sunos
@@ -294,8 +289,32 @@
   (define-call "setuid" int minusp (uid uid-t))
   (define-call "getegid" gid-t never-fails)
   (define-call "getgid" gid-t never-fails)
-  #-sunos
-  (define-call "getresgid" gid-t never-fails)
+  #-(or sunos darwin)
+  (progn
+    (export '(getresgid getresuid) :sb-posix)
+    (declaim (inline getresgid getresuid))
+    (defun getresgid ()
+      (with-alien ((rgid gid-t)
+                   (egid gid-t)
+                   (sgid gid-t))
+        (let ((r
+                (alien-funcall (extern-alien "getresgid"
+                                             (function int (* gid-t) (* gid-t) (* gid-t)))
+                               (addr rgid) (addr egid) (addr sgid))))
+          (if (minusp r)
+              (syscall-error 'getresgid)
+              (values rgid egid sgid)))))
+    (defun getresuid ()
+      (with-alien ((ruid uid-t)
+                   (euid uid-t)
+                   (suid uid-t))
+        (let ((r
+                (alien-funcall (extern-alien "getresuid"
+                                             (function int (* uid-t) (* uid-t) (* uid-t)))
+                               (addr ruid) (addr euid) (addr suid))))
+          (if (minusp r)
+              (syscall-error 'getresuid)
+              (values ruid euid suid))))))
   (define-call "setegid" int minusp (gid gid-t))
   #-sunos
   (define-call "setfsgid" int minusp (gid gid-t))
@@ -314,22 +333,29 @@
 
   ;; FIXME this is a lie, of course this can fail, but there's no
   ;; error handling here yet!
-  #+mach-exception-handler
-  (define-call "setup_mach_exceptions" void never-fails)
+  #+darwin
+  (define-call "darwin_reinit" void never-fails)
   (define-call ("posix_fork" :c-name "fork") pid-t minusp)
   (defun fork ()
     "Forks the current process, returning 0 in the new process and the PID of
 the child process in the parent. Forking while multiple threads are running is
 not supported."
     (tagbody
-       (sb-thread::with-all-threads-lock
-         (when (cdr sb-thread::*all-threads*)
-           (go :error))
-         (let ((pid (posix-fork)))
-           #+mach-exception-handler
-           (when (= pid 0)
-             (setup-mach-exceptions))
-           (return-from fork pid)))
+       (let ()
+         #+sb-thread
+         (sb-impl::finalizer-thread-stop)
+         (sb-thread::with-all-threads-lock
+           (when (let ((avltree sb-thread::*all-threads*))
+                   (or (sb-thread::avlnode-left avltree)
+                       (sb-thread::avlnode-right avltree)))
+             (go :error))
+           (let ((pid (posix-fork)))
+             #+darwin
+             (when (= pid 0)
+               (darwin-reinit))
+             #+sb-thread
+             (setf sb-impl::*finalizer-thread* t)
+             (return-from fork pid))))
      :error
        (error "Cannot fork with multiple threads running.")))
   (export 'fork :sb-posix)
@@ -437,7 +463,6 @@ not supported."
  (define-call "wtermsig" int never-fails (status int))
  (define-call "wifstopped" boolean never-fails (status int))
  (define-call "wstopsig" int never-fails (status int))
- #+nil ; see alien/waitpid-macros.c
  (define-call "wifcontinued" boolean never-fails (status int)))
 
 ;;; mmap, msync
@@ -445,16 +470,15 @@ not supported."
 (progn
  (define-call ("mmap" :options :largefile) sb-sys:system-area-pointer
    (lambda (res)
-     (= (sb-sys:sap-int res) #.(1- (expt 2 sb-vm::n-machine-word-bits))))
+     (= (sb-sys:sap-int res) #.(1- (expt 2 sb-vm:n-machine-word-bits))))
    (addr sap-or-nil) (length size-t) (prot unsigned)
    (flags unsigned) (fd file-descriptor) (offset off-t))
 
  (define-call "munmap" int minusp
    (start sb-sys:system-area-pointer) (length unsigned))
 
-#-win32
-(define-call "msync" int minusp
-  (addr sb-sys:system-area-pointer) (length unsigned) (flags int)))
+ (define-call "msync" int minusp
+   (addr sb-sys:system-area-pointer) (length unsigned) (flags int)))
 #+win32
 (progn
   ;; No attempt is made to offer a full mmap-like interface on Windows.
@@ -697,6 +721,7 @@ not supported."
  (defun cfsetispeed (speed &optional termios)
    (declare (type (or null termios) termios))
    (with-alien-termios a-termios ()
+     (termios-to-alien termios a-termios)
      (let ((r (alien-funcall
                (extern-alien "cfsetispeed"
                              (function int (* alien-termios) speed-t))
@@ -711,6 +736,7 @@ not supported."
  (defun cfsetospeed (speed &optional termios)
    (declare (type (or null termios) termios))
    (with-alien-termios a-termios ()
+     (termios-to-alien termios a-termios)
      (let ((r (alien-funcall
                (extern-alien "cfsetospeed"
                              (function int (* alien-termios) speed-t))
@@ -795,10 +821,6 @@ not supported."
 
 ;;; environment
 
-(eval-when (:compile-toplevel :load-toplevel)
-  ;; Do this at compile-time as Win32 code below refers to it as
-  ;; sb-posix:getenv.
-  (export 'getenv :sb-posix))
 (defun getenv (name)
   (let ((r (alien-funcall
             (extern-alien "getenv" (function (* char) (c-string :not-null t)))

@@ -61,25 +61,6 @@
       class))
 
 ;;; interface
-(defun specializer-from-type (type &aux args)
-  (when (symbolp type)
-    (return-from specializer-from-type (find-class type)))
-  (when (consp type)
-    (setq args (cdr type) type (car type)))
-  (cond ((symbolp type)
-         (or (ecase type
-               (class    (coerce-to-class (car args)))
-               (prototype (make-instance 'class-prototype-specializer
-                                         :object (coerce-to-class (car args))))
-               (class-eq (class-eq-specializer (coerce-to-class (car args))))
-               (eql      (intern-eql-specializer (car args))))))
-        ;; FIXME: do we still need this?
-        ((and (null args) (typep type 'classoid))
-         (or (classoid-pcl-class type)
-             (ensure-non-standard-class (classoid-name type) type)))
-        ((specializerp type) type)))
-
-;;; interface
 (defun type-from-specializer (specl)
   (cond ((eq specl t)
          t)
@@ -98,7 +79,6 @@
          (error "~S is neither a type nor a specializer." specl))))
 
 (defun type-class (type)
-  (declare (special *the-class-t*))
   (setq type (type-from-specializer type))
   (if (atom type)
       (if (eq type t)
@@ -128,7 +108,7 @@
          (let ((class (find-class type nil)))
            (if class
                (let ((type (specializer-type class)))
-                 (if (listp type) type `(,type)))
+                 (ensure-list type))
                `(,type))))
         ((or (not (eq **boot-state** 'complete))
              (specializerp type))
@@ -177,23 +157,13 @@
               (t
                (subtypep (convert-to-system-type type1)
                          (convert-to-system-type type2))))))))
-
-(defvar *built-in-class-symbols* ())
-(defvar *built-in-wrapper-symbols* ())
 
-(defun get-built-in-class-symbol (class-name)
-  (or (cadr (assq class-name *built-in-class-symbols*))
-      (let ((symbol (make-class-symbol class-name)))
-        (push (list class-name symbol) *built-in-class-symbols*)
-        symbol)))
+(defun make-class-symbol (class-name)
+  (format-symbol #.(find-package "SB-PCL")
+                 "*THE-CLASS-~A*" (symbol-name class-name)))
 
-(defun get-built-in-wrapper-symbol (class-name)
-  (or (cadr (assq class-name *built-in-wrapper-symbols*))
-      (let ((symbol (make-wrapper-symbol class-name)))
-        (push (list class-name symbol) *built-in-wrapper-symbols*)
-        symbol)))
-
 (defvar *standard-method-combination*)
+(defvar *or-method-combination*)
 
 (defun plist-value (object name)
   (getf (object-plist object) name))
@@ -207,10 +177,10 @@
 
 ;;;; built-in classes
 
-;;; Grovel over SB-KERNEL::*BUILT-IN-CLASSES* in order to set
+;;; Grovel over SB-KERNEL::+!BUILT-IN-CLASSES+ in order to set
 ;;; SB-PCL:*BUILT-IN-CLASSES*.
 (/show "about to set up SB-PCL::*BUILT-IN-CLASSES*")
-(defvar *built-in-classes*
+(define-load-time-global *built-in-classes*
   (labels ((direct-supers (class)
              (/noshow "entering DIRECT-SUPERS" (classoid-name class))
              (if (typep class 'built-in-classoid)
@@ -234,27 +204,15 @@
     (mapcar (lambda (kernel-bic-entry)
               (/noshow "setting up" kernel-bic-entry)
               (let* ((name (car kernel-bic-entry))
-                     (class (find-classoid name))
-                     (prototype-form
-                      (getf (cdr kernel-bic-entry) :prototype-form)))
+                     (class (find-classoid name)))
                 (/noshow name class)
                 `(,name
                   ,(mapcar #'classoid-name (direct-supers class))
                   ,(mapcar #'classoid-name (direct-subs class))
                   ,(map 'list
-                        (lambda (x)
-                          (classoid-name
-                           (layout-classoid x)))
-                        (reverse
-                         (layout-inherits
-                          (classoid-layout class))))
-                  ,(if prototype-form
-                       (eval prototype-form)
-                       ;; This is the default prototype value which
-                       ;; was used, without explanation, by the CMU CL
-                       ;; code we're derived from. Evidently it's safe
-                       ;; in all relevant cases.
-                       42))))
+                        (lambda (x) (classoid-name (layout-classoid x)))
+                        (reverse (layout-inherits (classoid-layout class))))
+                  ,(eval (getf (cdr kernel-bic-entry) :prototype-form)))))
             (remove-if (lambda (kernel-bic-entry)
                          (member (first kernel-bic-entry)
                                  ;; remove special classes (T and our
@@ -262,7 +220,7 @@
                                  ;; BUILT-IN-CLASS list
                                  '(t function stream sequence
                                      file-stream string-stream)))
-                       sb-kernel::*built-in-classes*))))
+                       sb-kernel::+!built-in-classes+))))
 (/noshow "done setting up SB-PCL::*BUILT-IN-CLASSES*")
 
 ;;;; the classes that define the kernel of the metabraid
@@ -296,10 +254,6 @@
 
 (defclass structure-object (slot-object) ()
   (:metaclass structure-class))
-
-(defstruct (dead-beef-structure-object
-            (:constructor |STRUCTURE-OBJECT class constructor|)
-            (:copier nil)))
 
 (defclass standard-object (slot-object) ())
 
@@ -361,12 +315,7 @@
    ;; Used to make DFUN-STATE & FIN-FUNCTION updates atomic.
    (%lock
     :initform (sb-thread:make-mutex :name "GF lock")
-    :reader gf-lock)
-   ;; Set to true by ADD-METHOD, REMOVE-METHOD; to false by
-   ;; MAYBE-UPDATE-INFO-FOR-GF.
-   (info-needs-update
-    :initform nil
-    :accessor gf-info-needs-update))
+    :reader gf-lock))
   (:metaclass funcallable-standard-class)
   (:default-initargs :method-class *the-class-standard-method*
                      :method-combination *standard-method-combination*))
@@ -411,32 +360,30 @@
 (defclass method-combination (metaobject)
   ((%documentation :initform nil :initarg :documentation)))
 
+(defun make-gf-hash-table ()
+  (make-hash-table :test 'eq
+                   :hash-function #'sb-impl::fsc-instance-hash ; stable hash
+                   :weakness :key
+                   :synchronized t))
+
 (defclass standard-method-combination (definition-source-mixin
                                        method-combination)
-  ((type-name
-    :reader method-combination-type-name
-    :initarg :type-name)
-   (options
-    :reader method-combination-options
-    :initarg :options)))
+  ((type-name :reader method-combination-type-name :initarg :type-name)
+   (options :reader method-combination-options :initarg :options)
+   (%generic-functions :initform (make-gf-hash-table)
+                       :reader method-combination-%generic-functions)))
 
 (defclass long-method-combination (standard-method-combination)
-  ((function
-    :initarg :function
-    :reader long-method-combination-function)
-   (args-lambda-list
-    :initarg :args-lambda-list
-    :reader long-method-combination-args-lambda-list)))
+  ((function :initarg :function :reader long-method-combination-function)
+   (args-lambda-list :initarg :args-lambda-list
+                     :reader long-method-combination-args-lambda-list)))
 
 (defclass short-method-combination (standard-method-combination)
-  ((operator
-    :reader short-combination-operator
-    :initarg :operator)
-   (identity-with-one-argument
-    :reader short-combination-identity-with-one-argument
+  ((operator :reader short-combination-operator :initarg :operator)
+   (identity-with-one-argument :reader short-combination-identity-with-one-argument
     :initarg :identity-with-one-argument)))
 
-(defclass slot-definition (metaobject)
+(defclass slot-definition (metaobject definition-source-mixin)
   ((name
     :initform nil
     :initarg :name
@@ -516,6 +463,7 @@
 ;;; these functions can access the SLOT-INFO directly, avoiding the overhead
 ;;; of accessing a standard-instance.
 (defstruct (slot-info
+            (:copier nil)
             (:constructor make-slot-info
                 (&key slotd typecheck
                  (reader (uninitialized-accessor-function :reader slotd))
@@ -568,6 +516,8 @@
 ;;; and vestiges of PROTOTYPE specializers
 (defclass standard-specializer (specializer) ())
 
+;;; Note that this class cannot define the OBJECT slot and
+;;; SPECIALIZER-OBJECT reader because of bootstrapping limitations.
 (defclass specializer-with-object (specializer) ())
 
 (defclass exact-class-specializer (specializer) ())
@@ -579,24 +529,46 @@
            :reader specializer-class
            :reader specializer-object)))
 
-(defclass class-prototype-specializer (standard-specializer specializer-with-object)
+(defclass class-prototype-specializer (standard-specializer
+                                       specializer-with-object)
   ((object :initarg :class
            :reader specializer-class
            :reader specializer-object)))
 
-(defclass eql-specializer (standard-specializer exact-class-specializer specializer-with-object)
+(defclass eql-specializer (standard-specializer
+                           exact-class-specializer
+                           specializer-with-object)
   ((object :initarg :object :reader specializer-object
-           :reader eql-specializer-object)))
+           :reader eql-specializer-object)
+   ;; Because EQL specializers are interned, any two putative instances
+   ;; of EQL-specializer referring to the same object are in fact EQ to
+   ;; each other. Therefore a list of direct methods in the specializer can
+   ;; reliably track all methods that are specialized on the identical object.
+   (direct-methods :initform (cons nil nil))))
 
-(defvar *eql-specializer-table* (make-hash-table :test 'eql))
+;; Why is this weak-value, not weak-key: suppose the value is unreachable (dead)
+;; but the key is reachable - this should allow dropping the entry, because
+;; you're indifferent to getting a fresh EQL specializer if you re-intern the
+;; same key. There's no way to know that you got a new VALUE, since the
+;; pre-condition of this case was that the old value was unreachable.
+;; KEY weakness is actually equivalent to KEY-OR-VALUE weakness, which would
+;; be less likely to drop the entry. The equivalence stems from the fact that
+;; holding the value (the specializer) also holds the key.
+;; Whereas, with :VALUE weakness, you can drop the specializer as soon as
+;; nothing needs it, even if OBJECT persists. You might think that calling
+;; gethash on a live key should get the identical specializer, but since
+;; nothing referenced the old specializer, consing a new one is fine.
+(defglobal *eql-specializer-table*
+  (make-hash-table :test 'eql :weakness :value))
 
 (defun intern-eql-specializer (object)
+  ;; Avoid style-warning about compiler-macro being unavailable.
+  (declare (notinline make-instance))
   ;; Need to lock, so that two threads don't get non-EQ specializers
   ;; for an EQL object.
   (with-locked-system-table (*eql-specializer-table*)
-    (or (gethash object *eql-specializer-table*)
-        (setf (gethash object *eql-specializer-table*)
-              (make-instance 'eql-specializer :object object)))))
+    (ensure-gethash object *eql-specializer-table*
+                    (make-instance 'eql-specializer :object object))))
 
 (defclass class (dependent-update-mixin
                  definition-source-mixin
@@ -631,19 +603,6 @@
    (finalized-p
     :initform nil
     :reader class-finalized-p)))
-
-(def!method make-load-form ((class class) &optional env)
-  ;; FIXME: should we not instead pass ENV to FIND-CLASS?  Probably
-  ;; doesn't matter while all our environments are the same...
-  (declare (ignore env))
-  (let ((name (class-name class)))
-    (unless (and name (eq (find-class name nil) class))
-      (error "~@<Can't use anonymous or undefined class as constant: ~S~:@>"
-             class))
-    ;; Essentially we want `(FIND-CLASS ',NAME) but without using backquote.
-    ;; Because this is a delayed DEF!METHOD, its entire body is quoted structure
-    ;; and can't contain a comma object until a MAKE-LOAD-FORM exists for that.
-    (list 'find-class (list 'quote name))))
 
 ;;; The class PCL-CLASS is an implementation-specific common
 ;;; superclass of all specified subclasses of the class CLASS.
@@ -708,39 +667,9 @@
   ((source
     :initform nil
     :reader definition-source
-    :initarg :definition-source)))
+    :initarg source)))
 
 (defclass plist-mixin (standard-object)
   ((plist :initform () :accessor object-plist :initarg plist)))
 
 (defclass dependent-update-mixin (plist-mixin) ())
-
-(defparameter *!early-class-predicates*
-  '((specializer specializerp)
-    (standard-specializer standard-specializer-p)
-    (exact-class-specializer exact-class-specializer-p)
-    (class-eq-specializer class-eq-specializer-p)
-    (eql-specializer eql-specializer-p)
-    (class classp)
-    (slot-class slot-class-p)
-    (std-class std-class-p)
-    (standard-class standard-class-p)
-    (funcallable-standard-class funcallable-standard-class-p)
-    (condition-class condition-class-p)
-    (structure-class structure-class-p)
-    (forward-referenced-class forward-referenced-class-p)
-    (method method-p)
-    (standard-method standard-method-p)
-    (accessor-method accessor-method-p)
-    (standard-accessor-method standard-accessor-method-p)
-    (standard-reader-method standard-reader-method-p)
-    (standard-writer-method standard-writer-method-p)
-    (standard-boundp-method standard-boundp-method-p)
-    (global-reader-method global-reader-method-p)
-    (global-writer-method global-writer-method-p)
-    (global-boundp-method global-boundp-method-p)
-    (generic-function generic-function-p)
-    (standard-generic-function standard-generic-function-p)
-    (method-combination method-combination-p)
-    (long-method-combination long-method-combination-p)
-    (short-method-combination short-method-combination-p)))

@@ -9,10 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-vop (debug-cur-sp)
-  (:translate sb!di::current-sp)
+  (:translate sb-di::current-sp)
   (:policy :fast-safe)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
@@ -20,7 +20,7 @@
     (load-csp res)))
 
 (define-vop (debug-cur-fp)
-  (:translate sb!di::current-fp)
+  (:translate sb-di::current-fp)
   (:policy :fast-safe)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
@@ -28,7 +28,7 @@
     (move res cfp-tn)))
 
 (define-vop (read-control-stack)
-  (:translate sb!kernel:stack-ref)
+  (:translate sb-kernel:stack-ref)
   (:policy :fast-safe)
   (:args (sap :scs (sap-reg))
          (offset :scs (any-reg)))
@@ -39,7 +39,7 @@
     (inst ldr result (@ sap offset))))
 
 (define-vop (write-control-stack)
-  (:translate sb!kernel:%set-stack-ref)
+  (:translate sb-kernel:%set-stack-ref)
   (:policy :fast-safe)
   (:args (sap :scs (sap-reg))
          (offset :scs (any-reg))
@@ -59,6 +59,7 @@
   (:variant-vars lowtag)
   (:generator 5
     (loadw temp thing 0 lowtag)
+    ;; SLEAZY ASSUMPTION: THE WIDETAG HAS TWO HIGH ZERO BITS
     (inst mov temp (lsr temp (- n-widetag-bits word-shift)))
     (inst cmp temp 0)
     (unless (= lowtag other-pointer-lowtag)
@@ -67,11 +68,11 @@
     (inst mov :eq code null-tn)))
 
 (define-vop (code-from-lra code-from-mumble)
-  (:translate sb!di::lra-code-header)
+  (:translate sb-di::lra-code-header)
   (:variant other-pointer-lowtag))
 
 (define-vop (code-from-fun code-from-mumble)
-  (:translate sb!di::fun-code-header)
+  (:translate sb-di::fun-code-header)
   (:variant fun-pointer-lowtag))
 
 (define-vop (%make-lisp-obj)
@@ -85,21 +86,9 @@
 
 (define-vop (get-lisp-obj-address)
   (:policy :fast-safe)
-  (:translate sb!di::get-lisp-obj-address)
-  (:args (thing :scs (descriptor-reg) :target result))
+  (:translate sb-di::get-lisp-obj-address)
+  (:args (thing :scs (descriptor-reg any-reg) :target result))
   (:results (result :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:generator 1
     (move result thing)))
-
-
-(define-vop (fun-word-offset)
-  (:policy :fast-safe)
-  (:translate sb!di::fun-word-offset)
-  (:args (fun :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 5
-    (loadw res fun 0 fun-pointer-lowtag)
-    (inst mov res (lsr res n-widetag-bits))))
-

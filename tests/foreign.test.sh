@@ -60,25 +60,25 @@ long long powish(unsigned int x, unsigned int y) {
   return xx*acc;
 }
 
-float return9th(float f1, float f2, float f3, float f4, float f5, 
-		float f6, float f7, float f8, float f9, float f10, 
-		float f11, float f12) { 
-    return f9; 
+float return9th(float f1, float f2, float f3, float f4, float f5,
+		float f6, float f7, float f8, float f9, float f10,
+		float f11, float f12) {
+    return f9;
 }
 
-double return9thd(double f1, double f2, double f3, double f4, double f5, 
+double return9thd(double f1, double f2, double f3, double f4, double f5,
 		  double f6, double f7, double f8, double f9, double f10,
-		  double f11, double f12) { 
-    return f9; 
+		  double f11, double f12) {
+    return f9;
 }
 
-int long_test8(int a1, int a2, int a3, int a4, int a5, 
-	       int a6, int a7, long long l1) { 
+int long_test8(int a1, int a2, int a3, int a4, int a5,
+	       int a6, int a7, long long l1) {
     return (l1 == powish(2,34));
 }
 
-int long_test9(int a1, int a2, int a3, int a4, int a5, 
-	       int a6, int a7, long long l1, int a8) { 
+int long_test9(int a1, int a2, int a3, int a4, int a5,
+	       int a6, int a7, long long l1, int a8) {
     return (l1 == powish(2,35));
 }
 
@@ -97,6 +97,30 @@ int long_sap_test2(int *p1, int i1, long long l1) {
 
 long long return_long_long() {
     return powish(2,33);
+}
+
+signed char return_schar_test(signed char *p) {
+    return *p;
+}
+
+unsigned char return_uchar_test(unsigned char *p) {
+    return *p;
+}
+
+short return_short_test(short *p) {
+    return *p;
+}
+
+unsigned short return_ushort_test(unsigned short *p) {
+    return *p;
+}
+
+int return_int_test(int *p) {
+    return *p;
+}
+
+unsigned int return_uint_test(unsigned int *p) {
+    return *p;
 }
 EOF
 
@@ -148,6 +172,12 @@ cat > $TEST_FILESTEM.base.lisp <<EOF
   (define-alien-routine long-sap-test1 int (ptr1 int :copy) (long1 (integer 64)))
   (define-alien-routine long-sap-test2 int (ptr1 int :copy) (int1 int) (long1 (integer 64)))
   (define-alien-routine return-long-long (integer 64))
+  (define-alien-routine return-schar-test char (p char :copy))
+  (define-alien-routine return-uchar-test unsigned-char (p unsigned-char :copy))
+  (define-alien-routine return-short-test short (p short :copy))
+  (define-alien-routine return-ushort-test unsigned-short (p unsigned-short :copy))
+  (define-alien-routine return-int-test int (p int :copy))
+  (define-alien-routine return-uint-test unsigned-int (p unsigned-int :copy))
 
   ;; compiling this gets us the FOP-FOREIGN-DATAREF-FIXUP on
   ;; linkage-table ports
@@ -161,17 +191,6 @@ cat > $TEST_FILESTEM.base.lisp <<EOF
   ;; that the location will be the same.
   (assert (= (sb-sys:sap-int (alien-sap *environ*))
              (sb-sys:sap-int (alien-sap environ))))
-
-  ;; automagic restarts
-  (setf *invoke-debugger-hook*
-        (lambda (condition hook)
-          (declare (ignore hook))
-          (princ condition)
-          (let ((cont (find-restart 'continue condition)))
-            (when cont
-              (invoke-restart cont)))
-          (print :fell-through)
-          (invoke-debugger condition)))
 EOF
 
 echo "(declaim (optimize speed))" > $TEST_FILESTEM.fast.lisp
@@ -214,6 +233,14 @@ cat > $TEST_FILESTEM.test.lisp <<EOF
   (assert (= 1 (long-sap-test1 38 (+ 3 (ash 1 38)))))
   (assert (= 1 (long-sap-test2 38 1 (+ 3 (ash 1 38)))))
   (assert (= (ash 1 33) (return-long-long)))
+  (assert (= -1 (return-schar-test -1)))
+  (assert (= 1 (return-schar-test 1)))
+  (assert (= 255 (return-uchar-test 255)))
+  (assert (= 1 (return-uchar-test 1)))
+  (assert (= -1 (return-short-test -1)))
+  (assert (= 65535 (return-ushort-test 65535)))
+  (assert (= -1 (return-int-test -1)))
+  (assert (= #xffffffff (return-uint-test #xffffffff)))
 
   (note "/initial assertions ok")
 
@@ -284,11 +311,10 @@ test_use small
 test_use fast
 
 test_save() {
-    echo testing save $1 
+    echo testing save $1
     x="$1"
     run_sbcl --load $TEST_FILESTEM.$1.fasl <<EOF
 #+linkage-table (save-lisp-and-die "$TEST_FILESTEM.$x.core")
-#-linkage-table nil
 (sb-ext:exit :code 22) ; catch this
 EOF
     check_status_maybe_lose "save $1" $? \
@@ -299,18 +325,46 @@ test_save small
 test_save fast
 
 test_start() {
-    echo testing start $1
-    run_sbcl_with_core $TEST_FILESTEM.$1.core \
-	--no-sysinit --no-userinit --load $TEST_FILESTEM.test.lisp
-    check_status_maybe_lose "start $1" $?
+    if [ -f $TEST_FILESTEM.$1.core ] ; then
+        echo testing start $1
+        run_sbcl_with_core $TEST_FILESTEM.$1.core \
+            --no-sysinit --no-userinit \
+            --eval "(setf sb-ext:*evaluator-mode* :${TEST_SBCL_EVALUATOR_MODE:-compile})" \
+            --load $TEST_FILESTEM.test.lisp
+        check_status_maybe_lose "start $1" $?
+    else
+        echo "not testing start $1 (no core file, possibly due to linkage table above)"
+    fi
 }
 
 test_start fast
 test_start small
 
+if [ -f $TEST_FILESTEM.fast.core ] ; then
 # missing object file
+    run_sbcl_with_core $TEST_FILESTEM.fast.core --no-sysinit --no-userinit \
+        --eval "(setf sb-ext:*evaluator-mode* :${TEST_SBCL_EVALUATOR_MODE:-compile})" \
+        <<EOF
+  (setf *invoke-debugger-hook*
+        (lambda (condition hook)
+          (declare (ignore hook))
+          (let ((cont (find-restart 'continue condition)))
+            (when cont
+              (invoke-restart cont)))
+          (print :fell-through)
+          (invoke-debugger condition)))
+   #+linkage-table (save-lisp-and-die "$TEST_FILESTEM.missing.core")
+   (sb-ext:exit :code 22) ; catch this
+EOF
+    check_status_maybe_lose "saving-missing-so-core" $? \
+	0 "(successful save)" 22 "(linkage table not available)"
+fi
+
 rm $TEST_FILESTEM-b.so $TEST_FILESTEM-b2.so
-run_sbcl_with_core $TEST_FILESTEM.fast.core --no-sysinit --no-userinit <<EOF
+if [ -f $TEST_FILESTEM.missing.core ] ; then
+    run_sbcl_with_core $TEST_FILESTEM.missing.core --no-sysinit --no-userinit \
+        --eval "(setf sb-ext:*evaluator-mode* :${TEST_SBCL_EVALUATOR_MODE:-compile})" \
+        <<EOF
   (assert (= 22 (summish 10 11)))
   (multiple-value-bind (val err) (ignore-errors (eval 'foo))
     (assert (not val))
@@ -320,7 +374,10 @@ run_sbcl_with_core $TEST_FILESTEM.fast.core --no-sysinit --no-userinit <<EOF
     (assert (typep err 'undefined-alien-error)))
   (exit :code $EXIT_LISP_WIN)
 EOF
-check_status_maybe_lose "missing-so" $?
+    check_status_maybe_lose "missing-so" $?
+else
+    echo "skipping missing-so test (no core file, possibly due to linkage table above)"
+fi
 
 # ADDR of a heap-allocated object
 cat > $TEST_FILESTEM.addr.heap.c <<EOF
@@ -351,10 +408,10 @@ run_sbcl <<EOF
   (defvar *outer* (make-alien outer))
   (defvar *inner* (make-alien inner))
   (setf (slot *inner* 'var) 20)
-  (setf (slot *outer* 'one) *inner*)
+  (setf (slot *outer* 'one) (deref *inner*)) ; lp#1514023 (?)
   (assert (= (slot (slot *outer* 'one) 'var) 20))
   (setf (slot *inner* 'var) 40)
-  (setf (slot *outer* 'two) *inner*)
+  (setf (slot *outer* 'two) (deref *inner*)) ; lp#1514023 (?)
   (assert (= (slot (slot *outer* 'two) 'var) 40))
   (exit :code $EXIT_LISP_WIN)
 EOF

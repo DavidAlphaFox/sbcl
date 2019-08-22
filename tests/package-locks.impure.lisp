@@ -11,11 +11,7 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package :cl-user)
-
-(load "assertoid.lisp")
 (load "compiler-test-util.lisp")
-(use-package "ASSERTOID")
 
 ;;;; Our little labrats and a few utilities
 
@@ -23,13 +19,20 @@
 
 (defpackage :test-unused)
 
+(defpackage :test-nicknamed)
+
+(defpackage :test-not-nicknamed)
+
 (defpackage :test-aux (:export #:noslot #:noslot2))
 
 (defpackage :test
   (:use :test-used)
   (:shadow #:shadowed)
+  (:import-from :cl nil)
   (:export
    #:*special*
+   #:*unbound-special*
+   #:bound-non-special
    #:car
    #:cdr
    #:class
@@ -51,8 +54,7 @@
    #:numfun
    #:shadowed
    #:symbol-macro
-   #:unused
-   ))
+   #:unused))
 
 (defvar *uninterned* "UNINTERNED")
 (defvar *interned* "INTERNED")
@@ -80,6 +82,9 @@
       (unintern s)
       (intern (symbol-name s) :test))
     (rename-package (find-package :test) :test)
+    (dolist (nickname (package-local-nicknames :test))
+      (remove-package-local-nickname (car nickname) :test))
+    (add-package-local-nickname :nicknamed :test-nicknamed :test)
     (unexport (intern "INTERNAL" :test) :test)
     (intern *interned* :test)
     (use-package :test-used :test)
@@ -89,6 +94,8 @@
     (defun test:function () 'test:function)
     (defmacro test:macro () ''test:macro)
     (defparameter test:*special* 'test:*special*)
+    (defvar test:*unbound-special*)
+    (set 'test:bound-non-special 10)
     (defconstant test:constant 'test:constant)
     (intern "UNUSED" :test)
     (dolist (s '(test:nocondition-slot test:noclass-slot test:nostruct-slot
@@ -115,6 +122,7 @@
 
 (defmacro with-error-info ((string &rest args) &body forms)
   `(handler-bind ((error (lambda (e)
+                           (declare (ignorable e))
                            (format t ,string ,@args)
                            (finish-output))))
      (progn ,@forms)))
@@ -187,6 +195,8 @@
       (rename-package p :test '(:test-nick)))
     (use-package :test-unused :test)
     (unuse-package :test-used :test)
+    (add-package-local-nickname :not-nicknamed :test-not-nicknamed :test)
+    (remove-package-local-nickname :nicknamed :test)
     (shadow 'not-from-test :test)
     (unintern (or (find-symbol *interned* :test) (error "bugo")) :test)
     (delete-package :test-delete)
@@ -201,6 +211,7 @@
     (defmacro test:unused () ''foo)
     (setf (macro-function 'test:unused) (constantly 'foo))
     (define-compiler-macro test:unused (&whole form arg)
+      (declare (ignore arg))
       form)
     (setf (compiler-macro-function 'test:unused) (constantly 'foo))
 
@@ -241,6 +252,7 @@
     (define-setf-expander test:car (place)
       (multiple-value-bind (dummies vals newval setter getter)
           (get-setf-expansion place)
+        (declare (ignore newval setter))
         (let ((store (gensym)))
           (values dummies
                   vals
@@ -296,8 +308,8 @@
 
     ;; ftype
     ;;
-    ;; The interpreter doesn't do anything with ftype declarations
-    #+#.(cl:if (cl:eq sb-ext:*evaluator-mode* :compile) '(and) '(or))
+    ;; The legacy interpreter doesn't do anything with ftype declarations
+    #+(or :sb-fasteval (not :interpreter))
     (test:function . (locally
                          (declare (ftype function test:function))
                        (cons t t)))
@@ -305,7 +317,7 @@
     ;; type
     ;;
     ;; Nor with type declarations
-    #+#.(cl:if (cl:eq sb-ext:*evaluator-mode* :compile) '(and) '(or))
+    #+(or :sb-fasteval (not :interpreter))
     (test:num . (locally
                     (declare (type fixnum test:num))
                   (cons t t)))
@@ -316,7 +328,7 @@
                         (cons t t)))
 
     ;; declare ftype
-    #+#.(cl:if (cl:eq sb-ext:*evaluator-mode* :compile) '(and) '(or))
+    #+(or :sb-fasteval (not :interpreter))
     (test:numfun . (locally
                        (declare (ftype (function (fixnum) fixnum) test:numfun))
                      (cons t t)))))
@@ -335,7 +347,7 @@
 
 (with-test (:name :unlocked-package)
   (dolist (form (append *legal-forms* *illegal-forms*))
-    (with-error-info ("~Unlocked form: ~S~%" form)
+    (with-error-info ("Unlocked form: ~S~%" form)
       (eval form))))
 
 ;;; Locked. Errors for all illegal forms, none for legal.
@@ -347,31 +359,42 @@
       (eval form))))
 
 (with-test (:name :locked-package/illegal-runtime-forms)
-  (dolist (form (append *illegal-runtime-forms* *illegal-double-forms*))
+  (dolist (form (remove 'declaim (append *illegal-runtime-forms*
+                                         *illegal-double-forms*)
+                        :key #'first))
     (with-error-info ("locked illegal runtime form: ~S~%" form)
-      (let ((fun (compile nil `(lambda () ,form))))
+      (let ((fun (checked-compile `(lambda () ,form))))
         (assert-error (funcall fun) sb-ext:package-lock-violation))
       (assert-error (eval form) sb-ext:package-lock-violation))))
 
 (with-test (:name :locked-package/illegal-lexical-forms)
-  (dolist (pair *illegal-lexical-forms-alist*)
-    (let ((form (cdr pair)))
-      (with-error-info ("compile locked illegal lexical form: ~S~%" form)
-        (let ((fun (compile nil `(lambda () ,form))))
-          (assert-error (funcall fun) program-error))
-        (assert-error (eval form) program-error)))))
+  (loop :for (nil . form) :in *illegal-lexical-forms-alist* :do
+     (with-error-info ("compile locked illegal lexical form: ~S~%" form)
+       (let ((fun (checked-compile `(lambda () ,form)
+                                   :allow-failure t
+                                   :allow-warnings 'simple-warning)))
+         (assert-error (funcall fun) program-error))
+       (assert-error (let ((*error-output* (make-broadcast-stream)))
+                       (eval form))
+                     ;; Let's not be pedantic here.
+                     ;; PACKAGE-LOCK-VIOLATION is right,
+                     ;; because the distinction between lexical analysis
+                     ;; and running is artificial for interpreted code.
+                     (or sb-ext:package-lock-violation program-error)))))
 
 ;;; Locked, WITHOUT-PACKAGE-LOCKS
 (reset-test t)
 
-(dolist (form *illegal-runtime-forms*)
-  (with-error-info ("without-package-locks illegal runtime form: ~S~%" form)
-    (funcall (compile nil `(lambda () (without-package-locks ,form))))))
+(with-test (:name (sb-ext:without-package-locks :locked-package :illegal-runtime-forms))
+  (dolist (form (remove 'declaim *illegal-runtime-forms* :key #'first))
+    (with-error-info ("without-package-locks illegal runtime form: ~S~%" form)
+      (funcall (checked-compile `(lambda () (without-package-locks ,form)))))))
 
-(dolist (form *illegal-lexical-forms*)
-  (let ((fun (without-package-locks (compile nil `(lambda () ,form)))))
-    (funcall fun))
-  (without-package-locks (eval form)))
+(with-test (:name (sb-ext:without-package-locks :locked-package :illegal-lexical-forms))
+ (dolist (form *illegal-lexical-forms*)
+   (let ((fun (without-package-locks (checked-compile `(lambda () ,form)))))
+     (funcall fun))
+   (without-package-locks (eval form))))
 
 ;;; Locked, DISABLE-PACKAGE-LOCKS
 (reset-test t)
@@ -380,9 +403,9 @@
   (destructuring-bind (sym . form) pair
     (with-error-info ("disable-package-locks on illegal form: ~S~%"
                       form)
-      (funcall (compile nil `(lambda ()
-                              (declare (disable-package-locks ,sym))
-                              ,form)))
+      (funcall (checked-compile `(lambda ()
+                                   (declare (disable-package-locks ,sym))
+                                   ,form)))
       (eval `(locally
                  (declare (disable-package-locks ,sym))
                ,form)))))
@@ -391,67 +414,74 @@
 ;;; test restarts.
 (reset-test t)
 
-(dolist (form *illegal-runtime-forms*)
-  (with-error-info ("one error per form ~S~%" form)
-    (let ((errorp nil))
-      (handler-bind ((package-lock-violation (lambda (e)
-                                               (when errorp
-                                                 (error "multiple errors"))
-                                               (setf errorp t)
-                                               (continue e))))
-        (eval form)))))
+(with-test (:name :illegal-runtime-forms)
+ (dolist (form *illegal-runtime-forms*)
+   (with-error-info ("one error per form ~S~%" form)
+     (let ((errorp nil))
+       (handler-bind ((package-lock-violation (lambda (e)
+                                                (when errorp
+                                                  (error "multiple errors ~%~a~% and ~%~a"
+                                                         errorp e))
+                                                (setf errorp e)
+                                                (continue e))))
+         (eval form))))))
 
-(dolist (form *illegal-double-forms*)
-  (with-error-info ("two errors per form: ~S~%" form)
-    (let ((error-count 0))
-      ;; check that we don't get multiple errors from a single form
-      (handler-bind ((package-lock-violation (lambda (x)
-                                               (declare (ignore x))
-                                               (incf error-count)
-                                               (continue x))))
-        (eval form)
-        (unless (= 2 error-count)
-          (error "expected 2 errors per form, got ~A for ~A"
-                 error-count form))))))
+(with-test (:name :illegal-double-forms)
+  (dolist (form *illegal-double-forms*)
+    (with-error-info ("two errors per form: ~S~%" form)
+      (let ((error-count 0))
+        ;; check that we don't get multiple errors from a single form
+        (handler-bind ((package-lock-violation (lambda (x)
+                                                 (declare (ignorable x))
+                                                 (incf error-count)
+                                                 (continue x))))
+          (eval form)
+          (unless (= 2 error-count)
+            (error "expected 2 errors per form, got ~A for ~A"
+                   error-count form)))))))
 
 ;;; COMPILE-FILE when unlocked, LOAD locked -- *illegal-runtime-forms* only
 ;;;
 ;;; This is not part of the interface, but it is the behaviour we want
-(let* ((tmp "package-locks.tmp.lisp")
-       (fasl (compile-file-pathname tmp))
-       (n 0))
-  (dolist (form *illegal-runtime-forms*)
-    (unwind-protect
-         (with-simple-restart (next "~S failed, continue with next test" form)
-           (reset-test nil)
-           (with-open-file (f tmp :direction :output)
-             (prin1 form f))
-           (multiple-value-bind (file warnings failure-p) (compile-file tmp)
-             (set-test-locks t)
-             (assert-error (load fasl)
-                           sb-ext:package-lock-violation)))
-      (when (probe-file tmp)
-        (delete-file tmp))
-      (when (probe-file fasl)
-        (delete-file fasl)))))
+(with-test (:name (compile-file load :locked-package))
+  (let* ((tmp (scratch-file-name "lisp"))
+         (fasl (compile-file-pathname tmp)))
+    (dolist (form *illegal-runtime-forms*)
+      (unwind-protect
+           (with-simple-restart (next "~S failed, continue with next test" form)
+             (reset-test nil)
+             (with-open-file (f tmp :direction :output)
+               (prin1 form f))
+             (multiple-value-bind (file warnings failure-p) (compile-file tmp)
+               (declare (ignore file warnings failure-p))
+               (set-test-locks t)
+               (assert-error (load fasl) sb-ext:package-lock-violation)))
+        (when (probe-file tmp)
+          (delete-file tmp))
+        (when (probe-file fasl)
+          (delete-file fasl))))))
 
 ;;;; Tests for enable-package-locks declarations
 (reset-test t)
 
-(dolist (pair *illegal-lexical-forms-alist*)
-  (destructuring-bind (sym . form) pair
-    (let ((fun (compile nil `(lambda ()
-                               (declare (disable-package-locks ,sym))
-                               ,form
-                               (locally (declare (enable-package-locks ,sym))
-                                 ,form)))))
-      (assert-error (funcall fun) program-error))
-    (assert-error
-     (eval `(locally (declare (disable-package-locks ,sym))
-              ,form
-              (locally (declare (enable-package-locks ,sym))
-                ,form)))
-     program-error)))
+(with-test (:name (sb-ext:enable-package-locks))
+  (loop :for (sym . form) :in *illegal-lexical-forms-alist* :do
+     (let ((fun (checked-compile
+                 `(lambda ()
+                    (declare (disable-package-locks ,sym))
+                    ,form
+                    (locally (declare (enable-package-locks ,sym))
+                      ,form))
+                 :allow-failure t
+                 :allow-warnings 'simple-warning)))
+       (assert-error (funcall fun) program-error))
+     (assert-error
+      (let ((*error-output* (make-broadcast-stream)))
+        (eval `(locally (declare (disable-package-locks ,sym))
+                 ,form
+                 (locally (declare (enable-package-locks ,sym))
+                   ,form))))
+      (or sb-ext:package-lock-violation program-error))))
 
 ;;;; See that trace on functions in locked packages doesn't break
 ;;;; anything.
@@ -460,19 +490,15 @@
 
 ;;;; No bogus violations from defclass with accessors in a locked
 ;;;; package. Reported by by Francois-Rene Rideau.
-(assert (package-locked-p :sb-gray))
-(multiple-value-bind (fun compile-errors)
-    (ignore-errors
-      (compile
-       nil
-       '(lambda ()
-         (defclass fare-class ()
-           ((line-column :initform 0 :reader sb-gray:stream-line-column))))))
-  (assert (not compile-errors))
-  (assert fun)
-  (multiple-value-bind (class run-errors) (ignore-errors (funcall fun))
-    (assert (not run-errors))
-    (assert (eq class (find-class 'fare-class)))))
+(with-test (:name (defclass :accessor :package-locked))
+  (assert (package-locked-p :sb-gray))
+  (let ((fun (checked-compile
+              '(lambda ()
+                (defclass fare-class ()
+                  ((line-column :initform 0 :reader sb-gray:stream-line-column)))))))
+    (multiple-value-bind (class run-errors) (ignore-errors (funcall fun))
+      (assert (not run-errors))
+      (assert (eq class (find-class 'fare-class))))))
 
 ;;;; No bogus violations from DECLARE's done by PCL behind the
 ;;;; scenes. Reported by David Wragg on sbcl-help.
@@ -482,7 +508,8 @@
   test:*special*)
 (assert (eq *terminal-io* (pcl-type-declaration-method-bug *terminal-io*)))
 
-#+#.(cl:if (cl:eq sb-ext:*evaluator-mode* :compile) '(and) '(or))
+;; Interpreters don't walk into a method body until it's executed.
+#-:interpreter
 (assert-error
  (eval
   '(defmethod pcl-type-declaration-method-bug ((test:*special* stream))
@@ -492,8 +519,9 @@
 
 ;;; Bogus package lock violations from LOOP
 
-(assert (equal (loop :for *print-base* :from 2 :to 3 :collect *print-base*)
-               '(2 3)))
+(with-test (:name (loop :bogus sb-ext:package-lock-violation))
+  (assert (equal (loop :for *print-base* :from 2 :to 3 :collect *print-base*)
+                 '(2 3))))
 
 ;;; Package lock for DEFMACRO -> DEFUN and vice-versa.
 (reset-test t)
@@ -568,8 +596,7 @@
                     :ok))))))
 
 (with-test (:name :assert-symbol-home-package-unlocked)
-  (assert-error                         ; TODO use assert-signals
-                (sb-impl::assert-symbol-home-package-unlocked
+  (assert-error (sb-impl::assert-symbol-home-package-unlocked
                  'cl:cons "trying to foo ~S")
                 symbol-package-locked-error)
   (assert-error
@@ -578,4 +605,64 @@
     :foo :bar)
    symbol-package-locked-error))
 
-;;; WOOT! Done.
+(with-test (:name :defcostant-locks)
+  (assert-error (defconstant test:constant 100)
+                symbol-package-locked-error))
+
+(with-test (:name :defstruct-compile-time-locks)
+  (assert-error (ctu:file-compile
+                 `((defstruct test:nostruct)))
+      symbol-package-locked-error)
+  (assert-error (ctu:file-compile
+                 `((defstruct (a-struct-test.1
+                               (:conc-name))
+                     test:nostruct)))
+      symbol-package-locked-error)
+  (assert-error (ctu:file-compile
+                 `((defstruct (a-struct-test.2
+                               (:predicate test:nostruct)))))
+      symbol-package-locked-error)
+  (assert-error (ctu:file-compile
+                 `((defstruct (a-struct-test.3
+                               (:copier test:nostruct)))))
+      symbol-package-locked-error)
+  (assert-error (ctu:file-compile
+                 `((defstruct (a-struct-test.4
+                               (:constructor test:nostruct)))))
+      symbol-package-locked-error))
+
+(with-test (:name :set-undefined-vars)
+  (assert-error (eval '(set 'test:car 10))
+                symbol-package-locked-error)
+  (assert-error (eval '(setf test:car 10))
+                symbol-package-locked-error)
+  (assert-error (eval '(setf (symbol-value 'test:car) 10))
+                symbol-package-locked-error))
+
+(with-test (:name :set-undefined-vars-warnings)
+  (flet ((test (lambda)
+           (multiple-value-bind (fun failure warnings)
+               (checked-compile lambda :allow-warnings t)
+             (assert (and failure warnings))
+             (assert-error (funcall fun)
+                           symbol-package-locked-error))))
+    (test '(lambda () (set 'test:car 10)))
+    (test '(lambda () (setf test:car 10)))
+    (test '(lambda () (setf (symbol-value 'test:car) 10)))))
+
+(with-test (:name :declare-unbound-special)
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda ()
+                        (declare (fixnum test:*unbound-special*)))
+                      :allow-failure t
+                      :allow-warnings t))))
+
+(with-test (:name :declare-bound-non-special)
+  (checked-compile '(lambda (test:bound-non-special)
+                     (declare (fixnum test:bound-non-special))
+                     test:bound-non-special)))
+
+(with-test (:name :unintern-nil)
+  (assert-error (unintern nil 'test)
+                package-locked-error))

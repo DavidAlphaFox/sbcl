@@ -11,23 +11,27 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_VECTOR
-#define SBCL_GENESIS_VECTOR 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_VECTOR
+#ifndef __ASSEMBLER__
 
 struct vector {
     lispobj header;
     lispobj length;
     uword_t data[1];
 };
+static inline struct vector* VECTOR(lispobj obj) {
+  return (struct vector*)(obj - 15);
+}
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
 #define VECTOR_LENGTH_OFFSET -7
 #define VECTOR_DATA_OFFSET 1
+#define VECTOR_SIZE 2
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_VECTOR */
+#endif

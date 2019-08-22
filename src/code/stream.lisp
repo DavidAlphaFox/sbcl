@@ -9,19 +9,47 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; standard streams
 
 ;;; The initialization of these streams is performed by
 ;;; STREAM-COLD-INIT-OR-RESET.
-(defvar *terminal-io* () #!+sb-doc "terminal I/O stream")
-(defvar *standard-input* () #!+sb-doc "default input stream")
-(defvar *standard-output* () #!+sb-doc "default output stream")
-(defvar *error-output* () #!+sb-doc "error output stream")
-(defvar *query-io* () #!+sb-doc "query I/O stream")
-(defvar *trace-output* () #!+sb-doc "trace output stream")
-(defvar *debug-io* () #!+sb-doc "interactive debugging stream")
+(defvar *terminal-io* () "terminal I/O stream")
+(defvar *standard-input* () "default input stream")
+(defvar *standard-output* () "default output stream")
+(defvar *error-output* () "error output stream")
+(defvar *query-io* () "query I/O stream")
+(defvar *trace-output* () "trace output stream")
+(defvar *debug-io* () "interactive debugging stream")
+
+(defun stream-element-type-stream-element-mode (element-type)
+  (cond ((or (not element-type)
+             (eq element-type t)
+             (eq element-type :default)) :bivalent)
+        ((or (eq element-type 'character)
+             (eq element-type 'base-char))
+         'character)
+        ((memq element-type '(signed-byte unsigned-byte))
+         element-type)
+        ((and (proper-list-of-length-p element-type 2)
+              (memq (car element-type)
+                    '(signed-byte unsigned-byte)))
+         (car element-type))
+        ((not (ignore-errors
+               (setf element-type
+                     (type-or-nil-if-unknown element-type t))))
+         :bivalent)
+        ((eq element-type *empty-type*)
+         :bivalent)
+        ((csubtypep element-type (specifier-type 'character))
+         'character)
+        ((csubtypep element-type (specifier-type 'unsigned-byte))
+         'unsigned-byte)
+        ((csubtypep element-type (specifier-type 'signed-byte))
+         'signed-byte)
+        (t
+         :bivalent)))
 
 (defun ill-in (stream &rest ignore)
   (declare (ignore ignore))
@@ -59,10 +87,37 @@
 
 ;;; stream manipulation functions
 
+(defstruct (broadcast-stream (:include ansi-stream
+                                       (out #'broadcast-out)
+                                       (bout #'broadcast-bout)
+                                       (sout #'broadcast-sout)
+                                       (misc #'broadcast-misc))
+                             (:constructor %make-broadcast-stream
+                                           (streams))
+                             (:copier nil)
+                             (:predicate nil))
+  ;; a list of all the streams we broadcast to
+  (streams () :type list :read-only t))
+(declaim (freeze-type broadcast-stream))
+
+(defun maybe-resolve-synonym-stream (stream)
+  (labels ((recur (stream)
+             (if (synonym-stream-p stream)
+                 (recur (symbol-value (synonym-stream-symbol stream)))
+                 stream)))
+    (recur stream)))
+
+(declaim (inline resolve-synonym-stream))
+(defun resolve-synonym-stream (stream)
+  (let ((result (symbol-value (synonym-stream-symbol stream))))
+    (if (synonym-stream-p result)
+        (maybe-resolve-synonym-stream result)
+        result)))
+
 (defun ansi-stream-input-stream-p (stream)
   (declare (type ansi-stream stream))
   (if (synonym-stream-p stream)
-      (input-stream-p (symbol-value (synonym-stream-symbol stream)))
+      (input-stream-p (resolve-synonym-stream stream))
       (and (not (eq (ansi-stream-in stream) #'closed-flame))
        ;;; KLUDGE: It's probably not good to have EQ tests on function
        ;;; values like this. What if someone's redefined the function?
@@ -71,6 +126,7 @@
            (or (not (eq (ansi-stream-in stream) #'ill-in))
                (not (eq (ansi-stream-bin stream) #'ill-bin))))))
 
+;;; Temporary definition that gets overwritten by pcl/gray-streams
 (defun input-stream-p (stream)
   (declare (type stream stream))
   (and (ansi-stream-p stream)
@@ -79,14 +135,14 @@
 (defun ansi-stream-output-stream-p (stream)
   (declare (type ansi-stream stream))
   (if (synonym-stream-p stream)
-      (output-stream-p (symbol-value (synonym-stream-symbol stream)))
+      (output-stream-p (resolve-synonym-stream stream))
       (and (not (eq (ansi-stream-in stream) #'closed-flame))
            (or (not (eq (ansi-stream-out stream) #'ill-out))
                (not (eq (ansi-stream-bout stream) #'ill-bout))))))
 
+;;; Temporary definition that gets overwritten by pcl/gray-streams
 (defun output-stream-p (stream)
   (declare (type stream stream))
-
   (and (ansi-stream-p stream)
        (ansi-stream-output-stream-p stream)))
 
@@ -138,10 +194,10 @@
   (ef-char-size (get-external-format external-format)))
 
 ;;; Call the MISC method with the :FILE-POSITION operation.
-#!-sb-fluid (declaim (inline ansi-stream-file-position))
+#-sb-fluid (declaim (inline ansi-stream-file-position))
 (defun ansi-stream-file-position (stream position)
   (declare (type stream stream))
-  (declare (type (or index (alien sb!unix:off-t) (member nil :start :end))
+  (declare (type (or index (alien sb-unix:unix-offset) (member nil :start :end))
                  position))
   ;; FIXME: It would be good to comment on the stuff that is done here...
   ;; FIXME: This doesn't look interrupt safe.
@@ -152,11 +208,11 @@
     (t
      (let ((res (funcall (ansi-stream-misc stream) stream :file-position nil)))
        (when res
-         #!-sb-unicode
+         #-sb-unicode
          (- res
             (- +ansi-stream-in-buffer-length+
                (ansi-stream-in-index stream)))
-         #!+sb-unicode
+         #+sb-unicode
          (let ((char-size (if (fd-stream-p stream)
                               (fd-stream-char-size stream)
                               (external-format-char-size (stream-external-format stream)))))
@@ -175,7 +231,10 @@
 (defun file-position (stream &optional position)
   (if (ansi-stream-p stream)
       (ansi-stream-file-position stream position)
-      (stream-file-position stream position)))
+      (let ((result (stream-file-position stream position)))
+        (if (numberp result)
+            result
+            (and result t)))))
 
 ;;; This is a literal translation of the ANSI glossary entry "stream
 ;;; associated with a file".
@@ -188,44 +247,34 @@
 ;;; qualification for operations like FILE-LENGTH (so that ANSI was
 ;;; probably thinking of something like what Unix calls block devices)
 ;;; but I can't see any better way to do it. -- WHN 2001-04-14
-(defun stream-associated-with-file-p (x)
-  #!+sb-doc
-  "Test for the ANSI concept \"stream associated with a file\"."
-  (or (typep x 'file-stream)
-      (and (synonym-stream-p x)
-           (stream-associated-with-file-p (symbol-value
-                                           (synonym-stream-symbol x))))))
+(defun stream-file-stream (stream)
+  "Test for the ANSI concept \"stream associated with a file\".
 
-(defun stream-must-be-associated-with-file (stream)
+   Return NIL or the underlying FILE-STREAM."
+  (typecase stream
+    (file-stream stream)
+    (synonym-stream
+     (stream-file-stream (resolve-synonym-stream stream)))))
+
+(defun stream-file-stream-or-lose (stream)
   (declare (type stream stream))
-  (unless (stream-associated-with-file-p stream)
-    (error 'simple-type-error
-           ;; KLUDGE: The ANSI spec for FILE-LENGTH specifically says
-           ;; this should be TYPE-ERROR. But what then can we use for
-           ;; EXPECTED-TYPE? This SATISFIES type (with a nonstandard
-           ;; private predicate function..) is ugly and confusing, but
-           ;; I can't see any other way. -- WHN 2001-04-14
-           :datum stream
-           :expected-type '(satisfies stream-associated-with-file-p)
-           :format-control
-           "~@<The stream ~2I~_~S ~I~_isn't associated with a file.~:>"
-           :format-arguments (list stream))))
+  (or (stream-file-stream stream)
+      (error 'simple-type-error
+             ;; KLUDGE: The ANSI spec for FILE-LENGTH specifically says
+             ;; this should be TYPE-ERROR. But what then can we use for
+             ;; EXPECTED-TYPE? This SATISFIES type (with a nonstandard
+             ;; private predicate function..) is ugly and confusing, but
+             ;; I can't see any other way. -- WHN 2001-04-14
+             :datum stream
+             :expected-type '(satisfies stream-file-stream)
+             :format-control
+             "~@<The stream ~2I~_~S ~I~_isn't associated with a file.~:>"
+             :format-arguments (list stream))))
 
-;;; like FILE-POSITION, only using :FILE-LENGTH
-(defun file-length (stream)
-  ;; FIXME: The following declaration uses yet undefined types, which
-  ;; cause cross-compiler hangup.
-  ;;
-  ;; (declare (type (or file-stream synonym-stream) stream))
-  ;;
-  ;; The description for FILE-LENGTH says that an error must be raised
-  ;; for streams not associated with files (which broadcast streams
-  ;; aren't according to the glossary). However, the behaviour of
-  ;; FILE-LENGTH for broadcast streams is explicitly described in the
-  ;; BROADCAST-STREAM entry.
-  (unless (typep stream 'broadcast-stream)
-    (stream-must-be-associated-with-file stream))
-  (funcall (ansi-stream-misc stream) stream :file-length))
+(defun stream-file-name-or-lose (stream)
+  (or (file-name (stream-file-stream-or-lose stream))
+      (error "~@<The stream ~2I~_~S ~I~_is not associated with a named file.~:>"
+             stream)))
 
 (defun file-string-length (stream object)
   (funcall (ansi-stream-misc stream) stream :file-string-length object))
@@ -235,63 +284,45 @@
 (defun ansi-stream-read-line-from-frc-buffer (stream eof-error-p eof-value)
   (prepare-for-fast-read-char stream
     (declare (ignore %frc-method%))
+    (declare (type ansi-stream-cin-buffer %frc-buffer%))
     (let ((chunks-total-length 0)
           (chunks nil))
       (declare (type index chunks-total-length)
                (list chunks))
       (labels ((refill-buffer ()
-                 (prog1
-                     (fast-read-char-refill stream nil nil)
+                 (prog1 (fast-read-char-refill stream nil)
                    (setf %frc-index% (ansi-stream-in-index %frc-stream%))))
-               (newline-position ()
-                 (position #\Newline (the (simple-array character (*))
-                                       %frc-buffer%)
-                           :test #'char=
-                           :start %frc-index%))
-               (make-and-return-result-string (pos)
-                 (let* ((len (+ (- (or pos %frc-index%)
-                                   %frc-index%)
-                                chunks-total-length))
-                        (res (make-string len))
-                        (start 0))
-                   (declare (type index start))
-                   (when chunks
-                     (dolist (chunk (nreverse chunks))
-                       (declare (type (simple-array character) chunk))
-                       (replace res chunk :start1 start)
-                       (incf start (length chunk))))
-                   (unless (null pos)
+               (build-result (pos n-more-chars)
+                 (let ((res (make-string (+ chunks-total-length n-more-chars)))
+                       (start1 chunks-total-length))
+                   (declare (type index start1))
+                   (when (>= pos 0)
                      (replace res %frc-buffer%
-                              :start1 start
-                              :start2 %frc-index% :end2 pos)
+                              :start1 start1 :start2 %frc-index% :end2 pos)
                      (setf %frc-index% (1+ pos)))
                    (done-with-fast-read-char)
-                   (return-from ansi-stream-read-line-from-frc-buffer (values res (null pos)))))
-               (add-chunk ()
-                 (let* ((end (length %frc-buffer%))
-                        (len (- end %frc-index%))
-                        (chunk (make-string len)))
-                   (replace chunk %frc-buffer% :start2 %frc-index% :end2 end)
-                   (push chunk chunks)
-                   (incf chunks-total-length len)
-                   (when (refill-buffer)
-                     (make-and-return-result-string nil)))))
-        (declare (inline make-and-return-result-string
-                         refill-buffer))
-        (when (and (= %frc-index% +ansi-stream-in-buffer-length+)
-                   (refill-buffer))
+                   (dolist (chunk chunks res)
+                     (declare (type (simple-array character (*)) chunk))
+                     (decf start1 (length chunk))
+                     (replace res chunk :start1 start1)))))
+        (declare (inline refill-buffer))
+        (if (or (< %frc-index% +ansi-stream-in-buffer-length+) (refill-buffer))
+            (loop
+             (let ((pos (position #\Newline %frc-buffer%
+                                  :test #'char= :start %frc-index%)))
+               (when pos
+                 (return (values (build-result pos (- pos %frc-index%)) nil)))
+               (let ((chunk (subseq %frc-buffer% %frc-index%)))
+                 (incf chunks-total-length (length chunk))
+                 (push chunk chunks))
+               (unless (refill-buffer)
+                 (return (values (build-result -1 0) t)))))
           ;; EOF had been reached before we read anything
           ;; at all. Return the EOF value or signal the error.
-          (done-with-fast-read-char)
-          (return-from ansi-stream-read-line-from-frc-buffer
-            (values (eof-or-lose stream eof-error-p eof-value) t)))
-        (loop
-           (let ((pos (newline-position)))
-             (if pos
-                 (make-and-return-result-string pos)
-                 (add-chunk))))))))
+            (progn (done-with-fast-read-char)
+                   (eof-or-lose stream eof-error-p (values eof-value t))))))))
 
-#!-sb-fluid (declaim (inline ansi-stream-read-line))
+#-sb-fluid (declaim (inline ansi-stream-read-line))
 (defun ansi-stream-read-line (stream eof-error-p eof-value recursive-p)
   (declare (ignore recursive-p))
   (if (ansi-stream-cin-buffer stream)
@@ -330,7 +361,8 @@
 
 (defun read-line (&optional (stream *standard-input*) (eof-error-p t) eof-value
                             recursive-p)
-  (let ((stream (in-synonym-of stream)))
+  (declare (explicit-check))
+  (let ((stream (in-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-read-line stream eof-error-p eof-value recursive-p)
         ;; must be Gray streams FUNDAMENTAL-STREAM
@@ -341,9 +373,9 @@
 
 ;;; We proclaim them INLINE here, then proclaim them NOTINLINE later on,
 ;;; so, except in this file, they are not inline by default, but they can be.
-#!-sb-fluid (declaim (inline read-char unread-char read-byte listen))
+#-sb-fluid (declaim (inline read-char unread-char read-byte listen))
 
-#!-sb-fluid (declaim (inline ansi-stream-read-char))
+#-sb-fluid (declaim (inline ansi-stream-read-char))
 (defun ansi-stream-read-char (stream eof-error-p eof-value recursive-p)
   (declare (ignore recursive-p))
   (prepare-for-fast-read-char stream
@@ -355,7 +387,8 @@
                             (eof-error-p t)
                             eof-value
                             recursive-p)
-  (let ((stream (in-synonym-of stream)))
+  (declare (explicit-check))
+  (let ((stream (in-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-read-char stream eof-error-p eof-value recursive-p)
         ;; must be Gray streams FUNDAMENTAL-STREAM
@@ -364,7 +397,7 @@
               (eof-or-lose stream eof-error-p eof-value)
               (the character char))))))
 
-#!-sb-fluid (declaim (inline ansi-stream-unread-char))
+#-sb-fluid (declaim (inline ansi-stream-unread-char))
 (defun ansi-stream-unread-char (character stream)
   (let ((index (1- (ansi-stream-in-index stream)))
         (buffer (ansi-stream-cin-buffer stream)))
@@ -372,20 +405,25 @@
     (when (minusp index) (error "nothing to unread"))
     (cond (buffer
            (setf (aref buffer index) character)
-           (setf (ansi-stream-in-index stream) index))
+           (setf (ansi-stream-in-index stream) index)
+           ;; Ugh. an ANSI-STREAM with a char buffer never gives a chance to
+           ;; the stream's misc routine to handle the UNREAD operation.
+           (when (ansi-stream-input-char-pos stream)
+             (decf (ansi-stream-input-char-pos stream))))
           (t
            (funcall (ansi-stream-misc stream) stream
                     :unread character)))))
 
 (defun unread-char (character &optional (stream *standard-input*))
-  (let ((stream (in-synonym-of stream)))
+  (declare (explicit-check))
+  (let ((stream (in-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-unread-char character stream)
         ;; must be Gray streams FUNDAMENTAL-STREAM
         (stream-unread-char stream character)))
   nil)
 
-#!-sb-fluid (declaim (inline ansi-stream-listen))
+#-sb-fluid (declaim (inline ansi-stream-listen))
 (defun ansi-stream-listen (stream)
   (or (/= (the fixnum (ansi-stream-in-index stream))
           +ansi-stream-in-buffer-length+)
@@ -396,13 +434,14 @@
             result))))
 
 (defun listen (&optional (stream *standard-input*))
-  (let ((stream (in-synonym-of stream)))
+  (declare (explicit-check))
+  (let ((stream (in-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-listen stream)
         ;; Fall through to Gray streams FUNDAMENTAL-STREAM case.
         (stream-listen stream))))
 
-#!-sb-fluid (declaim (inline ansi-stream-read-char-no-hang))
+#-sb-fluid (declaim (inline ansi-stream-read-char-no-hang))
 (defun ansi-stream-read-char-no-hang (stream eof-error-p eof-value recursive-p)
   (if (funcall (ansi-stream-misc stream) stream :listen)
       ;; On T or :EOF get READ-CHAR to do the work.
@@ -413,7 +452,8 @@
                                     (eof-error-p t)
                                     eof-value
                                     recursive-p)
-  (let ((stream (in-synonym-of stream)))
+  (declare (explicit-check))
+  (let ((stream (in-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-read-char-no-hang stream eof-error-p eof-value
                                        recursive-p)
@@ -423,20 +463,21 @@
               (eof-or-lose stream eof-error-p eof-value)
               (the (or character null) char))))))
 
-#!-sb-fluid (declaim (inline ansi-stream-clear-input))
+#-sb-fluid (declaim (inline ansi-stream-clear-input))
 (defun ansi-stream-clear-input (stream)
   (setf (ansi-stream-in-index stream) +ansi-stream-in-buffer-length+)
   (funcall (ansi-stream-misc stream) stream :clear-input))
 
 (defun clear-input (&optional (stream *standard-input*))
-  (let ((stream (in-synonym-of stream)))
+  (declare (explicit-check))
+  (let ((stream (in-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-clear-input stream)
         ;; must be Gray streams FUNDAMENTAL-STREAM
         (stream-clear-input stream)))
   nil)
 
-#!-sb-fluid (declaim (inline ansi-stream-read-byte))
+#-sb-fluid (declaim (inline ansi-stream-read-byte))
 (defun ansi-stream-read-byte (stream eof-error-p eof-value recursive-p)
   ;; Why the "recursive-p" parameter?  a-s-r-b is funcall'ed from
   ;; a-s-read-sequence and needs a lambda list that's congruent with
@@ -446,6 +487,7 @@
     (fast-read-byte)))
 
 (defun read-byte (stream &optional (eof-error-p t) eof-value)
+  (declare (explicit-check))
   (if (ansi-stream-p stream)
       (ansi-stream-read-byte stream eof-error-p eof-value nil)
       ;; must be Gray streams FUNDAMENTAL-STREAM
@@ -464,7 +506,7 @@
 ;;; some cases, but it wasn't being used in SBCL, so it was dropped.
 ;;; If we ever need it, it could be added later as a new variant N-BIN
 ;;; method (perhaps N-BIN-ASAP?) or something.
-#!-sb-fluid (declaim (inline read-n-bytes))
+#-sb-fluid (declaim (inline read-n-bytes))
 (defun read-n-bytes (stream buffer start numbytes &optional (eof-error-p t))
   (if (ansi-stream-p stream)
       (ansi-stream-read-n-bytes stream buffer start numbytes eof-error-p)
@@ -528,7 +570,13 @@
 ;;; the IN-BUFFER for text streams. There is definitely an IN-BUFFER,
 ;;; and hence must be an N-BIN method. It's also called by other stream
 ;;; functions which directly peek into the frc buffer.
-(defun fast-read-char-refill (stream eof-error-p eof-value)
+;;; If EOF is hit and EOF-ERROR-P is false, then return NIL,
+;;; otherwise return the new index into CIN-BUFFER.
+(defun fast-read-char-refill (stream eof-error-p)
+  (when (ansi-stream-input-char-pos stream)
+    ;; Characters between (ANSI-STREAM-IN-INDEX %FRC-STREAM%)
+    ;; and +ANSI-STREAM-IN-BUFFER-LENGTH+ have to be re-scanned.
+    (update-input-char-pos stream))
   (let* ((ibuf (ansi-stream-cin-buffer stream))
          (count (funcall (ansi-stream-n-bin stream)
                          stream
@@ -557,30 +605,36 @@
            (let* ((index (1- +ansi-stream-in-buffer-length+))
                   (value (funcall (ansi-stream-in stream) stream nil :eof)))
              (cond
+               ;; When not signaling an error, it is important that IN-INDEX
+               ;; be set to +ANSI-STREAM-IN-BUFFER-LENGTH+ here, even though
+               ;; DONE-WITH-FAST-READ-CHAR will do the same, thereby writing
+               ;; the caller's %FRC-INDEX% (= +ANSI-STREAM-IN-BUFFER-LENGTH+)
+               ;; into the slot. But because we've already bumped INPUT-CHAR-POS
+               ;; and scanned characters between the original %FRC-INDEX%
+               ;; and the buffer end (above), we must *not* do that again.
                ((eql value :eof)
                 ;; definitely EOF now
                 (setf (ansi-stream-in-index stream)
                       +ansi-stream-in-buffer-length+)
-                (values t (eof-or-lose stream eof-error-p eof-value)))
+                (eof-or-lose stream eof-error-p nil))
                ;; we resynced or were given something instead
                (t
                 (setf (aref ibuf index) value)
-                (values nil (setf (ansi-stream-in-index stream) index))))))
+                (setf (ansi-stream-in-index stream) index)))))
           (t
            (when (/= start +ansi-stream-in-buffer-extra+)
              (#.(let* ((n-character-array-bits
-                        (sb!vm:saetp-n-bits
+                        (sb-vm:saetp-n-bits
                          (find 'character
-                               sb!vm:*specialized-array-element-type-properties*
-                               :key #'sb!vm:saetp-specifier)))
+                               sb-vm:*specialized-array-element-type-properties*
+                               :key #'sb-vm:saetp-specifier)))
                        (bash-function (intern (format nil "UB~D-BASH-COPY" n-character-array-bits)
-                                              (find-package "SB!KERNEL"))))
+                                              (find-package "SB-KERNEL"))))
                   bash-function)
                 ibuf +ansi-stream-in-buffer-extra+
                 ibuf start
                 count))
-           (values nil
-                   (setf (ansi-stream-in-index stream) start))))))
+           (setf (ansi-stream-in-index stream) start)))))
 
 ;;; This is similar to FAST-READ-CHAR-REFILL, but we don't have to
 ;;; leave room for unreading.
@@ -605,28 +659,31 @@
 ;;; output functions
 
 (defun write-char (character &optional (stream *standard-output*))
+  (declare (explicit-check))
   (with-out-stream stream (ansi-stream-out character)
                    (stream-write-char character))
   character)
 
 (defun terpri (&optional (stream *standard-output*))
+  (declare (explicit-check))
   (with-out-stream stream (ansi-stream-out #\newline) (stream-terpri))
   nil)
 
-#!-sb-fluid (declaim (inline ansi-stream-fresh-line))
+#-sb-fluid (declaim (inline ansi-stream-fresh-line))
 (defun ansi-stream-fresh-line (stream)
-  (when (/= (or (charpos stream) 1) 0)
+  (unless (eql (charpos stream) 0)
     (funcall (ansi-stream-out stream) stream #\newline)
     t))
 
 (defun fresh-line (&optional (stream *standard-output*))
-  (let ((stream (out-synonym-of stream)))
+  (declare (explicit-check))
+  (let ((stream (out-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-fresh-line stream)
         ;; must be Gray streams FUNDAMENTAL-STREAM
         (stream-fresh-line stream))))
 
-#!-sb-fluid (declaim (inline ansi-stream-write-string))
+#-sb-fluid (declaim (inline ansi-stream-write-string))
 (defun ansi-stream-write-string (string stream start end)
   (with-array-data ((data string) (offset-start start)
                     (offset-end end)
@@ -635,7 +692,7 @@
              stream data offset-start offset-end)))
 
 (defun %write-string (string stream start end)
-  (let ((stream (out-synonym-of stream)))
+  (let ((stream (out-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-write-string string stream start end)
         ;; must be Gray streams FUNDAMENTAL-STREAM
@@ -646,13 +703,15 @@
                             &key (start 0) end)
   (declare (type string string))
   (declare (type stream-designator stream))
+  (declare (explicit-check))
   (%write-string string stream start end))
 
 (defun write-line (string &optional (stream *standard-output*)
                    &key (start 0) end)
   (declare (type string string))
   (declare (type stream-designator stream))
-  (let ((stream (out-synonym-of stream)))
+  (declare (explicit-check))
+  (let ((stream (out-stream-from-designator stream)))
     (cond ((ansi-stream-p stream)
            (ansi-stream-write-string string stream start end)
            (funcall (ansi-stream-out stream) stream #\newline))
@@ -669,23 +728,27 @@
                    (stream-line-length)))
 
 (defun finish-output (&optional (stream *standard-output*))
+  (declare (explicit-check))
   (with-out-stream stream (ansi-stream-misc :finish-output)
                    (stream-finish-output))
   nil)
 
 (defun force-output (&optional (stream *standard-output*))
+  (declare (explicit-check))
   (with-out-stream stream (ansi-stream-misc :force-output)
                    (stream-force-output))
   nil)
 
 (defun clear-output (&optional (stream *standard-output*))
+  (declare (explicit-check))
   (with-out-stream stream (ansi-stream-misc :clear-output)
                    (stream-clear-output))
   nil)
 
 (defun write-byte (integer stream)
-  (with-out-stream/no-synonym stream (ansi-stream-bout integer)
-                              (stream-write-byte integer))
+  (declare (explicit-check))
+  ;; The STREAM argument is not allowed to be a designator.
+  (%with-out-stream stream (ansi-stream-bout integer) (stream-write-byte integer))
   integer)
 
 
@@ -723,8 +786,13 @@
      (force-output stream))
     (:finish-output
      (finish-output stream))
+    (:clear-output
+     (clear-output stream))
     (:element-type
      (stream-element-type stream))
+    (:element-mode
+     (stream-element-type-stream-element-mode
+      (stream-element-type stream)))
     (:stream-external-format
      (stream-external-format stream))
     (:interactive-p
@@ -739,24 +807,36 @@
      (file-string-length stream arg1))
     (:file-position
      (file-position stream arg1))))
+
+(declaim (inline stream-element-mode))
+(defun stream-element-mode (stream)
+  (declare (type stream stream))
+  (cond
+    ((fd-stream-p stream)
+     (fd-stream-element-mode stream))
+    ((and (ansi-stream-p stream)
+          (funcall (ansi-stream-misc stream) stream :element-mode)))
+    (t
+     (stream-element-type-stream-element-mode
+      (stream-element-type stream)))))
 
 ;;;; broadcast streams
 
-(defstruct (broadcast-stream (:include ansi-stream
-                                       (out #'broadcast-out)
-                                       (bout #'broadcast-bout)
-                                       (sout #'broadcast-sout)
-                                       (misc #'broadcast-misc))
-                             (:constructor %make-broadcast-stream
-                                           (streams))
-                             (:copier nil)
-                             (:predicate nil))
-  ;; a list of all the streams we broadcast to
-  (streams () :type list :read-only t))
-
-(declaim (freeze-type broadcast-stream))
-
 (defun make-broadcast-stream (&rest streams)
+  (unless streams
+    (return-from make-broadcast-stream
+      (load-time-value (let ((out (lambda (stream arg)
+                                    (declare (ignore stream arg)
+                                             (optimize speed (safety 0)))))
+                             (sout (lambda (stream string start end)
+                                     (declare (ignore stream string start end)
+                                              (optimize speed (safety 0)))))
+                             (stream (%make-broadcast-stream nil)))
+                         (setf (broadcast-stream-out stream) out
+                               (broadcast-stream-bout stream) out
+                               (broadcast-stream-sout stream) sout)
+                         stream)
+                       t)))
   (dolist (stream streams)
     (unless (output-stream-p stream)
       (error 'type-error
@@ -802,6 +882,9 @@
          (if last
              (stream-element-type (car last))
              t)))
+      (:element-mode
+       (awhen (last streams)
+         (stream-element-mode (car it))))
       (:external-format
        (let ((last (last streams)))
          (if last
@@ -827,7 +910,8 @@
              (file-string-length (car last) arg1)
              1)))
       (:close
-       (set-closed-flame stream))
+       (when (broadcast-stream-streams stream)
+         (set-closed-flame stream)))
       (t
        (let ((res nil))
          (dolist (stream streams res)
@@ -839,22 +923,7 @@
 
 ;;;; synonym streams
 
-(defstruct (synonym-stream (:include ansi-stream
-                                     (in #'synonym-in)
-                                     (bin #'synonym-bin)
-                                     (n-bin #'synonym-n-bin)
-                                     (out #'synonym-out)
-                                     (bout #'synonym-bout)
-                                     (sout #'synonym-sout)
-                                     (misc #'synonym-misc))
-                           (:constructor make-synonym-stream (symbol))
-                           (:copier nil))
-  ;; This is the symbol, the value of which is the stream we are synonym to.
-  (symbol nil :type symbol :read-only t))
-
-(declaim (freeze-type synonym-stream))
-
-(def!method print-object ((x synonym-stream) stream)
+(defmethod print-object ((x synonym-stream) stream)
   (print-unreadable-object (x stream :type t :identity t)
     (format stream ":SYMBOL ~S" (synonym-stream-symbol x))))
 
@@ -918,12 +987,8 @@
 (defprinter (two-way-stream) input-stream output-stream)
 
 (defun make-two-way-stream (input-stream output-stream)
-  #!+sb-doc
   "Return a bidirectional stream which gets its input from INPUT-STREAM and
    sends its output to OUTPUT-STREAM."
-  ;; FIXME: This idiom of the-real-stream-of-a-possibly-synonym-stream
-  ;; should be encapsulated in a function, and used here and most of
-  ;; the other places that SYNONYM-STREAM-P appears.
   (unless (output-stream-p output-stream)
     (error 'type-error
            :datum output-stream
@@ -971,7 +1036,13 @@
        (let ((in-type (stream-element-type in))
              (out-type (stream-element-type out)))
          (if (equal in-type out-type)
-             in-type `(and ,in-type ,out-type))))
+             in-type
+             `(and ,in-type ,out-type))))
+      (:element-mode
+       (let ((in-mode (stream-element-mode in))
+             (out-mode (stream-element-mode out)))
+         (when (equal in-mode out-mode)
+           in-mode)))
       (:close
        (set-closed-flame stream))
       (t
@@ -998,14 +1069,13 @@
 
 (declaim (freeze-type concatenated-stream))
 
-(def!method print-object ((x concatenated-stream) stream)
+(defmethod print-object ((x concatenated-stream) stream)
   (print-unreadable-object (x stream :type t :identity t)
     (format stream
             ":STREAMS ~S"
             (concatenated-stream-streams x))))
 
 (defun make-concatenated-stream (&rest streams)
-  #!+sb-doc
   "Return a stream which takes its input from each of the streams in turn,
    going on to the next at EOF."
   (dolist (stream streams)
@@ -1095,7 +1165,7 @@
 
 (declaim (freeze-type echo-stream))
 
-(def!method print-object ((x echo-stream) stream)
+(defmethod print-object ((x echo-stream) stream)
   (print-unreadable-object (x stream :type t :identity t)
     (format stream
             ":INPUT-STREAM ~S :OUTPUT-STREAM ~S"
@@ -1103,7 +1173,6 @@
             (two-way-stream-output-stream x))))
 
 (defun make-echo-stream (input-stream output-stream)
-  #!+sb-doc
   "Return a bidirectional stream which gets its input from INPUT-STREAM and
    sends its output to OUTPUT-STREAM. In addition, all input is echoed to
    the output stream."
@@ -1253,10 +1322,10 @@
     (:listen (or (/= (the index (string-input-stream-current stream))
                      (the index (string-input-stream-end stream)))
                  :eof))
-    (:element-type (array-element-type (string-input-stream-string stream)))))
+    (:element-type (array-element-type (string-input-stream-string stream)))
+    (:element-mode 'character)))
 
 (defun make-string-input-stream (string &optional (start 0) end)
-  #!+sb-doc
   "Return an input stream which will supply the characters of STRING between
   START and END in order."
   (declare (type string string)
@@ -1285,25 +1354,23 @@
 ;;;; corrupt the heap here, it certainly is possible to end up with
 ;;;; a string-output-stream whose internal state is messed up.
 ;;;;
-;;;; FIXME: It would be nice to support space-efficient
-;;;; string-output-streams with element-type base-char. This would
-;;;; mean either a separate subclass, or typecases in functions.
-
-(defparameter *string-output-stream-buffer-initial-size* 64)
+(defconstant +string-output-stream-buffer-initial-size+ 64)
 
 (defstruct (string-output-stream
             (:include ansi-stream
-                      (out #'string-ouch)
                       (sout #'string-sout)
                       (misc #'string-out-misc))
-            (:constructor make-string-output-stream
-                          (&key (element-type 'character)))
+            (:constructor nil)
             (:copier nil)
             (:predicate nil))
+  ;; Function to perform a piece of the SOUT operation
+  (sout-aux nil :type (sfunction (t t t t t) t) :read-only t)
   ;; The string we throw stuff in.
-  (buffer (make-string
-           *string-output-stream-buffer-initial-size*)
-   :type (simple-array character (*)))
+  (buffer nil :type (or simple-base-string simple-character-string))
+  ;; Whether any non-base character has been written.
+  ;; BASE-STRING-OUTPUT-STREAM initializes this to :IGNORE
+  ;; which prevents SOUT from doing unnecessary work.
+  (unicode-p :ignore)
   ;; Chains of buffers to use
   (prev nil :type list)
   (next nil :type list)
@@ -1315,35 +1382,159 @@
   ;; and index here, so the greater of index and this is always the
   ;; end of the stream.
   (index-cache 0 :type index)
-  ;; Requested element type
-  (element-type 'character :type type-specifier
-                           :read-only t))
+  ;; Pseudo-actual element type. We no longer store the as-requested type.
+  ;; (If the value is :DEFAULT, we return CHARACTER on inquiry.)
+  (element-type nil :read-only t
+                    :type (member #+sb-unicode :default
+                                  #+sb-unicode character
+                                  base-char nil)))
+
+;;; NB: BASE-STRING-OUTPUT-STREAM means a string-output-stream that holds BASE-CHAR.
+;;; It is not the "ancestral type" of output streams. That's just STRING-OUTPUT-STREAM.
+;;;
+;;; This is not the only way to implement a more space-efficient string stream.
+;;; One other possibility would be to have only one type of stream that buffers
+;;; octets and uses UTF-8 encoding. But depending on how FILE-POSITION is supposed
+;;; to work (if it is) for setting the position, using a variable-length encoding
+;;; may not be a wise choice.
+(defmacro def-string-stream (et kind)
+  ;; DEFSTRUCTs aren't so happy when buried in a macrolet,
+  ;; especially if we want to inline the constructor to stack-allocate the thing.
+  (let ((obj-type (symbolicate kind "-STRING-OSTREAM"))
+        (buf-type `(simple-array ,et (*)))
+        (ouch-fun (symbolicate kind "-STRING-OUCH")))
+    `(progn
+       (defstruct (,obj-type
+                   (:include string-output-stream
+                    (buffer (make-string +string-output-stream-buffer-initial-size+
+                                         :element-type ',et)
+                            :type ,buf-type)
+                    (out #',ouch-fun)
+                    (sout-aux #',(symbolicate kind "-STRING-SOUT")))
+                   ,@(case et
+                       (base-char
+                        ;; BASE-STRING stream can create an output string
+                        ;; of type (VECTOR NIL) - whether we need to or not,
+                        ;; which seems somewhat in dispute - by supplying an
+                        ;; element-type of NIL to the constructor.
+                        `((:constructor %make-base-string-ostream
+                              (&optional (element-type 'base-char)))))
+                       (character
+                        `((:constructor %make-default-string-ostream
+                              (&aux (element-type :default) (unicode-p nil)
+                                    (out #'default-string-ouch)))
+                          (:constructor %make-character-string-ostream
+                              (&aux (element-type 'character) (unicode-p t))))))
+                   ;; Don't want a distinct family of accessors
+                   (:conc-name string-output-stream-)
+                   (:copier nil)
+                   (:predicate nil)))
+
+       (declaim (freeze-type ,obj-type))
+
+       ;; For CHARACTER stream, we define two OUCH functions, one which checks
+       ;; per each character whether it is above the range of base-char,
+       ;; setting UNICODE-P if true, and one which doesn't check.
+       ;; The checking version is used when the stream element type is :DEFAULT,
+       ;; which means that we want to try to return a BASE-STRING if possible.
+       ,@(flet ((define-char-out-fun (name initially)
+                 `(defun ,name (stream char)
+                    (declare (,et char))
+                    ,@initially
+                    (let ((pointer (string-output-stream-pointer stream))
+                          (buffer (truly-the ,buf-type
+                                             (string-output-stream-buffer stream)))
+                          (index (string-output-stream-index stream)))
+                      (when (= pointer (length buffer))
+                        (setf buffer (string-output-stream-new-buffer stream index)
+                              pointer 0))
+                      (setf (aref buffer pointer) char
+                            (string-output-stream-pointer stream) (1+ pointer))
+                      (setf (string-output-stream-index stream) (1+ index))))))
+
+           (list
+            (when (eq et 'character)
+              (define-char-out-fun
+                  'default-string-ouch
+                  '((when (>= (char-code char) base-char-code-limit)
+                      (setf (string-output-stream-unicode-p stream) t
+                            ;; no need to keep checking each character
+                            (ansi-stream-out stream) #'character-string-ouch)))))
+            (define-char-out-fun ouch-fun nil)))
+
+       ;; Define some helper functions for the STRING-SOUT method to handle
+       ;; all combinations of {base,character} source and destination string.
+       ;; REPLACE transforms (see src/compiler/seqtran) can handle those 4 cases
+       ;; efficiently, utilizing a bit-bash copier for same-sized copies,
+       ;; otherwise an inlined loop. The one case that needs to type-check each
+       ;; character copied is a Unicode source string into a stream of base-char,
+       ;; which may signal OBJECT-NOT-BASE-CHAR-ERROR.
+       (defun ,(symbolicate kind "-STRING-SOUT") (dst src start1 start2 end2)
+         (declare (index start1 start2 end2) (optimize speed))
+         (macrolet ((copy (dst-type src-type)
+                      `(replace (truly-the ,dst-type dst)
+                                (truly-the ,src-type src)
+                                :start1 start1 :start2 start2 :end2 end2)))
+           (etypecase src
+             #+sb-unicode (simple-character-string
+                           (copy ,buf-type simple-character-string))
+             (simple-base-string (copy ,buf-type simple-base-string))))))))
+
+;; Define two stream types and 2 helper functions for copying strings
+;; into the stream buffer for purposes of WRITE-STRING.
+;; For non-unicode, only define BASE-STRING-OUTPUT-STREAM and 1 helper.
+#+sb-unicode (def-string-stream character character)
+(def-string-stream base-char base)
 
 (declaim (freeze-type string-output-stream))
-
-#!+sb-doc
-(setf (fdocumentation 'make-string-output-stream 'function)
+(defun make-string-output-stream (&key (element-type 'character))
   "Return an output stream which will accumulate all output given it for the
-benefit of the function GET-OUTPUT-STREAM-STRING.")
+benefit of the function GET-OUTPUT-STREAM-STRING."
+  (declare (explicit-check))
+  (let ((ctype (specifier-type element-type)))
+    (cond ((csubtypep ctype (specifier-type 'base-char))
+           (%make-base-string-ostream (if (eq ctype *empty-type*) nil 'base-char)))
+          #+sb-unicode
+          ((csubtypep ctype (specifier-type 'character))
+           (%make-character-string-ostream))
+          (t
+           (error "~S is not a subtype of CHARACTER" element-type)))))
+
+;;; This stream has no SOUT method.
+;;; Now that we support base-char string-output streams, it may be possible to eliminate
+;;; this, though the other benefit it confers is that the buffer never needs to extend,
+;;; and we merely shrink it to the proper size when done writing.
+(defstruct (finite-base-string-output-stream
+            (:include ansi-stream
+                      (out #'finite-base-string-ouch)
+                      (misc #'finite-base-string-out-misc))
+            (:constructor %make-finite-base-string-output-stream (buffer))
+            (:copier nil)
+            (:predicate nil))
+  (buffer nil :type simple-base-string :read-only t)
+  (pointer 0 :type index))
+(declaim (freeze-type finite-base-string-output-stream))
 
 ;;; Pushes the current segment onto the prev-list, and either pops
 ;;; or allocates a new one.
 (defun string-output-stream-new-buffer (stream size)
   (declare (index size))
-  (/noshow0 "/string-output-stream-new-buffer")
+  (declare (string-output-stream stream))
   (push (string-output-stream-buffer stream)
         (string-output-stream-prev stream))
   (setf (string-output-stream-buffer stream)
         (or (pop (string-output-stream-next stream))
             ;; FIXME: This would be the correct place to detect that
-            ;; more then FIXNUM characters are being written to the
+            ;; more than FIXNUM characters are being written to the
             ;; stream, and do something about it.
-            (make-string size))))
+            (if (member (string-output-stream-element-type stream) '(base-char nil))
+                (make-array size :element-type 'base-char)
+                (make-array size :element-type 'character)))))
 
 ;;; Moves to the end of the next segment or the current one if there are
 ;;; no more segments. Returns true as long as there are next segments.
 (defun string-output-stream-next-buffer (stream)
-  (/noshow0 "/string-output-stream-next-buffer")
+  (declare (string-output-stream stream))
   (let* ((old (string-output-stream-buffer stream))
          (new (pop (string-output-stream-next stream)))
          (old-size (length old))
@@ -1363,7 +1554,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
 ;;; Moves to the start of the previous segment or the current one if there
 ;;; are no more segments. Returns true as long as there are prev segments.
 (defun string-output-stream-prev-buffer (stream)
-  (/noshow0 "/string-output-stream-prev-buffer")
+  (declare (string-output-stream stream))
   (let ((old (string-output-stream-buffer stream))
         (new (pop (string-output-stream-prev stream)))
         (skipped (string-output-stream-pointer stream)))
@@ -1378,23 +1569,32 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
            (decf (string-output-stream-index stream) skipped)
            nil))))
 
-(defun string-ouch (stream character)
-  (/noshow0 "/string-ouch")
-  (let ((pointer (string-output-stream-pointer stream))
-        (buffer (string-output-stream-buffer stream))
-        (index (string-output-stream-index stream)))
-    (cond ((= pointer (length buffer))
-           (setf buffer (string-output-stream-new-buffer stream index)
-                 (aref buffer 0) character
-                 (string-output-stream-pointer stream) 1))
-          (t
-           (setf (aref buffer pointer) character
-                 (string-output-stream-pointer stream) (1+ pointer))))
-    (setf (string-output-stream-index stream) (1+ index))))
-
 (defun string-sout (stream string start end)
-  (declare (type simple-string string)
+  (declare (explicit-check string)
            (type index start end))
+  (case (%other-pointer-widetag string)
+    #+sb-unicode
+    (#.sb-vm:simple-character-string-widetag
+     ;; For streams with :DEFAULT element-type (producing the most space-efficient
+     ;; string that can hold the output), checking whether Unicode characters appear
+     ;; in the source material is potentially advantageous versus checking the
+     ;; buffer in GET-OUTPUT-STREAM-STRING, because if all source strings are
+     ;; BASE-STRING, we needn't check anything.
+     ;; When UNICODE-P is NIL, then we care whether Unicode characters
+     ;; would be written, changing the flag to T. If non-nil, skip this.
+     (unless (string-output-stream-unicode-p stream)
+       ;; Bounds check was already performed by ANSI-STREAM-WRITE-STRING
+       (locally
+           (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+         (let ((s (truly-the simple-character-string string)))
+           (when (loop for i from start below end
+                         thereis (>= (char-code (aref s i)) base-char-code-limit))
+             (setf (string-output-stream-unicode-p stream) t
+                   ;; no need to keep checking each character
+                   (ansi-stream-out stream) #'character-string-ouch))))))
+    (#.sb-vm:simple-array-nil-widetag
+     (return-from string-sout ; fail if the span is nonempty
+       (if (> end start) (aref string start)))))
   (let* ((full-length (- end start))
          (length full-length)
          (buffer (string-output-stream-buffer stream))
@@ -1404,18 +1604,12 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
          (stop (+ start here))
          (overflow (- length space)))
     (declare (index length space here stop full-length)
-             (fixnum overflow)
-             (type (simple-array character (*)) buffer))
+             (fixnum overflow))
     (tagbody
      :more
        (when (plusp here)
-         (etypecase string
-           ((simple-array character (*))
-            (replace buffer string :start1 pointer :start2 start :end2 stop))
-           (simple-base-string
-            (replace buffer string :start1 pointer :start2 start :end2 stop))
-           ((simple-array nil (*))
-            (replace buffer string :start1 pointer :start2 start :end2 stop)))
+         (funcall (string-output-stream-sout-aux stream)
+                  buffer string pointer start stop)
          (setf (string-output-stream-pointer stream) (+ here pointer)))
        (when (plusp overflow)
          (setf start stop
@@ -1488,10 +1682,12 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
             (buffer (string-output-stream-buffer stream))
             (prev (string-output-stream-prev stream))
             (base 0))
-        (declare (type (or null (simple-array character (*))) buffer))
       :next
-      (let ((pos (when buffer
-                   (position #\newline buffer :from-end t :end pointer))))
+      (let ((pos (when buffer ; could be NIL because of SETF below
+                   (string-dispatch (simple-base-string
+                                     #+sb-unicode simple-character-string)
+                                    buffer
+                     (position #\newline buffer :from-end t :end pointer)))))
         (when (or pos (not buffer))
           ;; If newline is at index I, and pointer at index I+N, charpos
           ;; is N-1. If there is no newline, and pointer is at index N,
@@ -1510,34 +1706,33 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
     (:close
      (/noshow0 "/string-out-misc close")
      (set-closed-flame stream))
-    (:element-type (string-output-stream-element-type stream))))
+    (:element-type
+     (let ((et (string-output-stream-element-type stream)))
+       ;; Always return a valid type-specifier
+       (if (eq et :default) 'character et)))
+    (:element-mode 'character)))
 
 ;;; Return a string of all the characters sent to a stream made by
 ;;; MAKE-STRING-OUTPUT-STREAM since the last call to this function.
 (defun get-output-stream-string (stream)
   (declare (type string-output-stream stream))
+  (when (eq (string-output-stream-element-type stream) nil)
+    (return-from get-output-stream-string
+      (load-time-value (make-array 0 :element-type nil) t)))
   (let* ((length (max (string-output-stream-index stream)
                       (string-output-stream-index-cache stream)))
-         (element-type (string-output-stream-element-type stream))
          (prev (nreverse (string-output-stream-prev stream)))
          (this (string-output-stream-buffer stream))
          (next (string-output-stream-next stream))
-         (result
-          (case element-type
-            ;; overwhelmingly common case: can be inlined
-            ;;
-            ;; FIXME: If we were willing to use %SHRINK-VECTOR here,
-            ;; and allocate new strings the size of 2 * index in
-            ;; STRING-SOUT, we would not need to allocate one here in
-            ;; the common case, but could just use the last one
-            ;; allocated, and chop it down to size..
-            ;;
-            ((character) (make-string length))
-            ;; slightly less common cases: inline it anyway
-            ((base-char standard-char)
-             (make-string length :element-type 'base-char))
-            (t
-             (make-string length :element-type element-type)))))
+         (base-string-p (neq (string-output-stream-unicode-p stream) t))
+         ;; This used to contain a FIXME about not allocating a result string,
+         ;; instead shrinking the final buffer down to size. But given the likelihood
+         ;; of a Unicode buffer and ASCII result, that seems inapplicable nowadays.
+         ;; Also, how it impacts setting FILE-POSITION on a string stream is unclear.
+         ;; (See https://bugs.launchpad.net/sbcl/+bug/1839040)
+         (result (if base-string-p
+                     (make-string length :element-type 'base-char)
+                     (make-string length))))
 
     (setf (string-output-stream-index stream) 0
           (string-output-stream-index-cache stream) 0
@@ -1548,8 +1743,25 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
           (string-output-stream-prev stream) nil
           (string-output-stream-next stream) nil)
 
-    (flet ((replace-all (fun)
-             (let ((start 0))
+    ;; Reset UNICODE-P unless it was :IGNORE or element-type is CHARACTER.
+    #+sb-unicode
+    (when (and (eq (string-output-stream-element-type stream) :default)
+               (eq (string-output-stream-unicode-p stream) t))
+      (setf (string-output-stream-unicode-p stream) nil
+            ;; resume checking for Unicode characters
+            (ansi-stream-out stream) #'default-string-ouch))
+
+    ;; There are exactly 3 cases that we have to deal with when copying:
+    ;;  CHARACTER-STRING into BASE-STRING (without type-checking per character)
+    ;;  CHARACTER-STRING into CHARACTER-STRING
+    ;;  BASE-STRING into BASE-STRING
+    ;; BASE-STRING copied into CHARACTER-STRING is not possible.
+    ;; Strings with element type NIL are not possible.
+    ;; The first case occurs when and only when the element type is :DEFAULT and
+    ;; only base characters were written. The other two cases can be handled
+    ;; using BYTE-BLT with indices multiplied by either 1 or 4.
+    (flet ((copy (fun)
+             (let ((start 0)) ; index into RESULT
                (declare (index start))
                (dolist (buffer prev)
                  (funcall fun buffer start)
@@ -1558,27 +1770,47 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
                (incf start (length this))
                (dolist (buffer next)
                  (funcall fun buffer start)
-                 (incf start (length buffer)))
-               ;; Hack: erase the pointers to strings, to make it less
-               ;; likely that the conservative GC will accidentally
-               ;; retain the buffers.
-               (fill prev nil)
-               (fill next nil))))
-      (macrolet ((frob (type)
-                   `(replace-all (lambda (buffer from)
-                                   (declare (type ,type result)
-                                            (type (simple-array character (*))
-                                                  buffer))
-                                   (replace result buffer :start1 from)))))
-        (etypecase result
-          ((simple-array character (*))
-           (frob (simple-array character (*))))
-          (simple-base-string
-           (frob simple-base-string))
-          ((simple-array nil (*))
-           (frob (simple-array nil (*)))))))
-
+                 (incf start (length buffer))))))
+      (if (and (eq (string-output-stream-element-type stream) :default)
+               base-string-p)
+          ;; This is the most common case, arising from WRITE-TO-STRING,
+          ;; PRINx-TO-STRING, (FORMAT NIL ...), and many other constructs.
+          ;; REPLACE will elide the type test per compilation policy
+          ;; which is fine because we've already checked that it'll work.
+          (copy (lambda (source start)
+                  (declare (optimize speed (sb-c::type-check 0)))
+                  (replace (the simple-base-string result)
+                           (the simple-character-string source)
+                           :start1 start)))
+          (let ((scale (if base-string-p 0 2)))
+            (with-pinned-objects (result)
+              ;; BYTE-BLT doesn't know that it could use memcpy rather then memmove,
+              ;; but it nonetheless should be faster than REPLACE.
+              (copy (lambda (source start)
+                      (let* ((length (min (- (length result) start) (length source)))
+                             (end (+ start length)))
+                        (with-pinned-objects (source)
+                          (%byte-blt (vector-sap source)
+                                     0
+                                     (vector-sap result)
+                                     (truly-the index (ash (the index start) scale))
+                                     (truly-the index (ash (the index end) scale)))))))))))
     result))
+
+(defun finite-base-string-ouch (stream character)
+  (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+  (let ((pointer (finite-base-string-output-stream-pointer stream))
+        (buffer (finite-base-string-output-stream-buffer stream)))
+    (cond ((= pointer (length buffer))
+           (bug "Should not happen"))
+          (t
+           (setf (char buffer pointer) (truly-the base-char character)
+                 (finite-base-string-output-stream-pointer stream)
+                 (truly-the index (1+ pointer)))))))
+
+(defun finite-base-string-out-misc (stream operation &optional arg1 arg2)
+  (declare (ignore stream operation arg1 arg2))
+  (error "finite-base-string-out-misc needs an implementation"))
 
 ;;;; fill-pointer streams
 
@@ -1596,6 +1828,18 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
 (deftype string-with-fill-pointer ()
   `(and (or (vector character) (vector base-char))
         (satisfies vector-with-fill-pointer-p)))
+
+;;; FIXME: The stream should refuse to accept more characters than the given
+;;; string can hold without adjustment unless expressly adjustable.
+;;; This is a portability issue - the fact that all of our fill-pointer vectors
+;;; are implicitly adjustable is an implementation detail that should not be leaked.
+;;; For comparison, when evaluating:
+;;; (let ((s (make-array 5 :fill-pointer 0 :element-type 'base-char)))
+;;;       (with-output-to-string (stream s) (dotimes (i 6) (write-char #\a stream))) s)
+;;; CLISP:
+;;; *** - VECTOR-PUSH-EXTEND works only on adjustable arrays, not on "aaaaa"
+;;; CCL:
+;;; > Error: "aaaaa" is not an adjustable array.
 
 (defstruct (fill-pointer-output-stream
             (:include ansi-stream
@@ -1616,10 +1860,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
          (current+1 (1+ current)))
     (declare (fixnum current))
     (with-array-data ((workspace buffer) (start) (end))
-      (string-dispatch
-          ((simple-array character (*))
-           (simple-array base-char (*)))
-          workspace
+      (string-dispatch (simple-character-string simple-base-string) workspace
         (let ((offset-current (+ start current)))
           (declare (fixnum offset-current))
           (if (= offset-current end)
@@ -1641,10 +1882,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
 
 (defun fill-pointer-sout (stream string start end)
   (declare (fixnum start end))
-  (string-dispatch
-      ((simple-array character (*))
-       (simple-array base-char (*)))
-      string
+  (string-dispatch (simple-character-string simple-base-string) string
     (let* ((buffer (fill-pointer-output-stream-string stream))
            (current (fill-pointer buffer))
            (string-len (- end start))
@@ -1700,15 +1938,17 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
      (let* ((buffer (fill-pointer-output-stream-string stream))
             (current (fill-pointer buffer)))
        (with-array-data ((string buffer) (start) (end current))
-         (declare (simple-string string) (ignore start))
+         (declare (simple-string string))
          (let ((found (position #\newline string :test #'char=
-                                :end end :from-end t)))
+                                                 :start start :end end
+                                                 :from-end t)))
            (if found
-               (- end (the fixnum found))
+               (1- (- end found))
                current)))))
-     (:element-type
+    (:element-type
       (array-element-type
-       (fill-pointer-output-stream-string stream)))))
+       (fill-pointer-output-stream-string stream)))
+    (:element-mode 'character)))
 
 ;;;; case frobbing streams, used by FORMAT ~(...~)
 
@@ -1722,7 +1962,6 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
 (declaim (freeze-type case-frob-stream))
 
 (defun make-case-frob-stream (target kind)
-  #!+sb-doc
   "Return a stream that sends all output to the stream TARGET, but modifies
    the case of letters, depending on KIND, which should be one of:
      :UPCASE - convert to upper case.
@@ -1761,6 +2000,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
   (case op
     (:close
      (set-closed-flame stream))
+    (:element-mode 'character)
     (t
      (let ((target (case-frob-stream-target stream)))
        (if (ansi-stream-p target)
@@ -1948,10 +2188,51 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
         (funcall (ansi-stream-sout target) target str 0 len)
         (stream-write-string target str 0 len))))
 
+;;;; Shared {READ,WRITE}-SEQUENCE support functions
+
+(declaim (inline stream-compute-io-function
+                 compatible-vector-and-stream-element-types-p))
+
+(defun stream-compute-io-function (stream
+                                   stream-element-mode sequence-element-type
+                                   character-io binary-io bivalent-io)
+  (ecase stream-element-mode
+    (character
+     character-io)
+    ((unsigned-byte signed-byte)
+     binary-io)
+    (:bivalent
+     (cond
+       ((member sequence-element-type '(nil t))
+        bivalent-io)
+       ;; Pick off common subtypes.
+       ((eq sequence-element-type 'character)
+        character-io)
+       ((or (equal sequence-element-type '(unsigned-byte 8))
+            (equal sequence-element-type '(signed-byte 8)))
+        binary-io)
+       ;; Proper subtype tests.
+       ((subtypep sequence-element-type 'character)
+        character-io)
+       ((subtypep sequence-element-type 'integer)
+        binary-io)
+       (t
+        (error "~@<Cannot select IO functions to use for bivalent ~
+                stream ~S and a sequence with element-type ~S.~@:>"
+                stream sequence-element-type))))))
+
+(defun compatible-vector-and-stream-element-types-p (vector stream)
+  (declare (type vector vector)
+           (type ansi-stream stream))
+  (or (and (typep vector '(simple-array (unsigned-byte 8) (*)))
+           (memq (stream-element-mode stream) '(unsigned-byte :bivalent))
+           t)
+      (and (typep vector '(simple-array (signed-byte 8) (*)))
+           (eq (stream-element-mode stream) 'signed-byte))))
+
 ;;;; READ-SEQUENCE
 
 (defun read-sequence (seq stream &key (start 0) end)
-  #!+sb-doc
   "Destructively modify SEQ by reading elements from STREAM.
   That part of SEQ bounded by START and END is destructively modified by
   copying successive elements into it from STREAM. If the end of file
@@ -1968,73 +2249,86 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
       ;; must be Gray streams FUNDAMENTAL-STREAM
       (stream-read-sequence stream seq start end)))
 
-(declaim (inline compatible-vector-and-stream-element-types-p))
-(defun compatible-vector-and-stream-element-types-p (vector stream)
-  (declare (type vector vector)
-           (type ansi-stream stream))
-  (or (and (typep vector '(simple-array (unsigned-byte 8) (*)))
-           (subtypep (stream-element-type stream) '(unsigned-byte 8)))
-      (and (typep vector '(simple-array (signed-byte 8) (*)))
-           (subtypep (stream-element-type stream) '(signed-byte 8)))))
+(declaim (inline read-sequence/read-function))
+(defun read-sequence/read-function (seq stream start %end
+                                    stream-element-mode
+                                    character-read-function binary-read-function)
+  (declare (type sequence seq)
+           (type stream stream)
+           (type index start)
+           (type sequence-end %end)
+           (type stream-element-mode stream-element-mode)
+           (type function character-read-function binary-read-function)
+           (values index &optional))
+  (let ((end (or %end (length seq))))
+    (declare (type index end))
+    (labels ((compute-read-function (sequence-element-type)
+               (stream-compute-io-function
+                stream
+                stream-element-mode sequence-element-type
+                character-read-function binary-read-function
+                character-read-function))
+             (read-list (read-function)
+               (do ((rem (nthcdr start seq) (rest rem))
+                    (i start (1+ i)))
+                   ((or (endp rem) (>= i end)) i)
+                 (declare (type list rem)
+                          (type index i))
+                 (let ((el (funcall read-function stream nil :eof nil)))
+                   (when (eq el :eof)
+                     (return i))
+                   (setf (first rem) el))))
+             (read-vector/fast (data offset-start)
+               (let* ((numbytes (- end start))
+                      (bytes-read (read-n-bytes
+                                   stream data offset-start numbytes nil)))
+                 (if (< bytes-read numbytes)
+                     (+ start bytes-read)
+                     end)))
+             (read-vector (read-function data offset-start offset-end)
+               (do ((i offset-start (1+ i)))
+                   ((>= i offset-end) end)
+                 (declare (type index i))
+                 (let ((el (funcall read-function stream nil :eof nil)))
+                   (when (eq el :eof)
+                     (return (+ start (- i offset-start))))
+                   (setf (aref data i) el))))
+             (read-generic-sequence (read-function)
+               (declare (ignore read-function))
+               (error "~@<~A does not yet support generic sequences.~@:>"
+                      'read-sequence)))
+      (declare (dynamic-extent #'compute-read-function
+                               #'read-list #'read-vector/fast #'read-vector
+                               #'read-generic-sequence))
+      (cond
+        ((typep seq 'list)
+         (read-list (compute-read-function nil)))
+        ((and (ansi-stream-p stream)
+              (ansi-stream-cin-buffer stream)
+              (typep seq 'simple-string))
+         (ansi-stream-read-string-from-frc-buffer seq stream start %end))
+        ((typep seq 'vector)
+         (with-array-data ((data seq) (offset-start start) (offset-end end)
+                           :check-fill-pointer t)
+           (if (and (ansi-stream-p stream)
+                    (compatible-vector-and-stream-element-types-p data stream))
+               (read-vector/fast data offset-start)
+               (read-vector (compute-read-function (array-element-type data))
+                            data offset-start offset-end))))
+        (t
+         (read-generic-sequence (compute-read-function nil)))))))
+(declaim (notinline read-sequence/read-function))
 
 (defun ansi-stream-read-sequence (seq stream start %end)
   (declare (type sequence seq)
            (type ansi-stream stream)
            (type index start)
            (type sequence-end %end)
-           (values index))
-  (let ((end (or %end (length seq))))
-    (declare (type index end))
-    (etypecase seq
-      (list
-       (let ((read-function
-              (if (subtypep (stream-element-type stream) 'character)
-                  #'ansi-stream-read-char
-                  #'ansi-stream-read-byte)))
-         (do ((rem (nthcdr start seq) (rest rem))
-              (i start (1+ i)))
-             ((or (endp rem) (>= i end)) i)
-           (declare (type list rem)
-                    (type index i))
-           (let ((el (funcall read-function stream nil :eof nil)))
-             (when (eq el :eof)
-               (return i))
-             (setf (first rem) el)))))
-      (vector
-       (with-array-data ((data seq) (offset-start start) (offset-end end)
-                         :check-fill-pointer t)
-         (cond ((compatible-vector-and-stream-element-types-p data stream)
-                (let* ((numbytes (- end start))
-                       (bytes-read (read-n-bytes stream data offset-start
-                                                 numbytes nil)))
-                  (if (< bytes-read numbytes)
-                      (+ start bytes-read)
-                      end)))
-               ((and (ansi-stream-cin-buffer stream)
-                     (typep seq 'simple-string))
-                (ansi-stream-read-string-from-frc-buffer seq stream
-                                                         start %end))
-               (t
-                (let ((read-function
-                       (if (subtypep (stream-element-type stream) 'character)
-                           ;; If the stream-element-type is CHARACTER,
-                           ;; this might be a bivalent stream. If the
-                           ;; sequence is a specialized unsigned-byte
-                           ;; vector, try to read use binary IO. It'll
-                           ;; signal an error if stream is an pure
-                           ;; character stream.
-                           (if (subtypep (array-element-type data)
-                                         'unsigned-byte)
-                               #'ansi-stream-read-byte
-                               #'ansi-stream-read-char)
-                           #'ansi-stream-read-byte)))
-                  (do ((i offset-start (1+ i)))
-                      ((>= i offset-end) end)
-                    (declare (type index i))
-                    (let ((el (funcall read-function stream nil :eof nil)))
-                      (when (eq el :eof)
-                        (return (+ start (- i offset-start))))
-                      (setf (aref data i) el)))))))))))
+           (values index &optional))
+  (locally (declare (inline read-sequence/read-function))
+    (read-sequence/read-function
+     seq stream start %end (stream-element-mode stream)
+     #'ansi-stream-read-char #'ansi-stream-read-byte)))
 
 (defun ansi-stream-read-string-from-frc-buffer (seq stream start %end)
   (declare (type simple-string seq)
@@ -2049,16 +2343,14 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
       (unless %frc-buffer%
         (return-from ansi-stream-read-string-from-frc-buffer nil))
       (labels ((refill-buffer ()
-                 (prog1
-                     (fast-read-char-refill stream nil nil)
+                 (prog1 (fast-read-char-refill stream nil)
                    (setf %frc-index% (ansi-stream-in-index %frc-stream%))))
                (add-chunk ()
                  (let* ((end (length %frc-buffer%))
                         (len (min (- end %frc-index%)
                                   (- needed read))))
                    (declare (type index end len read needed))
-                   (string-dispatch (simple-base-string
-                                     (simple-array character (*)))
+                   (string-dispatch (simple-base-string simple-character-string)
                        seq
                      (replace seq %frc-buffer%
                               :start1 (+ start read)
@@ -2067,16 +2359,15 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
                               :end2 (+ %frc-index% len)))
                    (incf read len)
                    (incf %frc-index% len)
-                   (when (or (eql needed read)
-                             (refill-buffer))
+                   (when (or (eql needed read) (not (refill-buffer)))
                      (done-with-fast-read-char)
                      (return-from ansi-stream-read-string-from-frc-buffer
                        (+ start read))))))
         (declare (inline refill-buffer))
         (when (and (= %frc-index% +ansi-stream-in-buffer-length+)
-                   (refill-buffer))
+                   (not (refill-buffer)))
           ;; EOF had been reached before we read anything
-          ;; at all. Return the EOF value or signal the error.
+          ;; at all. But READ-SEQUENCE never signals an EOF error.
           (done-with-fast-read-char)
           (return-from ansi-stream-read-string-from-frc-buffer start))
         (loop (add-chunk))))))
@@ -2085,66 +2376,132 @@ benefit of the function GET-OUTPUT-STREAM-STRING.")
 ;;;; WRITE-SEQUENCE
 
 (defun write-sequence (seq stream &key (start 0) (end nil))
-  #!+sb-doc
   "Write the elements of SEQ bounded by START and END to STREAM."
+  (cond ((typep stream 'broadcast-stream)
+         (let* ((length (length seq))
+                (end (or end length)))
+           (unless (<= start end length)
+             (sequence-bounding-indices-bad-error seq start end))
+           (dolist (s (broadcast-stream-streams stream) seq)
+             (write-sequence seq s :start start :end end))))
+        ((ansi-stream-p stream)
+         (ansi-stream-write-sequence seq stream start end))
+        (t
+         ;; must be Gray-streams FUNDAMENTAL-STREAM
+         (stream-write-sequence stream seq start end))))
+
+;;; This macro allows sharing code between
+;;; WRITE-SEQUENCE/WRITE-FUNCTION and SB-GRAY:STREAM-WRITE-STRING.
+(defmacro write-sequence/vector ((seq type) stream start end write-function)
+  (once-only ((seq seq) (stream stream) (start start) (end end)
+              (write-function write-function))
+    `(locally
+         (declare (type ,type ,seq)
+                  (type index ,start ,end)
+                  (type function ,write-function))
+       (do ((i ,start (1+ i)))
+           ((>= i ,end))
+         (declare (type index i))
+         (funcall ,write-function ,stream (aref ,seq i))))))
+
+(declaim (inline write-sequence/write-function))
+(defun write-sequence/write-function (seq stream start %end
+                                      stream-element-mode
+                                      character-write-function
+                                      binary-write-function)
   (declare (type sequence seq)
            (type stream stream)
            (type index start)
-           (type sequence-end end)
-           (values sequence))
-  (if (ansi-stream-p stream)
-      (ansi-stream-write-sequence seq stream start end)
-      ;; must be Gray-streams FUNDAMENTAL-STREAM
-      (stream-write-sequence stream seq start end)))
+           (type sequence-end %end)
+           (type stream-element-mode stream-element-mode)
+           (type function character-write-function binary-write-function))
+  (let ((end (or %end (length seq))))
+    (declare (type index end))
+    (labels ((compute-write-function (sequence-element-type)
+               (stream-compute-io-function
+                stream
+                stream-element-mode sequence-element-type
+                character-write-function binary-write-function
+                #'write-element/bivalent))
+             (write-element/bivalent (stream object)
+               (if (characterp object)
+                   (funcall character-write-function stream object)
+                   (funcall binary-write-function stream object)))
+             (write-list (write-function)
+               (do ((rem (nthcdr start seq) (rest rem))
+                    (i start (1+ i)))
+                   ((or (endp rem) (>= i end)))
+                 (declare (type list rem)
+                          (type index i))
+                 (funcall write-function stream (first rem))))
+             (write-vector (data start end write-function)
+               (write-sequence/vector
+                (data (simple-array * (*))) stream start end write-function))
+             (write-generic-sequence (write-function)
+               (declare (ignore write-function))
+               (error "~@<~A does not yet support generic sequences.~@:>"
+                      'write-sequence)))
+      (declare (dynamic-extent #'compute-write-function
+                               #'write-element/bivalent #'write-list
+                               #'write-vector  #'write-generic-sequence))
+      (etypecase seq
+        (list
+         (write-list (compute-write-function nil)))
+        (string
+         (if (ansi-stream-p stream)
+             (ansi-stream-write-string seq stream start end)
+             (stream-write-string stream seq start end)))
+        (vector
+         (with-array-data ((data seq) (offset-start start) (offset-end end)
+                           :check-fill-pointer t)
+           (cond ((not (and (fd-stream-p stream)
+                            (compatible-vector-and-stream-element-types-p data stream)))
+                  (write-vector data offset-start offset-end
+                                (compute-write-function
+                                 (array-element-type seq))))
+                 ((eq (fd-stream-buffering stream) :none)
+                  (write-or-buffer-output stream data offset-start offset-end))
+                 (t
+                  (buffer-output stream data offset-start offset-end)))))
+        (sequence
+         (write-generic-sequence (compute-write-function nil)))))))
+(declaim (notinline write-sequence/write-function))
 
 (defun ansi-stream-write-sequence (seq stream start %end)
   (declare (type sequence seq)
            (type ansi-stream stream)
            (type index start)
            (type sequence-end %end)
-           (values sequence))
-  (let ((end (or %end (length seq))))
-    (declare (type index end))
-    (etypecase seq
-      (list
-       (let ((write-function
-              (if (subtypep (stream-element-type stream) 'character)
-                  (ansi-stream-out stream)
-                  (ansi-stream-bout stream))))
-         (do ((rem (nthcdr start seq) (rest rem))
-              (i start (1+ i)))
-             ((or (endp rem) (>= i end)))
-           (declare (type list rem)
-                    (type index i))
-           (funcall write-function stream (first rem)))))
-      (string
-       (%write-string seq stream start end))
-      (vector
-       (with-array-data ((data seq) (offset-start start) (offset-end end)
-                         :check-fill-pointer t)
-         (labels
-             ((output-seq-in-loop ()
-                (let ((write-function
-                       (if (subtypep (stream-element-type stream) 'character)
-                           (lambda (stream object)
-                             ;; This might be a bivalent stream, so we need
-                             ;; to dispatch on a per-element basis, rather
-                             ;; than just based on the sequence or stream
-                             ;; element types.
-                             (if (characterp object)
-                                 (funcall (ansi-stream-out stream)
-                                          stream object)
-                                 (funcall (ansi-stream-bout stream)
-                                          stream object)))
-                           (ansi-stream-bout stream))))
-                  (do ((i offset-start (1+ i)))
-                      ((>= i offset-end))
-                    (declare (type index i))
-                    (funcall write-function stream (aref data i))))))
-           (if (and (fd-stream-p stream)
-                    (compatible-vector-and-stream-element-types-p data stream))
-               (buffer-output stream data offset-start offset-end)
-               (output-seq-in-loop)))))))
+           (values sequence)
+           (inline write-sequence/write-function))
+  (write-sequence/write-function
+   seq stream start %end (stream-element-mode stream)
+   (ansi-stream-out stream) (ansi-stream-bout stream))
   seq)
-
+
+;;; like FILE-POSITION, only using :FILE-LENGTH
+(defun file-length (stream)
+  ;; The description for FILE-LENGTH says that an error must be raised
+  ;; for streams not associated with files (which broadcast streams
+  ;; aren't according to the glossary). However, the behaviour of
+  ;; FILE-LENGTH for broadcast streams is explicitly described in the
+  ;; BROADCAST-STREAM entry.
+  (unless (typep stream 'broadcast-stream)
+    (stream-file-stream-or-lose stream))
+  (funcall (ansi-stream-misc stream) stream :file-length))
+
+;; Placing this definition (formerly in "toplevel") after the important
+;; stream types are known produces smaller+faster code than it did before.
+(defun stream-output-stream (stream)
+  (typecase stream
+    (fd-stream
+     stream)
+    (synonym-stream
+     (stream-output-stream (resolve-synonym-stream stream)))
+    (two-way-stream
+     (stream-output-stream
+      (two-way-stream-output-stream stream)))
+    (t
+     stream)))
+
 ;;;; etc.

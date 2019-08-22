@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Moves and coercions:
 
@@ -45,8 +45,6 @@
   (:results (y :scs (sap-reg)
                :load-if (not (location= x y))))
   (:note "SAP move")
-  (:effects)
-  (:affected)
   (:generator 0
     (move x y)))
 

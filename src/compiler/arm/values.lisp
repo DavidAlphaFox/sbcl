@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-vop (reset-stack-pointer)
   (:args (ptr :scs (any-reg)))
@@ -23,7 +23,7 @@
   (:results (r-moved-ptrs :scs (any-reg) :more t))
   (:temporary (:sc any-reg) src)
   (:temporary (:sc any-reg) dest)
-  (:temporary (:sc non-descriptor-reg) temp)
+  (:temporary (:sc descriptor-reg) temp)
   (:temporary (:sc any-reg) stack-pointer)
   (:ignore r-moved-ptrs)
   (:generator 1
@@ -91,7 +91,7 @@
   (:policy :fast-safe)
   (:results (start :scs (any-reg))
             (count :scs (any-reg)))
-  (:temporary (:scs (descriptor-reg) :type list :from (:argument 0)) list)
+  (:temporary (:scs (descriptor-reg) :from (:argument 0)) list)
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:temporary (:sc any-reg) csp-temp)
@@ -110,8 +110,8 @@
     (inst add csp-temp csp-temp n-word-bytes)
     (store-csp csp-temp)
     (storew temp csp-temp -1)
-    (test-type list LOOP nil (list-pointer-lowtag) :temp ndescr)
-    (error-call vop 'bogus-arg-to-values-list-error list)
+    (test-type list ndescr LOOP nil (list-pointer-lowtag))
+    (cerror-call vop 'bogus-arg-to-values-list-error list)
 
     DONE
     (inst sub count csp-temp start)))

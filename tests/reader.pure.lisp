@@ -11,10 +11,6 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package "CL-USER")
-
-(load "compiler-test-util.lisp")
-
 (assert (equal (symbol-name '#:|fd\sA|) "fdsA"))
 
 ;;; Prior to sbcl-0.7.2.10, SBCL disobeyed the ANSI requirements on
@@ -211,16 +207,31 @@
     (let ((*readtable* (copy-readtable nil)))
       (assert (null (loop for c across standard-chars append (frob c)))))))
 
+(with-test (:name :copy-readtable-with-unicode-macro
+                  :skipped-on (not :sb-unicode))
+  (let ((rt (copy-readtable)))
+    (set-macro-character (code-char #x100fa) #'error nil rt)
+    (assert (plusp (hash-table-count (sb-impl::character-macro-hash-table rt))))
+    (copy-readtable nil rt)
+    (assert (null (get-macro-character #\UFC rt)))))
+
 ;;; All these must return a primary value of NIL when *read-suppress* is T
 ;;; Reported by Bruno Haible on cmucl-imp 2004-10-25.
-(let ((*read-suppress* t))
-  (assert (null (read-from-string "(1 2 3)")))
-  (assert (null (with-input-from-string (s "abc xyz)")
-                  (read-delimited-list #\) s))))
-  (assert (null (with-input-from-string (s "(1 2 3)")
-                  (read-preserving-whitespace s))))
-  (assert (null (with-input-from-string (s "(1 2 3)")
-                 (read s)))))
+(with-test (:name :read-suppress-char-macros)
+  (let ((*read-suppress* t))
+    (assert (null (read-from-string "(1 2 3)")))
+    (assert (null (with-input-from-string (s "abc xyz)")
+                    (read-delimited-list #\) s))))
+    (assert (null (with-input-from-string (s "(1 2 3)")
+                    (read-preserving-whitespace s))))
+    (assert (null (with-input-from-string (s "(1 2 3)")
+                    (read s))))
+    ;; .. and it's better to avoid consing rather than produce an object and
+    ;; throw it away, even though it's (mostly) indistinguishable to the user.
+    (let ((input (make-string-input-stream "this-is-a-string! .")))
+      (assert (string= (sb-impl::with-read-buffer ()
+                         (sb-impl::read-string input #\!))
+                       "")))))
 
 ;;; System code that asks whether %READ-PRESERVING-WHITESPACE hit EOF
 ;;; mistook NIL as an object returned normally for NIL the default eof mark.
@@ -279,12 +290,14 @@
   (set-syntax-from-char #\7 #\Space)
   (assert (string= (format nil "~7D" 1) "      1")))
 
-(let ((symbol (find-symbol "DOES-NOT-EXIST" "CL-USER")))
-  (assert (null symbol))
-  (handler-case
-      (read-from-string "CL-USER:DOES-NOT-EXIST")
-    (reader-error (c)
-      (princ c))))
+(with-test (:name :report-reader-error)
+  ;; Apparently this wants to test the printing of the error string
+  ;; otherwise we'd just use ASSERT-SIGNAL.
+  (let ((symbol (find-symbol "DOES-NOT-EXIST" "CL-USER")))
+    (declare (optimize safety)) ; don't flush PRINC-TO-STRING
+    (assert (null symbol))
+    (handler-case (read-from-string "CL-USER:DOES-NOT-EXIST")
+     (reader-error (c) (princ-to-string c)))))
 
 ;;; The GET-MACRO-CHARACTER in SBCL <= "1.0.34.2" bogusly computed its
 ;;; second return value relative to *READTABLE* rather than the passed
@@ -319,7 +332,6 @@
                  (read-from-string "sb-c::(a sb-kernel::(x y) b)")))
   (assert (equal '(cl-user::yes-this-is-sbcl)
                  (read-from-string "cl-user::(#+sbcl yes-this-is-sbcl)")))
-  #+sb-package-locks
   (assert (eq :violated!
               (handler-case
                   (read-from-string "cl::'foo")
@@ -340,7 +352,6 @@
   ;; it is hardcoded to *keyword-package*.
   (assert (equal (read-from-string "::(foo bar)") '(:foo :bar))))
 
-#+x86-64
 ;; I do not know the complete list of platforms for which this test
 ;; will not cons, but there were four different heap allocations
 ;; instead of using dx allocation or a recyclable resource:
@@ -348,7 +359,8 @@
 ;;  - calling SUBSEQ for package names
 ;;  - multiple-value-call in WITH-CHAR-MACRO-RESULT
 ;;  - the initial cons cell in READ-LIST
-(with-test (:name :read-does-not-cons-per-se)
+(with-test (:name :read-does-not-cons-per-se
+                  :skipped-on (:or :interpreter (:not :x86-64)))
   (flet ((test-reading (string)
            (let ((s (make-string-input-stream string)))
              (read s) ; once outside the loop, to make A-SYMBOL
@@ -378,8 +390,190 @@
     (test-reading "#-sbcl(a (b c (d (e) (f) g)) h i j . x . y baz) 5")
     ))
 
+(with-test (:name :sharp-left-paren-empty-list)
+  (assert (read-from-string "#0()")) ; edge case that works
+  (assert (eq (handler-case (read-from-string "#3()")
+                (sb-int:simple-reader-error () :win))
+              :win)))
 
 (with-test (:name :sharp-star-empty-multiple-escapes)
   (assert (eq (handler-case (read-from-string "#*101||1")
                 (sb-int:simple-reader-error () :win))
               :win)))
+
+;;; The WITH-FAST-READ-BYTE macro accidentally left the package lock
+;;; of FAST-READ-BYTE disabled during its body.
+(with-test (:name :fast-read-byte-package-lock)
+  (let ((fun
+         ;; Suppress the compiler output to avoid noise when running the
+         ;; test. (There are a warning and an error about the package
+         ;; lock violation and a note about FAST-READ-BYTE being
+         ;; unused.) It's easy and more precise to test for the error
+         ;; that the compiled function signals when it is called.
+         (let ((*error-output* (make-broadcast-stream)))
+           (compile nil
+                    '(lambda ()
+                      (sb-int:with-fast-read-byte (t *standard-input*)
+                        ;; Signal an error if the symbol is locked.
+                        (declare (special sb-int:fast-read-byte))))))))
+    (assert-error (funcall fun) program-error)))
+
+(with-test (:name :sharp-plus-requires-subform)
+  (assert-error (read-from-string "(let ((foo 3) #+sbcl) wat)"))
+  (assert-error (read-from-string "(let ((foo 3) #-brand-x) wat)")))
+
+;; Another test asserting that a signaled condition is printable
+(with-test (:name :impossible-number-error)
+  (locally
+   (declare (optimize safety)) ; don't flush PRINC-TO-STRING
+   (princ-to-string (nth-value 1 (ignore-errors (READ-FROM-STRING "1/0"))))))
+
+(with-test (:name :read-from-string-compiler-macro)
+  ;; evaluation order should be the customary one. In particular,
+  ;; do not assume that EOF-ERROR-P and EOF-VALUE are constants.
+  (sb-int:collect ((l))
+    (read-from-string "a" (l 'first) (l 'second) :start (progn (l 'third) 0))
+    (assert (equal (l) '(first second third)))))
+
+(with-test (:name :sharp-star-reader-error)
+  (assert-error (read-from-string (format nil "#~D*" (1+ most-positive-fixnum))) reader-error))
+
+(defun test1 (print &optional expect)
+  (let ((*readtable* (copy-readtable nil)))
+    (when print
+      (format t "READTABLE-CASE  Input   Symbol-name~@
+                 ----------------------------------~%"))
+    (dolist (readtable-case '(:upcase :downcase :preserve :invert))
+      (setf (readtable-case *readtable*) readtable-case)
+      (dolist (input '("ZEBRA" "Zebra" "zebra"))
+        (if print
+            (format t "~&:~A~16T~A~24T~A"
+                    (string-upcase readtable-case)
+                    input
+                    (symbol-name (read-from-string input)))
+            (assert (string= (symbol-name (read-from-string input))
+                             (pop expect))))))))
+
+(defun test2 (print &optional expect)
+  (let ((*readtable* (copy-readtable nil)))
+    (when print
+      (format t "READTABLE-CASE *PRINT-CASE*  Symbol-name  Output  Princ~@
+                 --------------------------------------------------------~%"))
+    (dolist (readtable-case '(:upcase :downcase :preserve :invert))
+      (setf (readtable-case *readtable*) readtable-case)
+      (dolist (*print-case* '(:upcase :downcase :capitalize))
+        (dolist (symbol '(|ZEBRA| |Zebra| |zebra|))
+          (if print
+              (format t "~&:~A~15T:~A~29T~A~42T~A~50T~A"
+                      (string-upcase readtable-case)
+                      (string-upcase *print-case*)
+                      (symbol-name symbol)
+                      (prin1-to-string symbol)
+                      (princ-to-string symbol))
+              (progn
+                (assert (string= (prin1-to-string symbol) (pop expect)))
+                (assert (string= (princ-to-string symbol) (pop expect))))))))))
+
+(with-test (:name :readtable-cases)
+  (test1 nil '("ZEBRA" "ZEBRA" "ZEBRA"
+               "zebra" "zebra" "zebra"
+               "ZEBRA" "Zebra" "zebra"
+               "zebra" "Zebra" "ZEBRA"))
+  (test2 nil '("ZEBRA"   "ZEBRA"
+               "|Zebra|" "Zebra"
+               "|zebra|" "zebra"
+               "zebra"   "zebra"
+               "|Zebra|" "zebra"
+               "|zebra|" "zebra"
+               "Zebra"   "Zebra"
+               "|Zebra|" "Zebra"
+               "|zebra|" "zebra"
+               "|ZEBRA|" "ZEBRA"
+               "|Zebra|" "ZEBRA"
+               "ZEBRA"   "ZEBRA"
+               "|ZEBRA|" "ZEBRA"
+               "|Zebra|" "Zebra"
+               "zebra"   "zebra"
+               "|ZEBRA|" "ZEBRA"
+               "|Zebra|" "Zebra"
+               "Zebra"   "Zebra"
+               "ZEBRA"   "ZEBRA"
+               "Zebra"   "Zebra"
+               "zebra"   "zebra"
+               "ZEBRA"   "ZEBRA"
+               "Zebra"   "Zebra"
+               "zebra"   "zebra"
+               "ZEBRA"   "ZEBRA"
+               "Zebra"   "Zebra"
+               "zebra"   "zebra"
+               "zebra"   "zebra"
+               "Zebra"   "Zebra"
+               "ZEBRA"   "ZEBRA"
+               "zebra"   "zebra"
+               "Zebra"   "Zebra"
+               "ZEBRA"   "ZEBRA"
+               "zebra"   "zebra"
+               "Zebra"   "Zebra"
+               "ZEBRA"   "ZEBRA")))
+
+#+sb-unicode
+(with-test (:name :base-char-preference)
+  (let* ((rt (copy-readtable))
+         (*readtable* rt)
+         (callcount 0))
+    (flet ((expect (setting symbol-name-type string-type)
+             (unless (eq setting :default)
+               (setf (readtable-base-char-preference rt) setting))
+             ;; Each test has to intern a new symbol of course.
+             (let ((input (format nil "MAMALOOK~D" (incf callcount))))
+               (assert (equal (type-of (symbol-name (read-from-string input)))
+                              symbol-name-type))
+               (assert (equal (type-of (read-from-string "\"Foobarbaz\""))
+                              string-type)))
+             ;; Also verify that COPY-READTABLE works
+             (assert (eq (readtable-base-char-preference (copy-readtable rt))
+                         (readtable-base-char-preference rt)))))
+      ;; Verify correctness of the stated default as per the docstring
+      (assert (eq (readtable-base-char-preference rt) :symbols))
+      ;; Default: prefer base symbols, but CHARACTER strings.
+      (expect :default '(simple-base-string 9) '(simple-array character (9)))
+      ;; Prefer base strings, but CHARACTER strings for symbol names
+      (expect :strings
+              '(simple-array character (9))
+              '(simple-base-string 9))
+      ;; Prefer base-string for everything
+      (expect :both '(simple-base-string 9) '(simple-base-string 9))
+      ;; Prefer base-string for neither
+      (expect nil
+              '(simple-array character (9))
+              '(simple-array character (9))))))
+
+(with-test (:name :rational-rdff)
+  (with-standard-io-syntax
+    (let ((*read-default-float-format* 'rational))
+      (macrolet ((assert-read-eqlity (x y)
+                   `(assert (eql (read-from-string ,x) ,y)))
+                 (assert-print-string= (x y)
+                   `(assert (string= (prin1-to-string ,x) ,y))))
+        (assert-read-eqlity "1.0" 1)
+        (assert-read-eqlity "-1.0e0" -1)
+        (assert-read-eqlity "0.1" 1/10)
+        (assert-read-eqlity "-0.1e0" -1/10)
+        (assert-read-eqlity "0.1d0" 0.1d0)
+        (assert-read-eqlity "-0.1f0" -0.1f0)
+
+        (assert-print-string= 1 "1")
+        (assert-print-string= 1/10 "1/10")
+        (assert-print-string= 0.1f0 "0.1f0")
+        (assert-print-string= 0.1d0 "0.1d0")))))
+
+(with-test (:name :rational-exponent)
+  (with-standard-io-syntax
+    (macrolet ((assert-read-eqlity (x y)
+                 `(assert (eql (read-from-string ,x) ,y))))
+      (assert-read-eqlity "1.0r0" 1)
+      (assert-read-eqlity "1.0r5" 100000)
+      (assert-read-eqlity "0.1r0" 1/10)
+      (assert-read-eqlity "0.333R0" 333/1000)
+      (assert-read-eqlity "1R-3" 1/1000)
+      (assert-read-eqlity ".1R2" 10))))

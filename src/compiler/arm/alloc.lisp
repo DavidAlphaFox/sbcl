@@ -9,13 +9,13 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-vop (list-or-list*)
   (:args (things :more t :scs (control-stack)))
-  (:temporary (:scs (descriptor-reg) :type list) ptr)
+  (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (any-reg)) temp)
-  (:temporary (:scs (descriptor-reg) :type list :to (:result 0) :target result)
+  (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
   (:temporary (:sc non-descriptor-reg :offset ocfp-offset) pa-flag)
   (:info num)
@@ -68,31 +68,6 @@
   (:variant t))
 
 ;;;; Special purpose inline allocators.
-#!-gencgc
-(define-vop (allocate-code-object)
-  (:args (boxed-arg :scs (any-reg))
-         (unboxed-arg :scs (any-reg)))
-  (:results (result :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) ndescr)
-  (:temporary (:scs (non-descriptor-reg)) size)
-  (:temporary (:scs (any-reg) :from (:argument 0)) boxed)
-  (:temporary (:scs (non-descriptor-reg)) unboxed)
-  (:temporary (:sc non-descriptor-reg :offset ocfp-offset) pa-flag)
-  (:generator 100
-    (inst add boxed boxed-arg (fixnumize (1+ code-constants-offset)))
-    (inst bic boxed boxed lowtag-mask)
-    (inst mov unboxed (lsr unboxed-arg word-shift))
-    (inst add unboxed unboxed lowtag-mask)
-    (inst bic unboxed unboxed lowtag-mask)
-    (inst mov ndescr (lsl boxed (- n-widetag-bits word-shift)))
-    (inst orr ndescr ndescr code-header-widetag)
-    (inst add size boxed unboxed)
-    (pseudo-atomic (pa-flag)
-      (allocation result size other-pointer-lowtag :flag-tn pa-flag)
-      (storew ndescr result 0 other-pointer-lowtag)
-      (storew unboxed-arg result code-code-size-slot other-pointer-lowtag)
-      (storew null-tn result code-entry-points-slot other-pointer-lowtag)
-      (storew null-tn result code-debug-info-slot other-pointer-lowtag))))
 
 (define-vop (make-fdefn)
   (:args (name :scs (descriptor-reg) :to :eval))
@@ -109,13 +84,14 @@
         (storew name result fdefn-name-slot other-pointer-lowtag)
         (storew null-tn result fdefn-fun-slot other-pointer-lowtag)
         (storew temp result fdefn-raw-addr-slot other-pointer-lowtag))
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label undefined-tramp-fixup)
-        (inst word (make-fixup "undefined_tramp" :foreign))))))
+        (inst word (make-fixup 'undefined-tramp :assembly-routine))))))
 
 (define-vop (make-closure)
   (:args (function :to :save :scs (descriptor-reg)))
-  (:info length stack-allocate-p)
+  (:info label length stack-allocate-p)
+  (:ignore label)
   (:temporary (:sc non-descriptor-reg :offset ocfp-offset) pa-flag)
   (:results (result :scs (descriptor-reg)))
   (:generator 10
@@ -126,8 +102,10 @@
                     fun-pointer-lowtag
                     :flag-tn pa-flag
                     :stack-allocate-p stack-allocate-p)
-        (inst mov pa-flag (ash (1- size) n-widetag-bits))
-        (inst orr pa-flag pa-flag closure-header-widetag)
+        (load-immediate-word pa-flag
+                             (logior
+                              (ash (1- size) n-widetag-bits)
+                              closure-widetag))
         (storew pa-flag result 0 fun-pointer-lowtag)
         (storew function result closure-fun-slot fun-pointer-lowtag)))))
 
@@ -139,7 +117,7 @@
   (:info stack-allocate-p)
   (:results (result :scs (descriptor-reg)))
   (:generator 10
-    (with-fixed-allocation (result pa-flag value-cell-header-widetag
+    (with-fixed-allocation (result pa-flag value-cell-widetag
                             value-cell-size :stack-allocate-p stack-allocate-p)
       (storew value result value-cell-value-slot other-pointer-lowtag))))
 
@@ -158,9 +136,9 @@
   (:generator 1
     (let ((fixup (gen-label)))
       (inst load-from-label result lip fixup)
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label fixup)
-        (inst word (make-fixup "funcallable_instance_tramp" :foreign))))))
+        (inst word (make-fixup 'funcallable-instance-tramp :assembly-routine))))))
 
 (define-vop (fixed-alloc)
   (:args)
@@ -185,12 +163,17 @@
   (:generator 6
     ;; Build the object header, assuming that the header was in WORDS
     ;; but should not be in the header
-    (inst add bytes extra (* (1- words) n-word-bytes))
+    (if (= type code-header-widetag)
+        (inst add bytes extra 0)
+        (inst add bytes extra (* (1- words) n-word-bytes)))
     (inst mov header (lsl bytes (- n-widetag-bits n-fixnum-tag-bits)))
     (inst add header header type)
     ;; Add the object header to the allocation size and round up to
     ;; the allocation granularity
-    (inst add bytes bytes (* 2 n-word-bytes))
+    ;; The specified EXTRA value is the exact value placed in the header
+    ;; as the word count when allocating code.
+    (unless (= type code-header-widetag)
+      (inst add bytes bytes (* 2 n-word-bytes)))
     (inst bic bytes bytes lowtag-mask)
     ;; Allocate the object and set its header
     (pseudo-atomic (pa-flag)

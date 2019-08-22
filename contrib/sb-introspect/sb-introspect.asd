@@ -9,15 +9,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(defpackage #:sb-introspect-system (:use :cl :asdf :uiop))
-(in-package #:sb-introspect-system)
-
-(defsystem :sb-introspect
+(defsystem "sb-introspect"
   :components ((:file "introspect"))
   #+sb-building-contrib :pathname
   #+sb-building-contrib #p"SYS:CONTRIB;SB-INTROSPECT;"
   :perform (load-op :after (o c) (provide 'sb-introspect))
-  :perform (test-op (o c) (test-system :sb-introspect/tests)))
+  :in-order-to ((test-op (test-op "sb-introspect/tests"))))
 
 (defclass plist-file (cl-source-file)
   ((source-plist
@@ -33,25 +30,14 @@
   (with-compilation-unit (:source-plist (plist-file-source-plist com))
     (call-next-method)))
 
-(defclass source-only-file (cl-source-file)
-  ())
-
-(defmethod perform ((op compile-op) (com source-only-file)))
-(defmethod perform ((op load-op) (com source-only-file)))
-(defmethod output-files ((op compile-op) (com source-only-file))
-  ())
-(defmethod component-depends-on ((op load-op) (com source-only-file))
-  `((load-source-op ,com) ,@(call-next-method)))
-
-(defsystem :sb-introspect/tests
-  :depends-on (:sb-introspect :sb-rt)
+(defsystem "sb-introspect/tests"
+  :depends-on ("sb-introspect" "sb-rt")
   #+sb-building-contrib :pathname
   #+sb-building-contrib #p"SYS:CONTRIB;SB-INTROSPECT;"
   :components ((:file "xref-test-data")
                (:file "xref-test" :depends-on ("xref-test-data"))
                (:plist-file "test" :source-plist (:test-outer "OUT") :operation-done-p (compile-op (o c) nil))
-               (:source-only-file "load-test")
-               (:file "test-driver" :depends-on ("test" "load-test")))
+               (:file "test-driver" :depends-on ("test")))
   :perform
   (test-op (o c)
     ;; N.b. At least DEFINITION-SOURCE-PLIST.1 assumes that CWD is the

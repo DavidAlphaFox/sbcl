@@ -11,24 +11,22 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_CLASSOID
-#define SBCL_GENESIS_CLASSOID 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_CLASSOID
+#ifndef __ASSEMBLER__
 
 struct classoid {
-    lispobj header;
-    lispobj _layout;
+    lispobj header; // = word_0_
     lispobj class_info;
-    lispobj enumerable;
     lispobj hash_value;
-    lispobj might_contain_other_types_p;
     lispobj name;
     lispobj layout;
     lispobj state;
     lispobj direct_superclasses;
+    lispobj source_location;
     lispobj subclasses;
     lispobj pcl_class;
 };
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_CLASSOID */
+#endif

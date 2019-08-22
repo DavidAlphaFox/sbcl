@@ -18,9 +18,9 @@
            #:assert-no-consing
            #:compiler-derived-type
            #:count-full-calls
-           #:find-value-cell-values
            #:find-code-constants
            #:find-named-callees
+           #:find-anonymous-callees
            #:file-compile))
 
 (cl:in-package :ctu)
@@ -34,17 +34,10 @@
     (declare (ignore x))
     (values t nil)))
 
-(defun find-value-cell-values (fun)
-  (let ((code (fun-code-header (%fun-fun fun))))
-    (loop for i from sb-vm::code-constants-offset below (get-header-data code)
-          for c = (code-header-ref code i)
-          when (= sb-vm::value-cell-header-widetag (widetag-of c))
-          collect (sb-vm::value-cell-ref c))))
-
 (defun find-named-callees (fun &key (type t) (name nil namep))
-  (let ((code (sb-kernel:fun-code-header (sb-kernel:%fun-fun fun))))
-    (loop for i from sb-vm::code-constants-offset below (sb-kernel:get-header-data code)
-          for c = (sb-kernel:code-header-ref code i)
+  (let ((code (fun-code-header (%fun-fun fun))))
+    (loop for i from sb-vm:code-constants-offset below (code-header-words code)
+          for c = (code-header-ref code i)
           when (and (typep c 'sb-impl::fdefn)
                     (let ((fun (sb-impl::fdefn-fun c)))
                       (and (typep fun type)
@@ -52,16 +45,33 @@
                                (equal name (sb-impl::fdefn-name c))))))
           collect (sb-impl::fdefn-fun c))))
 
+(defun find-anonymous-callees (fun &key (type 'function))
+  (let ((code (fun-code-header (%fun-fun fun))))
+    (loop for i from sb-vm:code-constants-offset below (code-header-words code)
+          for fun = (code-header-ref code i)
+          when (typep fun type)
+          collect fun)))
+
+;;; Return a subset of the code constants for FUN's code but excluding
+;;; constants that are present on behalf of %SIMPLE-FUN-foo accessors.
 (defun find-code-constants (fun &key (type t))
-  (let ((code (sb-kernel:fun-code-header (sb-kernel:%fun-fun fun))))
-    (loop for i from sb-vm::code-constants-offset below (sb-kernel:get-header-data code)
-          for c = (sb-kernel:code-header-ref code i)
-          when (typep c type)
-          collect c)))
+  (let ((code (fun-code-header (%fun-fun fun))))
+    (loop for i from (+ sb-vm:code-constants-offset
+                        (* (code-n-entries code) sb-vm:code-slots-per-simple-fun))
+          below (code-header-words code)
+          for c = (code-header-ref code i)
+          for value = (if (= (widetag-of c) sb-vm:value-cell-widetag)
+                          (value-cell-ref c)
+                          c)
+          when (typep value type)
+          collect value)))
 
 (defun collect-consing-stats (thunk times)
   (declare (type function thunk))
   (declare (type fixnum times))
+  #+(and sb-thread gencgc)
+  (sb-vm::close-current-gc-region)
+  (setf sb-int:*n-bytes-freed-or-purified* 0)
   (let ((before (sb-ext:get-bytes-consed)))
     (dotimes (i times)
       (funcall thunk))
@@ -95,9 +105,11 @@
 (defmacro assert-consing (form &optional (times '+times+))
   `(check-consing t ',form (lambda () ,form) ,times))
 
-(defun file-compile (toplevel-forms &key load)
-  (let* ((lisp (merge-pathnames "file-compile-tmp.lisp"))
-         (fasl (compile-file-pathname lisp)))
+(defun file-compile (toplevel-forms &key load
+                                         before-load)
+  (let* ((lisp (test-util:scratch-file-name "lisp"))
+         (fasl (compile-file-pathname lisp))
+         (error-stream (make-string-output-stream)))
     (unwind-protect
          (progn
            (with-open-file (f lisp :direction :output)
@@ -105,22 +117,34 @@
                  (write-line toplevel-forms f)
                  (dolist (form toplevel-forms)
                    (prin1 form f))))
-           (multiple-value-bind (fasl warn fail) (compile-file lisp)
+           (multiple-value-bind (fasl warn fail)
+               (let ((*error-output* error-stream))
+                 (compile-file lisp :print nil :verbose nil))
              (when load
-               (load fasl))
-             (values warn fail)))
+               (when before-load
+                 (funcall before-load))
+               (let ((*error-output* error-stream))
+                 (load fasl :print nil :verbose nil)))
+             (values warn fail error-stream)))
       (ignore-errors (delete-file lisp))
       (ignore-errors (delete-file fasl)))))
 
 ;; Pretty horrible, but does the job
 (defun count-full-calls (name function)
   (let ((code (with-output-to-string (s)
-                (disassemble function :stream s)))
+                (let ((*print-right-margin* 120))
+                  (disassemble function :stream s))))
         (n 0))
-    (with-input-from-string (s code)
-      (loop for line = (read-line s nil nil)
-            while line
-            when (and (search name line)
-                      (search "#<FDEFINITION" line))
-            do (incf n)))
-    n))
+    (flet ((asm-line-calls-name-p (line name)
+             (dolist (herald '("#<FDEFN" "#<SB-KERNEL:FDEFN" "#<FUNCTION"))
+               (let ((pos (search herald line)))
+                 (when pos
+                   (return (string= (subseq line
+                                            (+ pos (length herald) 1)
+                                            (1- (length line)))
+                                    name)))))))
+      (with-input-from-string (s code)
+        (loop for line = (read-line s nil nil)
+              while line
+              when (asm-line-calls-name-p line name) do (incf n)))
+      n)))

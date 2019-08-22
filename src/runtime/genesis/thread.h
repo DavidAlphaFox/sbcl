@@ -11,19 +11,38 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_THREAD
-#define SBCL_GENESIS_THREAD 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_THREAD
+#ifndef __ASSEMBLER__
+
+#define THREAD_HEADER_SLOTS 16
+#define THREAD_FUNCTION_LAYOUT_SLOT -1
+#define THREAD_VARYOBJ_SPACE_ADDR_SLOT -2
+#define THREAD_VARYOBJ_CARD_COUNT_SLOT -3
+#define THREAD_VARYOBJ_CARD_MARKS_SLOT -4
 
 struct thread {
     lispobj no_tls_value_marker;
     os_thread_t os_thread;
-    void * os_address;
-    struct alloc_region alloc_region;
+    lispobj * binding_stack_pointer;
+    lispobj current_catch_block;
+    lispobj current_unwind_protect_block;
     lispobj pseudo_atomic_bits;
     lispobj * alien_stack_pointer;
-    lispobj * binding_stack_pointer;
+    lispobj stepping;
+    lispobj msan_param_tls;
+    lispobj dynspace_addr;
+    lispobj dynspace_card_count;
+    lispobj dynspace_pte_base;
+    uword_t * profile_data;
+    struct alloc_region alloc_region;
+    void * os_address;
     lispobj * alien_stack_start;
     lispobj * binding_stack_start;
+    os_sem_t * state_sem;
+    os_sem_t * state_not_running_sem;
+    int state_not_running_waitcount;
+    os_sem_t * state_not_stopped_sem;
+    int state_not_stopped_waitcount;
     lispobj * control_stack_start;
     lispobj * control_stack_end;
     lispobj control_stack_guard_page_protected;
@@ -31,42 +50,54 @@ struct thread {
     struct thread * prev;
     struct thread * next;
     lispobj state;
-    lispobj tls_cookie;
+    lispobj tls_size;
     struct interrupt_data * interrupt_data;
-    lispobj stepping;
+    boolean foreign_function_call_active;
+    lispobj * control_stack_pointer;
     mach_port_name_t mach_port_name;
-    struct nonpointer_thread_data * nonpointer_data;
-    os_context_t * interrupt_contexts[1];
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
 #define THREAD_NO_TLS_VALUE_MARKER_OFFSET 0
 #define THREAD_OS_THREAD_OFFSET 8
-#define THREAD_OS_ADDRESS_OFFSET 16
-#define THREAD_ALLOC_REGION_OFFSET 24
-#define THREAD_PSEUDO_ATOMIC_BITS_OFFSET 64
-#define THREAD_ALIEN_STACK_POINTER_OFFSET 72
-#define THREAD_BINDING_STACK_POINTER_OFFSET 80
-#define THREAD_ALIEN_STACK_START_OFFSET 88
-#define THREAD_BINDING_STACK_START_OFFSET 96
-#define THREAD_CONTROL_STACK_START_OFFSET 104
-#define THREAD_CONTROL_STACK_END_OFFSET 112
-#define THREAD_CONTROL_STACK_GUARD_PAGE_PROTECTED_OFFSET 120
-#define THREAD_THIS_OFFSET 128
-#define THREAD_PREV_OFFSET 136
-#define THREAD_NEXT_OFFSET 144
-#define THREAD_STATE_OFFSET 152
-#define THREAD_TLS_COOKIE_OFFSET 160
-#define THREAD_INTERRUPT_DATA_OFFSET 168
-#define THREAD_STEPPING_OFFSET 176
-#define THREAD_MACH_PORT_NAME_OFFSET 184
-#define THREAD_NONPOINTER_DATA_OFFSET 192
-#define THREAD_INTERRUPT_CONTEXTS_OFFSET 200
+#define THREAD_BINDING_STACK_POINTER_OFFSET 16
+#define THREAD_CURRENT_CATCH_BLOCK_OFFSET 24
+#define THREAD_CURRENT_UNWIND_PROTECT_BLOCK_OFFSET 32
+#define THREAD_PSEUDO_ATOMIC_BITS_OFFSET 40
+#define THREAD_ALIEN_STACK_POINTER_OFFSET 48
+#define THREAD_STEPPING_OFFSET 56
+#define THREAD_MSAN_PARAM_TLS_OFFSET 64
+#define THREAD_DYNSPACE_ADDR_OFFSET 72
+#define THREAD_DYNSPACE_CARD_COUNT_OFFSET 80
+#define THREAD_DYNSPACE_PTE_BASE_OFFSET 88
+#define THREAD_PROFILE_DATA_OFFSET 96
+#define THREAD_ALLOC_REGION_OFFSET 104
+#define THREAD_OS_ADDRESS_OFFSET 136
+#define THREAD_ALIEN_STACK_START_OFFSET 144
+#define THREAD_BINDING_STACK_START_OFFSET 152
+#define THREAD_STATE_SEM_OFFSET 160
+#define THREAD_STATE_NOT_RUNNING_SEM_OFFSET 168
+#define THREAD_STATE_NOT_RUNNING_WAITCOUNT_OFFSET 176
+#define THREAD_STATE_NOT_STOPPED_SEM_OFFSET 184
+#define THREAD_STATE_NOT_STOPPED_WAITCOUNT_OFFSET 192
+#define THREAD_CONTROL_STACK_START_OFFSET 200
+#define THREAD_CONTROL_STACK_END_OFFSET 208
+#define THREAD_CONTROL_STACK_GUARD_PAGE_PROTECTED_OFFSET 216
+#define THREAD_THIS_OFFSET 224
+#define THREAD_PREV_OFFSET 232
+#define THREAD_NEXT_OFFSET 240
+#define THREAD_STATE_OFFSET 248
+#define THREAD_TLS_SIZE_OFFSET 256
+#define THREAD_INTERRUPT_DATA_OFFSET 264
+#define THREAD_FOREIGN_FUNCTION_CALL_ACTIVE_OFFSET 272
+#define THREAD_CONTROL_STACK_POINTER_OFFSET 280
+#define THREAD_MACH_PORT_NAME_OFFSET 288
+#define THREAD_SIZE 37
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_THREAD */
+#endif

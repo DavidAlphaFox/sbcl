@@ -11,21 +11,22 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_BIGNUM
-#define SBCL_GENESIS_BIGNUM 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_BIGNUM
+#ifndef __ASSEMBLER__
 
 struct bignum {
     lispobj header;
     sword_t digits[1];
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
 #define BIGNUM_DIGITS_OFFSET -7
+#define BIGNUM_SIZE 1
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_BIGNUM */
+#endif

@@ -2,12 +2,13 @@
 
 ;;;
 
-(define-condition unknown-protocol ()
+(define-condition unknown-protocol (error)
   ((name :initarg :name
          :reader unknown-protocol-name))
-  (:report (lambda (c s)
-             (format s "Protocol not found: ~a" (prin1-to-string
-                                                 (unknown-protocol-name c))))))
+  (:report (lambda (condition stream)
+             (format stream "Protocol not found: ~A"
+                     (prin1-to-string (unknown-protocol-name condition))))))
+
 (defvar *protocols*
   `((:tcp ,sockint::ipproto_tcp "tcp" "TCP")
     (:udp ,sockint::ipproto_udp "udp" "UDP")
@@ -79,13 +80,16 @@ a list of protocol aliases"
                            name result-buf buffer buffer-length #-solaris result)))
                  (cond ((eql res 0)
                         #-solaris
-                        (when (sb-alien::null-alien (sb-alien:deref result 0))
+                        (when (sb-alien:null-alien (sb-alien:deref result 0))
                           (error 'unknown-protocol :name name))
                         (return-from getprotobyname
                           (protoent-to-values result-buf)))
                        (t
-                        (let ((errno (sb-unix::get-errno)))
-                          (cond ((eql errno sockint::erange)
+                        (let ((errno (sb-alien:get-errno)))
+                          (cond ((eql errno sb-unix:enoent)
+                                 ;; Usually caused by missing /etc/protocols
+                                 (error 'unknown-protocol :name name))
+                                ((eql errno sockint::erange)
                                  (incf buffer-length 1024)
                                  (when (> buffer-length max-buffer)
                                    (error "Exceeded max-buffer of ~d" max-buffer)))

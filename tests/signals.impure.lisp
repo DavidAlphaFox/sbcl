@@ -61,13 +61,11 @@
     ;; Wait, but not with sleep because that will be interrupted and
     ;; we get EINTR.
     (loop until returning)
-    (loop repeat 1000000000)
     (assert (= saved-errno (sb-unix::get-errno)))))
-
-(with-test (:name :handle-interactive-interrupt
-                  ;; It is desirable to support C-c on Windows, but SIGINT
-                  ;; is not the mechanism to use on this platform.
-                  :skipped-on :win32)
+;; It is desirable to support C-c on Windows, but SIGINT
+;; is not the mechanism to use on this platform.
+#-win32
+(with-test (:name :handle-interactive-interrupt)
   (assert (eq :condition
               (handler-case
                   (progn

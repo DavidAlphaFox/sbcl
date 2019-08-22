@@ -9,21 +9,22 @@
 # provided with absolutely no warranty. See the COPYING and CREDITS
 # files for more information.
 
-ASFLAGS = -g -Wall -Wa,-xarch=v8plus
-LINKFLAGS += -v -rdynamic
+CFLAGS += -m32 -fno-PIC
+ASFLAGS = -m32 -fno-PIC -g -Wall -Wa,-xarch=v8plus
+LINKFLAGS += -rdynamic -m32
 NM = ./linux-nm
 
 ASSEM_SRC = sparc-assem.S ldso-stubs.S
 ARCH_SRC = sparc-arch.c #undefineds.c 
 
-OS_SRC = linux-os.c sparc-linux-os.c
+OS_SRC = linux-os.c linux-mman.c sparc-linux-os.c
 OS_LIBS = -ldl
 ifdef LISP_FEATURE_SB_CORE_COMPRESSION
   OS_LIBS += -lz
 endif
 
 ifdef LISP_FEATURE_GENCGC
-  GC_SRC = gencgc.c
+  GC_SRC = fullcgc.c gencgc.c traceroot.c
 else
   GC_SRC = cheneygc.c
 endif

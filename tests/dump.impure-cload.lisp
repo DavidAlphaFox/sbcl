@@ -11,19 +11,20 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(cl:in-package :cl-user)
-
 (declaim (optimize (debug 3) (speed 2) (space 1)))
+
+;;; this would fail an AVER in NOTE-POTENTIAL-CIRCULARITY
+(defparameter *circular-2d-array* #1=#2A((a b) (#1# x)))
 
 ;;; Don Geddis reported this test case 25 December 1999 on a CMU CL
 ;;; mailing list: dumping circular lists caused the compiler to enter
 ;;; an infinite loop. Douglas Crosher reported a patch 27 Dec 1999.
 ;;; The patch was tested on SBCL by Martin Atzmueller 2 Nov 2000, and
 ;;; merged in sbcl-0.6.8.11.
-(defun q-dg1999-1 () (dolist (x '#1=("A" "B" . #1#)) x))
-(defun q-dg1999-2 () (dolist (x '#1=("C" "D" . #1#)) x))
-(defun q-dg1999-3 () (dolist (x '#1=("E" "F" . #1#)) x))
-(defun q-dg1999-4 () (dolist (x '#1=("C" "D" . #1#)) x))
+(defun q-dg1999-1 () (dolist (x '#1=("A" "B" . #1#)) (progn x)))
+(defun q-dg1999-2 () (dolist (x '#1=("C" "D" . #1#)) (progn x)))
+(defun q-dg1999-3 () (dolist (x '#1=("E" "F" . #1#)) (progn x)))
+(defun q-dg1999-4 () (dolist (x '#1=("C" "D" . #1#)) (progn x)))
 (defun useful-dg1999 (keys)
   (declare (type list keys))
   (loop
@@ -47,7 +48,8 @@
   #.(make-foo :x "X" :y "Y"))
 
 (assert (equalp (foo-x *foo*) '("X")))
-(assert (eql (foo-y *foo*) *foo*))
+(assert (locally (declare (notinline eql)) ; noise suppression
+                 (eql (foo-y *foo*) *foo*)))
 
 ;;; Logical pathnames should be dumpable, too, but what does it mean?
 ;;; As of sbcl-0.7.7.16, we've taken dumping the host part to mean
@@ -138,6 +140,9 @@
 ;; Preparation for more MAKE-LOAD-FORM tests
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
+ (locally
+  ;; this file's global SPEED proclamation generates a lot of unwanted noise
+  (declare (optimize (speed 1)))
   (defstruct airport
     name code
     (latitude nil :type double-float)
@@ -218,39 +223,183 @@
               (s1-friends c) (list a b))
         (list a b c))))
 
-) ; end EVAL-WHEN
+)) ; end EVAL-WHEN
 
+;; Redefine the MAKE-LOAD-FORM method on FOO.
+(remove-method #'make-load-form (find-method #'make-load-form nil (list 'foo)))
+(defvar *foo-save-slots* nil)
+(defmethod make-load-form ((self foo) &optional env)
+  (declare (ignore env))
+  (if (eq *foo-save-slots* :all)
+      (make-load-form-saving-slots self)
+      (make-load-form-saving-slots self :slot-names *foo-save-slots*)))
 (with-test (:name :load-form-canonical-p)
   (let ((foo (make-foo :x 'x :y 'y)))
-    (multiple-value-bind (create init)
-        (make-load-form-saving-slots foo)
-      (assert (sb-kernel::canonical-slot-saving-forms-p foo create init)))
-    (multiple-value-bind (create init)
-        ;; specifying all slots is still canonical
-        (make-load-form-saving-slots foo :slot-names '(y x))
-      (assert (sb-kernel::canonical-slot-saving-forms-p foo create init)))
-    (multiple-value-bind (create init)
-        (make-load-form-saving-slots foo :slot-names '(x))
-      (assert (not (sb-kernel::canonical-slot-saving-forms-p
-                    foo create init))))))
+    (flet ((assert-canonical (slots)
+             (let ((*foo-save-slots* slots))
+               (assert (sb-fasl:load-form-is-default-mlfss-p foo)))))
+      (assert-canonical :all)
+      (assert-canonical '(x y)) ; specifying all slots explicitly is still canonical
+      (assert-canonical '(y x)))
+    ;; specifying only one slot is not canonical
+    (assert (equal (let ((*foo-save-slots* '(x))) (sb-c::%make-load-form foo))
+                   '(sb-kernel::new-instance foo)))))
 
 ;; A huge constant vector. This took 9 seconds to compile (on a MacBook Pro)
-;; prior to the optimization for using :SB-JUST-DUMP-IT-NORMALLY.
+;; prior to the optimization for using fops to dump.
 ;; This assertion is simply whether it comes out correctly, not the time taken.
 (defparameter *airport-vector* #.(compute-airports 4000))
 
 ;; a tangled forest of structures,
 (defparameter *metadata* '#.(compute-tangled-stuff))
 
-(test-util:with-test (:name :make-load-form-huge-vector)
-  (assert (equalp (compute-airports (length *airport-vector*))
+(with-test (:name :make-load-form-huge-vector)
+  (assert (equalp (compute-airports (length (the vector *airport-vector*)))
                   *airport-vector*)))
 
-(test-util:with-test (:name :make-load-form-circular-hair)
+(with-test (:name :make-load-form-circular-hair)
   (let ((testcase (compute-tangled-stuff)))
+    (declare (optimize (speed 1)))
     ;; MAKE-LOAD-FORM discards the value of the CDF slot of one structure.
     ;; This probably isn't something "reasonable" to do, but it indicates
-    ;; that :JUST-DUMP-IT-NORMALLY was correctly not used.
+    ;; that SB-FASL::FOP-STRUCT was correctly not used.
     (setf (s1-cdf (second testcase)) #c(0d0 0d0))
     (assert (string= (write-to-string testcase :circle t :pretty nil)
                      (write-to-string *metadata* :circle t :pretty nil)))))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defclass twp ()
+    ((node-name :initarg :name :accessor node-name)
+     (parent :accessor node-parent :initform nil)
+     (children :initarg :children :accessor node-children)))
+
+  (defmethod print-object ((self twp) stream)
+    (declare (optimize (speed 0))) ; silence noise
+    (format stream "#<Node ~A~@[->~A~]>"
+            (node-name self)
+            (handler-case (mapcar 'node-name (node-children self))
+              (unbound-slot () nil))))
+
+  (defmethod make-load-form ((x twp) &optional environment)
+    (declare (ignore environment))
+    (values
+     ;; creation form
+     `(make-instance ',(class-of x)
+                     ,@(if (slot-boundp x 'children)
+                           `(:children ',(slot-value x 'children))))
+     ;; initialization form
+     `(setf (node-parent ',x) ',(slot-value x 'parent))))
+
+  (defun make-tree-from-spec (node-class specs)
+    (let ((tree (make-hash-table)))
+      (dolist (node-name (remove-duplicates (apply #'append specs)))
+        (setf (gethash node-name tree)
+              (make-instance node-class :name node-name)))
+      (dolist (node-spec specs)
+        (let ((par (gethash (car node-spec) tree))
+              (kids (mapcar (lambda (x) (gethash x tree)) (cdr node-spec))))
+          (dolist (kid kids)
+            (assert (not (node-parent kid)))
+            (setf (slot-value kid 'parent) par))
+          (setf (slot-value par 'children) kids)))
+      (values (gethash 'root tree)))))
+
+(defun verify-tree (node)
+  (dolist (kid (if (slot-boundp node 'children) (node-children node) nil))
+    (unless (eq (node-parent kid) node)
+      (error "Node ~S shoud have ~S as parent but has ~S~%"
+             (node-name kid)
+             (node-name node)
+             (node-parent kid)))
+    (verify-tree kid)))
+
+(defvar *x*
+  #.(make-tree-from-spec
+      'twp
+      '((root a b c f)
+        (a x y)
+        (b p q r s)
+        (c d e g))))
+
+(with-test (:name :tree-with-parent-hand-made-load-form)
+  (verify-tree *x*))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defclass twp2 (twp) ())
+  (defmethod make-load-form ((x twp2) &optional environment)
+    (declare (ignore environment))
+    (make-load-form-saving-slots x)))
+
+;; Track the make-load-form FOPs as they fly by at load-time.
+(defvar *call-tracker* nil)
+(dolist (fop-name 'sb-fasl::(fop-allocate-instance fop-set-slot-values))
+  (let* ((index (position fop-name sb-fasl::**fop-funs**
+                          :key
+                          (lambda (x) (and (functionp x) (sb-kernel:%fun-name x)))))
+         (fun (aref sb-fasl::**fop-funs** index)))
+    (setf (aref sb-fasl::**fop-funs** index)
+          (lambda (&rest args)
+            (push fop-name *call-tracker*)
+            (apply fun args)))))
+
+;; Same as *X* but the MAKE-LOAD-FORM method is different
+(defvar *y*
+  #.(make-tree-from-spec
+      'twp2
+      '((root a b c f)
+        (a x y)
+        (b p q r s)
+        (c d e g))))
+
+(assert (= 14 (count 'sb-fasl::fop-allocate-instance *call-tracker*)))
+(assert (= 14 (count 'sb-fasl::fop-set-slot-values *call-tracker*)))
+
+(with-test (:name :tree-with-parent-m-l-f-s-s)
+  (verify-tree *y*))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defclass class-with-shared-slot ()
+    ((a-slot :allocation :class :initarg :a :accessor thing-a)))
+  (defmethod make-load-form ((self class-with-shared-slot) &optional environment)
+    (declare (ignore environment))
+    (make-load-form-saving-slots self :slot-names '(a-slot))))
+
+(defvar *fool1* (make-instance 'class-with-shared-slot :a 42))
+(defvar *fool2* #.(let ((i (make-instance 'class-with-shared-slot)))
+                    (slot-makunbound i 'a-slot)
+                    i))
+
+;; The CLHS writeup is slightly ambiguous about what to with unbound
+;; standard-object slots. Assuming that "initialized" and "uninitialized"
+;; correspond to slots for which SLOT-BOUNDP would return T
+;; and NIL respectively, the meaning of
+;;  "initialized slots in object are initialized ..."
+;; can only mean that you write values into slots of the reconstructed
+;; object that were bound in the compile-time object.
+;;
+;; However "Uninitialized slots in object are not initialized" has two
+;; opposing meanings depending on whether the verb is "are" which
+;; expresses state versus "are [not] initialized" which expresses inaction.
+;; For a similar grammatical construction, DEFINE-METHOD-COMBINATION
+;; says in the "Short Form" description that:
+;;   "that method serves as the effective method and operator is not called."
+;; In that sentence "is [not] called" means that "calling" does NOT happen.
+;; Analogously, "is [not] initialized" would imply that initializing
+;; does NOT happen; it does NOT imply that "uninitializing" DOES happen.
+;;
+;; It seems though, that "are [not] initialized" actually means
+;; SHALL be made to become uninitialized. This is based on the Notes
+;; below the main description referencing SLOT-MAKUNBOUND.
+;; (Though muddied by use of weasel-words "could" and "might")
+;;
+;; Ultimately the two end states (doing something / not doing something)
+;; agree when the slot is local to the object, and no behavior is imparted
+;; by ALLOCATE-INSTANCE to cause slots to be other than unbound.
+;; This tests the edge case: that we DO call slot-makunbound.
+(with-test (:name :mlfss-slot-makunbound)
+  (assert (not (slot-boundp *fool1* 'a-slot))))
+
+(defun try-literal-layout () #.(sb-kernel:find-layout 'class-with-shared-slot))
+(with-test (:name :dump-std-obj-literal-layout)
+  (assert (eq (try-literal-layout)
+              (sb-kernel:find-layout 'class-with-shared-slot))))

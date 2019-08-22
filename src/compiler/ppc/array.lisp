@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; Allocator for the array header.
@@ -24,11 +24,10 @@
   (:temporary (:sc non-descriptor-reg :offset nl3-offset) pa-flag)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:temporary (:scs (non-descriptor-reg)) gc-temp)
-  #!-gencgc (:ignore gc-temp)
   (:results (result :scs (descriptor-reg)))
   (:generator 0
     (pseudo-atomic (pa-flag)
-      (inst addi ndescr rank (+ (* (1+ array-dimensions-offset) n-word-bytes)
+      (inst addi ndescr rank (+ (* array-dimensions-offset n-word-bytes)
                                 lowtag-mask))
       (inst clrrwi ndescr ndescr n-lowtag-bits)
       (allocation header ndescr other-pointer-lowtag
@@ -73,17 +72,16 @@
   (:policy :fast-safe)
   (:args (array :scs (descriptor-reg))
          (bound :scs (any-reg descriptor-reg))
-         (index :scs (any-reg descriptor-reg) :target result))
-  (:results (result :scs (any-reg descriptor-reg)))
+         (index :scs (any-reg descriptor-reg)))
+  (:temporary (:scs (non-descriptor-reg)) temp)
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 5
     (let ((error (generate-error-code vop 'invalid-array-index-error
                                       array bound index)))
+      (%test-fixnum index temp error t)
       (inst cmplw index bound)
-      (inst bge error)
-      (move result index))))
-
+      (inst bge error))))
 
 
 ;;;; Accessors/Setters
@@ -115,7 +113,7 @@
        (:result-types ,element-type)))))
   (def-data-vector-frobs simple-base-string byte-index
     character character-reg)
-  #!+sb-unicode
+  #+sb-unicode
   (def-data-vector-frobs simple-character-string word-index
     character character-reg)
   (def-data-vector-frobs simple-vector word-index
@@ -140,7 +138,6 @@
   (def-data-vector-frobs simple-array-signed-byte-32 word-index
     signed-num signed-reg))
 
-#!+compare-and-swap-vops
 (define-vop (%compare-and-swap-svref word-index-cas)
   (:note "inline array compare-and-swap")
   (:policy :fast-safe)

@@ -14,7 +14,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (/show0 "late-type.lisp 19")
 
@@ -28,7 +28,47 @@
 ;;; This condition is signalled whenever we make a UNKNOWN-TYPE so that
 ;;; compiler warnings can be emitted as appropriate.
 (define-condition parse-unknown-type (condition)
-  ((specifier :reader parse-unknown-type-specifier :initarg :specifier)))
+  ((specifier :reader parse-unknown-type-specifier :initarg :specifier))
+  (:default-initargs
+   :specifier (missing-arg)))
+
+;;; This condition is signalled whenever we encounter a type (DEFTYPE,
+;;; structure, condition, class) that has been marked as deprecated.
+(define-condition parse-deprecated-type (condition)
+  ((specifier :reader parse-deprecated-type-specifier :initarg :specifier))
+  (:default-initargs
+   :specifier (missing-arg)))
+
+;;; For-effect-only variant of CHECK-DEPRECATED-THING for
+;;; type-specifiers that descends into compound type-specifiers.
+(defun sb-impl::%check-deprecated-type (type-specifier)
+  (let ((seen '()))
+    ;; KLUDGE: we have to use SPECIFIER-TYPE to sanely traverse
+    ;; TYPE-SPECIFIER and detect references to deprecated types. But
+    ;; then we may have to drop its cache to get the
+    ;; PARSE-DEPRECATED-TYPE condition when TYPE-SPECIFIER is parsed
+    ;; again later.
+    ;;
+    ;; Proper fix would be a
+    ;;
+    ;;   walk-type function type-specifier
+    ;;
+    ;; mechanism that could drive VALUES-SPECIFIER-TYPE but also
+    ;; things like this function.
+    (block nil
+      (handler-bind
+          ((parse-deprecated-type
+             (lambda (condition)
+               (let ((type-specifier (parse-deprecated-type-specifier condition)))
+                 (aver (symbolp type-specifier))
+                 (unless (memq type-specifier seen)
+                   (push type-specifier seen)
+                   (check-deprecated-thing 'type type-specifier)))))
+           ((or error parse-unknown-type)
+             (lambda (condition)
+               (declare (ignore condition))
+               (return))))
+        (specifier-type type-specifier)))))
 
 ;;; These functions are used as method for types which need a complex
 ;;; subtypep method to handle some superclasses, but cover a subtree
@@ -48,12 +88,76 @@
         (funcall method type2 type1)
         (hierarchical-intersection2 type1 type2))))
 
+(defun map-type (function ctype)
+  (declare (type (or ctype null) ctype)
+           (dynamic-extent function))
+  (named-let %map ((type ctype))
+    (funcall function type)
+    (typecase type
+      (compound-type
+       (mapc #'%map (compound-type-types type)))
+      (negation-type (%map (negation-type-type type)))
+      (cons-type
+       (%map (cons-type-car-type type))
+       (%map (cons-type-cdr-type type)))
+      (array-type
+       (%map (array-type-element-type type)))
+      (args-type
+       (mapc #'%map (args-type-required type))
+       (mapc #'%map (args-type-optional type))
+       (when (args-type-rest type)
+         (%map (args-type-rest type)))
+       (mapc (lambda (x) (%map (key-info-type x)))
+             (args-type-keywords type))
+       (when (fun-type-p type)
+         (%map (fun-type-returns type))))))
+  nil)
+
 (defun contains-unknown-type-p (ctype)
-  (cond ((unknown-type-p ctype) t)
-        ((compound-type-p ctype)
-         (some #'contains-unknown-type-p (compound-type-types ctype)))
-        ((negation-type-p ctype)
-         (contains-unknown-type-p (negation-type-type ctype)))))
+  (map-type (lambda (type)
+              (when (unknown-type-p type)
+                (return-from contains-unknown-type-p t)))
+            ctype))
+
+(defun contains-hairy-type-p (ctype)
+  (map-type (lambda (type)
+              (when (hairy-type-p type)
+                (return-from contains-hairy-type-p t)))
+            ctype))
+
+(defun replace-hairy-type (type)
+  (if (contains-hairy-type-p type)
+      (typecase type
+        (hairy-type *universal-type*)
+        (intersection-type (%type-intersection
+                            (mapcar #'replace-hairy-type (intersection-type-types type))))
+        (union-type (%type-union
+                     (mapcar #'replace-hairy-type (union-type-types type))))
+        (negation-type
+         (let ((new (replace-hairy-type (negation-type-type type))))
+           (if (eq new *universal-type*)
+               new
+               (type-negation new))))
+        (t
+         *universal-type*))
+      type))
+
+;; Similar to (NOT CONTAINS-UNKNOWN-TYPE-P), but report that (SATISFIES F)
+;; is not a testable type unless F is currently bound.
+(defun testable-type-p (ctype)
+  (map-type
+   (lambda (ctype)
+     (typecase ctype
+       (unknown-type
+        (return-from testable-type-p nil)) ; must precede HAIRY because an unknown is HAIRY
+       (hairy-type
+        (let ((spec (hairy-type-specifier ctype)))
+          ;; Anything other than (SATISFIES ...) is testable
+          ;; because there's no reason to suppose that it isn't.
+          (unless (or (neq (car spec) 'satisfies) (fboundp (cadr spec)))
+            (return-from testable-type-p nil))))))
+   ctype)
+  t)
 
 ;;; This is used by !DEFINE-SUPERCLASSES to define the SUBTYPE-ARG1
 ;;; method. INFO is a list of conses
@@ -61,27 +165,34 @@
 (defun has-superclasses-complex-subtypep-arg1 (type1 type2 info)
   ;; If TYPE2 might be concealing something related to our class
   ;; hierarchy
-  (if (type-might-contain-other-types-p type2)
-      ;; too confusing, gotta punt
-      (values nil nil)
-      ;; ordinary case expected by old CMU CL code, where the taxonomy
-      ;; of TYPE2's representation accurately reflects the taxonomy of
-      ;; the underlying set
-      (values
-       ;; FIXME: This old CMU CL code probably deserves a comment
-       ;; explaining to us mere mortals how it works...
-       (and (sb!xc:typep type2 'classoid)
-            (dolist (x info nil)
-              (when (or (not (cdr x))
-                        (csubtypep type1 (specifier-type (cdr x))))
-                (return
-                 (or (eq type2 (car x))
-                     (let ((inherits (layout-inherits
-                                      (classoid-layout (car x)))))
-                       (dotimes (i (length inherits) nil)
-                         (when (eq type2 (layout-classoid (svref inherits i)))
-                           (return t)))))))))
-       t)))
+  (cond ((type-might-contain-other-types-p type2)
+         ;; too confusing, gotta punt
+         (values nil nil))
+        ((fun-designator-type-p type1)
+         (values nil t))
+        (t
+         ;; ordinary case expected by old CMU CL code, where the taxonomy
+         ;; of TYPE2's representation accurately reflects the taxonomy of
+         ;; the underlying set
+         (values
+          ;; FIXME: This old CMU CL code probably deserves a comment
+          ;; explaining to us mere mortals how it works...
+          (and (sb-xc:typep type2 'classoid)
+               (dolist (x info nil)
+                 (let ((guard (cdr x)))
+                   (when (or (not guard)
+                             (csubtypep type1 (if (%instancep guard)
+                                                  guard
+                                                  (setf (cdr x)
+                                                        (specifier-type guard)))))
+                     (return
+                       (or (eq type2 (car x))
+                           (let ((inherits (layout-inherits
+                                            (classoid-layout (car x)))))
+                             (dotimes (i (length inherits) nil)
+                               (when (eq type2 (layout-classoid (svref inherits i)))
+                                 (return t))))))))))
+          t))))
 
 ;;; This function takes a list of specs, each of the form
 ;;;    (SUPERCLASS-NAME &OPTIONAL GUARD).
@@ -95,23 +206,24 @@
 ;;;    G0,(and G1 (not G0)), (and G2 (not (or G0 G1))).
 ;;;
 ;;; WHEN controls when the forms are executed.
-(defmacro !define-superclasses (type-class-name specs when)
-  (with-unique-names (type-class info)
-    `(,when
-       (let ((,type-class (type-class-or-lose ',type-class-name))
-             (,info (mapcar (lambda (spec)
-                              (destructuring-bind
-                                  (super &optional guard)
-                                  spec
-                                (cons (find-classoid super) guard)))
-                            ',specs)))
-         (setf (type-class-complex-subtypep-arg1 ,type-class)
-               (lambda (type1 type2)
-                 (has-superclasses-complex-subtypep-arg1 type1 type2 ,info)))
-         (setf (type-class-complex-subtypep-arg2 ,type-class)
+(defmacro !define-superclasses (type-class-name specs progn-oid)
+  (let ((defun-name (symbolicate type-class-name "-COMPLEX-SUBTYPEP-ARG1")))
+    `(progn
+       (defun ,defun-name (type1 type2)
+         (has-superclasses-complex-subtypep-arg1
+          type1 type2
+          (load-time-value
+           (list ,@(mapcar (lambda (spec)
+                             (destructuring-bind (super &optional guard) spec
+                               `(cons (find-classoid ',super) ',guard)))
+                           specs)) #-sb-xc-host t)))
+       (,progn-oid
+        (let ((type-class (type-class-or-lose ',type-class-name)))
+         (setf (type-class-complex-subtypep-arg1 type-class) #',defun-name)
+         (setf (type-class-complex-subtypep-arg2 type-class)
                #'delegate-complex-subtypep-arg2)
-         (setf (type-class-complex-intersection2 ,type-class)
-               #'delegate-complex-intersection2)))))
+         (setf (type-class-complex-intersection2 type-class)
+               #'delegate-complex-intersection2))))))
 
 ;;;; FUNCTION and VALUES types
 ;;;;
@@ -129,29 +241,21 @@
 ;;;; -- Many of the places that can be annotated with real types can
 ;;;;    also be annotated with function or values types.
 
-;;; the description of a &KEY argument
-(defstruct (key-info #-sb-xc-host (:pure t)
-                     (:copier nil))
-  ;; the key (not necessarily a keyword in ANSI Common Lisp)
-  (name (missing-arg) :type symbol :read-only t)
-  ;; the type of the argument value
-  (type (missing-arg) :type ctype :read-only t))
-
-(!define-type-method (values :simple-subtypep :complex-subtypep-arg1)
+(define-type-method (values :simple-subtypep :complex-subtypep-arg1)
                      (type1 type2)
   (declare (ignore type2))
   ;; FIXME: should be TYPE-ERROR, here and in next method
   (error "SUBTYPEP is illegal on this type:~%  ~S" (type-specifier type1)))
 
-(!define-type-method (values :complex-subtypep-arg2)
+(define-type-method (values :complex-subtypep-arg2)
                      (type1 type2)
   (declare (ignore type1))
   (error "SUBTYPEP is illegal on this type:~%  ~S" (type-specifier type2)))
 
-(!define-type-method (values :negate) (type)
+(define-type-method (values :negate) (type)
   (error "NOT VALUES too confusing on ~S" (type-specifier type)))
 
-(!define-type-method (values :unparse) (type)
+(define-type-method (values :unparse) (type)
   (cons 'values
         (let ((unparsed (unparse-args-types type)))
           (if (or (values-type-optional type)
@@ -178,97 +282,112 @@
       (unless val
         (return (values nil t))))))
 
-(!define-type-method (values :simple-=) (type1 type2)
+(define-type-method (values :simple-=) (type1 type2)
   (type=-args type1 type2))
-
-(!define-type-class function)
 
 ;;; a flag that we can bind to cause complex function types to be
 ;;; unparsed as FUNCTION. This is useful when we want a type that we
 ;;; can pass to TYPEP.
-(!defvar *unparse-fun-type-simplify* nil)
+(defparameter *unparse-fun-type-simplify* nil) ; initialized by genesis
 ;;; A flag to prevent TYPE-OF calls by user applications from returning
 ;;; (NOT x). TYPE-SPECIFIER usually allows it to preserve information.
-(!defvar *unparse-allow-negation* t)
+(defparameter *unparse-allow-negation* t) ; initialized by genesis
 
-(!define-type-method (function :negate) (type)
-  (make-negation-type :type type))
+(define-type-method (function :negate) (type) (make-negation-type type))
 
-(!define-type-method (function :unparse) (type)
-  (if *unparse-fun-type-simplify*
-      'function
-      (list 'function
-            (if (fun-type-wild-args type)
-                '*
-                (unparse-args-types type))
-            (type-specifier
-             (fun-type-returns type)))))
+(define-type-method (function :unparse) (type)
+  (let ((name (if (fun-designator-type-p type)
+                  'function-designator
+                  'function)))
+    (cond (*unparse-fun-type-simplify*
+           name)
+          (t
+           (list name
+                 (if (fun-type-wild-args type)
+                     '*
+                     (unparse-args-types type))
+                 (type-specifier
+                  (fun-type-returns type)))))))
 
 ;;; The meaning of this is a little confused. On the one hand, all
 ;;; function objects are represented the same way regardless of the
 ;;; arglists and return values, and apps don't get to ask things like
 ;;; (TYPEP #'FOO (FUNCTION (FIXNUM) *)) in any meaningful way. On the
 ;;; other hand, Python wants to reason about function types. So...
-(!define-type-method (function :simple-subtypep) (type1 type2)
- (flet ((fun-type-simple-p (type)
-          (not (or (fun-type-rest type)
-                   (fun-type-keyp type))))
-        (every-csubtypep (types1 types2)
-          (loop
-             for a1 in types1
-             for a2 in types2
-             do (multiple-value-bind (res sure-p)
-                    (csubtypep a1 a2)
-                  (unless res (return (values res sure-p))))
-             finally (return (values t t)))))
-   (and/type (values-subtypep (fun-type-returns type1)
-                              (fun-type-returns type2))
-             (cond ((fun-type-wild-args type2) (values t t))
-                   ((fun-type-wild-args type1)
-                    (cond ((fun-type-keyp type2) (values nil nil))
-                          ((not (fun-type-rest type2)) (values nil t))
-                          ((not (null (fun-type-required type2)))
-                           (values nil t))
-                          (t (and/type (type= *universal-type*
-                                              (fun-type-rest type2))
-                                       (every/type #'type=
-                                                   *universal-type*
-                                                   (fun-type-optional
-                                                    type2))))))
-                   ((not (and (fun-type-simple-p type1)
-                              (fun-type-simple-p type2)))
-                    (values nil nil))
-                   (t (multiple-value-bind (min1 max1) (fun-type-nargs type1)
-                        (multiple-value-bind (min2 max2) (fun-type-nargs type2)
-                          (cond ((or (> max1 max2) (< min1 min2))
-                                 (values nil t))
-                                ((and (= min1 min2) (= max1 max2))
-                                 (and/type (every-csubtypep
-                                            (fun-type-required type1)
-                                            (fun-type-required type2))
-                                           (every-csubtypep
-                                            (fun-type-optional type1)
-                                            (fun-type-optional type2))))
-                                (t (every-csubtypep
-                                    (concatenate 'list
-                                                 (fun-type-required type1)
-                                                 (fun-type-optional type1))
-                                    (concatenate 'list
-                                                 (fun-type-required type2)
-                                                 (fun-type-optional type2))))))))))))
+(define-type-method (function :simple-subtypep) (type1 type2)
+  (cond ((and (fun-designator-type-p type1)
+              (not (fun-designator-type-p type2)))
+         (values nil t))
+        ((type= type1 type2)
+         ;; Since the following doesn't handle &rest or &key at least
+         ;; pick out equal types.
+         (values t t))
+        (t
+         (flet ((fun-type-simple-p (type)
+                  (not (or (fun-type-rest type)
+                           (fun-type-keyp type))))
+                (every-csubtypep (types1 types2)
+                  (loop
+                    for a1 in types1
+                    for a2 in types2
+                    do (multiple-value-bind (res sure-p)
+                           (csubtypep a1 a2)
+                         (unless res (return (values res sure-p))))
+                    finally (return (values t t)))))
+           (and/type (values-subtypep (fun-type-returns type1)
+                                      (fun-type-returns type2))
+                     (cond ((fun-type-wild-args type2) (values t t))
+                           ((fun-type-wild-args type1)
+                            (cond ((fun-type-keyp type2) (values nil nil))
+                                  ((not (fun-type-rest type2)) (values nil t))
+                                  ((not (null (fun-type-required type2)))
+                                   (values nil t))
+                                  (t (and/type (type= *universal-type*
+                                                      (fun-type-rest type2))
+                                               (every/type #'type=
+                                                           *universal-type*
+                                                           (fun-type-optional
+                                                            type2))))))
+                           ((not (and (fun-type-simple-p type1)
+                                      (fun-type-simple-p type2)))
+                            (values nil nil))
+                           (t (multiple-value-bind (min1 max1) (fun-type-nargs type1)
+                                (multiple-value-bind (min2 max2) (fun-type-nargs type2)
+                                  (cond ((or (> max1 max2) (< min1 min2))
+                                         (values nil t))
+                                        ((and (= min1 min2) (= max1 max2))
+                                         (and/type (every-csubtypep
+                                                    (fun-type-required type1)
+                                                    (fun-type-required type2))
+                                                   (every-csubtypep
+                                                    (fun-type-optional type1)
+                                                    (fun-type-optional type2))))
+                                        (t (every-csubtypep
+                                            (concatenate 'list
+                                                         (fun-type-required type1)
+                                                         (fun-type-optional type1))
+                                            (concatenate 'list
+                                                         (fun-type-required type2)
+                                                         (fun-type-optional type2))))))))))))))
 
 (!define-superclasses function ((function)) !cold-init-forms)
 
 ;;; The union or intersection of two FUNCTION types is FUNCTION.
-(!define-type-method (function :simple-union2) (type1 type2)
-  (declare (ignore type1 type2))
-  (specifier-type 'function))
-(!define-type-method (function :simple-intersection2) (type1 type2)
+(define-type-method (function :simple-union2) (type1 type2)
+  (if (or (fun-designator-type-p type1)
+          (fun-designator-type-p type2))
+      (specifier-type '(or function symbol))
+      (specifier-type 'function)))
+
+(define-type-method (function :simple-intersection2) (type1 type2)
   (let ((ftype (specifier-type 'function)))
     (cond ((eq type1 ftype) type2)
           ((eq type2 ftype) type1)
           (t (let ((rtype (values-type-intersection (fun-type-returns type1)
-                                                    (fun-type-returns type2))))
+                                                    (fun-type-returns type2)))
+                   (designator
+                     (and (fun-designator-type-p type1)
+                          (fun-designator-type-p type2))))
                (flet ((change-returns (ftype rtype)
                         (declare (type fun-type ftype) (type ctype rtype))
                         (make-fun-type :required (fun-type-required ftype)
@@ -276,33 +395,40 @@
                                        :keyp (fun-type-keyp ftype)
                                        :keywords (fun-type-keywords ftype)
                                        :allowp (fun-type-allowp ftype)
-                                       :returns rtype)))
-               (cond
-                 ((fun-type-wild-args type1)
-                  (if (fun-type-wild-args type2)
-                      (make-fun-type :wild-args t
-                                     :returns rtype)
-                      (change-returns type2 rtype)))
-                 ((fun-type-wild-args type2)
-                  (change-returns type1 rtype))
-                 (t (multiple-value-bind (req opt rest)
-                        (args-type-op type1 type2 #'type-intersection #'max)
-                      (make-fun-type :required req
-                                     :optional opt
-                                     :rest rest
-                                     ;; FIXME: :keys
-                                     :allowp (and (fun-type-allowp type1)
-                                                  (fun-type-allowp type2))
-                                     :returns rtype))))))))))
+                                       :returns rtype
+                                       :designator designator)))
+                 (cond
+                   ((fun-type-wild-args type1)
+                    (if (fun-type-wild-args type2)
+                        (make-fun-type :wild-args t
+                                       :returns rtype
+                                       :designator designator)
+                        (change-returns type2 rtype)))
+                   ((fun-type-wild-args type2)
+                    (change-returns type1 rtype))
+                   (t (multiple-value-bind (req opt rest)
+                          (args-type-op type1 type2 #'type-intersection #'max)
+                        (make-fun-type :required req
+                                       :optional opt
+                                       :rest rest
+                                       ;; FIXME: :keys
+                                       :allowp (and (fun-type-allowp type1)
+                                                    (fun-type-allowp type2))
+                                       :returns rtype
+                                       :designator designator))))))))))
 
 ;;; The union or intersection of a subclass of FUNCTION with a
 ;;; FUNCTION type is somewhat complicated.
-(!define-type-method (function :complex-intersection2) (type1 type2)
+(define-type-method (function :complex-intersection2) (type1 type2)
   (cond
+    ((and (fun-designator-type-p type2)
+          (or (csubtypep type1 (specifier-type 'symbol))
+              (csubtypep type1 (specifier-type 'function))))
+     type1)
     ((type= type1 (specifier-type 'function)) type2)
     ((csubtypep type1 (specifier-type 'function)) nil)
     (t :call-other-method)))
-(!define-type-method (function :complex-union2) (type1 type2)
+(define-type-method (function :complex-union2) (type1 type2)
   (declare (ignore type2))
   ;; TYPE2 is a FUNCTION type.  If TYPE1 is a classoid type naming
   ;; FUNCTION, then it is the union of the two; otherwise, there is no
@@ -311,30 +437,35 @@
     ((type= type1 (specifier-type 'function)) type1)
     (t nil)))
 
-(!define-type-method (function :simple-=) (type1 type2)
-  (macrolet ((compare (comparator field)
-               (let ((reader (symbolicate '#:fun-type- field)))
-                 `(,comparator (,reader type1) (,reader type2)))))
-    (and/type (compare type= returns)
-              (cond ((neq (fun-type-wild-args type1) (fun-type-wild-args type2))
-                     (values nil t))
-                    ((eq (fun-type-wild-args type1) t)
-                     (values t t))
-                    (t (type=-args type1 type2))))))
+(define-type-method (function :simple-=) (type1 type2)
+  (if (or (and (fun-designator-type-p type1)
+               (not (fun-designator-type-p type2)))
+          (and (not (fun-designator-type-p type1))
+               (fun-designator-type-p type2)))
+      (values nil t)
+      (macrolet ((compare (comparator field)
+                   (let ((reader (symbolicate '#:fun-type- field)))
+                     `(,comparator (,reader type1) (,reader type2)))))
+        (and/type (compare type= returns)
+                  (cond ((neq (fun-type-wild-args type1) (fun-type-wild-args type2))
+                         (values nil t))
+                        ((eq (fun-type-wild-args type1) t)
+                         (values t t))
+                        (t (type=-args type1 type2)))))))
 
-(!define-type-class constant :inherits values)
+(define-type-class constant :inherits values)
 
-(!define-type-method (constant :negate) (type)
+(define-type-method (constant :negate) (type)
   (error "NOT CONSTANT too confusing on ~S" (type-specifier type)))
 
-(!define-type-method (constant :unparse) (type)
+(define-type-method (constant :unparse) (type)
   `(constant-arg ,(type-specifier (constant-type-type type))))
 
-(!define-type-method (constant :simple-=) (type1 type2)
+(define-type-method (constant :simple-=) (type1 type2)
   (type= (constant-type-type type1) (constant-type-type type2)))
 
-(!def-type-translator constant-arg (type)
-  (make-constant-type :type (single-value-specifier-type type)))
+(def-type-translator constant-arg ((:context context) type)
+  (make-constant-type :type (single-value-specifier-type-r context type)))
 
 ;;; Return the lambda-list-like type specification corresponding
 ;;; to an ARGS-TYPE.
@@ -365,45 +496,53 @@
 
     (result)))
 
-(!def-type-translator function (&optional (args '*) (result '*))
-  (let ((result (coerce-to-values (values-specifier-type result))))
-    (if (eq args '*)
-        (if (eq result *wild-type*)
-            (specifier-type 'function)
-            (make-fun-type :wild-args t :returns result))
-        (multiple-value-bind (required optional rest keyp keywords allowp)
-            (parse-args-types args)
-          (if (and (null required)
-                   (null optional)
-                   (eq rest *universal-type*)
-                   (not keyp))
-              (if (eq result *wild-type*)
-                  (specifier-type 'function)
-                  (make-fun-type :wild-args t :returns result))
-              (make-fun-type :required required
-                             :optional optional
-                             :rest rest
-                             :keyp keyp
-                             :keywords keywords
-                             :allowp allowp
-                             :returns result))))))
+(defun translate-fun-type (context args result
+                           &key designator)
+  (let ((result (coerce-to-values (values-specifier-type-r context result))))
+    (cond ((neq args '*)
+           (multiple-value-bind (llks required optional rest keywords)
+               (parse-args-types context args :function-type)
+             (if (and (null required)
+                      (null optional)
+                      (eq rest *universal-type*)
+                      (not (ll-kwds-keyp llks)))
+                 (if (eq result *wild-type*)
+                     (specifier-type 'function)
+                     (make-fun-type :wild-args t :returns result
+                                    :designator designator))
+                 (make-fun-type :required required
+                                :optional optional
+                                :rest rest
+                                :keyp (ll-kwds-keyp llks)
+                                :keywords keywords
+                                :allowp (ll-kwds-allowp llks)
+                                :returns result
+                                :designator designator))))
+          ((eq result *wild-type*)
+           (specifier-type
+            (if designator
+                'callable
+                'function)))
+          (t
+           (make-fun-type :wild-args t :returns result
+                          :designator designator)))))
 
-(!def-type-translator values (&rest values)
+(def-type-translator function ((:context context)
+                                &optional (args '*) (result '*))
+  (translate-fun-type context args result))
+
+(def-type-translator function-designator ((:context context)
+                                &optional (args '*) (result '*))
+  (translate-fun-type context args result :designator t))
+
+(def-type-translator values :list ((:context context) &rest values)
   (if (eq values '*)
       *wild-type*
-      (multiple-value-bind (required optional rest keyp keywords allowp llk-p)
-          (parse-args-types values)
-        (declare (ignore keywords))
-        (cond (keyp
-               (error "&KEY appeared in a VALUES type specifier ~S."
-                      `(values ,@values)))
-              (llk-p
-               (make-values-type :required required
-                                 :optional optional
-                                 :rest rest
-                                 :allowp allowp))
-              (t
-               (make-short-values-type required))))))
+      (multiple-value-bind (llks required optional rest)
+          (parse-args-types context values :values-type)
+        (if (plusp llks)
+            (make-values-type :required required :optional optional :rest rest)
+            (make-short-values-type required)))))
 
 ;;;; VALUES types interfaces
 ;;;;
@@ -427,11 +566,11 @@
   (etypecase type
     (named-type
      (ecase (named-type-name type)
-       ((t *) call-arguments-limit)
+       ((t *) sb-xc:call-arguments-limit)
        ((nil) 0)))
     (values-type
      (if (values-type-rest type)
-         call-arguments-limit
+         sb-xc:call-arguments-limit
          (+ (length (values-type-optional type))
             (length (values-type-required type)))))))
 
@@ -449,7 +588,7 @@
 
 ;;; Return the type of the first value indicated by TYPE. This is used
 ;;; by people who don't want to have to deal with VALUES types.
-#!-sb-fluid (declaim (freeze-type values-type))
+#-sb-fluid (declaim (freeze-type values-type))
 ; (inline single-value-type))
 (defun single-value-type (type)
   (declare (type ctype type))
@@ -503,8 +642,8 @@
       (values nil *universal-type*)
       (values (append (args-type-required type)
                       (args-type-optional type))
-              (cond ((args-type-rest type))
-                    (t default-type)))))
+              (or (args-type-rest type)
+                  default-type))))
 
 ;;; types of values in (the <type> (values o_1 ... o_n))
 (defun values-type-out (type count)
@@ -519,10 +658,10 @@
                        do (res type))))
           (process-types (values-type-required type))
           (process-types (values-type-optional type))
-          (when (plusp count)
-            (loop with rest = (the ctype (values-type-rest type))
-                  repeat count
-                  do (res rest))))
+          (let ((rest (values-type-rest type)))
+            (when rest
+              (loop repeat count
+                    do (res rest)))))
         (res))))
 
 ;;; types of variable in (m-v-bind (v_1 ... v_n) (the <type> ...
@@ -805,14 +944,32 @@
                                :complex-arg1 :complex-subtypep-arg1)))))
 
 ;;; Just parse the type specifiers and call CSUBTYPE.
-(defun sb!xc:subtypep (type1 type2 &optional environment)
-  #!+sb-doc
+;;; Well, not "just" - Despite memoization of parsing and CSUBTYPEP,
+;;; it's nonetheless better to test EQUAL first, which is ~10x faster
+;;; in the positive case, and insigificant in the negative.
+;;; The specifiers might not be legal type specifiers,
+;;; but we're not obligated to police that:
+;;;   "This version eliminates the requirement to signal an error."
+;;; http://www.lispworks.com/documentation/HyperSpec/Issues/iss335_w.htm
+;;; (Status: Passed, as amended, Jun89 X3J13)
+;;;
+;;; Also, inferring from the version of the text that was obsoleted
+;;; - which while it has no direct impact on the final requirement,
+;;; implies something about what would have been legal -
+;;;   "SUBTYPEP must always return values T T in the case where the two
+;;;    type specifiers (or their expansions) are EQUAL."
+;;; i.e. though it is not longer technically a MUST, it suggests that EQUAL is
+;;; in fact a valid implementation, at least where it computes T.
+(defun sb-xc:subtypep (type1 type2 &optional environment)
   "Return two values indicating the relationship between type1 and type2.
   If values are T and T, type1 definitely is a subtype of type2.
   If values are NIL and T, type1 definitely is not a subtype of type2.
   If values are NIL and NIL, it couldn't be determined."
-  (declare (ignore environment))
-  (csubtypep (specifier-type type1) (specifier-type type2)))
+  (declare (type lexenv-designator environment) (ignore environment))
+  (declare (explicit-check))
+  (if (equal type1 type2)
+      (values t t)
+      (csubtypep (specifier-type type1) (specifier-type type2))))
 
 ;;; If two types are definitely equivalent, return true. The second
 ;;; value indicates whether the first value is definitely correct.
@@ -823,9 +980,25 @@
                      :values 2)
               ((type1 eq) (type2 eq))
   (declare (type ctype type1 type2))
-  (if (eq type1 type2)
-      (values t t)
-      (memoize (!invoke-type-method :simple-= :complex-= type1 type2))))
+  (cond ((eq type1 type2)
+         (values t t))
+        ;; If args are not EQ, but both allow TYPE= optimization,
+        ;; and at least one is interned, then return no and certainty.
+        ;; Most of the interned CTYPEs admit this optimization,
+        ;; NUMERIC and MEMBER types do as well.
+        ((and (minusp (logior (type-hash-value type1) (type-hash-value type2)))
+              (logtest (logand (type-hash-value type1) (type-hash-value type2))
+                       +type-admits-type=-optimization+))
+         (values nil t))
+        (t
+         (memoize (!invoke-type-method :simple-= :complex-= type1 type2)))))
+
+(declaim (inline ctype-eq-comparable))
+(defun ctype-eq-comparable (ctype)
+  (logtest (type-hash-value ctype) +type-admits-type=-optimization+))
+
+(defun ctype-interned-p (ctype)
+  (minusp (type-hash-value ctype)))
 
 ;;; Not exactly the negation of TYPE=, since when the relationship is
 ;;; uncertain, we still return NIL, NIL. This is useful in cases where
@@ -963,6 +1136,11 @@
 ;;; definitely correct. NIL is considered to intersect with any type.
 ;;; If T is a subtype of either type, then we also return T, T. This
 ;;; way we recognize that hairy types might intersect with T.
+;;;
+;;; Well now given the statement above that this is "useful for ..."
+;;; a particular thing, I see how treating *empty-type* magically could
+;;; be useful, however given all the _other_ calls to this function within
+;;; this file, it seems suboptimal, because logically it is wrong.
 (defun types-equal-or-intersect (type1 type2)
   (declare (type ctype type1 type2))
   (if (or (eq type1 *empty-type*) (eq type2 *empty-type*))
@@ -981,6 +1159,12 @@
 (defun type-specifier (type)
   (declare (type ctype type))
   (funcall (type-class-unparse (type-class-info type)) type))
+
+;;; Don't try to define a print method until it's actually gonna work!
+;;; (Otherwise this would be near the DEFSTRUCT)
+(defmethod print-object ((ctype ctype) stream)
+  (print-unreadable-object (ctype stream :type t)
+    (prin1 (type-specifier ctype) stream)))
 
 (defun-cached (type-negation :hash-function #'type-hash-value
                              :hash-bits 8
@@ -1004,23 +1188,27 @@
 
 ;;; Take a list of type specifiers, computing the translation of each
 ;;; specifier and defining it as a builtin type.
-(declaim (ftype (function (list) (values)) precompute-types))
-(defun precompute-types (specs)
+;;; Seee the comments in 'type-init' for why this is a slightly
+;;; screwy way to go about it.
+(declaim (ftype (function (list) (values)) !precompute-types))
+(defun !precompute-types (specs)
   (dolist (spec specs)
-    (let ((res (specifier-type spec)))
+    (let ((res (handler-bind
+                   ((parse-unknown-type
+                     (lambda (c)
+                       (declare (ignore c))
+                       ;; We can handle conditions at this point,
+                       ;; but win32 can not perform i/o here because
+                       ;; !MAKE-COLD-STDERR-STREAM has no implementation.
+                       ;; FIXME: where is this coming from???
+                       #+nil
+                       (progn (write-string "//caught: parse-unknown ")
+                              (write spec)
+                              (terpri)))))
+             (specifier-type spec))))
       (unless (unknown-type-p res)
         (setf (info :type :builtin spec) res)
-        ;; KLUDGE: the three copies of this idiom in this file (and
-        ;; the one in class.lisp as at sbcl-0.7.4.1x) should be
-        ;; coalesced, or perhaps the error-detecting code that
-        ;; disallows redefinition of :PRIMITIVE types should be
-        ;; rewritten to use *TYPE-SYSTEM-FINALIZED* (rather than
-        ;; *TYPE-SYSTEM-INITIALIZED*). The effect of this is not to
-        ;; cause redefinition errors when precompute-types is called
-        ;; for a second time while building the target compiler using
-        ;; the cross-compiler. -- CSR, trying to explain why this
-        ;; isn't completely wrong, 2002-06-07
-        (setf (info :type :kind spec) #+sb-xc-host :defined #-sb-xc-host :primitive))))
+        (setf (info :type :kind spec) :primitive))))
   (values))
 
 ;;;; general TYPE-UNION and TYPE-INTERSECTION operations
@@ -1081,10 +1269,8 @@
                                                         other-types)))
           (if distributed
               (apply #'type-union distributed)
-              (make-hairy-type
-               :specifier `(and ,@(map 'list
-                                       #'type-specifier
-                                       simplified-types)))))
+              (%make-hairy-type `(and ,@(map 'list #'type-specifier
+                                             simplified-types)))))
         (cond
           ((null simplified-types) *universal-type*)
           ((null (cdr simplified-types)) (car simplified-types))
@@ -1106,43 +1292,7 @@
 
 ;;;; built-in types
 
-(!define-type-class named)
-
-(!cold-init-forms
- (macrolet ((frob (name var)
-              `(progn
-                 (setq ,var (make-named-type :name ',name))
-                 (setf (info :type :kind ',name)
-                       #+sb-xc-host :defined #-sb-xc-host :primitive)
-                 (setf (info :type :builtin ',name) ,var))))
-   ;; KLUDGE: In ANSI, * isn't really the name of a type, it's just a
-   ;; special symbol which can be stuck in some places where an
-   ;; ordinary type can go, e.g. (ARRAY * 1) instead of (ARRAY T 1).
-   ;; In SBCL it also used to denote universal VALUES type.
-   (frob * *wild-type*)
-   (frob nil *empty-type*)
-   (frob t *universal-type*)
-   (setf (sb!c::type-info-default (sb!c::type-info-or-lose :variable :type))
-         *universal-type*)
-   ;; new in sbcl-0.9.5: these used to be CLASSOID types, but that
-   ;; view of them was incompatible with requirements on the MOP
-   ;; metaobject class hierarchy: the INSTANCE and
-   ;; FUNCALLABLE-INSTANCE types are disjoint (instances have
-   ;; instance-pointer-lowtag; funcallable-instances have
-   ;; fun-pointer-lowtag), while FUNCALLABLE-STANDARD-OBJECT is
-   ;; required to be a subclass of STANDARD-OBJECT.  -- CSR,
-   ;; 2005-09-09
-   (frob instance *instance-type*)
-   (frob funcallable-instance *funcallable-instance-type*)
-   ;; new in sbcl-1.0.3.3: necessary to act as a join point for the
-   ;; extended sequence hierarchy.  (Might be removed later if we use
-   ;; a dedicated FUNDAMENTAL-SEQUENCE class for this.)
-   (frob extended-sequence *extended-sequence-type*))
- (setf *universal-fun-type*
-       (make-fun-type :wild-args t
-                      :returns *wild-type*)))
-
-(!define-type-method (named :simple-=) (type1 type2)
+(define-type-method (named :simple-=) (type1 type2)
   ;;(aver (not (eq type1 *wild-type*))) ; * isn't really a type.
   (values (eq type1 type2) t))
 
@@ -1164,7 +1314,24 @@
            (aver (not yes))
            (not surep))))))
 
-(!define-type-method (named :complex-=) (type1 type2)
+(defun cons-type-length-info (type)
+  (declare (type cons-type type))
+  (do ((min 1 (1+ min))
+       (cdr (cons-type-cdr-type type) (cons-type-cdr-type cdr)))
+      ((not (cons-type-p cdr))
+       (cond
+         ((csubtypep cdr (specifier-type 'null))
+          (values min t))
+         ((csubtypep *universal-type* cdr)
+          (values min nil))
+         ((type/= (type-intersection (specifier-type 'cons) cdr) *empty-type*)
+          (values min nil))
+         ((type/= (type-intersection (specifier-type 'null) cdr) *empty-type*)
+          (values min t))
+         (t (values min :maybe))))
+    ()))
+
+(define-type-method (named :complex-=) (type1 type2)
   (cond
     ((and (eq type2 *empty-type*)
           (or (and (intersection-type-p type1)
@@ -1183,14 +1350,14 @@
      (invoke-complex-=-other-method type1 type2))
     (t (values nil t))))
 
-(!define-type-method (named :simple-subtypep) (type1 type2)
+(define-type-method (named :simple-subtypep) (type1 type2)
   (aver (not (eq type1 *wild-type*))) ; * isn't really a type.
   (aver (not (eq type1 type2)))
   (values (or (eq type1 *empty-type*)
               (eq type2 *wild-type*)
               (eq type2 *universal-type*)) t))
 
-(!define-type-method (named :complex-subtypep-arg1) (type1 type2)
+(define-type-method (named :complex-subtypep-arg1) (type1 type2)
   ;; This AVER causes problems if we write accurate methods for the
   ;; union (and possibly intersection) types which then delegate to
   ;; us; while a user shouldn't get here, because of the odd status of
@@ -1224,7 +1391,7 @@
          ;; named type in disguise, TYPE2 is not a superset of TYPE1.
          (values nil t))))
 
-(!define-type-method (named :complex-subtypep-arg2) (type1 type2)
+(define-type-method (named :complex-subtypep-arg2) (type1 type2)
   (aver (not (eq type2 *wild-type*))) ; * isn't really a type.
   (cond ((eq type2 *universal-type*)
          (values t t))
@@ -1242,36 +1409,24 @@
          ;; FUNCALLABLE-INSTANCE in surprising ways.
          (invoke-complex-subtypep-arg1-method type1 type2))
         ((and (eq type2 *extended-sequence-type*) (classoid-p type1))
-         (let* ((layout (classoid-layout type1))
-                (inherits (layout-inherits layout))
-                (sequencep (find (classoid-layout (find-classoid 'sequence))
-                                 inherits)))
-           (values (if sequencep t nil) t)))
+         (values (if (classoid-inherits-from type1 'sequence) t nil) t))
         ((and (eq type2 *instance-type*) (classoid-p type1))
-         (if (member type1 *non-instance-classoid-types* :key #'find-classoid)
-             (values nil t)
-             (let* ((layout (classoid-layout type1))
-                    (inherits (layout-inherits layout))
-                    (functionp (find (classoid-layout (find-classoid 'function))
-                                     inherits)))
-               (cond
-                 (functionp
-                  (values nil t))
-                 ((eq type1 (find-classoid 'function))
-                  (values nil t))
-                 ((or (structure-classoid-p type1)
-                      #+nil
-                      (condition-classoid-p type1))
-                  (values t t))
-                 (t (values nil nil))))))
+         (cond
+           ((classoid-non-instance-p type1)
+            (values nil t))
+           ((classoid-inherits-from type1 'function)
+            (values nil t))
+           ((eq type1 (find-classoid 'function))
+            (values nil t))
+           ((or (structure-classoid-p type1)
+                (condition-classoid-p type1))
+            (values t t))
+           (t (values nil nil))))
         ((and (eq type2 *funcallable-instance-type*) (classoid-p type1))
-         (if (member type1 *non-instance-classoid-types* :key #'find-classoid)
-             (values nil t)
-             (let* ((layout (classoid-layout type1))
-                    (inherits (layout-inherits layout))
-                    (functionp (find (classoid-layout (find-classoid 'function))
-                                     inherits)))
-               (values (if functionp t nil) t))))
+         (if (and (not (classoid-non-instance-p type1))
+                  (classoid-inherits-from type1 'function))
+             (values t t)
+             (values nil t)))
         (t
          ;; FIXME: This seems to rely on there only being 4 or 5
          ;; NAMED-TYPE values, and the exclusion of various
@@ -1279,98 +1434,79 @@
          ;; rewrite it so that it's clearer.
          (values nil t))))
 
-(!define-type-method (named :complex-intersection2) (type1 type2)
+(define-type-method (named :simple-intersection2) (type1 type2)
+  (cond
+    ((and (eq type1 *extended-sequence-type*)
+          (or (eq type2 *instance-type*)
+              (eq type2 *funcallable-instance-type*)))
+     nil)
+    ((and (or (eq type1 *instance-type*)
+              (eq type1 *funcallable-instance-type*))
+          (eq type2 *extended-sequence-type*))
+     nil)
+    (t
+     (hierarchical-intersection2 type1 type2))))
+
+(define-type-method (named :complex-intersection2) (type1 type2)
   ;; FIXME: This assertion failed when I added it in sbcl-0.6.11.13.
   ;; Perhaps when bug 85 is fixed it can be reenabled.
   ;;(aver (not (eq type2 *wild-type*))) ; * isn't really a type.
-  (cond
-    ((eq type2 *extended-sequence-type*)
-     (typecase type1
-       (structure-classoid *empty-type*)
-       (classoid
-        (if (member type1 *non-instance-classoid-types* :key #'find-classoid)
-            *empty-type*
-            (if (find (classoid-layout (find-classoid 'sequence))
-                      (layout-inherits (classoid-layout type1)))
-                type1
-                nil)))
-       (t
-        (if (or (type-might-contain-other-types-p type1)
-                (member-type-p type1))
-            nil
-            *empty-type*))))
-    ((eq type2 *instance-type*)
-     (typecase type1
-       (structure-classoid type1)
-       (classoid
-        (if (and (not (member type1 *non-instance-classoid-types*
-                              :key #'find-classoid))
-                 (not (eq type1 (find-classoid 'function)))
-                 (not (find (classoid-layout (find-classoid 'function))
-                            (layout-inherits (classoid-layout type1)))))
-            nil
-            *empty-type*))
-       (t
-        (if (or (type-might-contain-other-types-p type1)
-                (member-type-p type1))
-            nil
-            *empty-type*))))
-    ((eq type2 *funcallable-instance-type*)
-     (typecase type1
-       (structure-classoid *empty-type*)
-       (classoid
-        (if (member type1 *non-instance-classoid-types* :key #'find-classoid)
-            *empty-type*
-            (if (find (classoid-layout (find-classoid 'function))
-                      (layout-inherits (classoid-layout type1)))
-                type1
-                (if (type= type1 (find-classoid 'function))
-                    type2
-                    nil))))
-       (fun-type nil)
-       (t
-        (if (or (type-might-contain-other-types-p type1)
-                (member-type-p type1))
-            nil
-            *empty-type*))))
-    (t (hierarchical-intersection2 type1 type2))))
+  (flet ((empty-unless-hairy (type)
+           (unless (or (type-might-contain-other-types-p type)
+                       (member-type-p type))
+             *empty-type*)))
+    (cond
+      ((eq type2 *extended-sequence-type*)
+       (typecase type1
+         ((or structure-classoid condition-classoid) *empty-type*)
+         (classoid (cond
+                     ((classoid-non-instance-p type1) *empty-type*)
+                     ((classoid-inherits-from type1 'sequence) type1)))
+         (t (empty-unless-hairy type1))))
+      ((eq type2 *instance-type*)
+       (typecase type1
+         ((or structure-classoid condition-classoid) type1)
+         (classoid (when (or (classoid-non-instance-p type1)
+                             (eq type1 (find-classoid 'function))
+                             (classoid-inherits-from type1 'function))
+                     *empty-type*))
+         (t (empty-unless-hairy type1))))
+      ((eq type2 *funcallable-instance-type*)
+       (typecase type1
+         ((or structure-classoid condition-classoid) *empty-type*)
+         (classoid
+          (cond
+            ((classoid-non-instance-p type1) *empty-type*)
+            ((classoid-inherits-from type1 'function) type1)
+            ((type= type1 (find-classoid 'function)) type2)))
+         (fun-type nil)
+         (t (empty-unless-hairy type1))))
+      (t (hierarchical-intersection2 type1 type2)))))
 
-(!define-type-method (named :complex-union2) (type1 type2)
+(define-type-method (named :complex-union2) (type1 type2)
   ;; Perhaps when bug 85 is fixed this can be reenabled.
   ;;(aver (not (eq type2 *wild-type*))) ; * isn't really a type.
   (cond
     ((eq type2 *extended-sequence-type*)
-     (if (classoid-p type1)
-         (if (or (member type1 *non-instance-classoid-types*
-                         :key #'find-classoid)
-                 (not (find (classoid-layout (find-classoid 'sequence))
-                            (layout-inherits (classoid-layout type1)))))
-             nil
-             type2)
-         nil))
+     (cond ((not (classoid-p type1)) nil)
+           ((and (not (classoid-non-instance-p type1))
+                 (classoid-inherits-from type1 'sequence))
+            type2)))
     ((eq type2 *instance-type*)
-     (if (classoid-p type1)
-         (if (or (member type1 *non-instance-classoid-types*
-                         :key #'find-classoid)
-                 (find (classoid-layout (find-classoid 'function))
-                       (layout-inherits (classoid-layout type1))))
-             nil
-             type2)
-         nil))
+     (when (and (classoid-p type1)
+                (neq type1 (specifier-type 'function))
+                (not (classoid-non-instance-p type1))
+                (not (classoid-inherits-from type1 'function)))
+       type2))
     ((eq type2 *funcallable-instance-type*)
-     (if (classoid-p type1)
-         (if (or (member type1 *non-instance-classoid-types*
-                         :key #'find-classoid)
-                 (not (find (classoid-layout (find-classoid 'function))
-                            (layout-inherits (classoid-layout type1)))))
-             nil
-             (if (eq type1 (specifier-type 'function))
-                 type1
-                 type2))
-         nil))
+     (cond ((not (classoid-p type1)) nil)
+           ((classoid-non-instance-p type1) nil)
+           ((not (classoid-inherits-from type1 'function)) nil)
+           ((eq type1 (specifier-type 'function)) type1)
+           (t type2)))
     (t (hierarchical-union2 type1 type2))))
 
-(!define-type-method (named :negate) (x)
+(define-type-method (named :negate) (x)
   (aver (not (eq x *wild-type*)))
   (cond
     ((eq x *universal-type*) *empty-type*)
@@ -1378,21 +1514,21 @@
     ((or (eq x *instance-type*)
          (eq x *funcallable-instance-type*)
          (eq x *extended-sequence-type*))
-     (make-negation-type :type x))
+     (make-negation-type x))
     (t (bug "NAMED type unexpected: ~S" x))))
 
-(!define-type-method (named :unparse) (x)
+(define-type-method (named :unparse) (x)
   (named-type-name x))
 
 ;;;; hairy and unknown types
+;;;; DEFINE-TYPE-CLASS HAIRY is in 'early-type'
 
-(!define-type-method (hairy :negate) (x)
-  (make-negation-type :type x))
+(define-type-method (hairy :negate) (x) (make-negation-type x))
 
-(!define-type-method (hairy :unparse) (x)
+(define-type-method (hairy :unparse) (x)
   (hairy-type-specifier x))
 
-(!define-type-method (hairy :simple-subtypep) (type1 type2)
+(define-type-method (hairy :simple-subtypep) (type1 type2)
   (let ((hairy-spec1 (hairy-type-specifier type1))
         (hairy-spec2 (hairy-type-specifier type2)))
     (cond ((equal-but-no-car-recursion hairy-spec1 hairy-spec2)
@@ -1404,7 +1540,7 @@
           (t
            (values nil nil)))))
 
-(!define-type-method (hairy :complex-subtypep-arg2) (type1 type2)
+(define-type-method (hairy :complex-subtypep-arg2) (type1 type2)
   (if (maybe-reparse-specifier! type2)
       (csubtypep type1 type2)
       (let ((specifier (hairy-type-specifier type2)))
@@ -1417,62 +1553,83 @@
               (t
                (invoke-complex-subtypep-arg1-method type1 type2))))))
 
-(!define-type-method (hairy :complex-subtypep-arg1) (type1 type2)
+(define-type-method (hairy :complex-subtypep-arg1) (type1 type2)
   (if (maybe-reparse-specifier! type1)
       (csubtypep type1 type2)
       (values nil nil)))
 
-(!define-type-method (hairy :complex-=) (type1 type2)
+(define-type-method (hairy :complex-=) (type1 type2)
   (if (maybe-reparse-specifier! type2)
       (type= type1 type2)
       (values nil nil)))
 
-(!define-type-method (hairy :simple-intersection2 :complex-intersection2)
+(define-type-method (hairy :simple-intersection2 :complex-intersection2)
+                     (type1 type2)
+ (acond ((type= type1 type2)
+         type1)
+        ((eq type2 (literal-ctype *satisfies-keywordp-type*))
+         ;; (AND (MEMBER A) (SATISFIES KEYWORDP)) is possibly non-empty
+         ;; if A is re-homed as :A. However as a special case that really
+         ;; does occur, (AND (MEMBER NIL) (SATISFIES KEYWORDP))
+         ;; is empty because of the illegality of changing NIL's package.
+         (if (eq type1 (specifier-type 'null))
+             *empty-type*
+             (multiple-value-bind (answer certain)
+                 (types-equal-or-intersect type1 (specifier-type 'symbol))
+               (and (not answer) certain *empty-type*))))
+        ((eq type2 (literal-ctype *fun-name-type*))
+         (multiple-value-bind (answer certain)
+             (types-equal-or-intersect type1 (specifier-type 'symbol))
+           (and (not answer)
+                certain
+                (multiple-value-bind (answer certain)
+                    (types-equal-or-intersect type1 (specifier-type 'cons))
+                  (and (not answer) certain *empty-type*)))))
+        ((and (typep (hairy-type-specifier type2) '(cons (eql satisfies)))
+              (info :function :predicate-truth-constraint
+                    (cadr (hairy-type-specifier type2))))
+         (multiple-value-bind (answer certain)
+             (types-equal-or-intersect type1 (specifier-type it))
+           (and (not answer) certain *empty-type*)))))
+
+(define-type-method (hairy :simple-union2)
                      (type1 type2)
   (if (type= type1 type2)
       type1
       nil))
 
-(!define-type-method (hairy :simple-union2)
-                     (type1 type2)
-  (if (type= type1 type2)
-      type1
-      nil))
-
-(!define-type-method (hairy :simple-=) (type1 type2)
+(define-type-method (hairy :simple-=) (type1 type2)
   (if (equal-but-no-car-recursion (hairy-type-specifier type1)
                                   (hairy-type-specifier type2))
       (values t t)
       (values nil nil)))
 
-(!def-type-translator satisfies (&whole whole fun)
-  (declare (ignore fun))
-  ;; Check legality of arguments.
-  (destructuring-bind (satisfies predicate-name) whole
-    (declare (ignore satisfies))
-    (unless (symbolp predicate-name)
-      (error 'simple-type-error
-             :datum predicate-name
-             :expected-type 'symbol
-             :format-control "The SATISFIES predicate name is not a symbol: ~S"
-             :format-arguments (list predicate-name))))
-  ;; Create object.
-  (make-hairy-type :specifier whole))
+(def-type-translator satisfies :list (&whole whole predicate-name)
+  (unless (symbolp predicate-name)
+    (error 'simple-type-error
+           :datum predicate-name
+           :expected-type 'symbol
+           :format-control "The SATISFIES predicate name is not a symbol: ~S"
+           :format-arguments (list predicate-name)))
+  (case predicate-name
+   (keywordp (literal-ctype *satisfies-keywordp-type*))
+   (legal-fun-name-p (literal-ctype *fun-name-type*))
+   (t (%make-hairy-type whole))))
 
 ;;;; negation types
 
-(!define-type-method (negation :negate) (x)
+(define-type-method (negation :negate) (x)
   (negation-type-type x))
 
-(!define-type-method (negation :unparse) (x)
+(define-type-method (negation :unparse) (x)
   (if (type= (negation-type-type x) (specifier-type 'cons))
       'atom
       `(not ,(type-specifier (negation-type-type x)))))
 
-(!define-type-method (negation :simple-subtypep) (type1 type2)
+(define-type-method (negation :simple-subtypep) (type1 type2)
   (csubtypep (negation-type-type type2) (negation-type-type type1)))
 
-(!define-type-method (negation :complex-subtypep-arg2) (type1 type2)
+(define-type-method (negation :complex-subtypep-arg2) (type1 type2)
   (let* ((complement-type2 (negation-type-type type2))
          (intersection2 (type-intersection2 type1
                                             complement-type2)))
@@ -1481,7 +1638,7 @@
         (type= intersection2 *empty-type*)
         (invoke-complex-subtypep-arg1-method type1 type2))))
 
-(!define-type-method (negation :complex-subtypep-arg1) (type1 type2)
+(define-type-method (negation :complex-subtypep-arg1) (type1 type2)
   ;; "Incrementally extended heuristic algorithms tend inexorably toward the
   ;; incomprehensible." -- http://www.unlambda.com/~james/lambda/lambda.txt
   ;;
@@ -1564,7 +1721,7 @@
       ;; OTOH we might still get here:
       (values nil nil))))
 
-(!define-type-method (negation :complex-=) (type1 type2)
+(define-type-method (negation :complex-=) (type1 type2)
   ;; (NOT FOO) isn't equivalent to anything that's not a negation
   ;; type, except possibly a type that might contain it in disguise.
   (declare (ignore type2))
@@ -1572,7 +1729,7 @@
       (values nil nil)
       (values nil t)))
 
-(!define-type-method (negation :simple-intersection2) (type1 type2)
+(define-type-method (negation :simple-intersection2) (type1 type2)
   (let ((not1 (negation-type-type type1))
         (not2 (negation-type-type type2)))
     (cond
@@ -1597,13 +1754,13 @@
          (nseltype (array-type-specialized-element-type ntype))
          (neltype (array-type-element-type ntype)))
     (if (and (eql ndims '*) (null ncomplexp)
-             (eql neltype *wild-type*) (eql nseltype *wild-type*))
+             (eq neltype *wild-type*) (eq nseltype *wild-type*))
         (make-array-type (array-type-dimensions type1)
                          :complexp t
                          :element-type (array-type-element-type type1)
                          :specialized-element-type (array-type-specialized-element-type type1)))))
 
-(!define-type-method (negation :complex-intersection2) (type1 type2)
+(define-type-method (negation :complex-intersection2) (type1 type2)
   (cond
     ((csubtypep type1 (negation-type-type type2)) *empty-type*)
     ((eq (type-intersection type1 (negation-type-type type2)) *empty-type*)
@@ -1612,7 +1769,7 @@
      (maybe-complex-array-refinement type1 type2))
     (t nil)))
 
-(!define-type-method (negation :simple-union2) (type1 type2)
+(define-type-method (negation :simple-union2) (type1 type2)
   (let ((not1 (negation-type-type type1))
         (not2 (negation-type-type type2)))
     (cond
@@ -1622,22 +1779,20 @@
        *universal-type*)
       (t nil))))
 
-(!define-type-method (negation :complex-union2) (type1 type2)
+(define-type-method (negation :complex-union2) (type1 type2)
   (cond
     ((csubtypep (negation-type-type type2) type1) *universal-type*)
     ((eq (type-intersection type1 (negation-type-type type2)) *empty-type*)
      type2)
     (t nil)))
 
-(!define-type-method (negation :simple-=) (type1 type2)
+(define-type-method (negation :simple-=) (type1 type2)
   (type= (negation-type-type type1) (negation-type-type type2)))
 
-(!def-type-translator not (typespec)
-  (type-negation (specifier-type typespec)))
+(def-type-translator not :list ((:context context) typespec)
+  (type-negation (specifier-type-r context typespec)))
 
 ;;;; numeric types
-
-(!define-type-class number)
 
 (declaim (inline numeric-type-equal))
 (defun numeric-type-equal (type1 type2)
@@ -1645,45 +1800,42 @@
        (eq (numeric-type-format type1) (numeric-type-format type2))
        (eq (numeric-type-complexp type1) (numeric-type-complexp type2))))
 
-(!define-type-method (number :simple-=) (type1 type2)
+(define-type-method (number :simple-=) (type1 type2)
   (values
    (and (numeric-type-equal type1 type2)
         (equalp (numeric-type-low type1) (numeric-type-low type2))
         (equalp (numeric-type-high type1) (numeric-type-high type2)))
    t))
 
-(!define-type-method (number :negate) (type)
-  (if (and (null (numeric-type-low type)) (null (numeric-type-high type)))
-      (make-negation-type :type type)
-      (type-union
-       (make-negation-type
-        :type (modified-numeric-type type :low nil :high nil))
-       (cond
-         ((null (numeric-type-low type))
-          (modified-numeric-type
-           type
-           :low (let ((h (numeric-type-high type)))
-                  (if (consp h) (car h) (list h)))
-           :high nil))
-         ((null (numeric-type-high type))
-          (modified-numeric-type
-           type
-           :low nil
-           :high (let ((l (numeric-type-low type)))
-                   (if (consp l) (car l) (list l)))))
-         (t (type-union
-             (modified-numeric-type
-              type
-              :low nil
-              :high (let ((l (numeric-type-low type)))
-                      (if (consp l) (car l) (list l))))
-             (modified-numeric-type
-              type
-              :low (let ((h (numeric-type-high type)))
-                     (if (consp h) (car h) (list h)))
-              :high nil)))))))
+(define-type-method (number :negate) (type)
+  (let ((low (numeric-type-low type))
+        (high (numeric-type-high type)))
+    (if (bounds-unbounded-p low high)
+        (make-negation-type type)
+        (type-union
+         (make-negation-type (modified-numeric-type type :low nil :high nil))
+         (cond
+           ((null low)
+            (modified-numeric-type
+             type
+             :low (if (consp high) (car high) (list high))
+             :high nil))
+           ((null high)
+            (modified-numeric-type
+             type
+             :low nil
+             :high (if (consp low) (car low) (list low))))
+           (t (type-union
+               (modified-numeric-type
+                type
+                :low nil
+                :high (if (consp low) (car low) (list low)))
+               (modified-numeric-type
+                type
+                :low (if (consp high) (car high) (list high))
+                :high nil))))))))
 
-(!define-type-method (number :unparse) (type)
+(define-type-method (number :unparse) (type)
   (let* ((complexp (numeric-type-complexp type))
          (low (numeric-type-low type))
          (high (numeric-type-high type))
@@ -1704,8 +1856,8 @@
                                   `(unsigned-byte ,high-length))
                                  (t
                                   `(mod ,(1+ high)))))
-                          ((and (= low sb!xc:most-negative-fixnum)
-                                (= high sb!xc:most-positive-fixnum))
+                          ((and (= low sb-xc:most-negative-fixnum)
+                                (= high sb-xc:most-positive-fixnum))
                            'fixnum)
                           ((and (= low (lognot high))
                                 (= high-count high-length)
@@ -1721,22 +1873,22 @@
                  (t base))))
       (ecase complexp
         (:real
+         (aver (neq base 'real))
          base+bounds)
         (:complex
-         (aver (neq base+bounds 'real))
+         (aver (neq base 'real))
          `(complex ,base+bounds))
         ((nil)
          (aver (eq base+bounds 'real))
          'number)))))
 
-(!define-type-method (number :singleton-p) (type)
+(define-type-method (number :singleton-p) (type)
   (let ((low  (numeric-type-low  type))
         (high (numeric-type-high type)))
     (if (and low
              (eql low high)
              (eql (numeric-type-complexp type) :real)
-             (member (numeric-type-class type) '(integer rational
-                                                 #-sb-xc-host float)))
+             (member (numeric-type-class type) '(integer rational float)))
         (values t (numeric-type-low type))
         (values nil nil))))
 
@@ -1751,6 +1903,8 @@
 ;;; This is for comparing bounds of the same kind, e.g. upper and
 ;;; upper. Use NUMERIC-BOUND-TEST* for different kinds of bounds.
 (defmacro numeric-bound-test (x y closed open)
+  (setq closed (intern (string closed) "SB-XC")
+        open (intern (string open) "SB-XC"))
   `(cond ((not ,y) t)
          ((not ,x) nil)
          ((consp ,x)
@@ -1769,6 +1923,8 @@
 ;;; -- an open inner bound is "greater" and also squeezes the interval,
 ;;;    causing us to use the OPEN test for those cases as well.
 (defmacro numeric-bound-test* (x y closed open)
+  (setq closed (intern (string closed) "SB-XC")
+        open (intern (string open) "SB-XC"))
   `(cond ((not ,y) t)
          ((not ,x) t)
          ((consp ,x)
@@ -1786,6 +1942,8 @@
 ;;; upper. If MAX-P is true, then we return NIL if X or Y is NIL,
 ;;; otherwise we return the other arg.
 (defmacro numeric-bound-max (x y closed open max-p)
+  (setq closed (intern (string closed) "SB-XC")
+        open (intern (string open) "SB-XC"))
   (once-only ((n-x x)
               (n-y y))
     `(cond ((not ,n-x) ,(if max-p nil n-y))
@@ -1799,7 +1957,7 @@
                 (if (,open (car ,n-y) ,n-x) ,n-y ,n-x)
                 (if (,closed ,n-y ,n-x) ,n-y ,n-x))))))
 
-(!define-type-method (number :simple-subtypep) (type1 type2)
+(define-type-method (number :simple-subtypep) (type1 type2)
   (let ((class1 (numeric-type-class type1))
         (class2 (numeric-type-class type2))
         (complexp2 (numeric-type-complexp type2))
@@ -1836,55 +1994,36 @@
 (!define-superclasses number ((number)) !cold-init-forms)
 
 ;;; If the high bound of LOW is adjacent to the low bound of HIGH,
-;;; then return true, otherwise NIL.
+;;; then return true, otherwise NIL. Adjacency of floating-point intervals
+;;; implies that exactly one is an open interval and exactly one is closed
+;;; at the adjacency point.
+;;; We never (as of now) get here in the cross-compiler with target
+;;; floating-point numbers. This seems legitimate as we seldom specify
+;;; anything as open intervals.  The few cases seem to be the fun-types
+;;; of %RANDOM-{SINGLE,DOUBLE}-FLOAT and HASH-TABLE-REHASH-mumble.
 (defun numeric-types-adjacent (low high)
   (let ((low-bound (numeric-type-high low))
         (high-bound (numeric-type-low high)))
-    (cond ((not (and low-bound high-bound)) nil)
-          ((and (consp low-bound) (consp high-bound)) nil)
-          ((consp low-bound)
-           (let ((low-value (car low-bound)))
-             (or (eql low-value high-bound)
-                 (and (eql low-value
-                           (load-time-value (make-unportable-float
-                                             :single-float-negative-zero)))
-                      (eql high-bound 0f0))
-                 (and (eql low-value 0f0)
-                      (eql high-bound
-                           (load-time-value (make-unportable-float
-                                             :single-float-negative-zero))))
-                 (and (eql low-value
-                           (load-time-value (make-unportable-float
-                                             :double-float-negative-zero)))
-                      (eql high-bound 0d0))
-                 (and (eql low-value 0d0)
-                      (eql high-bound
-                           (load-time-value (make-unportable-float
-                                             :double-float-negative-zero)))))))
-          ((consp high-bound)
-           (let ((high-value (car high-bound)))
-             (or (eql high-value low-bound)
-                 (and (eql high-value
-                           (load-time-value (make-unportable-float
-                                             :single-float-negative-zero)))
-                      (eql low-bound 0f0))
-                 (and (eql high-value 0f0)
-                      (eql low-bound
-                           (load-time-value (make-unportable-float
-                                             :single-float-negative-zero))))
-                 (and (eql high-value
-                           (load-time-value (make-unportable-float
-                                             :double-float-negative-zero)))
-                      (eql low-bound 0d0))
-                 (and (eql high-value 0d0)
-                      (eql low-bound
-                           (load-time-value (make-unportable-float
-                                             :double-float-negative-zero)))))))
-          ((and (eq (numeric-type-class low) 'integer)
-                (eq (numeric-type-class high) 'integer))
-           (eql (1+ low-bound) high-bound))
-          (t
-           nil))))
+    ;; Return T if and only if X is EQL to Y, or X = 0 and -X is EQL to Y.
+    ;; If both intervals have the same sign of zero at the adjacency point,
+    ;; then they intersect (as per NUMERIC-TYPES-INTESECT)
+    ;; so it doesn't matter much what we say here.
+    (flet ((float-zeros-eqlish (x y)
+             (or (eql x y)
+                 ;; Calling (EQL (- X) Y) might cons. Using = would be almost the same
+                 ;; but not cons, however I prefer not to assume that the caller has
+                 ;; already checked for matching float formats. EQL enforces that.
+                 ;; Change to use SB-XC:- here if anything requires it.
+                 (and (fp-zero-p x) (fp-zero-p y) (eql (- x) y)))))
+      (cond ((not (and low-bound high-bound)) nil)
+            ((and (consp low-bound) (consp high-bound)) nil)
+            ((consp low-bound) (float-zeros-eqlish (car low-bound) high-bound))
+            ((consp high-bound) (float-zeros-eqlish low-bound (car high-bound)))
+            ((and (eq (numeric-type-class low) 'integer)
+                  (eq (numeric-type-class high) 'integer))
+             (eql (1+ low-bound) high-bound)) ; Integer intervals are never open
+            (t
+             nil)))))
 
 ;;; Return a numeric type that is a supertype for both TYPE1 and TYPE2.
 ;;;
@@ -1894,7 +2033,7 @@
 ;;; creating absurdly complex unions of numeric types.
 (defvar *approximate-numeric-unions* nil)
 
-(!define-type-method (number :simple-union2) (type1 type2)
+(define-type-method (number :simple-union2) (type1 type2)
   (declare (type numeric-type type1 type2))
   (cond ((csubtypep type1 type2) type2)
         ((csubtypep type2 type1) type1)
@@ -1968,13 +2107,12 @@
              (t nil))))))
 
 
-(!cold-init-forms
-  (setf (info :type :kind 'number)
-        #+sb-xc-host :defined #-sb-xc-host :primitive)
+(!cold-init-forms ;; is !PRECOMPUTE-TYPES not doing the right thing?
+  (setf (info :type :kind 'number) :primitive)
   (setf (info :type :builtin 'number)
         (make-numeric-type :complexp nil)))
 
-(!def-type-translator complex (&optional (typespec '*))
+(def-type-translator complex ((:context context) &optional (typespec '*))
   (if (eq typespec '*)
       (specifier-type '(complex real))
       (labels ((not-numeric ()
@@ -1986,7 +2124,7 @@
                (complex1 (component-type)
                  (unless (numeric-type-p component-type)
                    (not-numeric))
-                 (when (eq (numeric-type-complexp component-type) :complex)
+                 (unless (eq (numeric-type-complexp component-type) :real)
                    (not-real))
                  (if (csubtypep component-type (specifier-type '(eql 0)))
                      *empty-type*
@@ -2003,7 +2141,10 @@
                    ((typep ctype 'member-type)
                     (apply #'type-union
                            (mapcar-member-type-members
-                            (lambda (x) (do-complex (ctype-of x)))
+                            (lambda (x)
+                              (if (realp x)
+                                  (do-complex (ctype-of x))
+                                  (not-real)))
                             ctype)))
                    ((and (typep ctype 'intersection-type)
                          ;; FIXME: This is very much a
@@ -2032,52 +2173,41 @@
                           ;; REALP) (SATISFIES ZEROP)), in which case we fall
                           ;; through the logic above and end up here,
                           ;; stumped.
+                          ;; FIXME: (COMPLEX NUMBER) is not rejected but should
+                          ;; be, as NUMBER is clearly not a subtype of real.
                           (bug "~@<(known bug #145): The type ~S is too hairy to be ~
 used for a COMPLEX component.~:@>"
                                typespec)))))))
-        (let ((ctype (specifier-type typespec)))
+        (let ((ctype (specifier-type-r context typespec)))
           (do-complex ctype)))))
 
 ;;; If X is *, return NIL, otherwise return the bound, which must be a
 ;;; member of TYPE or a one-element list of a member of TYPE.
-#!-sb-fluid (declaim (inline canonicalized-bound))
-(defun canonicalized-bound (bound type)
-  (cond ((eq bound '*) nil)
-        ((or (sb!xc:typep bound type)
-             (and (consp bound)
-                  (sb!xc:typep (car bound) type)
-                  (null (cdr bound))))
-          bound)
-        (t
-         (error "Bound is not ~S, a ~S or a list of a ~S: ~S"
-                '*
-                type
-                type
-                bound))))
+;;; This is not necessarily the canonical bound. An integer bound
+;;; should always be an atom, which we'll enforce later if needed.
+(defmacro valid-bound (bound type)
+  `(cond ((eq ,bound '*) nil)
+         ((sb-xc:typep (if (singleton-p ,bound) (car ,bound) ,bound) ',type) ,bound)
+         (t
+          (error ,(format nil "~A bound is not * or ~A ~A or list of one ~:*~A: ~~S"
+                          (string-capitalize bound)
+                          (if (eq type 'integer) "an" "a")
+                          (string-downcase type))
+                 ,bound))))
 
-(!def-type-translator integer (&optional (low '*) (high '*))
-  (let* ((l (canonicalized-bound low 'integer))
-         (lb (if (consp l) (1+ (car l)) l))
-         (h (canonicalized-bound high 'integer))
-         (hb (if (consp h) (1- (car h)) h)))
-    (if (and hb lb (< hb lb))
-        *empty-type*
-      (make-numeric-type :class 'integer
-                         :complexp :real
-                         :enumerable (not (null (and l h)))
-                         :low lb
-                         :high hb))))
+(def-type-translator integer (&optional (low '*) (high '*))
+  (let ((lb (valid-bound low integer))
+        (hb (valid-bound high integer)))
+    (make-numeric-type :class 'integer :complexp :real
+                       :enumerable (not (null (and lb hb)))
+                       :low lb :high hb)))
 
 (defmacro !def-bounded-type (type class format)
-  `(!def-type-translator ,type (&optional (low '*) (high '*))
-     (let ((lb (canonicalized-bound low ',type))
-           (hb (canonicalized-bound high ',type)))
-       (if (not (numeric-bound-test* lb hb <= <))
-           *empty-type*
-         (make-numeric-type :class ',class
-                            :format ',format
-                            :low lb
-                            :high hb)))))
+  `(def-type-translator ,type (&optional (low '*) (high '*))
+     (let ((lb (valid-bound low ,type))
+           (hb (valid-bound high ,type)))
+       (make-numeric-type :class ',class :format ',format
+                          :low lb :high hb))))
 
 (!def-bounded-type rational rational nil)
 
@@ -2109,99 +2239,84 @@ used for a COMPLEX component.~:@>"
 ;;; bounded RATIONAL types should be represented as (OR RATIO INTEGER).
 (defun coerce-bound (bound type upperp inner-coerce-bound-fun)
   (declare (type function inner-coerce-bound-fun))
-  (if (eql bound '*)
+  (if (eq bound '*)
       bound
       (funcall inner-coerce-bound-fun bound type upperp)))
+
+(macrolet ((make-bound (val)
+             `(let ((coerced ,val))
+                (if (listp bound) (list coerced) coerced))))
+
 (defun inner-coerce-real-bound (bound type upperp)
-  #+sb-xc-host (declare (ignore upperp))
-  (let #+sb-xc-host ()
-       #-sb-xc-host
-       ((nl (load-time-value (symbol-value 'sb!xc:most-negative-long-float)))
-        (pl (load-time-value (symbol-value 'sb!xc:most-positive-long-float))))
-    (let ((nbound (if (consp bound) (car bound) bound))
-          (consp (consp bound)))
+  (let ((nl sb-xc:most-negative-long-float)
+        (pl sb-xc:most-positive-long-float))
+    (let ((nbound (if (listp bound) (car bound) bound)))
       (ecase type
         (rational
-         (if consp
-             (list (rational nbound))
-             (rational nbound)))
+         (make-bound (rational nbound)))
         (float
          (cond
            ((floatp nbound) bound)
            (t
             ;; Coerce to the widest float format available, to avoid
             ;; unnecessary loss of precision, but don't coerce
-            ;; unrepresentable numbers, except on the host where we
-            ;; shouldn't be making these types (but KLUDGE: can't even
-            ;; assert portably that we're not).
-            #-sb-xc-host
+            ;; unrepresentable numbers.
             (ecase upperp
               ((nil)
-               (when (< nbound nl) (return-from inner-coerce-real-bound nl)))
+               (when (sb-xc:< nbound nl) (return-from inner-coerce-real-bound nl)))
               ((t)
-               (when (> nbound pl) (return-from inner-coerce-real-bound pl))))
-            (let ((result (coerce nbound 'long-float)))
-              (if consp (list result) result)))))))))
+               (when (sb-xc:> nbound pl) (return-from inner-coerce-real-bound pl))))
+            (make-bound (coerce nbound 'long-float)))))))))
+
 (defun inner-coerce-float-bound (bound type upperp)
-  #+sb-xc-host (declare (ignore upperp))
-  (let #+sb-xc-host ()
-       #-sb-xc-host
-       ((nd (load-time-value (symbol-value 'sb!xc:most-negative-double-float)))
-        (pd (load-time-value (symbol-value 'sb!xc:most-positive-double-float)))
-        (ns (load-time-value (symbol-value 'sb!xc:most-negative-single-float)))
-        (ps (load-time-value
-             (symbol-value 'sb!xc:most-positive-single-float))))
-    (let ((nbound (if (consp bound) (car bound) bound))
-          (consp (consp bound)))
+  (let ((nd sb-xc:most-negative-double-float)
+        (pd sb-xc:most-positive-double-float)
+        (ns sb-xc:most-negative-single-float)
+        (ps sb-xc:most-positive-single-float))
+    (let ((nbound (if (listp bound) (car bound) bound)))
       (ecase type
         (single-float
          (cond
-           ((typep nbound 'single-float) bound)
+           ((cl:typep nbound 'single-float) bound)
            (t
-            #-sb-xc-host
             (ecase upperp
               ((nil)
-               (when (< nbound ns) (return-from inner-coerce-float-bound ns)))
+               (when (sb-xc:< nbound ns) (return-from inner-coerce-float-bound ns)))
               ((t)
-               (when (> nbound ps) (return-from inner-coerce-float-bound ps))))
-            (let ((result (coerce nbound 'single-float)))
-              (if consp (list result) result)))))
+               (when (sb-xc:> nbound ps) (return-from inner-coerce-float-bound ps))))
+            (make-bound (coerce nbound 'single-float)))))
         (double-float
          (cond
-           ((typep nbound 'double-float) bound)
+           ((cl:typep nbound 'double-float) bound)
            (t
-            #-sb-xc-host
             (ecase upperp
               ((nil)
-               (when (< nbound nd) (return-from inner-coerce-float-bound nd)))
+               (when (sb-xc:< nbound nd) (return-from inner-coerce-float-bound nd)))
               ((t)
-               (when (> nbound pd) (return-from inner-coerce-float-bound pd))))
-            (let ((result (coerce nbound 'double-float)))
-              (if consp (list result) result)))))))))
+               (when (sb-xc:> nbound pd) (return-from inner-coerce-float-bound pd))))
+            (make-bound (coerce nbound 'double-float)))))))))
+) ; end MACROLET
+
 (defun coerced-real-bound (bound type upperp)
   (coerce-bound bound type upperp #'inner-coerce-real-bound))
 (defun coerced-float-bound (bound type upperp)
   (coerce-bound bound type upperp #'inner-coerce-float-bound))
-(!def-type-translator real (&optional (low '*) (high '*))
+(def-type-translator real (&optional (low '*) (high '*))
   (specifier-type `(or (float ,(coerced-real-bound  low 'float nil)
                               ,(coerced-real-bound high 'float t))
                        (rational ,(coerced-real-bound  low 'rational nil)
                                  ,(coerced-real-bound high 'rational t)))))
-(!def-type-translator float (&optional (low '*) (high '*))
+(def-type-translator float (&optional (low '*) (high '*))
   (specifier-type
    `(or (single-float ,(coerced-float-bound  low 'single-float nil)
                       ,(coerced-float-bound high 'single-float t))
         (double-float ,(coerced-float-bound  low 'double-float nil)
                       ,(coerced-float-bound high 'double-float t))
-        #!+long-float ,(error "stub: no long float support yet"))))
+        #+long-float ,(error "stub: no long float support yet"))))
 
-(defmacro !define-float-format (f)
-  `(!def-bounded-type ,f float ,f))
-
-(!define-float-format short-float)
-(!define-float-format single-float)
-(!define-float-format double-float)
-(!define-float-format long-float)
+(macrolet ((define-float-format (f) `(!def-bounded-type ,f float ,f)))
+  (define-float-format single-float)
+  (define-float-format double-float))
 
 (defun numeric-types-intersect (type1 type2)
   (declare (type numeric-type type1 type2))
@@ -2274,18 +2389,21 @@ used for a COMPLEX component.~:@>"
                (if up-p (1+ cx) (1- cx))
                (if up-p (ceiling cx) (floor cx))))
           (float
+           (aver format)
            (let ((res
-                  (cond
-                    ((and format (subtypep format 'double-float))
-                     (if (<= most-negative-double-float cx most-positive-double-float)
-                         (coerce cx format)
-                         nil))
-                    (t
-                     (if (<= most-negative-single-float cx most-positive-single-float)
-                         ;; FIXME: bug #389
-                         (coerce cx (or format 'single-float))
-                         nil)))))
-             (if (consp x) (list res) res)))))
+                   (cond
+                     ((and format (subtypep format 'double-float))
+                      (if (sb-xc:<= sb-xc:most-negative-double-float cx sb-xc:most-positive-double-float)
+                          (coerce cx format)
+                          nil))
+                     (t
+                      (if (sb-xc:<= sb-xc:most-negative-single-float cx sb-xc:most-positive-single-float)
+                          ;; FIXME: bug #389
+                          (coerce cx (or format 'single-float))
+                          nil)))))
+             (if (and (consp x) res)
+                 (list res)
+                 res)))))
       nil))
 
 ;;; Handle the case of type intersection on two numeric types. We use
@@ -2304,7 +2422,7 @@ used for a COMPLEX component.~:@>"
 ;;; appropriate numeric type before maximizing. This avoids possible
 ;;; confusion due to mixed-type comparisons (but I think the result is
 ;;; the same).
-(!define-type-method (number :simple-intersection2) (type1 type2)
+(define-type-method (number :simple-intersection2) (type1 type2)
   (declare (type numeric-type type1 type2))
   (if (numeric-types-intersect type1 type2)
       (let* ((class1 (numeric-type-class type1))
@@ -2373,13 +2491,13 @@ used for a COMPLEX component.~:@>"
                           ((nil)
                            ;; A double-float with any real number is a
                            ;; double-float.
-                           #!-long-float
+                           #-long-float
                            (if (eq format1 'double-float)
                              'double-float
                              nil)
                            ;; A long-float with any real number is a
                            ;; long-float.
-                           #!+long-float
+                           #+long-float
                            (if (eq format1 'long-float)
                              'long-float
                              nil)))
@@ -2398,9 +2516,7 @@ used for a COMPLEX component.~:@>"
 
 ;;;; array types
 
-(!define-type-class array)
-
-(!define-type-method (array :simple-=) (type1 type2)
+(define-type-method (array :simple-=) (type1 type2)
   (cond ((not (and (equal (array-type-dimensions type1)
                           (array-type-dimensions type2))
                    (eq (array-type-complexp type1)
@@ -2415,7 +2531,7 @@ used for a COMPLEX component.~:@>"
                         (array-type-specialized-element-type type2))
                  t))))
 
-(!define-type-method (array :negate) (type)
+(define-type-method (array :negate) (type)
   ;; FIXME (and hint to PFD): we're vulnerable here to attacks of the
   ;; form "are (AND ARRAY (NOT (ARRAY T))) and (OR (ARRAY BIT) (ARRAY
   ;; NIL) (ARRAY CHAR) ...) equivalent?" -- CSR, 2003-12-10
@@ -2434,10 +2550,10 @@ used for a COMPLEX component.~:@>"
       (type-union (make-array-type '* :complexp nil
                                    :element-type *wild-type*)
                   (make-negation-type
-                   :type (make-array-type '* :element-type *wild-type*)))
-      (make-negation-type :type type)))
+                         (make-array-type '* :element-type *wild-type*)))
+      (make-negation-type type)))
 
-(!define-type-method (array :unparse) (type)
+(define-type-method (array :unparse) (type)
   (let* ((dims (array-type-dimensions type))
          ;; Compare the specialised element type and the
          ;; derived element type.  If the derived type
@@ -2474,12 +2590,12 @@ used for a COMPLEX component.~:@>"
                       (if (eq (car dims) '*)
                           (case eltype
                             (bit 'bit-vector)
-                            ((base-char #!-sb-unicode character) 'base-string)
+                            ((base-char #-sb-unicode character) 'base-string)
                             (* 'vector)
                             (t `(vector ,eltype)))
                           (case eltype
                             (bit `(bit-vector ,(car dims)))
-                            ((base-char #!-sb-unicode character)
+                            ((base-char #-sb-unicode character)
                              `(base-string ,(car dims)))
                             (t `(vector ,eltype ,(car dims)))))))
                  (if (eql complexp :maybe)
@@ -2488,12 +2604,12 @@ used for a COMPLEX component.~:@>"
                (if (eq (car dims) '*)
                    (case eltype
                      (bit 'simple-bit-vector)
-                     ((base-char #!-sb-unicode character) 'simple-base-string)
+                     ((base-char #-sb-unicode character) 'simple-base-string)
                      ((t) 'simple-vector)
                      (t `(simple-array ,eltype (*))))
                    (case eltype
                      (bit `(simple-bit-vector ,(car dims)))
-                     ((base-char #!-sb-unicode character)
+                     ((base-char #-sb-unicode character)
                       `(simple-base-string ,(car dims)))
                      ((t) `(simple-vector ,(car dims)))
                      (t `(simple-array ,eltype ,dims))))))
@@ -2503,7 +2619,7 @@ used for a COMPLEX component.~:@>"
              ((:maybe) `(array ,eltype ,dims))
              ((nil) `(simple-array ,eltype ,dims)))))))
 
-(!define-type-method (array :simple-subtypep) (type1 type2)
+(define-type-method (array :simple-subtypep) (type1 type2)
   (let ((dims1 (array-type-dimensions type1))
         (dims2 (array-type-dimensions type2))
         (complexp2 (array-type-complexp type2)))
@@ -2546,9 +2662,7 @@ used for a COMPLEX component.~:@>"
                           (array-type-specialized-element-type type2))
                    t)))))
 
-(!define-superclasses array
-  ((vector vector) (array))
-  !cold-init-forms)
+(!define-superclasses array ((vector vector) (array)) !cold-init-forms)
 
 (defun array-types-intersect (type1 type2)
   (declare (type array-type type1 type2))
@@ -2699,7 +2813,7 @@ used for a COMPLEX component.~:@>"
         (typep (remove-duplicates interesting-supertypes)
                '(cons array-type null)))))
 
-(!define-type-method (array :simple-union2) (type1 type2)
+(define-type-method (array :simple-union2) (type1 type2)
   (multiple-value-bind
         (result-eltype result-stype eltype-supertype)
       (unite-array-types-element-types type1 type2)
@@ -2718,7 +2832,7 @@ used for a COMPLEX component.~:@>"
            :element-type result-eltype
            :specialized-element-type result-stype))))))
 
-(!define-type-method (array :simple-intersection2) (type1 type2)
+(define-type-method (array :simple-intersection2) (type1 type2)
   (declare (type array-type type1 type2))
   (if (array-types-intersect type1 type2)
       (let ((dims1 (array-type-dimensions type1))
@@ -2755,17 +2869,17 @@ used for a COMPLEX component.~:@>"
     (integer
      (when (minusp dims)
        (error "Arrays can't have a negative number of dimensions: ~S" dims))
-     (when (>= dims sb!xc:array-rank-limit)
+     (when (>= dims sb-xc:array-rank-limit)
        (error "array type with too many dimensions: ~S" dims))
      (make-list dims :initial-element '*))
     (list
-     (when (>= (length dims) sb!xc:array-rank-limit)
+     (when (>= (length dims) sb-xc:array-rank-limit)
        (error "array type with too many dimensions: ~S" dims))
      (dolist (dim dims)
        (unless (eq dim '*)
          (unless (and (integerp dim)
                       (>= dim 0)
-                      (< dim sb!xc:array-dimension-limit))
+                      (< dim sb-xc:array-dimension-limit))
            (error "bad dimension in array type: ~S" dim))))
      dims)
     (t
@@ -2773,9 +2887,7 @@ used for a COMPLEX component.~:@>"
 
 ;;;; MEMBER types
 
-(!define-type-class member)
-
-(!define-type-method (member :negate) (type)
+(define-type-method (member :negate) (type)
   (let ((xset (member-type-xset type))
         (fp-zeroes (member-type-fp-zeroes type)))
     (if fp-zeroes
@@ -2784,40 +2896,39 @@ used for a COMPLEX component.~:@>"
         (apply #'type-intersection
                (if (xset-empty-p xset)
                    *universal-type*
-                   (make-negation-type
-                    :type (make-member-type :xset xset)))
+                   (make-negation-type (make-member-type xset nil)))
                (mapcar
                 (lambda (x)
-                  (let* ((opposite (neg-fp-zero x))
+                  (let* ((opposite (sb-xc:- x))
                          (type (ctype-of opposite)))
                     (type-union
                      (make-negation-type
-                      :type (modified-numeric-type type :low nil :high nil))
+                      (modified-numeric-type type :low nil :high nil))
                      (modified-numeric-type type :low nil :high (list opposite))
-                     (make-member-type :members (list opposite))
+                     (make-eql-type opposite)
                      (modified-numeric-type type :low (list opposite) :high nil))))
                 fp-zeroes))
         ;; Easy case
-        (make-negation-type :type type))))
+        (make-negation-type type))))
 
-(!define-type-method (member :unparse) (type)
-  (let ((members (member-type-members type)))
-    (cond ((equal members '(nil)) 'null)
-          (t `(member ,@members)))))
+(define-type-method (member :unparse) (type)
+  (cond ((eq type (specifier-type 'null)) 'null) ; NULL type is EQ-comparable
+        ((eq type (specifier-type 'boolean)) 'boolean) ; so is BOOLEAN
+        (t `(member ,@(member-type-members type)))))
 
-(!define-type-method (member :singleton-p) (type)
+(define-type-method (member :singleton-p) (type)
   (if (eql 1 (member-type-size type))
       (values t (first (member-type-members type)))
       (values nil nil)))
 
-(!define-type-method (member :simple-subtypep) (type1 type2)
+(define-type-method (member :simple-subtypep) (type1 type2)
    (values (and (xset-subset-p (member-type-xset type1)
                                  (member-type-xset type2))
                 (subsetp (member-type-fp-zeroes type1)
                          (member-type-fp-zeroes type2)))
            t))
 
-(!define-type-method (member :complex-subtypep-arg1) (type1 type2)
+(define-type-method (member :complex-subtypep-arg1) (type1 type2)
   (block punt
     (mapc-member-type-members
      (lambda (elt)
@@ -2832,19 +2943,19 @@ used for a COMPLEX component.~:@>"
 ;;; We punt if the odd type is enumerable and intersects with the
 ;;; MEMBER type. If not enumerable, then it is definitely not a
 ;;; subtype of the MEMBER type.
-(!define-type-method (member :complex-subtypep-arg2) (type1 type2)
+(define-type-method (member :complex-subtypep-arg2) (type1 type2)
   (cond ((not (type-enumerable type1)) (values nil t))
         ((types-equal-or-intersect type1 type2)
          (invoke-complex-subtypep-arg1-method type1 type2))
         (t (values nil t))))
 
-(!define-type-method (member :simple-intersection2) (type1 type2)
-  (make-member-type :xset (xset-intersection (member-type-xset type1)
-                                             (member-type-xset type2))
-                    :fp-zeroes (intersection (member-type-fp-zeroes type1)
-                                             (member-type-fp-zeroes type2))))
+(define-type-method (member :simple-intersection2) (type1 type2)
+  (make-member-type (xset-intersection (member-type-xset type1)
+                                       (member-type-xset type2))
+                    (intersection (member-type-fp-zeroes type1)
+                                  (member-type-fp-zeroes type2))))
 
-(!define-type-method (member :complex-intersection2) (type1 type2)
+(define-type-method (member :complex-intersection2) (type1 type2)
   (block punt
     (let ((xset (alloc-xset))
           (fp-zeroes nil))
@@ -2860,18 +2971,18 @@ used for a COMPLEX component.~:@>"
        type2)
       (if (and (xset-empty-p xset) (not fp-zeroes))
           *empty-type*
-          (make-member-type :xset xset :fp-zeroes fp-zeroes)))))
+          (make-member-type xset fp-zeroes)))))
 
 ;;; We don't need a :COMPLEX-UNION2, since the only interesting case is
 ;;; a union type, and the member/union interaction is handled by the
 ;;; union type method.
-(!define-type-method (member :simple-union2) (type1 type2)
-  (make-member-type :xset (xset-union (member-type-xset type1)
-                                      (member-type-xset type2))
-                    :fp-zeroes (union (member-type-fp-zeroes type1)
-                                      (member-type-fp-zeroes type2))))
+(define-type-method (member :simple-union2) (type1 type2)
+  (make-member-type (xset-union (member-type-xset type1)
+                                (member-type-xset type2))
+                    (union (member-type-fp-zeroes type1)
+                           (member-type-fp-zeroes type2))))
 
-(!define-type-method (member :simple-=) (type1 type2)
+(define-type-method (member :simple-=) (type1 type2)
   (let ((xset1 (member-type-xset type1))
         (xset2 (member-type-xset type2))
         (l1 (member-type-fp-zeroes type1))
@@ -2883,7 +2994,7 @@ used for a COMPLEX component.~:@>"
                  (subsetp l2 l1))
             t)))
 
-(!define-type-method (member :complex-=) (type1 type2)
+(define-type-method (member :complex-=) (type1 type2)
   (if (type-enumerable type1)
       (multiple-value-bind (val win) (csubtypep type2 type1)
         (if (or val (not win))
@@ -2891,26 +3002,20 @@ used for a COMPLEX component.~:@>"
             (values nil t)))
       (values nil t)))
 
-(!def-type-translator member (&rest members)
+(def-type-translator member :list (&rest members)
   (if members
       (let (ms numbers char-codes)
         (dolist (m (remove-duplicates members))
           (typecase m
-            (float (if (zerop m)
-                       (push m ms)
-                       (push (ctype-of m) numbers)))
-            (real (push (ctype-of m) numbers))
-           (character (push (sb!xc:char-code m) char-codes))
+            (character (push (sb-xc:char-code m) char-codes))
+            (real (if (and (floatp m) (zerop m))
+                      (push m ms)
+                      (push (ctype-of m) numbers)))
             (t (push m ms))))
         (apply #'type-union
-               (if ms
-                   (make-member-type :members ms)
-                   *empty-type*)
-              (if char-codes
-                  (make-character-set-type
-                   :pairs (mapcar (lambda (x) (cons x x))
-                                  (sort char-codes #'<)))
-                  *empty-type*)
+               (member-type-from-list ms)
+               (make-character-set-type (mapcar (lambda (x) (cons x x))
+                                                (sort char-codes #'<)))
                (nreverse numbers)))
       *empty-type*))
 
@@ -2933,18 +3038,28 @@ used for a COMPLEX component.~:@>"
 ;;;; (to the opaque HAIRY-TYPE) on sufficiently complicated types
 ;;;; involving AND.
 
-(!define-type-class intersection)
+(define-type-class intersection
+                    :enumerable #'compound-type-enumerable
+                    :might-contain-other-types t)
 
-(!define-type-method (intersection :negate) (type)
+(define-type-method (intersection :negate) (type)
   (apply #'type-union
          (mapcar #'type-negation (intersection-type-types type))))
 
 ;;; A few intersection types have special names. The others just get
 ;;; mechanically unparsed.
-(!define-type-method (intersection :unparse) (type)
+(define-type-method (intersection :unparse) (type)
   (declare (type ctype type))
   (or (find type '(ratio keyword compiled-function) :key #'specifier-type :test #'type=)
       `(and ,@(mapcar #'type-specifier (intersection-type-types type)))))
+
+(define-type-method (intersection :singleton-p) (type)
+  (loop for constituent in (intersection-type-types type)
+        do
+        (multiple-value-bind (single value) (type-singleton-p constituent)
+          (when single
+            (return (values single value))))
+        finally (return (values nil nil))))
 
 ;;; shared machinery for type equality: true if every type in the set
 ;;; TYPES1 matches a type in the set TYPES2 and vice versa
@@ -2964,7 +3079,7 @@ used for a COMPLEX component.~:@>"
 ;;; instead, since SUBTYPEP is the usual relationship that we care
 ;;; most about, so it would be good to leverage any ingenuity there
 ;;; in this more obscure method?
-(!define-type-method (intersection :simple-=) (type1 type2)
+(define-type-method (intersection :simple-=) (type1 type2)
   (type=-set (intersection-type-types type1)
              (intersection-type-types type2)))
 
@@ -2976,16 +3091,16 @@ used for a COMPLEX component.~:@>"
               type1
               (intersection-type-types type2)))
 
-(!define-type-method (intersection :simple-subtypep) (type1 type2)
+(define-type-method (intersection :simple-subtypep) (type1 type2)
   (%intersection-simple-subtypep type1 type2))
 
-(!define-type-method (intersection :complex-subtypep-arg1) (type1 type2)
+(define-type-method (intersection :complex-subtypep-arg1) (type1 type2)
   (%intersection-complex-subtypep-arg1 type1 type2))
 
 (defun %intersection-complex-subtypep-arg2 (type1 type2)
   (every/type #'csubtypep type1 (intersection-type-types type2)))
 
-(!define-type-method (intersection :complex-subtypep-arg2) (type1 type2)
+(define-type-method (intersection :complex-subtypep-arg2) (type1 type2)
   (%intersection-complex-subtypep-arg2 type1 type2))
 
 ;;; FIXME: This will look eeriely familiar to readers of the UNION
@@ -2995,7 +3110,7 @@ used for a COMPLEX component.~:@>"
 ;;; mathematics, it shouldn't be beyond the ken of some programmers to
 ;;; reflect those symmetries in code in a way that ties them together
 ;;; more strongly than having two independent near-copies :-/
-(!define-type-method (intersection :simple-union2 :complex-union2)
+(define-type-method (intersection :simple-union2 :complex-union2)
                      (type1 type2)
   ;; Within this method, type2 is guaranteed to be an intersection
   ;; type:
@@ -3058,22 +3173,107 @@ used for a COMPLEX component.~:@>"
                (setf accumulator
                      (type-intersection accumulator union))))))))
 
-(!def-type-translator and (&whole whole &rest type-specifiers)
+(def-type-translator and :list ((:context context) &rest type-specifiers)
   (apply #'type-intersection
-         (mapcar #'specifier-type type-specifiers)))
+         (mapcar (lambda (x) (specifier-type-r context x))
+                 type-specifiers)))
 
 ;;;; union types
 
-(!define-type-class union)
+(define-type-class union
+                    :enumerable #'compound-type-enumerable
+                    :might-contain-other-types t)
 
-(!define-type-method (union :negate) (type)
+(define-type-method (union :negate) (type)
   (declare (type ctype type))
   (apply #'type-intersection
          (mapcar #'type-negation (union-type-types type))))
 
+;;; Unlike ARRAY-TYPE-DIMENSIONS this handles union types, which
+;;; includes the type STRING.
+(defun ctype-array-dimensions (type)
+  (labels ((process-compound-type (types)
+             (let (dimensions)
+               (dolist (type types)
+                 (unless (or (hairy-type-p type)
+                             (negation-type-p type))
+                   (let ((current-dimensions (determine type)))
+                     (cond ((eq current-dimensions '*)
+                            (return-from ctype-array-dimensions '*))
+                           ((and dimensions
+                                 (not (equal current-dimensions dimensions)))
+                            (if (= (length dimensions)
+                                   (length current-dimensions))
+                                (setf dimensions
+                                      (loop for dimension in dimensions
+                                            for current-dimension in current-dimensions
+                                            collect (if (eql dimension current-dimension)
+                                                        dimension
+                                                        '*)))
+                                (return-from ctype-array-dimensions '*)))
+                           (t
+
+                            (setf dimensions current-dimensions))))))
+               dimensions))
+           (determine (type)
+             (etypecase type
+               (array-type
+                (array-type-dimensions type))
+               (union-type
+                (process-compound-type (union-type-types type)))
+               (member-type
+                (process-compound-type
+                 (mapcar #'ctype-of (member-type-members type))))
+               (intersection-type
+                (process-compound-type (intersection-type-types type))))))
+    (determine type)))
+
+(defun ctype-array-specialized-element-types (type)
+  (let (types)
+    (labels ((process-compound-type (types)
+               (loop for type in types
+                     unless (or (hairy-type-p type)
+                                (negation-type-p type))
+                     do (determine type)))
+             (determine (type)
+               (etypecase type
+                 (array-type
+                  (when (eq (array-type-specialized-element-type type) *wild-type*)
+                    (return-from ctype-array-specialized-element-types
+                      *wild-type*))
+                  (pushnew (array-type-specialized-element-type type)
+                           types :test #'type=))
+                 (union-type
+                  (process-compound-type (union-type-types type)))
+                 (intersection-type
+                  (process-compound-type (intersection-type-types type)))
+                 (member-type
+                  (process-compound-type
+                   (mapcar #'ctype-of (member-type-members type)))))))
+      (determine type))
+    types))
+
+(defun unparse-string-type (ctype string-type)
+  (let ((string-ctype (specifier-type string-type)))
+    (and (union-type-p ctype)
+         (csubtypep ctype string-ctype)
+         (let ((types (copy-list (union-type-types string-ctype))))
+           (and (loop for type in (union-type-types ctype)
+                      for matching = (and (array-type-p type)
+                                          (neq (array-type-complexp type) t)
+                                          (find type types
+                                                :test #'csubtypep))
+                      always matching
+                      do (setf types (delete matching types)))
+                (null types)))
+         (let ((dimensions (ctype-array-dimensions ctype)))
+           (cond ((and (singleton-p dimensions)
+                       (integerp (car dimensions)))
+                  `(,string-type ,@dimensions)))))))
+
 ;;; The LIST, FLOAT and REAL types have special names.  Other union
 ;;; types just get mechanically unparsed.
-(!define-type-method (union :unparse) (type)
+(define-type-method (union :unparse) (type)
   (declare (type ctype type))
   (cond
     ((type= type (specifier-type 'list)) 'list)
@@ -3083,8 +3283,9 @@ used for a COMPLEX component.~:@>"
     ((type= type (specifier-type 'bignum)) 'bignum)
     ((type= type (specifier-type 'simple-string)) 'simple-string)
     ((type= type (specifier-type 'string)) 'string)
+    ((unparse-string-type type 'simple-string))
+    ((unparse-string-type type 'string))
     ((type= type (specifier-type 'complex)) 'complex)
-    ((type= type (specifier-type 'standard-char)) 'standard-char)
     (t `(or ,@(mapcar #'type-specifier (union-type-types type))))))
 
 ;;; Two union types are equal if they are each subtypes of each
@@ -3097,7 +3298,7 @@ used for a COMPLEX component.~:@>"
 ;;; it is true, though too strong a condition:
 ;;;
 ;;; Two union types are equal if their subtypes are equal sets.
-(!define-type-method (union :simple-=) (type1 type2)
+(define-type-method (union :simple-=) (type1 type2)
   (multiple-value-bind (subtype certain?)
       (csubtypep type1 type2)
     (if subtype
@@ -3110,7 +3311,7 @@ used for a COMPLEX component.~:@>"
               (declare (ignore subtype))
               (values nil certain?))))))
 
-(!define-type-method (union :complex-=) (type1 type2)
+(define-type-method (union :complex-=) (type1 type2)
   (declare (ignore type1))
   (if (some #'type-might-contain-other-types-p
             (union-type-types type2))
@@ -3124,7 +3325,7 @@ used for a COMPLEX component.~:@>"
               type2
               (union-type-types type1)))
 
-(!define-type-method (union :simple-subtypep) (type1 type2)
+(define-type-method (union :simple-subtypep) (type1 type2)
   (union-simple-subtypep type1 type2))
 
 (defun union-complex-subtypep-arg1 (type1 type2)
@@ -3132,7 +3333,7 @@ used for a COMPLEX component.~:@>"
               type2
               (union-type-types type1)))
 
-(!define-type-method (union :complex-subtypep-arg1) (type1 type2)
+(define-type-method (union :complex-subtypep-arg1) (type1 type2)
   (union-complex-subtypep-arg1 type1 type2))
 
 (defun union-complex-subtypep-arg2 (type1 type2)
@@ -3165,23 +3366,26 @@ used for a COMPLEX component.~:@>"
   ;; implemented in terms of subtypep.
   ;;
   ;; Ouch. - CSR, 2002-04-10
-  (multiple-value-bind (sub-value sub-certain?)
-      (type= type1
-             (apply #'type-union
-                    (mapcar (lambda (x) (type-intersection type1 x))
-                            (union-type-types type2))))
-    (if sub-certain?
-        (values sub-value sub-certain?)
-        ;; The ANY/TYPE expression above is a sufficient condition for
-        ;; subsetness, but not a necessary one, so we might get a more
-        ;; certain answer by this CALL-NEXT-METHOD-ish step when the
-        ;; ANY/TYPE expression is uncertain.
-        (invoke-complex-subtypep-arg1-method type1 type2))))
+  (cond ((fun-designator-type-p type1)
+         (type= type2 (specifier-type 'callable)))
+        (t
+         (multiple-value-bind (sub-value sub-certain?)
+             (type= type1
+                    (apply #'type-union
+                           (mapcar (lambda (x) (type-intersection type1 x))
+                                   (union-type-types type2))))
+           (if sub-certain?
+               (values sub-value sub-certain?)
+               ;; The ANY/TYPE expression above is a sufficient condition for
+               ;; subsetness, but not a necessary one, so we might get a more
+               ;; certain answer by this CALL-NEXT-METHOD-ish step when the
+               ;; ANY/TYPE expression is uncertain.
+               (invoke-complex-subtypep-arg1-method type1 type2))))))
 
-(!define-type-method (union :complex-subtypep-arg2) (type1 type2)
+(define-type-method (union :complex-subtypep-arg2) (type1 type2)
   (union-complex-subtypep-arg2 type1 type2))
 
-(!define-type-method (union :simple-intersection2 :complex-intersection2)
+(define-type-method (union :simple-intersection2 :complex-intersection2)
                      (type1 type2)
   ;; The CSUBTYPEP clauses here let us simplify e.g.
   ;;   (TYPE-INTERSECTION2 (SPECIFIER-TYPE 'LIST)
@@ -3228,28 +3432,28 @@ used for a COMPLEX component.~:@>"
                    (type-union accumulator
                                (type-intersection type1 t2))))))))
 
-(!def-type-translator or (&rest type-specifiers)
+(def-type-translator or :list ((:context context) &rest type-specifiers)
   (let ((type (apply #'type-union
-                     (mapcar #'specifier-type type-specifiers))))
+                     (mapcar (lambda (x) (specifier-type-r context x))
+                             type-specifiers))))
     (if (union-type-p type)
-        (sb!kernel::simplify-array-unions type)
+        (sb-kernel::simplify-array-unions type)
         type)))
 
 ;;;; CONS types
 
-(!define-type-class cons)
-
-(!def-type-translator cons (&optional (car-type-spec '*) (cdr-type-spec '*))
-  (let ((car-type (single-value-specifier-type car-type-spec))
-        (cdr-type (single-value-specifier-type cdr-type-spec)))
+(def-type-translator cons ((:context context)
+                            &optional (car-type-spec '*) (cdr-type-spec '*))
+  (let ((car-type (single-value-specifier-type-r context car-type-spec))
+        (cdr-type (single-value-specifier-type-r context cdr-type-spec)))
     (make-cons-type car-type cdr-type)))
 
-(!define-type-method (cons :negate) (type)
+(define-type-method (cons :negate) (type)
   (if (and (eq (cons-type-car-type type) *universal-type*)
            (eq (cons-type-cdr-type type) *universal-type*))
-      (make-negation-type :type type)
+      (make-negation-type type)
       (type-union
-       (make-negation-type :type (specifier-type 'cons))
+       (make-negation-type (specifier-type 'cons))
        (cond
          ((and (not (eq (cons-type-car-type type) *universal-type*))
                (not (eq (cons-type-cdr-type type) *universal-type*)))
@@ -3270,15 +3474,13 @@ used for a COMPLEX component.~:@>"
            (type-negation (cons-type-cdr-type type))))
          (t (bug "Weird CONS type ~S" type))))))
 
-(!define-type-method (cons :unparse) (type)
-  (let ((car-eltype (type-specifier (cons-type-car-type type)))
-        (cdr-eltype (type-specifier (cons-type-cdr-type type))))
-    (if (and (member car-eltype '(t *))
-             (member cdr-eltype '(t *)))
-        'cons
-        `(cons ,car-eltype ,cdr-eltype))))
+(define-type-method (cons :unparse) (type)
+  (if (eq type (specifier-type 'cons))
+      'cons
+      `(cons ,(type-specifier (cons-type-car-type type))
+             ,(type-specifier (cons-type-cdr-type type)))))
 
-(!define-type-method (cons :simple-=) (type1 type2)
+(define-type-method (cons :simple-=) (type1 type2)
   (declare (type cons-type type1 type2))
   (multiple-value-bind (car-match car-win)
       (type= (cons-type-car-type type1) (cons-type-car-type type2))
@@ -3298,7 +3500,7 @@ used for a COMPLEX component.~:@>"
                           (not (and (cons-type-might-be-empty-type type1)
                                     (cons-type-might-be-empty-type type2))))))))))
 
-(!define-type-method (cons :simple-subtypep) (type1 type2)
+(define-type-method (cons :simple-subtypep) (type1 type2)
   (declare (type cons-type type1 type2))
   (multiple-value-bind (val-car win-car)
       (csubtypep (cons-type-car-type type1) (cons-type-car-type type2))
@@ -3311,7 +3513,7 @@ used for a COMPLEX component.~:@>"
 
 ;;; Give up if a precise type is not possible, to avoid returning
 ;;; overly general types.
-(!define-type-method (cons :simple-union2) (type1 type2)
+(define-type-method (cons :simple-union2) (type1 type2)
   (declare (type cons-type type1 type2))
   (let ((car-type1 (cons-type-car-type type1))
         (car-type2 (cons-type-car-type type2))
@@ -3363,7 +3565,7 @@ used for a COMPLEX component.~:@>"
             ((csubtypep cdr-type2 cdr-type1)
              (frob-cdr car-type2 car-type1 cdr-type2 cdr-type1))))))
 
-(!define-type-method (cons :simple-intersection2) (type1 type2)
+(define-type-method (cons :simple-intersection2) (type1 type2)
   (declare (type cons-type type1 type2))
   (let ((car-int2 (type-intersection2 (cons-type-car-type type1)
                                       (cons-type-car-type type2)))
@@ -3384,44 +3586,43 @@ used for a COMPLEX component.~:@>"
 
 ;;;; CHARACTER-SET types
 
-(!define-type-class character-set)
+(def-type-translator character-set
+    (&optional (pairs `((0 . ,(1- sb-xc:char-code-limit)))))
+  (make-character-set-type pairs))
 
-(!def-type-translator character-set
-    (&optional (pairs '((0 . #.(1- sb!xc:char-code-limit)))))
-  (make-character-set-type :pairs pairs))
-
-(!define-type-method (character-set :negate) (type)
+(define-type-method (character-set :negate) (type)
   (let ((pairs (character-set-type-pairs type)))
     (if (and (= (length pairs) 1)
              (= (caar pairs) 0)
-             (= (cdar pairs) (1- sb!xc:char-code-limit)))
-        (make-negation-type :type type)
+             (= (cdar pairs) (1- sb-xc:char-code-limit)))
+        (make-negation-type type)
         (let ((not-character
                (make-negation-type
-                :type (make-character-set-type
-                       :pairs '((0 . #.(1- sb!xc:char-code-limit)))))))
+                (make-character-set-type
+                 `((0 . ,(1- sb-xc:char-code-limit)))))))
           (type-union
            not-character
            (make-character-set-type
-            :pairs (let (not-pairs)
+                   (let (not-pairs)
                      (when (> (caar pairs) 0)
                        (push (cons 0 (1- (caar pairs))) not-pairs))
                      (do* ((tail pairs (cdr tail))
                            (high1 (cdar tail) (cdar tail))
                            (low2 (caadr tail) (caadr tail)))
                           ((null (cdr tail))
-                           (when (< (cdar tail) (1- sb!xc:char-code-limit))
+                           (when (< (cdar tail) (1- sb-xc:char-code-limit))
                              (push (cons (1+ (cdar tail))
-                                         (1- sb!xc:char-code-limit))
+                                         (1- sb-xc:char-code-limit))
                                    not-pairs))
                            (nreverse not-pairs))
                        (push (cons (1+ high1) (1- low2)) not-pairs)))))))))
 
-(!define-type-method (character-set :unparse) (type)
+(define-type-method (character-set :unparse) (type)
   (cond
-    ((type= type (specifier-type 'character)) 'character)
-    ((type= type (specifier-type 'base-char)) 'base-char)
-    ((type= type (specifier-type 'extended-char)) 'extended-char)
+    ((eq type (specifier-type 'character)) 'character)
+    ((eq type (specifier-type 'base-char)) 'base-char)
+    ((eq type (specifier-type 'extended-char)) 'extended-char)
+    ;; standard-char is not an interned type
     ((type= type (specifier-type 'standard-char)) 'standard-char)
     (t
      ;; Unparse into either MEMBER or CHARACTER-SET. We use MEMBER if there
@@ -3432,14 +3633,14 @@ used for a COMPLEX component.~:@>"
             (chars (loop named outer
                          for (low . high) in pairs
                          nconc (loop for code from low upto high
-                                     collect (sb!xc:code-char code)
+                                     collect (sb-xc:code-char code)
                                      when (minusp (decf count))
                                      do (return-from outer t)))))
        (if (eq chars t)
            `(character-set ,pairs)
            `(member ,@chars))))))
 
-(!define-type-method (character-set :singleton-p) (type)
+(define-type-method (character-set :singleton-p) (type)
   (let* ((pairs (character-set-type-pairs type))
          (pair  (first pairs)))
     (if (and (typep pairs '(cons t null))
@@ -3447,12 +3648,12 @@ used for a COMPLEX component.~:@>"
         (values t (code-char (car pair)))
         (values nil nil))))
 
-(!define-type-method (character-set :simple-=) (type1 type2)
+(define-type-method (character-set :simple-=) (type1 type2)
   (let ((pairs1 (character-set-type-pairs type1))
        (pairs2 (character-set-type-pairs type2)))
     (values (equal pairs1 pairs2) t)))
 
-(!define-type-method (character-set :simple-subtypep) (type1 type2)
+(define-type-method (character-set :simple-subtypep) (type1 type2)
   (values
    (dolist (pair (character-set-type-pairs type1) t)
      (unless (position pair (character-set-type-pairs type2)
@@ -3461,23 +3662,23 @@ used for a COMPLEX component.~:@>"
        (return nil)))
    t))
 
-(!define-type-method (character-set :simple-union2) (type1 type2)
+(define-type-method (character-set :simple-union2) (type1 type2)
   ;; KLUDGE: the canonizing in the MAKE-CHARACTER-SET-TYPE function
   ;; actually does the union for us.  It might be a little fragile to
   ;; rely on it.
   (make-character-set-type
-   :pairs (merge 'list
+          (merge 'list
                 (copy-alist (character-set-type-pairs type1))
                 (copy-alist (character-set-type-pairs type2))
                 #'< :key #'car)))
 
-(!define-type-method (character-set :simple-intersection2) (type1 type2)
+(define-type-method (character-set :simple-intersection2) (type1 type2)
   ;; KLUDGE: brute force.
 #|
   (let (pairs)
     (dolist (pair1 (character-set-type-pairs type1)
             (make-character-set-type
-             :pairs (sort pairs #'< :key #'car)))
+                    (sort pairs #'< :key #'car)))
       (dolist (pair2 (character-set-type-pairs type2))
        (cond
          ((<= (car pair1) (car pair2) (cdr pair1))
@@ -3486,7 +3687,7 @@ used for a COMPLEX component.~:@>"
           (push (cons (car pair1) (min (cdr pair1) (cdr pair2))) pairs))))))
 |#
   (make-character-set-type
-   :pairs (intersect-type-pairs
+          (intersect-type-pairs
            (character-set-type-pairs type1)
            (character-set-type-pairs type2))))
 
@@ -3533,79 +3734,28 @@ used for a COMPLEX component.~:@>"
 
 
 ;;; Return the type that describes all objects that are in X but not
-;;; in Y. If we can't determine this type, then return NIL.
-;;;
-;;; For now, we only are clever dealing with union and member types.
-;;; If either type is not a union type, then we pretend that it is a
-;;; union of just one type. What we do is remove from X all the types
-;;; that are a subtype any type in Y. If any type in X intersects with
-;;; a type in Y but is not a subtype, then we give up.
-;;;
-;;; We must also special-case any member type that appears in the
-;;; union. We remove from X's members all objects that are TYPEP to Y.
-;;; If Y has any members, we must be careful that none of those
-;;; members are CTYPEP to any of Y's non-member types. We give up in
-;;; this case, since to compute that difference we would have to break
-;;; the type from X into some collection of types that represents the
-;;; type without that particular element. This seems too hairy to be
-;;; worthwhile, given its low utility.
+;;; in Y.
 (defun type-difference (x y)
-  (if (and (numeric-type-p x) (numeric-type-p y))
-      ;; Numeric types are easy. Are there any others we should handle like this?
-      (type-intersection x (type-negation y))
-      (let ((x-types (if (union-type-p x) (union-type-types x) (list x)))
-            (y-types (if (union-type-p y) (union-type-types y) (list y))))
-        (collect ((res))
-          (dolist (x-type x-types)
-            (if (member-type-p x-type)
-                (let ((xset (alloc-xset))
-                      (fp-zeroes nil))
-                  (mapc-member-type-members
-                   (lambda (elt)
-                     (multiple-value-bind (ok sure) (ctypep elt y)
-                       (unless sure
-                         (return-from type-difference nil))
-                       (unless ok
-                         (if (fp-zero-p elt)
-                             (pushnew elt fp-zeroes)
-                             (add-to-xset elt xset)))))
-                   x-type)
-                  (unless (and (xset-empty-p xset) (not fp-zeroes))
-                    (res (make-member-type :xset xset :fp-zeroes fp-zeroes))))
-                (dolist (y-type y-types (res x-type))
-                  (multiple-value-bind (val win) (csubtypep x-type y-type)
-                    (unless win (return-from type-difference nil))
-                    (when val (return))
-                    (when (types-equal-or-intersect x-type y-type)
-                      (return-from type-difference nil))))))
-          (let ((y-mem (find-if #'member-type-p y-types)))
-            (when y-mem
-              (dolist (x-type x-types)
-                (unless (member-type-p x-type)
-                  (mapc-member-type-members
-                   (lambda (member)
-                     (multiple-value-bind (ok sure) (ctypep member x-type)
-                       (when (or (not sure) ok)
-                         (return-from type-difference nil))))
-                   y-mem)))))
-          (apply #'type-union (res))))))
+  (type-intersection x (type-negation y)))
 
-(!def-type-translator array (&optional (element-type '*)
+(def-type-translator array ((:context context)
+                             &optional (element-type '*)
                                        (dimensions '*))
   (let ((eltype (if (eq element-type '*)
                     *wild-type*
-                    (specifier-type element-type))))
+                    (specifier-type-r context element-type))))
     (make-array-type (canonical-array-dimensions dimensions)
                      :complexp :maybe
                      :element-type eltype
                      :specialized-element-type (%upgraded-array-element-type
                                                 eltype))))
 
-(!def-type-translator simple-array (&optional (element-type '*)
+(def-type-translator simple-array ((:context context)
+                                    &optional (element-type '*)
                                               (dimensions '*))
   (let ((eltype (if (eq element-type '*)
                     *wild-type*
-                    (specifier-type element-type))))
+                    (specifier-type-r context element-type))))
    (make-array-type (canonical-array-dimensions dimensions)
                     :complexp nil
                     :element-type eltype
@@ -3613,24 +3763,27 @@ used for a COMPLEX component.~:@>"
                                                eltype))))
 
 ;;;; SIMD-PACK types
-#!+sb-simd-pack
+#+sb-simd-pack
 (progn
-  (!define-type-class simd-pack)
+  (define-type-class simd-pack :enumerable nil
+                      :might-contain-other-types nil)
 
-  (!def-type-translator simd-pack (&optional (element-type-spec '*))
+  ;; Though this involves a recursive call to parser, parsing context need not
+  ;; be passed down, because an unknown-type condition is an immediate failure.
+  (def-type-translator simd-pack (&optional (element-type-spec '*))
      (if (eql element-type-spec '*)
          (%make-simd-pack-type *simd-pack-element-types*)
          (make-simd-pack-type (single-value-specifier-type element-type-spec))))
 
-  (!define-type-method (simd-pack :negate) (type)
+  (define-type-method (simd-pack :negate) (type)
      (let ((remaining (set-difference *simd-pack-element-types*
                                       (simd-pack-type-element-type type)))
-           (not-simd-pack (make-negation-type :type (specifier-type 'simd-pack))))
+           (not-simd-pack (make-negation-type (specifier-type 'simd-pack))))
        (if remaining
            (type-union not-simd-pack (%make-simd-pack-type remaining))
            not-simd-pack)))
 
-  (!define-type-method (simd-pack :unparse) (type)
+  (define-type-method (simd-pack :unparse) (type)
      (let ((eltypes (simd-pack-type-element-type type)))
        (cond ((equal eltypes *simd-pack-element-types*)
               'simd-pack)
@@ -3641,22 +3794,24 @@ used for a COMPLEX component.~:@>"
                                `(simd-pack ,eltype))
                              eltypes))))))
 
-  (!define-type-method (simd-pack :simple-=) (type1 type2)
+  (define-type-method (simd-pack :simple-=) (type1 type2)
      (declare (type simd-pack-type type1 type2))
-     (null (set-exclusive-or (simd-pack-type-element-type type1)
-                             (simd-pack-type-element-type type2))))
+     (values
+      (null (set-exclusive-or (simd-pack-type-element-type type1)
+                              (simd-pack-type-element-type type2)))
+      t))
 
-  (!define-type-method (simd-pack :simple-subtypep) (type1 type2)
+  (define-type-method (simd-pack :simple-subtypep) (type1 type2)
      (declare (type simd-pack-type type1 type2))
      (subsetp (simd-pack-type-element-type type1)
               (simd-pack-type-element-type type2)))
 
-  (!define-type-method (simd-pack :simple-union2) (type1 type2)
+  (define-type-method (simd-pack :simple-union2) (type1 type2)
      (declare (type simd-pack-type type1 type2))
      (%make-simd-pack-type (union (simd-pack-type-element-type type1)
                                   (simd-pack-type-element-type type2))))
 
-  (!define-type-method (simd-pack :simple-intersection2) (type1 type2)
+  (define-type-method (simd-pack :simple-intersection2) (type1 type2)
      (declare (type simd-pack-type type1 type2))
      (let ((intersection (intersection (simd-pack-type-element-type type1)
                                        (simd-pack-type-element-type type2))))
@@ -3665,6 +3820,64 @@ used for a COMPLEX component.~:@>"
            *empty-type*)))
 
   (!define-superclasses simd-pack ((simd-pack)) !cold-init-forms))
+
+#+sb-simd-pack-256
+(progn
+  (define-type-class simd-pack-256 :enumerable nil
+                      :might-contain-other-types nil)
+
+  ;; Though this involves a recursive call to parser, parsing context need not
+  ;; be passed down, because an unknown-type condition is an immediate failure.
+  (def-type-translator simd-pack-256 (&optional (element-type-spec '*))
+     (if (eql element-type-spec '*)
+         (%make-simd-pack-256-type *simd-pack-element-types*)
+         (make-simd-pack-256-type (single-value-specifier-type element-type-spec))))
+
+  (define-type-method (simd-pack-256 :negate) (type)
+     (let ((remaining (set-difference *simd-pack-element-types*
+                                      (simd-pack-256-type-element-type type)))
+           (not-simd-pack-256 (make-negation-type (specifier-type 'simd-pack-256))))
+       (if remaining
+           (type-union not-simd-pack-256 (%make-simd-pack-256-type remaining))
+           not-simd-pack-256)))
+
+  (define-type-method (simd-pack-256 :unparse) (type)
+     (let ((eltypes (simd-pack-256-type-element-type type)))
+       (cond ((equal eltypes *simd-pack-element-types*)
+              'simd-pack-256)
+             ((= 1 (length eltypes))
+              `(simd-pack-256 ,(first eltypes)))
+             (t
+              `(or ,@(mapcar (lambda (eltype)
+                               `(simd-pack-256 ,eltype))
+                             eltypes))))))
+
+  (define-type-method (simd-pack-256 :simple-=) (type1 type2)
+     (declare (type simd-pack-256-type type1 type2))
+     (values
+      (null (set-exclusive-or (simd-pack-256-type-element-type type1)
+                              (simd-pack-256-type-element-type type2)))
+      t))
+
+  (define-type-method (simd-pack-256 :simple-subtypep) (type1 type2)
+     (declare (type simd-pack-256-type type1 type2))
+     (subsetp (simd-pack-256-type-element-type type1)
+              (simd-pack-256-type-element-type type2)))
+
+  (define-type-method (simd-pack-256 :simple-union2) (type1 type2)
+     (declare (type simd-pack-256-type type1 type2))
+     (%make-simd-pack-256-type (union (simd-pack-256-type-element-type type1)
+                                  (simd-pack-256-type-element-type type2))))
+
+  (define-type-method (simd-pack-256 :simple-intersection2) (type1 type2)
+     (declare (type simd-pack-256-type type1 type2))
+     (let ((intersection (intersection (simd-pack-256-type-element-type type1)
+                                       (simd-pack-256-type-element-type type2))))
+       (if intersection
+           (%make-simd-pack-256-type intersection)
+           *empty-type*)))
+
+  (!define-superclasses simd-pack-256 ((simd-pack-256)) !cold-init-forms))
 
 ;;;; utilities shared between cross-compiler and target system
 
@@ -3710,7 +3923,7 @@ used for a COMPLEX component.~:@>"
     (multiple-value-bind (complexp low high)
         (if (complexp x)
             (let ((imag (imagpart x)))
-              (values :complex (min num imag) (max num imag)))
+              (values :complex (sb-xc:min num imag) (sb-xc:max num imag)))
             (values :real num num))
       (make-numeric-type :class (etypecase num
                                   (integer (if (complexp x)

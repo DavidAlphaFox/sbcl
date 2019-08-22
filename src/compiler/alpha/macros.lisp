@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; a handy macro for defining top level forms that depend on the
 ;;; compile environment
@@ -24,7 +24,6 @@
 
 ;;; c.f. x86 backend:
 ;;(defmacro move (dst src)
-;;  #!+sb-doc
 ;;  "Move SRC into DST unless they are location=."
 ;;  (once-only ((n-dst dst)
 ;;              (n-src src))
@@ -87,7 +86,7 @@
 (defmacro lisp-jump (function lip)
   "Jump to the lisp function FUNCTION.  LIP is an interior-reg temporary."
   `(progn
-     (inst lda ,lip (- (ash simple-fun-code-offset word-shift)
+     (inst lda ,lip (- (ash simple-fun-insts-offset word-shift)
                        fun-pointer-lowtag)
             ,function)
      (move ,function code-tn)
@@ -174,7 +173,7 @@
   (once-only ((result-tn result-tn) (temp-tn temp-tn) (size size))
     `(pseudo-atomic (:extra (pad-data-block ,size))
        (inst bis alloc-tn other-pointer-lowtag ,result-tn)
-       (inst li (logior (ash (1- ,size) n-widetag-bits) ,widetag) ,temp-tn)
+       (inst li (compute-object-header ,size ,widetag) ,temp-tn)
        (storew ,temp-tn ,result-tn 0 other-pointer-lowtag)
        ,@body)))
 
@@ -188,63 +187,23 @@
     (emit-label aligned)))
 
 ;;;; error code
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defun emit-error-break (vop kind code values)
-    (let ((vector (gensym)))
-      `((let ((vop ,vop))
-          (when vop
-            (note-this-location vop :internal-error)))
-        (inst gentrap ,kind)
-        (with-adjustable-vector (,vector)
-          (write-var-integer (error-number-or-lose ',code) ,vector)
-          ,@(mapcar (lambda (tn)
-                      `(let ((tn ,tn))
-                         (write-var-integer (make-sc-offset (sc-number
-                                                             (tn-sc tn))
-                                                            (tn-offset tn))
-                                            ,vector)))
-                    values)
-          (inst byte (length ,vector))
-          (dotimes (i (length ,vector))
-            (inst byte (aref ,vector i))))
-        (emit-alignment word-shift)))))
+(defun emit-error-break (vop kind code values)
+  (assemble ()
+    (when vop
+      (note-this-location vop :internal-error))
+    (emit-internal-error kind code values
+                         :trap-emitter (lambda (tramp-number)
+                                         (inst gentrap tramp-number)))
+    (emit-alignment word-shift)))
 
-(defmacro error-call (vop error-code &rest values)
-  "Cause an error.  ERROR-CODE is the error to cause."
-  (cons 'progn
-        (emit-error-break vop error-trap error-code values)))
-
-
-(defmacro cerror-call (vop label error-code &rest values)
-  "Cause a continuable error.  If the error is continued, execution resumes at
-  LABEL."
-  `(progn
-     (inst br zero-tn ,label)
-     ,@(emit-error-break vop cerror-trap error-code values)))
-
-(defmacro generate-error-code (vop error-code &rest values)
+(defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
-  `(assemble (*elsewhere*)
-     (let ((start-lab (gen-label)))
-       (emit-label start-lab)
-       (error-call ,vop ,error-code ,@values)
-       start-lab)))
-
-(defmacro generate-cerror-code (vop error-code &rest values)
-  "Generate-CError-Code Error-code Value*
-  Emit code for a continuable error with the specified Error-Code and
-  context Values.  If the error is continued, execution resumes after
-  the GENERATE-CERROR-CODE form."
-  (with-unique-names (continue error)
-    `(let ((,continue (gen-label)))
-       (emit-label ,continue)
-       (assemble (*elsewhere*)
-         (let ((,error (gen-label)))
-           (emit-label ,error)
-           (cerror-call ,vop ,continue ,error-code ,@values)
-           ,error)))))
-
+  (assemble (:elsewhere)
+    (let ((start-lab (gen-label)))
+      (emit-label start-lab)
+      (apply #'error-call vop error-code values)
+      start-lab)))
 
 ;;; a handy macro for making sequences look atomic
 (defmacro pseudo-atomic ((&key (extra 0)) &rest forms)
@@ -255,6 +214,16 @@
      (inst stl zero-tn 0 alloc-tn)))
 
 ;;;; memory accessor vop generators
+
+(sb-xc:deftype load/store-index (scale lowtag min-offset
+                                 &optional (max-offset min-offset))
+  `(integer ,(- (truncate (+ (ash 1 16)
+                             (* min-offset sb-vm:n-word-bytes)
+                             (- lowtag))
+                          scale))
+            ,(truncate (- (+ (1- (ash 1 16)) lowtag)
+                          (* max-offset sb-vm:n-word-bytes))
+                       scale)))
 
 (defmacro define-full-reffer (name type offset lowtag scs el-type
                                    &optional translate)
@@ -292,7 +261,7 @@
              '((inst mskll value 4 value)))))))
 
 (defmacro define-full-setter (name type offset lowtag scs el-type
-                                   &optional translate #!+gengc (remember t))
+                                   &optional translate #+gengc (remember t))
   `(progn
      (define-vop (,name)
        ,@(when translate
@@ -517,12 +486,3 @@
                                          (* index ,scale))
                                       ,lowtag) object))))
            (move value result))))))
-
-(def!macro with-pinned-objects ((&rest objects) &body body)
-  "Arrange with the garbage collector that the pages occupied by
-OBJECTS will not be moved in memory for the duration of BODY.
-Useful for e.g. foreign calls where another thread may trigger
-garbage collection.  This is currently implemented by disabling GC"
-  (declare (ignore objects))            ;should we eval these for side-effect?
-  `(without-gcing
-    ,@body))

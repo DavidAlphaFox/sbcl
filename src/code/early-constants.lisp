@@ -7,14 +7,9 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
-(macrolet ((def (name value &optional doc)
-             (declare (ignorable doc))
-             `(defconstant ,name (if (boundp ',name) (symbol-value ',name) ,value)
-                #!+sb-doc
-                ,@(when doc (list doc)))))
-  (def sb!xc:lambda-list-keywords
+(defconstant-eqx sb-xc:lambda-list-keywords
       '(&allow-other-keys
         &aux
         &body
@@ -24,4 +19,5 @@
         &optional
         &rest
         &whole)
-    "A list of symbols used as lambda list keywords in SBCL."))
+      #'equal
+    "A list of symbols used as lambda list keywords in SBCL.")

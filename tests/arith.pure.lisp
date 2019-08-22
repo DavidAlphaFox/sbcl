@@ -11,65 +11,95 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(cl:in-package :cl-user)
+(enable-test-parallelism)
 
 ;;; Once upon a time, in the process of porting CMUCL's SPARC backend
 ;;; to SBCL, multiplications were excitingly broken.  While it's
 ;;; unlikely that anything with such fundamental arithmetic errors as
 ;;; these are going to get this far, it's probably worth checking.
-(macrolet ((test (op res1 res2)
-             `(progn
-               (assert (= (,op 4 2) ,res1))
-               (assert (= (,op 2 4) ,res2))
-               (assert (= (funcall (compile nil '(lambda (x y) (,op x y))) 4 2)
-                        ,res1))
-               (assert (= (funcall (compile nil '(lambda (x y) (,op x y))) 2 4)
-                        ,res2)))))
-  (test + 6 6)
-  (test - 2 -2)
-  (test * 8 8)
-  (test / 2 1/2)
-  (test expt 16 16))
+(with-test (:name (:fundamental-arithmetic :smoke))
+  (macrolet ((test (op res1 res2)
+               `(progn
+                  (assert (= (,op 4 2) ,res1))
+                  (assert (= (,op 2 4) ,res2))
+                  (assert (= (funcall (checked-compile '(lambda (x y) (,op x y)))
+                                      4 2)
+                             ,res1))
+                  (assert (= (funcall (checked-compile '(lambda (x y) (,op x y)))
+                                      2 4)
+                             ,res2)))))
+    (test + 6 6)
+    (test - 2 -2)
+    (test * 8 8)
+    (test / 2 1/2)
+    (test expt 16 16)))
 
 ;;; In a bug reported by Wolfhard Buss on cmucl-imp 2002-06-18 (BUG
 ;;; 184), sbcl didn't catch all divisions by zero, notably divisions
 ;;; of bignums and ratios by 0.  Fixed in sbcl-0.7.6.13.
-(assert-error (/ 2/3 0) division-by-zero)
-(assert-error (/ (1+ most-positive-fixnum) 0) division-by-zero)
+(with-test (:name (/ :division-by-zero ratio))
+  (checked-compile-and-assert (:allow-style-warnings t)
+      '(lambda () (/ 2/3 0))
+    (() (condition 'division-by-zero))))
+
+(with-test (:name (/ :division-by-zero bignum))
+  (checked-compile-and-assert (:allow-style-warnings t)
+      '(lambda () (/ (1+ most-positive-fixnum) 0))
+    (() (condition 'division-by-zero))))
 
 ;;; In a bug reported by Raymond Toy on cmucl-imp 2002-07-18, (COERCE
 ;;; <RATIONAL> '(COMPLEX FLOAT)) was failing to return a complex
 ;;; float; a patch was given by Wolfhard Buss cmucl-imp 2002-07-19.
-(assert (= (coerce 1 '(complex float)) #c(1.0 0.0)))
-(assert (= (coerce 1/2 '(complex float)) #c(0.5 0.0)))
-(assert (= (coerce 1.0d0 '(complex float)) #c(1.0d0 0.0d0)))
+(with-test (:name (coerce complex float 1))
+  (assert (= (coerce 1 '(complex float)) #c(1.0 0.0)))
+  (assert (= (coerce 1/2 '(complex float)) #c(0.5 0.0)))
+  (assert (= (coerce 1.0d0 '(complex float)) #c(1.0d0 0.0d0))))
 
 ;;; (COERCE #c(<RATIONAL> <RATIONAL>) '(complex float)) resulted in
 ;;; an error up to 0.8.17.31
-(assert (= (coerce #c(1 2) '(complex float)) #c(1.0 2.0)))
+(with-test (:name (coerce complex float 2))
+  (assert (= (coerce #c(1 2) '(complex float)) #c(1.0 2.0))))
 
 ;;; COERCE also sometimes failed to verify that a particular coercion
 ;;; was possible (in particular coercing rationals to bounded float
 ;;; types.
-(assert-error (coerce 1 '(float 2.0 3.0)) type-error)
-(assert-error (coerce 1 '(single-float -1.0 0.0)) type-error)
-(assert (eql (coerce 1 '(single-float -1.0 2.0)) 1.0))
+(with-test (:name (coerce :to float :outside-bounds))
+  (checked-compile-and-assert (:allow-style-warnings t)
+      '(lambda () (coerce 1 '(float 2.0 3.0)))
+    (() (condition 'type-error)))
+  (checked-compile-and-assert (:allow-style-warnings t)
+      '(lambda () (coerce 1 '(single-float -1.0 0.0)))
+    (() (condition 'type-error)))
+  (assert (eql (coerce 1 '(single-float -1.0 2.0)) 1.0)))
 
 ;;; ANSI says MIN and MAX should signal TYPE-ERROR if any argument
 ;;; isn't REAL. SBCL 0.7.7 didn't in the 1-arg case. (reported as a
 ;;; bug in CMU CL on #lisp IRC by lrasinen 2002-09-01)
-(assert (null (ignore-errors (min '(1 2 3)))))
-(assert (= (min -1) -1))
-(assert (null (ignore-errors (min 1 #(1 2 3)))))
-(assert (= (min 10 11) 10))
-(assert (null (ignore-errors (min (find-package "CL") -5.0))))
-(assert (= (min 5.0 -3) -3))
-(assert (null (ignore-errors (max #c(4 3)))))
-(assert (= (max 0) 0))
-(assert (null (ignore-errors (max "MIX" 3))))
-(assert (= (max -1 10.0) 10.0))
-(assert (null (ignore-errors (max 3 #'max))))
-(assert (= (max -3 0) 0))
+(with-test (:name (min max type-error))
+  (checked-compile-and-assert (:allow-warnings t :allow-style-warnings t)
+      '(lambda () (min '(1 2 3)))
+    (() (condition 'type-error)))
+  (assert (= (min -1) -1))
+  (checked-compile-and-assert (:allow-warnings t :allow-style-warnings t)
+      '(lambda () (min 1 #(1 2 3)))
+    (() (condition 'type-error)))
+  (assert (= (min 10 11) 10))
+  (checked-compile-and-assert (:allow-warnings t :allow-style-warnings t)
+      '(lambda () (min (find-package "CL") -5.0))
+    (() (condition 'type-error)))
+  (assert (= (min 5.0 -3) -3))
+  (checked-compile-and-assert (:allow-warnings t :allow-style-warnings t)
+      '(lambda () (max #c(4 3)))
+    (() (condition 'type-error)))
+  (assert (= (max 0) 0))
+  (checked-compile-and-assert (:allow-warnings t :allow-style-warnings t)
+      '(lambda () (max "MIX" 3))
+    (() (condition 'type-error)))
+  (assert (= (max -1 10.0) 10.0))
+  (checked-compile-and-assert (:allow-warnings t :allow-style-warnings t)
+      '(lambda () (max 3 #'max))
+    (() (condition 'type-error)))
+  (assert (= (max -3 0) 0)))
 
 (with-test (:name :numeric-inequality-&rest-arguments)
   (dolist (f '(= < <= > >=))
@@ -92,158 +122,169 @@
     (assert-error (funcall f #c(1s0 -2s0)) type-error)))
 
 ;;; (CEILING x 2^k) was optimized incorrectly
-(loop for divisor in '(-4 4)
-      for ceiler = (compile nil `(lambda (x)
-                                   (declare (fixnum x))
-                                   (declare (optimize (speed 3)))
-                                   (ceiling x ,divisor)))
-      do (loop for i from -5 to 5
-               for exact-q = (/ i divisor)
-               do (multiple-value-bind (q r)
-                      (funcall ceiler i)
-                    (assert (= (+ (* q divisor) r) i))
-                    (assert (<= exact-q q))
-                    (assert (< q (1+ exact-q))))))
+(with-test (:name (ceiling :power-of-two))
+  (loop for divisor in '(-4 4)
+        for ceiler = (checked-compile `(lambda (x)
+                                         (declare (fixnum x))
+                                         (declare (optimize (speed 3)))
+                                         (ceiling x ,divisor)))
+        do (loop for i from -5 to 5
+                 for exact-q = (/ i divisor)
+                 do (multiple-value-bind (q r)
+                        (funcall ceiler i)
+                      (assert (= (+ (* q divisor) r) i))
+                      (assert (<= exact-q q))
+                      (assert (< q (1+ exact-q)))))))
 
 ;;; (TRUNCATE x 2^k) was optimized incorrectly
-(loop for divisor in '(-4 4)
-      for truncater = (compile nil `(lambda (x)
-                                      (declare (fixnum x))
-                                      (declare (optimize (speed 3)))
-                                      (truncate x ,divisor)))
-      do (loop for i from -9 to 9
-               for exact-q = (/ i divisor)
-               do (multiple-value-bind (q r)
-                      (funcall truncater i)
-                    (assert (= (+ (* q divisor) r) i))
-                    (assert (<= (abs q) (abs exact-q)))
-                    (assert (< (abs exact-q) (1+ (abs q)))))))
+(with-test (:name (truncate :power-of-two))
+  (loop for divisor in '(-4 4)
+        for truncater = (checked-compile `(lambda (x)
+                                            (declare (fixnum x))
+                                            (declare (optimize (speed 3)))
+                                            (truncate x ,divisor)))
+        do (loop for i from -9 to 9
+                 for exact-q = (/ i divisor)
+                 do (multiple-value-bind (q r)
+                        (funcall truncater i)
+                      (assert (= (+ (* q divisor) r) i))
+                      (assert (<= (abs q) (abs exact-q)))
+                      (assert (< (abs exact-q) (1+ (abs q))))))))
 
 ;;; CEILING had a corner case, spotted by Paul Dietz
-(assert (= (ceiling most-negative-fixnum (1+ most-positive-fixnum)) -1))
+(with-test  (:name (ceiling :corner-case))
+  (assert (= (ceiling most-negative-fixnum (1+ most-positive-fixnum)) -1)))
 
 ;;; give any optimizers of constant multiplication a light testing.
 ;;; 100 may seem low, but (a) it caught CSR's initial errors, and (b)
 ;;; before checking in, CSR tested with 10000.  So one hundred
 ;;; checkins later, we'll have doubled the coverage.
-(dotimes (i 100)
-  (let* ((x (random most-positive-fixnum))
-         (x2 (* x 2))
-         (x3 (* x 3)))
-    (let ((fn (handler-bind ((sb-ext:compiler-note
-                              (lambda (c)
-                                (when (<= x3 most-positive-fixnum)
-                                  (error c)))))
-                (compile nil
-                         `(lambda (y)
-                            (declare (optimize speed) (type (integer 0 3) y))
-                            (* y ,x))))))
-      (unless (and (= (funcall fn 0) 0)
-                   (= (funcall fn 1) x)
-                   (= (funcall fn 2) x2)
-                   (= (funcall fn 3) x3))
-        (error "bad results for ~D" x)))))
+(with-test (:name (* :multiplication :constant :optimization))
+  (dotimes (i 100)
+    (let* ((x (random most-positive-fixnum))
+           (x2 (* x 2))
+           (x3 (* x 3))
+           (fn (checked-compile
+                `(lambda (y)
+                   (declare (optimize speed) (type (integer 0 3) y))
+                   (* y ,x))
+                :allow-notes (> x3 most-positive-fixnum))))
+      (assert (= (funcall fn 0) 0))
+      (assert (= (funcall fn 1) x))
+      (assert (= (funcall fn 2) x2))
+      (assert (= (funcall fn 3) x3)))))
 
 ;;; Bugs reported by Paul Dietz:
 
 ;;; (GCD 0 x) must return (abs x)
-(dolist (x (list -10 (* 3 most-negative-fixnum)))
-  (assert (= (gcd 0 x) (abs x))))
+(with-test (:name (gcd 0))
+  (dolist (x (list -10 (* 3 most-negative-fixnum)))
+    (assert (= (gcd 0 x) (abs x)))))
+
 ;;; LCM returns a non-negative number
-(assert (= (lcm 4 -10) 20))
-(assert (= (lcm 0 0) 0))
+(with-test (:name (lcm :non-negative))
+  (assert (= (lcm 4 -10) 20))
+  (assert (= (lcm 0 0) 0)))
 
 ;;; PPC bignum arithmetic bug:
-(multiple-value-bind (quo rem)
-    (truncate 291351647815394962053040658028983955 10000000000000000000000000)
-  (assert (= quo 29135164781))
-  (assert (= rem 5394962053040658028983955)))
+(with-test (:name (truncate bignum :ppc))
+  (multiple-value-bind (quo rem)
+      (truncate 291351647815394962053040658028983955 10000000000000000000000000)
+    (assert (= quo 29135164781))
+    (assert (= rem 5394962053040658028983955))))
 
 ;;; x86 LEA bug:
-(assert (= (funcall
-            (compile nil '(lambda (x) (declare (bit x)) (+ x #xf0000000)))
-            1)
-           #xf0000001))
+(with-test (:name (:x86 :lea))
+  (checked-compile-and-assert ()
+      '(lambda (x) (declare (bit x)) (+ x #xf0000000))
+    ((1) #xf0000001)))
 
-;;; LOGBITP on bignums:
-(dolist (x '(((1+ most-positive-fixnum) 1 nil)
-             ((1+ most-positive-fixnum) -1 t)
-             ((1+ most-positive-fixnum) (1+ most-positive-fixnum) nil)
-             ((1+ most-positive-fixnum) (1- most-negative-fixnum) t)
-             (1 (ash most-negative-fixnum 1) nil)
-             (#.(- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits 1) most-negative-fixnum t)
-             (#.(1+ (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits 1)) (ash most-negative-fixnum 1) t)
-             (#.(+ 2 (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits 1)) (ash most-negative-fixnum 1) t)
-             (#.(+ sb-vm:n-word-bits 32) (ash most-negative-fixnum #.(+ 32 sb-vm:n-fixnum-tag-bits 2)) nil)
-             (#.(+ sb-vm:n-word-bits 33) (ash most-negative-fixnum #.(+ 32 sb-vm:n-fixnum-tag-bits 2)) t)))
-  (destructuring-bind (index int result) x
-    (assert (eq (eval `(logbitp ,index ,int)) result))))
+(with-test (:name (logbitp bignum))
+  (dolist (x '(((1+ most-positive-fixnum) 1 nil)
+               ((1+ most-positive-fixnum) -1 t)
+               ((1+ most-positive-fixnum) (1+ most-positive-fixnum) nil)
+               ((1+ most-positive-fixnum) (1- most-negative-fixnum) t)
+               (1 (ash most-negative-fixnum 1) nil)
+               (#.(- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits 1) most-negative-fixnum t)
+               (#.(1+ (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits 1)) (ash most-negative-fixnum 1) t)
+               (#.(+ 2 (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits 1)) (ash most-negative-fixnum 1) t)
+               (#.(+ sb-vm:n-word-bits 32) (ash most-negative-fixnum #.(+ 32 sb-vm:n-fixnum-tag-bits 2)) nil)
+               (#.(+ sb-vm:n-word-bits 33) (ash most-negative-fixnum #.(+ 32 sb-vm:n-fixnum-tag-bits 2)) t)))
+    (destructuring-bind (index int result) x
+      (assert (eq (eval `(logbitp ,index ,int)) result)))))
 
 ;;; off-by-1 type inference error for %DPB and %DEPOSIT-FIELD:
-(let ((f (compile nil '(lambda (b)
-                        (integer-length (dpb b (byte 4 28) -1005))))))
-  (assert (= (funcall f 1230070) 32)))
-(let ((f (compile nil '(lambda (b)
-                        (integer-length (deposit-field b (byte 4 28) -1005))))))
-  (assert (= (funcall f 1230070) 32)))
+(with-test (:name (dpb deposit-field :off-by-one))
+  (checked-compile-and-assert ()
+      '(lambda (b)
+         (integer-length (dpb b (byte 4 28) -1005)))
+    ((1230070) 32))
+  (checked-compile-and-assert ()
+      '(lambda (b)
+         (integer-length (deposit-field b (byte 4 28) -1005)))
+    ((1230070) 32)))
 
 ;;; type inference leading to an internal compiler error:
-(let ((f (compile nil '(lambda (x)
-                        (declare (type fixnum x))
-                        (ldb (byte 0 0) x)))))
-  (assert (= (funcall f 1) 0))
-  (assert (= (funcall f most-positive-fixnum) 0))
-  (assert (= (funcall f -1) 0)))
+(with-test (:name (ldb byte 0 :type-inference))
+  (checked-compile-and-assert ()
+      '(lambda (x)
+         (declare (type fixnum x))
+         (ldb (byte 0 0) x))
+    ((1)                    0)
+    ((most-positive-fixnum) 0)
+    ((-1)                   0)))
 
 ;;; Alpha bignum arithmetic bug:
-(assert (= (* 966082078641 419216044685) 404997107848943140073085))
+(with-test (:name (bignum :arithmetic :alpha))
+  (assert (= (* 966082078641 419216044685) 404997107848943140073085)))
 
 ;;; Alpha smallnum arithmetic bug:
-(assert (= (ash -129876 -1026) -1))
+(with-test (:name (fixnum :arithmetc :alpha))
+  (assert (= (ash -129876 -1026) -1)))
 
 ;;; Alpha middlenum (yes, really! Affecting numbers between 2^32 and
 ;;; 2^64 :) arithmetic bug
-(let ((fn (compile nil '(LAMBDA (A B C D)
-          (DECLARE (TYPE (INTEGER -1621 -513) A)
-                   (TYPE (INTEGER -3 34163) B)
-                   (TYPE (INTEGER -9485132993 81272960) C)
-                   (TYPE (INTEGER -255340814 519943) D)
-                   (IGNORABLE A B C D)
-                   (OPTIMIZE (SPEED 3) (SAFETY 1) (DEBUG 1)))
-          (TRUNCATE C (MIN -100 4149605))))))
-  (assert (= (funcall fn -1332 5864 -6963328729 -43789079) 69633287)))
+(with-test (:name (truncate :middlenum))
+  (checked-compile-and-assert ()
+      '(lambda (a b c d)
+         (declare (type (integer -1621 -513) a)
+                  (type (integer -3 34163) b)
+                  (type (integer -9485132993 81272960) c)
+                  (type (integer -255340814 519943) d)
+                  (ignorable a b c d))
+         (truncate c (min -100 4149605)))
+    ((-1332 5864 -6963328729 -43789079) (values 69633287 -29))))
 
 ;;; Here's another fantastic Alpha backend bug: the code to load
 ;;; immediate 64-bit constants into a register was wrong.
-(let ((fn (compile nil '(LAMBDA (A B C D)
-          (DECLARE (TYPE (INTEGER -3563 2733564) A)
-                   (TYPE (INTEGER -548947 7159) B)
-                   (TYPE (INTEGER -19 0) C)
-                   (TYPE (INTEGER -2546009 0) D)
-                   (IGNORABLE A B C D)
-                   (OPTIMIZE (SPEED 3) (SAFETY 1) (DEBUG 1)))
-          (CASE A
-            ((89 125 16) (ASH A (MIN 18 -706)))
-            (T (DPB -3 (BYTE 30 30) -1)))))))
-  (assert (= (funcall fn 1227072 -529823 -18 -792831) -2147483649)))
+(with-test (:name (dpb :constants))
+  (checked-compile-and-assert ()
+      '(lambda (a b c d)
+         (declare (type (integer -3563 2733564) a)
+                  (type (integer -548947 7159) b)
+                  (type (integer -19 0) c)
+                  (type (integer -2546009 0) d)
+                  (ignorable a b c d))
+         (case a
+           ((89 125 16) (ash a (min 18 -706)))
+           (t (dpb -3 (byte 30 30) -1))))
+    ((1227072 -529823 -18 -792831) -2147483649)))
 
 ;;; ASH of a negative bignum by a bignum count would erroneously
 ;;; return 0 prior to sbcl-0.8.4.4
-(assert (= (ash (1- most-negative-fixnum) (1- most-negative-fixnum)) -1))
+(with-test (:name (ash :negative bignum))
+  (assert (= (ash (1- most-negative-fixnum) (1- most-negative-fixnum)) -1)))
 
 ;;; Whoops.  Too much optimization in division operators for 0
 ;;; divisor.
-(macrolet ((frob (name)
-             `(let ((fn (compile nil '(lambda (x)
-                                       (declare (optimize speed) (fixnum x))
-                                       (,name x 0)))))
-                (assert-error (funcall fn 1) division-by-zero))))
-  (frob mod)
-  (frob truncate)
-  (frob rem)
-  (frob /)
-  (frob floor)
-  (frob ceiling))
+(with-test (:name (mod truncate rem / floor ceiling :division-by-zero fixnum))
+  (flet ((frob (name)
+           (let ((fn (checked-compile
+                      `(lambda (x)
+                         (declare (optimize speed) (fixnum x))
+                         (,name x 0)))))
+             (assert-error (funcall fn 1) division-by-zero))))
+    (mapc #'frob '(mod truncate rem / floor ceiling))))
 
 ;; Check that the logic in SB-KERNEL::BASIC-COMPARE for doing fixnum/float
 ;; comparisons without rationalizing the floats still gives the right anwers
@@ -280,14 +321,15 @@
   (test 32 single-float positive))
 
 ;; x86-64 sign-extension bug found using pfdietz's random tester.
-(assert (= 286142502
-           (funcall (lambda ()
-                      (declare (notinline logxor))
-                      (min (logxor 0 0 0 286142502))))))
+(with-test (:name (:x86-64 :sign-extension))
+  (assert (= 286142502
+             (funcall (lambda ()
+                        (declare (notinline logxor))
+                        (min (logxor 0 0 0 286142502)))))))
 
 ;; Small bugs in LOGCOUNT can still allow SBCL to be built and thus go
 ;; unnoticed, so check more thoroughly here.
-(with-test (:name :logcount)
+(with-test (:name logcount)
   (flet ((test (x n)
            (unless (= (logcount x) n)
              (error "logcount failure for ~a" x))))
@@ -312,7 +354,7 @@
           (test (- x) (test-logcount (- x))))))))
 
 ;; 1.0 had a broken ATANH on win32
-(with-test (:name :atanh)
+(with-test (:name atanh)
   (assert (= (atanh 0.9d0) 1.4722194895832204d0)))
 
 ;; Test some cases of integer operations with constant arguments
@@ -320,7 +362,7 @@
   (labels ((test-forms (op x y header &rest forms)
              (let ((val (funcall op x y)))
                (dolist (form forms)
-                 (let ((new-val (funcall (compile nil (append header form)) x y)))
+                 (let ((new-val (funcall (checked-compile (append header form)) x y)))
                    (unless (eql val new-val)
                      (error "~S /= ~S: ~S ~S ~S~%" val new-val (append header form) x y))))))
            (test-case (op x y type)
@@ -390,7 +432,7 @@
 
 ;; GCD used to sometimes return negative values. The following did, on 32 bit
 ;; builds.
-(with-test (:name :gcd)
+(with-test (:name gcd)
   ;; from lp#413680
   (assert (plusp (gcd 20286123923750474264166990598656
                       680564733841876926926749214863536422912)))
@@ -398,12 +440,18 @@
   (assert (plusp (gcd 2596102012663483082521318626691873
                       2596148429267413814265248164610048))))
 
-(with-test (:name :expt-zero-zero)
-  ;; Check that (expt 0.0 0.0) and (expt 0 0.0) signal error, but (expt 0.0 0)
-  ;; returns 1.0
-  (assert-error (expt 0.0 0.0) sb-int:arguments-out-of-domain-error)
-  (assert-error (expt 0 0.0) sb-int:arguments-out-of-domain-error)
-  (assert (eql (expt 0.0 0) 1.0)))
+(with-test (:name (expt 0 0))
+  ;; Check that (expt 0.0 0.0) and (expt 0 0.0) signal error, but
+  ;; (expt 0.0 0) returns 1.0
+  (flet ((error-case (expr)
+           (checked-compile-and-assert (:allow-style-warnings t)
+               `(lambda () ,expr)
+             (() (condition 'sb-int:arguments-out-of-domain-error)))))
+    (error-case '(expt 0.0 0.0))
+    (error-case '(expt 0 0.0)))
+  (checked-compile-and-assert (:allow-style-warnings t)
+      `(lambda () (expt 0.0 0))
+    (() 1.0)))
 
 (with-test (:name :multiple-constant-folding)
   (let ((*random-state* (make-random-state t)))
@@ -419,11 +467,15 @@
       (dolist (op '(+ * logior logxor logand logeqv gcd lcm - /))
         (loop repeat 10
               do (multiple-value-bind (args vars) (make-args)
-                   (let ((fast (compile nil `(lambda ,vars
-                                               (,op ,@args))))
-                         (slow (compile nil `(lambda ,vars
-                                               (declare (notinline ,op))
-                                               (,op ,@args)))))
+                   (let ((fast (checked-compile
+                                `(lambda ,vars
+                                   (,op ,@args))
+                                :allow-style-warnings (eq op '/)))
+                         (slow (checked-compile
+                                `(lambda ,vars
+                                   (declare (notinline ,op))
+                                   (,op ,@args))
+                                :allow-style-warnings (eq op '/))))
                      (loop repeat 3
                            do (let* ((call-args (loop repeat (length vars)
                                                       collect (- (random 21) 10)))
@@ -433,24 +485,25 @@
                                      (slow-result (handler-case
                                                       (apply slow call-args)
                                                     (division-by-zero () :div0))))
-                                (if (eql fast-result slow-result)
-                                    (print (list :ok `(,op ,@args) :=> fast-result))
-                                    (error "oops: ~S, ~S" args call-args)))))))))))
+                                (if (not (eql fast-result slow-result))
+                                    (error "oops: ~S, ~S" args call-args)
+                                    #+nil (print (list :ok `(,op ,@args) :=> fast-result))
+                                    ))))))))))
 
 ;;; (TRUNCATE <unsigned-word> <constant unsigned-word>) is optimized
 ;;; to use multiplication instead of division. This propagates to FLOOR,
 ;;; MOD and REM. Test that the transform is indeed triggered and test
 ;;; several cases for correct results.
 (with-test (:name (:integer-division-using-multiplication :used)
-                  :skipped-on '(not (or :x86-64 :x86)))
+                  :skipped-on (not (or :x86-64 :x86)))
   (dolist (fun '(truncate floor ceiling mod rem))
-    (let* ((foo (compile nil `(lambda (x)
-                                (declare (optimize (speed 3)
-                                                   (space 1)
-                                                   (compilation-speed 0))
-                                         (type (unsigned-byte
-                                                ,sb-vm:n-word-bits) x))
-                                (,fun x 9))))
+    (let* ((foo (checked-compile
+                 `(lambda (x)
+                    (declare (optimize (speed 3)
+                                       (space 1)
+                                       (compilation-speed 0))
+                             (type (unsigned-byte ,sb-vm:n-word-bits) x))
+                    (,fun x 9))))
            (disassembly (with-output-to-string (s)
                           (disassemble foo :stream s))))
       ;; KLUDGE copied from test :float-division-using-exact-reciprocal
@@ -476,12 +529,13 @@
                                  when (not (zerop (logand r (1- r))))
                                  collect r)))
         (dolist (fun '(truncate ceiling floor mod rem))
-          (let ((foo (compile nil `(lambda (x)
-                                     (declare (optimize (speed 3)
-                                                        (space 1)
-                                                        (compilation-speed 0))
-                                              (type ,dividend-type x))
-                                     (,fun x ,divisor)))))
+          (let ((foo (checked-compile
+                      `(lambda (x)
+                         (declare (optimize (speed 3)
+                                            (space 1)
+                                            (compilation-speed 0))
+                                  (type ,dividend-type x))
+                         (,fun x ,divisor)))))
             (dolist (dividend `(0 1 ,most-positive-fixnum
                                 ,(1- divisor) ,divisor
                                 ,(1- (* divisor 2)) ,(* divisor 2)
@@ -502,15 +556,15 @@
                              (list fun dividend divisor)
                              dividend-type))))))))))))
 
-;; The fast path for logbitp underestimated sb!vm:n-positive-fixnum-bits
+;; The fast path for logbitp underestimated sb-vm:n-positive-fixnum-bits
 ;; for > 61 bit fixnums.
-(with-test (:name :logbitp-wide-fixnum)
+(with-test (:name (logbitp :wide fixnum))
   (assert (not (logbitp (1- (integer-length most-positive-fixnum))
                         most-negative-fixnum))))
 
 ;; EXPT dispatches in a complicated way on the types of its arguments.
 ;; Check that all possible combinations are covered.
-(with-test (:name (:expt :argument-type-combinations))
+(with-test (:name (expt :argument-type-combinations))
   (let ((numbers '(2                 ; fixnum
                    3/5               ; ratio
                    1.2f0             ; single-float
@@ -522,9 +576,9 @@
         results)
     (dolist (base (cons bignum numbers))
       (dolist (power numbers)
-        (format t "(expt ~s ~s) => " base power)
+        #+nil (format t "(expt ~s ~s) => " base power)
         (let ((result (expt base power)))
-          (format t "~s~%" result)
+          #+nil (format t "~s~%" result)
           (push result results))))
     (assert (every #'numberp results))))
 
@@ -545,6 +599,8 @@
              (and (nearly-equal-p (realpart x) (realpart y))
                   (nearly-equal-p (imagpart x) (imagpart y))))
            (print-result (msg base power got expected)
+             (declare (ignorable msg base power got expected))
+             #+nil
              (format t "~a (expt ~s ~s)~%got      ~s~%expected ~s~%"
                      msg base power got expected)))
     (let ((n-broken 0))
@@ -573,16 +629,16 @@
       (when (> n-broken 0)
         (error "Number of broken combinations: ~a" n-broken)))))
 
-(with-test (:name (:ldb :rlwinm :ppc))
-  (let ((one (compile nil '(lambda (a) (ldb (byte 9 27) a))))
-        (two (compile nil '(lambda (a)
-                            (declare (type (integer -3 57216651) a))
-                            (ldb (byte 9 27) a)))))
+(with-test (:name (ldb :rlwinm :ppc))
+  (let ((one (checked-compile '(lambda (a) (ldb (byte 9 27) a))))
+        (two (checked-compile '(lambda (a)
+                                 (declare (type (integer -3 57216651) a))
+                                 (ldb (byte 9 27) a)))))
     (assert (= 0 (- (funcall one 10) (funcall two 10))))))
 
 ;; The ISQRT implementation is sufficiently complicated that it should
 ;; be tested.
-(with-test (:name :isqrt)
+(with-test (:name isqrt)
   (labels ((test (x)
              (let* ((r (isqrt x))
                     (r2 (expt r 2))
@@ -609,64 +665,164 @@
 
 ;; bug 1026634 (reported by Eric Marsden on sbcl-devel)
 (with-test (:name :recursive-cut-to-width)
-  (assert (eql (funcall
-                (compile nil
-                         `(lambda (x)
-                            (declare (optimize (space 3))
-                                     (type (integer 12417236377505266230
-                                                    12417274239874990070) x))
-                            (logand 8459622733968096971 x)))
-                12417237222845306758)
-               2612793697039849090)))
+  (checked-compile-and-assert (:optimize '(:speed t :safety t :debug t :space t))
+      '(lambda (x)
+         (declare (type (integer 12417236377505266230
+                                 12417274239874990070)
+                        x))
+         (logand 8459622733968096971 x))
+    ((12417237222845306758) 2612793697039849090)))
 
 ;; Also reported by Eric Marsden on sbcl-devel (2013-06-06)
-(with-test (:name :more-recursive-cut-to-width)
-  (assert (eql (funcall
-                (compile nil `(lambda (a b)
-                                (declare (optimize (speed 2) (safety 0)))
-                                (logand (the (eql 16779072918521075607) a)
-                                        (the (integer 21371810342718833225 21371810343571293860) b))))
-                16779072918521075607 21371810342718833263)
-               2923729245085762055)))
+(with-test (:name (:recursive-cut-to-width :more))
+  (checked-compile-and-assert ()
+      '(lambda (a b)
+         (logand (the (eql 16779072918521075607) a)
+                 (the (integer 21371810342718833225 21371810343571293860) b)))
+    ((16779072918521075607 21371810342718833263) 2923729245085762055)))
 
-(with-test (:name :complicated-logand-identity)
+(with-test (:name (logand :complicated-identity))
   (loop for k from -8 upto 8 do
     (loop for min from -16 upto 16 do
       (loop for max from min upto 16 do
-        (let ((f (compile nil `(lambda (x)
-                                 (declare (type (integer ,min ,max) x))
-                                 (logand x ,k)))))
+        (let ((f (checked-compile `(lambda (x)
+                                     (declare (type (integer ,min ,max) x))
+                                     (logand x ,k)))))
           (loop for x from min upto max do
             (assert (eql (logand x k) (funcall f x)))))))))
 
-(with-test (:name :complicated-logior-identity)
+(with-test (:name (logior :complicated-identity))
   (loop for k from -8 upto 8 do
     (loop for min from -16 upto 16 do
       (loop for max from min upto 16 do
-        (let ((f (compile nil `(lambda (x)
-                                 (declare (type (integer ,min ,max) x))
-                                 (logior x ,k)))))
+        (let ((f (checked-compile `(lambda (x)
+                                     (declare (type (integer ,min ,max) x))
+                                     (logior x ,k)))))
           (loop for x from min upto max do
             (assert (eql (logior x k) (funcall f x)))))))))
 
-(with-test (:name :ldb-negative-index-no-error)
-  (assert-error
-   (funcall (compile nil
-                     `(lambda (x y)
-                        (ldb (byte x y) 100)))
-            -1 -2))
-  (assert-error
-   (funcall (compile nil
-                     `(lambda (x y)
-                        (mask-field (byte x y) 100)))
-            -1 -2))
-  (assert-error
-   (funcall (compile nil
-                     `(lambda (x y)
-                        (dpb 0 (byte x y) 100)))
-            -1 -2))
-  (assert-error
-   (funcall (compile nil
-                     `(lambda (x y)
-                        (deposit-field 0 (byte x y) 100)))
-            -1 -2)))
+(with-test (:name (ldb :negative-index-no-error))
+  (checked-compile-and-assert ()
+      '(lambda (x y) (ldb (byte x y) 100))
+    ((-1 -2) (condition 'error)))
+  (checked-compile-and-assert ()
+      '(lambda (x y) (mask-field (byte x y) 100))
+    ((-1 -2) (condition 'error)))
+  (checked-compile-and-assert ()
+      '(lambda (x y) (dpb 0 (byte x y) 100))
+    ((-1 -2) (condition 'error)))
+  (checked-compile-and-assert ()
+      '(lambda (x y) (deposit-field 0 (byte x y) 100))
+    ((-1 -2) (condition 'error))))
+
+(with-test (:name (mask-field setf))
+  (checked-compile-and-assert ()
+      '(lambda (a)
+         (setf (mask-field (byte 2 0) a) 1) a)
+    ((15) 13)))
+
+(with-test (:name :complex-multiply)
+  (checked-compile-and-assert ()
+      '(lambda ()
+         (let (z)
+           (expt (setf z (complex -0.123 -0.789)) 2)))
+    (() #C(-0.60739195 0.194094))))
+
+(with-test (:name (sqrt complex))
+  (assert (= (expt (sqrt least-negative-double-float) 2)
+             least-negative-double-float)))
+
+(with-test (:name (ldb :sign))
+  (checked-compile-and-assert ()
+      `(lambda (x)
+         (ldb (byte ,(1- sb-vm:n-word-bits) 0) x))
+    ((12) 12)))
+
+(with-test (:name :mod-arith-large-constant)
+  (checked-compile-and-assert ()
+      '(lambda (x)
+         (declare (sb-ext:word x))
+         (logand sb-ext:most-positive-word
+                 (+ x 2312423423)))
+    ((12) 2312423435)))
+
+(with-test (:name (bignum :ash :left fixnum))
+  (assert (= (eval '(ash most-negative-fixnum (1- sb-vm:n-word-bits)))
+             (eval '(* most-negative-fixnum (expt 2 (1- sb-vm:n-word-bits)))))))
+
+(with-test (:name (ldb fixnum :sign-bits))
+  (checked-compile-and-assert ()
+      '(lambda (x)
+         (declare (fixnum x))
+         (ldb (byte (/ sb-vm:n-word-bits 2)
+                    (/ sb-vm:n-word-bits 2))
+              x))
+    ((most-positive-fixnum) (ash most-positive-fixnum (- (/ sb-vm:n-word-bits 2))))
+    ((-1)                   (1- (expt 2 (/ sb-vm:n-word-bits 2))))))
+
+(with-test (:name (dpb :sign-bits))
+  (checked-compile-and-assert ()
+      '(lambda (x)
+         (declare (fixnum x))
+         (dpb 1 (byte (/ sb-vm:n-word-bits 2)
+                      (/ sb-vm:n-word-bits 2))
+              x))
+    ((-1)
+     (logior (ash 1 (/ sb-vm:n-word-bits 2))
+             (logandc2 -1
+                       (mask-field (byte (/ sb-vm:n-word-bits 2)
+                                         (/ sb-vm:n-word-bits 2))
+                                   -1))))
+    ((most-positive-fixnum)
+     (logior (ash 1 (/ sb-vm:n-word-bits 2))
+             (logandc2 most-positive-fixnum
+                       (mask-field (byte (/ sb-vm:n-word-bits 2)
+                                         (/ sb-vm:n-word-bits 2))
+                                   -1))))))
+
+(with-test (:name (dpb :position-zero))
+  (checked-compile-and-assert ()
+      '(lambda (x)
+         (declare (sb-vm:word x))
+         (dpb 0 (byte (/ sb-vm:n-word-bits 2) 0) x))
+    ((1) 0)
+    ((sb-ext:most-positive-word)
+     (logxor sb-ext:most-positive-word
+             (1- (expt 2 (/ sb-vm:n-word-bits 2)))))))
+
+(with-test (:name (logand :mask-word))
+  (checked-compile-and-assert ()
+      '(lambda (x)
+         (logand x (ash sb-ext:most-positive-word -1)))
+    ((-1) (ash most-positive-word -1))))
+
+(with-test (:name (/ complex real single-float))
+  (checked-compile-and-assert ()
+      '(lambda (b)
+         (declare (type single-float b))
+         (/ #c(1.0 2.0) b))
+    ((1.0) #c(1.0 2.0))))
+
+(with-test (:name (ash :unsigned))
+  (checked-compile-and-assert ()
+      '(lambda (x)
+         (declare (sb-vm:signed-word x))
+         (ash x -64))
+    (( 123)  0)
+    ((-321) -1)))
+
+(with-test (:name :64-bit-logcount)
+  (checked-compile-and-assert
+      ()
+      '(lambda (x)
+        (declare (type (unsigned-byte 54) x))
+        (logcount x))
+    (((1- (ash 1 24))) 24)
+    (((1- (ash 1 32))) 32)
+    (((1- (ash 1 48))) 48)
+    (((1- (ash 1 54))) 54)))
+
+(with-test (:name :complex-rational-eql)
+  ;; ensure no funny business with constant sharing so that we're forced
+  ;; to do the most general form or EQL on two (complex rational)s
+  (eql (read-from-string "#c(1/2 1/3)") (read-from-string "#c(1/2 1/3)")))

@@ -1,27 +1,26 @@
 ;;; This file contains the MIPS specific runtime stuff.
 ;;;
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
-(define-alien-type os-context-t (struct os-context-t-struct))
-(define-alien-type os-context-register-t unsigned-long-long)
-
-
-;;;; MACHINE-TYPE
-
+#-sb-xc-host
 (defun machine-type ()
   "Returns a string describing the type of the local machine."
   "MIPS")
 
 ;;;; FIXUP-CODE-OBJECT
 
-(defun fixup-code-object (code offset value kind)
+(defconstant-eqx +fixup-kinds+ #(:absolute :jmp :lui :addi) #'equalp)
+(!with-bigvec-or-sap
+(defun fixup-code-object (code offset value kind flavor)
   (declare (type index offset))
-  (unless (zerop (rem offset n-word-bytes))
+  (declare (ignore flavor))
+  (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
     (error "Unaligned instruction?  offset=#x~X." offset))
-  (without-gcing
-   (let ((sap (%primitive sb!c::code-instructions code)))
-     (ecase kind
+  (let ((sap (code-instructions code)))
+    (ecase kind
+       (:absolute
+        (setf (sap-ref-32 sap offset) value))
        (:jump
         (aver (zerop (ash value -28)))
         (setf (ldb (byte 26 0) (sap-ref-32 sap offset))
@@ -31,45 +30,22 @@
               (ash (1+ (ash value -15)) -1)))
        (:addi
         (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
-              (ldb (byte 16 0) value)))))))
+              (ldb (byte 16 0) value)))))
+  nil))
 
 
-(define-alien-routine ("os_context_pc_addr" context-pc-addr)
-    (* os-context-register-t)
-  (context (* os-context-t) :in))
-
-(defun context-pc (context)
-  (declare (type (alien (* os-context-t)) context))
-  (int-sap (deref (context-pc-addr context))))
-
-(define-alien-routine ("os_context_register_addr" context-register-addr)
-    (* os-context-register-t)
-  (context (* os-context-t) :in)
-  (index int :in))
+#-sb-xc-host (progn
 
 (define-alien-routine ("os_context_bd_cause" context-bd-cause-int)
     unsigned-int
   (context (* os-context-t) :in))
-
-;;; FIXME: Should this and CONTEXT-PC be INLINE to reduce consing?
-;;; (Are they used in anything time-critical, or just the debugger?)
-(defun context-register (context index)
-  (declare (type (alien (* os-context-t)) context))
-  (let ((addr (context-register-addr context index)))
-    (declare (type (alien (* os-context-register-t)) addr))
-    (deref addr)))
-
-(defun %set-context-register (context index new)
-  (declare (type (alien (* os-context-t)) context))
-  (let ((addr (context-register-addr context index)))
-    (declare (type (alien (* os-context-register-t)) addr))
-    (setf (deref addr) new)))
 
 ;;; This is like CONTEXT-REGISTER, but returns the value of a float
 ;;; register. FORMAT is the type of float to return.
 
 ;;; FIXME: Whether COERCE actually knows how to make a float out of a
 ;;; long is another question. This stuff still needs testing.
+(define-alien-type os-context-register-t unsigned-long-long)
 (define-alien-routine ("os_context_fpregister_addr" context-float-register-addr)
     (* os-context-register-t)
   (context (* os-context-t) :in)
@@ -101,25 +77,13 @@
     unsigned-int
   (context (* os-context-t) :in))
 
-;;;; Internal-error-arguments.
-
-;;; INTERNAL-ERROR-ARGUMENTS -- interface.
-;;;
-;;; Given the sigcontext, extract the internal error arguments from the
-;;; instruction stream.  This is e.g.
-;;; 4       23      254     206     1       0       0       0
-;;; |       ~~~~~~~~~~~~~~~~~~~~~~~~~
-;;; length         data              (everything is an octet)
-;;; (pc + 4)
 (defun internal-error-args (context)
   (declare (type (alien (* os-context-t)) context))
-  (/show0 "entering INTERNAL-ERROR-ARGS, CONTEXT=..")
-  (/hexstr context)
-  (let ((pc (context-pc context))
-        (cause (context-bd-cause-int context)))
+  (let* ((pc (context-pc context))
+         (cause (context-bd-cause-int context))
+         ;; KLUDGE: This exposure of the branch delay mechanism hurts.
+         (offset (if (logbitp 31 cause) 4 0))
+         (trap-number (ldb (byte 8 6) (sap-ref-32 pc offset))))
     (declare (type system-area-pointer pc))
-    (multiple-value-bind (error-number length sc-offsets)
-        ;; KLUDGE: This exposure of the branch delay mechanism hurts.
-        (snarf-error-junk pc (if (logbitp 31 cause) 8 4))
-      (declare (ignore length))
-      (values error-number sc-offsets))))
+    (sb-kernel::decode-internal-error-args (sap+ pc (+ offset 4)) trap-number)))
+) ; end PROGN

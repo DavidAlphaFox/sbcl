@@ -9,18 +9,9 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; type frobbing VOPs
-
-(define-vop (lowtag-of)
-  (:translate lowtag-of)
-  (:policy :fast-safe)
-  (:args (object :scs (any-reg descriptor-reg)))
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 1
-    (inst and result object lowtag-mask)))
 
 (define-vop (widetag-of)
   (:translate widetag-of)
@@ -58,6 +49,14 @@
 
     DONE))
 
+(define-vop (%other-pointer-widetag)
+  (:translate %other-pointer-widetag)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg)))
+  (:results (result :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:generator 6
+    (load-type result object (- other-pointer-lowtag))))
 
 (define-vop (fun-subtype)
   (:translate fun-subtype)
@@ -68,21 +67,15 @@
   (:generator 6
     (load-type result function (- fun-pointer-lowtag))))
 
-;;; Is this VOP dead? I can't see anywhere that it is used... -- CSR,
-;;; 2002-06-21
-(define-vop (set-fun-subtype)
-  (:translate (setf fun-subtype))
+(define-vop (fun-header-data)
+  (:translate fun-header-data)
   (:policy :fast-safe)
-  (:args (type :scs (unsigned-reg) :target result)
-         (function :scs (descriptor-reg)))
-  (:arg-types positive-fixnum *)
-  (:results (result :scs (unsigned-reg)))
+  (:args (x :scs (descriptor-reg)))
+  (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    ;; FIXME: I don't understand what this hardcoded 3 is doing
-    ;; here. -- CSR, 2002-02-08
-    (inst stb type function (- 3 fun-pointer-lowtag))
-    (move result type)))
+    (loadw res x 0 fun-pointer-lowtag)
+    (inst srl res res n-widetag-bits)))
 
 (define-vop (get-header-data)
   (:translate get-header-data)
@@ -92,16 +85,6 @@
   (:result-types positive-fixnum)
   (:generator 6
     (loadw res x 0 other-pointer-lowtag)
-    (inst srl res res n-widetag-bits)))
-
-(define-vop (get-closure-length)
-  (:translate get-closure-length)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
     (inst srl res res n-widetag-bits)))
 
 (define-vop (set-header-data)
@@ -120,7 +103,12 @@
        (inst sll t2 data (- n-widetag-bits n-fixnum-tag-bits))
        (inst or t1 t2))
       (immediate
-       (inst or t1 (ash (tn-value data) n-widetag-bits)))
+       (let ((val (ash (tn-value data) n-widetag-bits)))
+         (cond ((typep val '(signed-byte 13))
+                (inst or t1 val))
+               (t
+                (inst li t2 val)
+                (inst or t1 t2)))))
       (zero))
     (storew t1 x 0 other-pointer-lowtag)
     (move res x)))
@@ -175,9 +163,7 @@
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 10
-    (loadw ndescr code 0 other-pointer-lowtag)
-    (inst srl ndescr n-widetag-bits)
-    (inst sll ndescr word-shift)
+    (loadw ndescr code code-boxed-size-slot other-pointer-lowtag)
     (inst sub ndescr other-pointer-lowtag)
     (inst add sap code ndescr)))
 
@@ -188,9 +174,7 @@
   (:results (func :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:generator 10
-    (loadw ndescr code 0 other-pointer-lowtag)
-    (inst srl ndescr n-widetag-bits)
-    (inst sll ndescr word-shift)
+    (loadw ndescr code code-boxed-size-slot other-pointer-lowtag)
     (inst add ndescr offset)
     (inst add ndescr (- fun-pointer-lowtag other-pointer-lowtag))
     (inst add func code ndescr)))
@@ -200,14 +184,14 @@
 ;;;; other random VOPs.
 
 
-(defknown sb!unix::receive-pending-interrupt () (values))
-(define-vop (sb!unix::receive-pending-interrupt)
+(defknown sb-unix::receive-pending-interrupt () (values))
+(define-vop (sb-unix::receive-pending-interrupt)
   (:policy :fast-safe)
-  (:translate sb!unix::receive-pending-interrupt)
+  (:translate sb-unix::receive-pending-interrupt)
   (:generator 1
     (inst unimp pending-interrupt-trap)))
 
-#!+sb-thread
+#+sb-thread
 (error "write a VOP for CURRENT-THREAD-OFFSET-SAP")
 
 (define-vop (halt)

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-vop (debug-cur-sp)
   (:translate current-sp)
@@ -64,12 +64,12 @@
       (inst srl temp n-widetag-bits)
       (inst cmp temp)
       (inst b :eq bogus)
-      (inst sll temp (1- (integer-length n-word-bytes)))
+      (inst sll temp word-shift)
       (unless (= lowtag other-pointer-lowtag)
         (inst add temp (- lowtag other-pointer-lowtag)))
       (inst sub code thing temp)
       (emit-label done)
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label bogus)
         (inst b done)
         (move code null-tn)))))
@@ -94,19 +94,8 @@
 (define-vop (get-lisp-obj-address)
   (:policy :fast-safe)
   (:translate get-lisp-obj-address)
-  (:args (thing :scs (descriptor-reg) :target result))
+  (:args (thing :scs (descriptor-reg any-reg) :target result))
   (:results (result :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:generator 1
     (move result thing)))
-
-
-(define-vop (fun-word-offset)
-  (:policy :fast-safe)
-  (:translate fun-word-offset)
-  (:args (fun :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 5
-    (loadw res fun 0 fun-pointer-lowtag)
-    (inst srl res n-widetag-bits)))

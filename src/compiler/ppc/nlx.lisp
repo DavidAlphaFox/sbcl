@@ -10,13 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
-
-;;; Make an environment-live stack TN for saving the SP for NLX entry.
-(defun make-nlx-sp-tn (env)
-  (physenv-live-tn
-   (make-representation-tn *fixnum-primitive-type* immediate-arg-scn)
-   env))
+(in-package "SB-VM")
 
 ;;; Make a TN for the argument count passing location for a
 ;;; non-local entry.
@@ -48,7 +42,7 @@
   (:args (catch :scs (descriptor-reg))
          (nfp :scs (descriptor-reg))
          (nsp :scs (descriptor-reg)))
-  #!+sb-thread (:temporary (:scs (any-reg)) temp)
+  #+sb-thread (:temporary (:scs (any-reg)) temp)
   (:vop-var vop)
   (:generator 10
     (store-tl-symbol-value catch *current-catch-block* temp)
@@ -67,6 +61,15 @@
   (:generator 1
     (move res bsp-tn)))
 
+(define-vop (current-nsp)
+  (:results (res :scs (any-reg descriptor-reg)))
+  (:generator 1
+    (move res nsp-tn)))
+
+(define-vop (set-nsp)
+  (:args (nsp :scs (any-reg descriptor-reg)))
+  (:generator 1
+    (move nsp-tn nsp)))
 
 
 ;;;; Unwind block hackery:
@@ -81,11 +84,11 @@
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:generator 22
-    (inst addi block cfp-tn (* (tn-offset tn) n-word-bytes))
+    (inst addi block cfp-tn (tn-byte-offset tn))
     (load-tl-symbol-value temp *current-unwind-protect-block*)
-    (storew temp block unwind-block-current-uwp-slot)
-    (storew cfp-tn block unwind-block-current-cont-slot)
-    (storew code-tn block unwind-block-current-code-slot)
+    (storew temp block unwind-block-uwp-slot)
+    (storew cfp-tn block unwind-block-cfp-slot)
+    (storew code-tn block unwind-block-code-slot)
     (inst compute-lra-from-code temp code-tn entry-label ndescr)
     (storew temp block catch-block-entry-pc-slot)))
 
@@ -102,11 +105,11 @@
   (:temporary (:scs (descriptor-reg) :target block :to (:result 0)) result)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:generator 44
-    (inst addi result cfp-tn (* (tn-offset tn) n-word-bytes))
+    (inst addi result cfp-tn (tn-byte-offset tn))
     (load-tl-symbol-value temp *current-unwind-protect-block*)
-    (storew temp result catch-block-current-uwp-slot)
-    (storew cfp-tn result catch-block-current-cont-slot)
-    (storew code-tn result catch-block-current-code-slot)
+    (storew temp result catch-block-uwp-slot)
+    (storew cfp-tn result catch-block-cfp-slot)
+    (storew code-tn result catch-block-code-slot)
     (inst compute-lra-from-code temp code-tn entry-label ndescr)
     (storew temp result catch-block-entry-pc-slot)
 
@@ -118,21 +121,19 @@
     (move block result)))
 
 
-;;; Just set the current unwind-protect to TN's address.  This instantiates an
+;;; Just set the current unwind-protect to UWP.  This instantiates an
 ;;; unwind block as an unwind-protect.
 ;;;
 (define-vop (set-unwind-protect)
-  (:args (tn))
-  (:temporary (:scs (descriptor-reg)) new-uwp)
-  #!+sb-thread (:temporary (:scs (any-reg)) temp)
+  (:args (uwp :scs (any-reg)))
+  #+sb-thread (:temporary (:scs (any-reg)) temp)
   (:generator 7
-    (inst addi new-uwp cfp-tn (* (tn-offset tn) n-word-bytes))
-    (store-tl-symbol-value new-uwp *current-unwind-protect-block* temp)))
+    (store-tl-symbol-value uwp *current-unwind-protect-block* temp)))
 
 
 (define-vop (unlink-catch-block)
   (:temporary (:scs (any-reg)) block)
-  #!+sb-thread (:temporary (:scs (any-reg)) temp)
+  #+sb-thread (:temporary (:scs (any-reg)) temp)
   (:policy :fast-safe)
   (:translate %catch-breakup)
   (:generator 17
@@ -142,12 +143,12 @@
 
 (define-vop (unlink-unwind-protect)
   (:temporary (:scs (any-reg)) block)
-  #!+sb-thread (:temporary (:scs (any-reg)) temp)
+  #+sb-thread (:temporary (:scs (any-reg)) temp)
   (:policy :fast-safe)
   (:translate %unwind-protect-breakup)
   (:generator 17
     (load-tl-symbol-value block *current-unwind-protect-block*)
-    (loadw block block unwind-block-current-uwp-slot)
+    (loadw block block unwind-block-uwp-slot)
     (store-tl-symbol-value block *current-unwind-protect-block* temp)))
 
 
@@ -199,7 +200,7 @@
 
                (emit-label defaulting-done)
 
-               (assemble (*elsewhere*)
+               (assemble (:elsewhere)
                  (dolist (def (defaults))
                    (emit-label (car def))
                    (let ((tn (cdr def)))

@@ -11,58 +11,83 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
+
+; ok, so we're supposed to use our instruction scheduler, but we don't,
+; because of "needs a little more work in the assembler"
+(defconstant sb-assem:assem-scheduler-p nil)
+(defconstant sb-assem:+inst-alignment-bytes+ 4)
+;;; needs a little more work in the assembler, to realise that the
+;;; delays requested here are not mandatory, so that the assembler
+;;; shouldn't fill gaps with NOPs but with real instructions.  -- CSR,
+;;; 2003-09-08
+#+nil (defconstant sb-assem:+assem-max-locations+ 70)
+
+(defconstant +backend-fasl-file-implementation+ :ppc)
+  ;; On Linux, the ABI specifies the page size to be 4k-64k, use the
+  ;; maximum of that range. FIXME: it'd be great if somebody would
+  ;; find out whether using exact multiples of the page size actually
+  ;; matters in the few places where that's done, or whether we could
+  ;; just use 4k everywhere.
+(defconstant +backend-page-bytes+ #+linux 65536 #-linux 4096)
+
+;;; The size in bytes of GENCGC cards, i.e. the granularity at which
+;;; writes to old generations are logged.  With mprotect-based write
+;;; barriers, this must be a multiple of the OS page size.
+(defconstant gencgc-card-bytes +backend-page-bytes+)
+;;; The minimum size of new allocation regions.  While it doesn't
+;;; currently make a lot of sense to have a card size lower than
+;;; the alloc granularity, it will, once we are smarter about finding
+;;; the start of objects.
+(defconstant gencgc-alloc-granularity 0)
+;;; The minimum size at which we release address ranges to the OS.
+;;; This must be a multiple of the OS page size.
+(defconstant gencgc-release-granularity +backend-page-bytes+)
 
 ;;; number of bits per word where a word holds one lisp descriptor
-(def!constant n-word-bits 32)
+(defconstant n-word-bits 32)
 
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
-(def!constant n-machine-word-bits 32)
-
-;;; number of bits per byte where a byte is the smallest addressable
-;;; object
-(def!constant n-byte-bits 8)
+(defconstant n-machine-word-bits 32)
 
 ;;; flags for the generational garbage collector
-(def!constant pseudo-atomic-interrupted-flag 1)
-(def!constant pseudo-atomic-flag 4)
+(defconstant pseudo-atomic-interrupted-flag 1)
+(defconstant pseudo-atomic-flag 4)
 
-(def!constant float-sign-shift 31)
+(defconstant float-sign-shift 31)
 
-(def!constant single-float-bias 126)
+(defconstant single-float-bias 126)
 (defconstant-eqx single-float-exponent-byte (byte 8 23) #'equalp)
 (defconstant-eqx single-float-significand-byte (byte 23 0) #'equalp)
-(def!constant single-float-normal-exponent-min 1)
-(def!constant single-float-normal-exponent-max 254)
-(def!constant single-float-hidden-bit (ash 1 23))
-(def!constant single-float-trapping-nan-bit (ash 1 22))
+(defconstant single-float-normal-exponent-min 1)
+(defconstant single-float-normal-exponent-max 254)
+(defconstant single-float-hidden-bit (ash 1 23))
 
-(def!constant double-float-bias 1022)
+(defconstant double-float-bias 1022)
 (defconstant-eqx double-float-exponent-byte (byte 11 20) #'equalp)
 (defconstant-eqx double-float-significand-byte (byte 20 0) #'equalp)
-(def!constant double-float-normal-exponent-min 1)
-(def!constant double-float-normal-exponent-max #x7FE)
-(def!constant double-float-hidden-bit (ash 1 20))
-(def!constant double-float-trapping-nan-bit (ash 1 19))
+(defconstant double-float-normal-exponent-min 1)
+(defconstant double-float-normal-exponent-max #x7FE)
+(defconstant double-float-hidden-bit (ash 1 20))
 
-(def!constant single-float-digits
+(defconstant single-float-digits
   (+ (byte-size single-float-significand-byte) 1))
 
-(def!constant double-float-digits
+(defconstant double-float-digits
   (+ (byte-size double-float-significand-byte) n-word-bits 1))
 
 
-(def!constant float-inexact-trap-bit (ash 1 0))
-(def!constant float-divide-by-zero-trap-bit (ash 1 1))
-(def!constant float-underflow-trap-bit (ash 1 2))
-(def!constant float-overflow-trap-bit (ash 1 3))
-(def!constant float-invalid-trap-bit (ash 1 4))
+(defconstant float-inexact-trap-bit (ash 1 0))
+(defconstant float-divide-by-zero-trap-bit (ash 1 1))
+(defconstant float-underflow-trap-bit (ash 1 2))
+(defconstant float-overflow-trap-bit (ash 1 3))
+(defconstant float-invalid-trap-bit (ash 1 4))
 
-(def!constant float-round-to-nearest 0)
-(def!constant float-round-to-zero 1)
-(def!constant float-round-to-positive 2)
-(def!constant float-round-to-negative 3)
+(defconstant float-round-to-nearest 0)
+(defconstant float-round-to-zero 1)
+(defconstant float-round-to-positive 2)
+(defconstant float-round-to-negative 3)
 
 (defconstant-eqx float-rounding-mode (byte 2 0) #'equalp)         ; RD
 ;;; FIXME I: Beware, all ye who trespass here. Despite its name,
@@ -82,49 +107,46 @@
 (defconstant-eqx float-traps-byte (byte 5 3) #'equalp)
 (defconstant-eqx float-exceptions-byte (byte 5 25) #'equalp)      ; cexc
 
-(def!constant float-fast-bit 2)         ; Non-IEEE mode
+(defconstant float-fast-bit 2)         ; Non-IEEE mode
 
 
 ;;;; Where to put the different spaces.
 
 ;;; On non-gencgc we need large dynamic and static spaces for PURIFY
-#!-gencgc
+#-gencgc
 (progn
-  (def!constant read-only-space-start #x04000000)
-  (def!constant read-only-space-end   #x07ff8000)
-  (def!constant static-space-start    #x08000000)
-  (def!constant static-space-end      #x097fff00)
+  (defconstant read-only-space-start #x04000000)
+  (defconstant read-only-space-end   #x07ff8000)
+  (defconstant static-space-start    #x08000000)
+  (defconstant static-space-end      #x097fff00)
 
-  (def!constant linkage-table-space-start #x0a000000)
-  (def!constant linkage-table-space-end   #x0b000000))
+  (defconstant linkage-table-space-start #x0a000000)
+  (defconstant linkage-table-space-end   #x0b000000))
 
 ;;; While on gencgc we don't.
-#!+gencgc
+#+gencgc
 (!gencgc-space-setup #x04000000
-                     #!+linux   #x4f000000
-                     #!+netbsd  #x4f000000
-                     #!+openbsd #x4f000000
-                     #!+darwin  #x10000000)
+                     :dynamic-space-start
+                     #+linux   #x4f000000
+                     #+netbsd  #x4f000000
+                     #+openbsd #x4f000000
+                     #+darwin  #x10000000)
 
-(def!constant linkage-table-entry-size 16)
+(defconstant linkage-table-entry-size 16)
 
-#!+linux
+#+linux
 (progn
-  #!-gencgc
+  #-gencgc
   (progn
-    (def!constant dynamic-0-space-start #x4f000000)
-    (def!constant dynamic-0-space-end   #x66fff000)
-    (def!constant dynamic-1-space-start #x67000000)
-    (def!constant dynamic-1-space-end   #x7efff000)))
+    (defparameter dynamic-0-space-start #x4f000000)
+    (defparameter dynamic-0-space-end   #x66fff000)))
 
-#!+netbsd
+#+netbsd
 (progn
-  #!-gencgc
+  #-gencgc
   (progn
-    (def!constant dynamic-0-space-start #x4f000000)
-    (def!constant dynamic-0-space-end   #x66fff000)
-    (def!constant dynamic-1-space-start #x67000000)
-    (def!constant dynamic-1-space-end   #x7efff000)))
+    (defparameter dynamic-0-space-start #x4f000000)
+    (defparameter dynamic-0-space-end   #x66fff000)))
 
 ;;; Text and data segments start at #x01800000.  Range for randomized
 ;;; malloc() starts #x20000000 (MAXDSIZ) after end of data seg and
@@ -133,42 +155,30 @@
 ;;; FIXME: MAXDSIZ is a kernel parameter, and can vary as high as 1GB.
 ;;; These parameters should probably be tested under such a configuration,
 ;;; as rare as it might or might not be.
-#!+openbsd
+#+openbsd
 (progn
-  #!-gencgc
+  #-gencgc
   (progn
-    (def!constant dynamic-0-space-start #x4f000000)
-    (def!constant dynamic-0-space-end   #x5cfff000)
-    (def!constant dynamic-1-space-start #x5f000000)
-    (def!constant dynamic-1-space-end   #x6cfff000)))
+    (defparameter dynamic-0-space-start #x4f000000)
+    (defparameter dynamic-0-space-end   #x5cfff000)))
 
-#!+darwin
+#+darwin
 (progn
-  #!-gencgc
+  #-gencgc
   (progn
-    (def!constant dynamic-0-space-start #x10000000)
-    (def!constant dynamic-0-space-end   #x3ffff000)
-
-    (def!constant dynamic-1-space-start #x40000000)
-    (def!constant dynamic-1-space-end   #x6ffff000)))
+    (defparameter dynamic-0-space-start #x10000000)
+    (defparameter dynamic-0-space-end   #x3ffff000)))
 
-;;;; Other miscellaneous constants.
-
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
-  error-trap
   cerror-trap
   breakpoint-trap
   fun-end-breakpoint-trap
   after-breakpoint-trap
-  fixnum-additive-overflow-trap
   single-step-around-trap
-  single-step-before-trap)
-
-(defenum (:start 24)
-  object-not-list-trap
-  object-not-instance-trap)
+  single-step-before-trap
+  error-trap)
 
 ;;;; Static symbols.
 
@@ -181,21 +191,12 @@
 ;;; space directly after the static symbols.  That way, the raw-addr
 ;;; can be loaded directly out of them by indirecting relative to NIL.
 ;;;
-(defparameter *static-symbols*
-  (append
-   *common-static-symbols*
-   *c-callable-static-symbols*
-   '(
-     #!+gencgc *restart-lisp-function*
+(defconstant-eqx +static-symbols+
+ `#(,@+common-static-symbols+)
+  #'equalp)
 
-     ;; CLH: 20060210 Taken from x86-64/parms.lisp per JES' suggestion
-     ;; Needed for callbacks to work across saving cores. see
-     ;; ALIEN-CALLBACK-ASSEMBLER-WRAPPER in c-call.lisp for gory
-     ;; details.
-     sb!alien::*enter-alien-callback*)))
-
-(defparameter *static-funs*
-  '(length
+(defconstant-eqx +static-fdefns+
+  #(length
     two-arg-+
     two-arg--
     two-arg-*
@@ -213,4 +214,5 @@
     two-arg-xor
     two-arg-eqv
     two-arg-gcd
-    two-arg-lcm))
+    two-arg-lcm)
+  #'equalp)

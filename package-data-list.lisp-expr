@@ -2,15 +2,10 @@
 
 ;;;; the specifications of target packages, except for a few things
 ;;;; which are handled elsewhere by other mechanisms:
-;;;;   * any SHADOWing and nickname hackery;
+;;;;   * some SHADOWing and nickname hackery;
 ;;;;   * the standard, non-SBCL-specific packages COMMON-LISP,
 ;;;;     COMMON-LISP-USER, and KEYWORD.
 ;;;;
-;;;; The packages are named SB!FOO here and elsewhere in
-;;;; cross-compilation, in order to avoid collision with possible
-;;;; corresponding SB-FOO packages in the cross-compilation host.
-;;;; They're renamed to SB-FOO later, after we've departed from the xc
-;;;; mothership and the danger of namespace collision is past.
 
 ;;;; This software is part of the SBCL system. See the README file for
 ;;;; more information.
@@ -25,14 +20,34 @@
 ;;;; (which prevents spurious conflicts in CVS) each longish list should
 ;;;; have only one string on the first line. Silly, but there you go.
 
+;;;; NOTE:
+;;;; All uses of #+ and #- reader macros within this file refer to
+;;;; the chosen target features, and not CL:*FEATURES*, but
+;;;; it is generally not necessary to use reader conditionals
+;;;; within this file. If A-NICE-FUNCTION is external in SB-KERNEL
+;;;; but not defined for a particular backend, it will not get
+;;;; interned during cold load, and hence will not exist in the target.
+;;;; This is exactly as desired - it is not necessary for the writer
+;;;; of architecture-specific code to clutter up the list of package
+;;;; definitions to avoid exporting some stuff. You just export what you
+;;;; need, and genesis will do the right thing. Most of the pre-existing
+;;;; conditionals are historical baggage, and should be removed.
+;;;; EXCEPTION: packages whose symbols are created mainly during
+;;;; warm load might have a reason to use reader conditionals.
+;;;; For those packages, all symbols listed here are interned during
+;;;; genesis, since otherwise the symbols would all disappear,
+;;;; and then warm load would intern them as internals, not externals.
+;;;; This list of exceptional packages can be found in the
+;;;; definition of the FINISH-SYMBOLS function.
+
 (#s(sb-cold:package-data
-    :name "SB!ALIEN"
+    :name "SB-ALIEN"
     :doc "public: the ALIEN foreign function interface (If you're
 porting CMU CL code, note that this package corresponds roughly to a union
 of the packages ALIEN and C-CALL at the time of the SBCL fork. SB-C-CALL
 is a deprecated nickname to help ease the transition from older versions
 of SBCL which maintained the CMU-CL-style split into two packages.)"
-    :use ("CL" "SB!EXT" "SB!INT" "SB!SYS" "SB!ALIEN-INTERNALS")
+    :use ("CL" "SB-EXT" "SB-INT" "SB-SYS" "SB-ALIEN-INTERNALS")
     :reexport ("ARRAY"
                "BOOLEAN" "CHAR" "DOUBLE-FLOAT"
                "FLOAT" "FUNCTION" "INTEGER" "LONG-FLOAT"
@@ -57,7 +72,7 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
              "NULL-ALIEN"
              "OFF-T"
              "SAP-ALIEN" "SHORT" "SIGNED"
-             "SIZE-T"
+             "SIZE-T" "SSIZE-T"
              "SLOT" "STRUCT"
              "UNDEFINED-ALIEN-ERROR"
              "UNLOAD-SHARED-OBJECT"
@@ -68,7 +83,7 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
              "WITH-ALIEN"))
 
    #s(sb-cold:package-data
-      :name "SB!ALIEN-INTERNALS"
+      :name "SB-ALIEN-INTERNALS"
       :doc "private: stuff for implementing ALIENs and friends"
       :use ("CL")
       :export ("%ALIEN-VALUE"
@@ -76,7 +91,7 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "%DEREF-ADDR" "%HEAP-ALIEN" "%HEAP-ALIEN-ADDR"
                "%LOCAL-ALIEN-ADDR" "%LOCAL-ALIEN-FORCED-TO-MEMORY-P" "%SAP-ALIEN"
                "%SET-DEREF" "%SET-HEAP-ALIEN" "%SET-LOCAL-ALIEN" "%SET-SLOT"
-               "%SLOT-ADDR" "*SAVED-FP-AND-PCS*" "*VALUES-TYPE-OKAY*"
+               "%SLOT-ADDR" "*SAVED-FP*" "*VALUES-TYPE-OKAY*"
                "ALIEN-ARRAY-TYPE"
                "ALIEN-ARRAY-TYPE-DIMENSIONS" "ALIEN-ARRAY-TYPE-ELEMENT-TYPE"
                "ALIEN-ARRAY-TYPE-P" "ALIEN-BOOLEAN-TYPE" "ALIEN-BOOLEAN-TYPE-P"
@@ -111,38 +126,51 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "COMPUTE-NATURALIZE-LAMBDA" "DEFINE-ALIEN-TYPE-CLASS"
                "DEFINE-ALIEN-TYPE-METHOD" "DEFINE-ALIEN-TYPE-TRANSLATOR"
                "DEPORT" "DEPORT-ALLOC"
-               "DISPOSE-LOCAL-ALIEN"
-               "*ENTER-ALIEN-CALLBACK*" "ENTER-ALIEN-CALLBACK"
-               "FIND-SAVED-FP-AND-PC"
+               "ENTER-ALIEN-CALLBACK"
                "HEAP-ALIEN-INFO" "HEAP-ALIEN-INFO-P" "HEAP-ALIEN-INFO-SAP-FORM"
                "HEAP-ALIEN-INFO-TYPE" "INVOKE-ALIEN-TYPE-METHOD"
-               "INVOKE-WITH-SAVED-FP-AND-PC" "LOCAL-ALIEN"
+               "INVOKE-WITH-SAVED-FP" "LOCAL-ALIEN"
                "LOCAL-ALIEN-INFO" "LOCAL-ALIEN-INFO-FORCE-TO-MEMORY-P"
                "LOCAL-ALIEN-INFO-P" "LOCAL-ALIEN-INFO-TYPE"
                "MAKE-ALIEN-FUN-TYPE" "MAKE-ALIEN-POINTER-TYPE"
-               "MAKE-ALIEN-VALUE" "MAYBE-WITH-PINNED-OBJECTS"
+               "MAYBE-WITH-PINNED-OBJECTS"
                "MAKE-LOCAL-ALIEN" "NATURALIZE"
                "NOTE-LOCAL-ALIEN-TYPE"
                "PARSE-ALIEN-TYPE" "UNPARSE-ALIEN-TYPE"))
 
    #s(sb-cold:package-data
-      :name "SB!ASSEM"
+      :name "SB-ASSEM"
       :doc "private: the assembler, used by the compiler"
-      :use ("CL" "SB!EXT" "SB!INT")
+      :use ("CL" "SB-EXT" "SB-INT")
       :export ("ASSEMBLY-UNIT"
+               "ASSEMBLY-UNIT-BITS"
+               "+INST-ALIGNMENT-BYTES+"
 
-               "*ASSEM-SCHEDULER-P*"
-               "*ASSEM-INSTRUCTIONS*"
-               "*ASSEM-MAX-LOCATIONS*"
+               "ASSEM-SCHEDULER-P"
+               "+ASSEM-MAX-LOCATIONS+"
 
-               "EMIT-ALIGNMENT" "EMIT-BYTE" "EMIT-SKIP" "EMIT-BACK-PATCH"
+               "*ASMSTREAM*" "MAKE-ASMSTREAM"
+               "ASMSTREAM-DATA-SECTION"
+               "ASMSTREAM-CODE-SECTION"
+               "ASMSTREAM-ELSEWHERE-SECTION"
+               "ASMSTREAM-ELSEWHERE-LABEL"
+               "ASMSTREAM-CONSTANT-TABLE"
+               "ASMSTREAM-CONSTANT-VECTOR"
+               "JOIN-SECTIONS" "ASSEMBLE-SECTIONS"
+               "EMIT" ".ALIGN" ".BYTE" ".SKIP"
+               ".COVERAGE-MARK" ".COMMENT"
+               "EMIT-ALIGNMENT" "EMIT-BYTE" "EMIT-BACK-PATCH"
                "EMIT-CHOOSER" "DEFINE-BITFIELD-EMITTER"
                "DEFINE-INSTRUCTION" "DEFINE-INSTRUCTION-MACRO"
                "EMIT-POSTIT"
+               "ANY-ALIGNMENT-BETWEEN-P"
 
-               "MAKE-SEGMENT" "SEGMENT-TYPE" "ASSEMBLE"
+               "MAKE-SEGMENT" "SEGMENT-ORIGIN" "ASSEMBLE"
+               "SEGMENT-BUFFER"
+               "SEGMENT-ENCODER-STATE"
+               "SEGMENT-HEADER-SKEW"
                "INST" "LABEL" "LABEL-P" "GEN-LABEL"
-               "EMIT-LABEL" "LABEL-POSITION" "APPEND-SEGMENT"
+               "EMIT-LABEL" "LABEL-POSITION" "LABEL-USEDP"
                "FINALIZE-SEGMENT"
                "SEGMENT-CONTENTS-AS-VECTOR" "WRITE-SEGMENT-CONTENTS"
                "READS" "WRITES" "SEGMENT"
@@ -155,13 +183,12 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                ;; are IN-PACKAGE SB-C. It would probably be cleaner
                ;; to move at least most of them to files which are
                ;; IN-PACKAGE SB-ASSEM.
-               "BRANCH" "DO-SSET-ELEMENTS" "FLUSHABLE" "MAKE-SSET" "SSET"
-               "SSET-ADJOIN" "SSET-DELETE" "SSET-ELEMENT" "SSET-EMPTY"))
+               "BRANCH"  "FLUSHABLE"))
 
    #s(sb-cold:package-data
-      :name "SB!BIGNUM"
+      :name "SB-BIGNUM"
       :doc "private: bignum implementation"
-      :use ("CL" "SB!KERNEL" "SB!INT" "SB!EXT")
+      :use ("CL" "SB-KERNEL" "SB-INT" "SB-EXT")
       :export ("%ADD-WITH-CARRY"
                "%ALLOCATE-BIGNUM" "%ASHL" "%ASHR"
                "%BIGNUM-LENGTH" "%BIGNUM-REF" "%BIGNUM-REF-WITH-OFFSET"
@@ -172,55 +199,60 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "%BIGFLOOR" "%LOGAND" "%LOGIOR" "%LOGNOT" "%LOGXOR"
                "%MULTIPLY" "%MULTIPLY-AND-ADD"
                "%SUBTRACT-WITH-BORROW" "ADD-BIGNUMS"
-               "BIGNUM-ASHIFT-LEFT" "BIGNUM-ASHIFT-RIGHT"
+               "BIGNUM-ASHIFT-LEFT" "BIGNUM-ASHIFT-LEFT-FIXNUM"
+               "BIGNUM-ASHIFT-RIGHT"
                "BIGNUM-COMPARE"
                "BIGNUM-ELEMENT-TYPE" "BIGNUM-GCD" "BIGNUM-INDEX"
+               "BIGNUM-LENGTH"
                "BIGNUM-INTEGER-LENGTH"
                "BIGNUM-LOGBITP"
                "BIGNUM-LOGCOUNT" "BIGNUM-LOGICAL-AND"
                "BIGNUM-LOGICAL-IOR" "BIGNUM-LOGICAL-NOT"
                "BIGNUM-LOGICAL-XOR" "BIGNUM-PLUS-P"
-               "BIGNUM-TO-FLOAT" "BIGNUM-TRUNCATE" "BIGNUM-TYPE"
+               "BIGNUM-TO-FLOAT" "BIGNUM-TRUNCATE"
                "MAKE-SMALL-BIGNUM"
                "MULTIPLY-BIGNUM-AND-FIXNUM" "MULTIPLY-BIGNUMS"
                "MULTIPLY-FIXNUMS" "NEGATE-BIGNUM"
                "%RANDOM-BIGNUM" "SUBTRACT-BIGNUM" "SXHASH-BIGNUM"))
 
    #s(sb-cold:package-data
-      :name "SB!C"
+      :name "SB-C"
       :doc "private: implementation of the compiler"
       ;; (It seems strange to have the compiler USE SB-ALIEN-INTERNALS,
       ;; but the point seems to be to be able to express things like
-      ;; SB!C:DEFTRANSFORM SB-ALIEN-INTERNALS:MAKE-LOCAL-ALIEN without
+      ;; SB-C:DEFTRANSFORM SB-ALIEN-INTERNALS:MAKE-LOCAL-ALIEN without
       ;; having to use a bunch of package prefixes, by putting them
       ;; in the SB-C package. Maybe it'd be tidier to define an SB-ALIEN-COMP
       ;; package for this? But it seems like a fairly low priority.)
       ;; (Probably the same considerations also explain why BIGNUM is
       ;;in the USE list.)
-      :use ("CL" "SB!ALIEN-INTERNALS" "SB!ALIEN" "SB!ASSEM" "SB!BIGNUM"
-                 #!+sb-dyncount "SB-DYNCOUNT" "SB!EXT" "SB!FASL" "SB!INT"
-                 "SB!KERNEL" "SB!SYS")
-      :reexport ("SLOT" "CODE-INSTRUCTIONS" "FLUSHABLE")
+      :use ("CL" "SB-ALIEN-INTERNALS" "SB-ALIEN" "SB-ASSEM" "SB-BIGNUM"
+                 #+sb-dyncount "SB-DYNCOUNT" "SB-EXT" "SB-FASL" "SB-INT"
+                 "SB-KERNEL" "SB-SYS")
+      ;; "flushable" is an assembly instruction attribute and a fun-info attribute.
+      ;; But why do we need SLOT re-exported?
+      :reexport ("SLOT" "FLUSHABLE")
       :export ("%ALIEN-FUNCALL"
                "%CATCH-BREAKUP" "%CONTINUE-UNWIND"
                "%LISTIFY-REST-ARGS" "%MORE-ARG" "%MORE-ARG-VALUES"
                "%UNWIND-PROTECT-BREAKUP"
 
                "*BACKEND-BYTE-ORDER*" "*BACKEND-DISASSEM-PARAMS*"
-               "*BACKEND-INTERNAL-ERRORS*" "*BACKEND-PAGE-BYTES*"
+               "+BACKEND-INTERNAL-ERRORS+" "+BACKEND-PAGE-BYTES+"
                "*BACKEND-REGISTER-SAVE-PENALTY*"
-               "*BACKEND-SB-LIST*"
+               "*BACKEND-SBS*" ; storage bases
                "*BACKEND-SC-NAMES*" "*BACKEND-SC-NUMBERS*"
                "*BACKEND-SUBFEATURES*"
                "*BACKEND-T-PRIMITIVE-TYPE*"
 
                "*CODE-SEGMENT*"
+               "*COMPILATION*"
                "*ELSEWHERE*" "*FREE-FUNS*"
                "*LEXENV*"
                "*SUPPRESS-VALUES-DECLARATION*"
 
-               #!+x86 "SET-FPU-WORD-FOR-C"
-               #!+x86 "SET-FPU-WORD-FOR-LISP"
+               #+x86 "SET-FPU-WORD-FOR-C"
+               #+x86 "SET-FPU-WORD-FOR-LISP"
                "ALIGN-STACK-POINTER"
                "ALIEN-FUNCALL-SAVES-FP-AND-PC"
                "ALLOC-ALIEN-STACK-SPACE" "ALLOC-NUMBER-STACK-SPACE"
@@ -230,20 +262,15 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "ANCESTOR-FRAME-REF" "ANCESTOR-FRAME-SET"
                "ANY" "ARG-COUNT-ERROR" "ASSEMBLE-FILE"
                "ATTRIBUTES" "ATTRIBUTES-INTERSECTION" "ATTRIBUTES-UNION"
-               "ATTRIBUTES=" "BIND"
-               "CALL" "CALL-LOCAL" "CALL-NAMED" "CALL-OUT" "CALL-VARIABLE"
+               "ATTRIBUTES="
+               "CALL" "CALL-LOCAL" "CALL-NAMED" "CALL-VARIABLE"
+               "CALL-OUT" "CALL-OUT-NAMED"
                "CALLEE-NFP-TN" "CALLEE-RETURN-PC-TN"
-               "CASE-BODY" "CATCH-BLOCK" "CHECK-CONS"
-               "CHECK-FIXNUM" "CHECK-FUN"
-               ;; FIXME: 32/64-bit issues
-               "CHECK-SIGNED-BYTE-32" "CHECK-SIGNED-BYTE-64"
-               "CHECK-SYMBOL"
-               ;; FIXME: 32/64-bit issues
-               "CHECK-UNSIGNED-BYTE-32" "CHECK-UNSIGNED-BYTE-64"
+               "CASE-BODY" "CATCH-BLOCK" "UNWIND-BLOCK"
                "CLOSURE-INIT" "CLOSURE-REF" "CLOSURE-INIT-FROM-FP"
-               "*CODE-COVERAGE-INFO*"
                "COMPARE-AND-SWAP-SLOT"
                "COMPILE-IN-LEXENV"
+               "COMPILED-DEBUG-FUN-FORM-NUMBER"
                "%COMPILER-DEFUN" "COMPILER-ERROR" "FATAL-COMPILER-ERROR"
                "COMPILER-NOTIFY"
                "COMPILER-STYLE-WARN" "COMPILER-WARN"
@@ -252,23 +279,26 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "COMPUTE-OLD-NFP" "COPY-MORE-ARG"
                "CURRENT-BINDING-POINTER" "CURRENT-NFP-TN"
                "CURRENT-STACK-POINTER"
+               "*ALIEN-STACK-POINTER*"
+               "CURRENT-NSP" "SET-NSP"
                "DEALLOC-ALIEN-STACK-SPACE"
                "DEALLOC-NUMBER-STACK-SPACE"
                "DEBUG-CATCH-TAG"
                "DEF-IR1-TRANSLATOR"
                "!DEF-PRIMITIVE-TYPE" "!DEF-PRIMITIVE-TYPE-ALIAS"
-               "DEFINE-SOURCE-TRANSFORM" "!DEF-VM-SUPPORT-ROUTINE"
-               "DEFINE-ASSEMBLY-ROUTINE"
+               "DEFINE-SOURCE-TRANSFORM"
                "DEFINITION-SOURCE-LOCATION"
                "DEFINITION-SOURCE-LOCATION-NAMESTRING"
                "DEFINITION-SOURCE-LOCATION-TOPLEVEL-FORM-NUMBER"
+               "DEFINITION-SOURCE-LOCATION-FORM-NUMBER"
                "DEFINITION-SOURCE-LOCATION-PLIST"
                "DEFINE-MODULAR-FUN"
                "DEFINE-MOVE-FUN"
-               "DEFINE-MOVE-VOP" "DEFINE-STORAGE-BASE"
-               "DEFINE-STORAGE-CLASS" "DEFINE-VOP"
+               "DEFINE-MOVE-VOP" "!DEFINE-STORAGE-BASES"
+               "!DEFINE-STORAGE-CLASS" "DEFINE-VOP"
                "DEFKNOWN" "DEFOPTIMIZER"
                "DEFTRANSFORM" "DERIVE-TYPE"
+               "DO-FORMS-FROM-INFO"
                "EMIT-BLOCK-HEADER"
                "PHYSENV-DEBUG-LIVE-TN" "PHYSENV-LIVE-TN"
                "FAST-SYMBOL-VALUE"
@@ -284,13 +314,15 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "GET-TOPLEVELISH-FILE-INFO"
                "HALT"
                "IF-EQ"
-               "IMMEDIATE-TN-P"
+               "CONSTANT-TN-P"
                "INHIBIT-SAFEPOINTS"
+               "COMPILER-MACRO-APPLICATION-MISSED-WARNING"
                "INLINING-DEPENDENCY-FAILURE"
                "INSERT-STEP-CONDITIONS"
                "IR2-COMPONENT-CONSTANTS" "IR2-CONVERT"
                "IR2-PHYSENV-NUMBER-STACK-P"
                "KNOWN-CALL-LOCAL" "KNOWN-RETURN"
+               "LAMBDA-VAR-IGNOREP"
                "LAMBDA-WITH-LEXENV" "LEXENV-FIND"
                "LOCATION=" "LTN-ANNOTATE"
                "MACRO-POLICY-DECLS"
@@ -299,49 +331,61 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "MAKE-FIXUP-NOTE"
                "MAKE-LOAD-TIME-CONSTANT-TN" "MAKE-N-TNS" "MAKE-NORMAL-TN"
                "MAKE-RANDOM-TN"
-               "MAKE-REPRESENTATION-TN" "MAKE-RESTRICTED-TN" "MAKE-SC-OFFSET"
+               "MAKE-REPRESENTATION-TN" "MAKE-RESTRICTED-TN"
                "MAKE-STACK-POINTER-TN" "MAKE-TN-REF" "MAKE-UNWIND-BLOCK"
                "MAKE-WIRED-TN" "MAYBE-COMPILER-NOTIFY"
                "MAYBE-INLINE-SYNTACTIC-CLOSURE"
+               "MSAN-UNPOISON"
                "MORE-ARG-CONTEXT" "MOVABLE" "MOVE" "MULTIPLE-CALL"
                "MULTIPLE-CALL-LOCAL" "MULTIPLE-CALL-NAMED"
                "MULTIPLE-CALL-VARIABLE"
-               "%%NIP-DX" "%%NIP-VALUES"
+                              "%%NIP-DX" "%%NIP-VALUES"
                "NLX-ENTRY" "NLX-ENTRY-MULTIPLE"
                "NODE-STACK-ALLOCATE-P"
                "NON-DESCRIPTOR-STACK" "NOTE-ENVIRONMENT-START"
-               "NOTE-THIS-LOCATION" "OPTIMIZER"
+               "NOTE-THIS-LOCATION" "*LOCATION-CONTEXT*"
+               "MAKE-RESTART-LOCATION"
+               "OPTIMIZER"
+               "PACK-CODE-FIXUP-LOCS"
                "PARSE-EVAL-WHEN-SITUATIONS"
                "POLICY"
                "%%POP-DX"
                "PRIMITIVE-TYPE" "PRIMITIVE-TYPE-OF"
-               "PRIMITIVE-TYPE-OR-LOSE" "PRIMITIVE-TYPE-VOP"
+               "PRIMITIVE-TYPE-OR-LOSE"
                "PRIMITIVE-TYPE-NAME"
                "PRIMITIVE-TYPE-INDIRECT-CELL-TYPE"
                "PROCLAIM-FTYPE" "PROCLAIM-TYPE"
                "PUSH-VALUES"
-               "READ-PACKED-BIT-VECTOR" "READ-VAR-INTEGER" "READ-VAR-STRING"
-               #!+inline-constants "REGISTER-INLINE-CONSTANT"
+               "READ-PACKED-BIT-VECTOR"
+               "READ-VAR-INTEGER" "READ-VAR-INTEGERF"
+               "SAP-READ-VAR-INTEGER" "SAP-READ-VAR-INTEGERF"
+               "READ-VAR-STRING"
+               "REGISTER-INLINE-CONSTANT"
                "RESET-STACK-POINTER" "RESTORE-DYNAMIC-STATE"
-               "RETURN-MULTIPLE" "SAVE-DYNAMIC-STATE" "SB"
-               "SB-ALLOCATED-SIZE" "SB-NAME" "SB-OR-LOSE" "SB-P" "SC" "SC-CASE"
-               "SC-IS" "SC-NAME" "SC-NUMBER" "SC-NUMBER-OR-LOSE" "SC-OFFSET"
-               "SC-OFFSET-OFFSET" "SC-OFFSET-SCN" "SC-OR-LOSE" "SC-P" "SC-SB"
+               "RETURN-MULTIPLE" "SAVE-DYNAMIC-STATE" "STORAGE-BASE"
+               "SB-ALLOCATED-SIZE" "SB-NAME" "SB-OR-LOSE"
+               "STORAGE-CLASS" "SC-CASE" "SC-OPERAND-SIZE"
+               "SC-IS" "SC-NAME" "SC-NUMBER" "SC-SB"
+               "SC-OR-LOSE" "SC-NUMBER-OR-LOSE"
+               "SC+OFFSET" "MAKE-SC+OFFSET" "SC+OFFSET-OFFSET" "SC+OFFSET-SCN"
                "SET-UNWIND-PROTECT" "SET-VECTOR-SUBTYPE"
-               "SETUP-CLOSURE-ENVIRONMENT" "SETUP-ENVIRONMENT"
+               "SETUP-CLOSURE-ENVIRONMENT"
                "SOURCE-LOCATION"
-               "SOURCE-TRANSFORM-LAMBDA"
                "SPECIFY-SAVE-TN"
-               "STORE-COVERAGE-DATA"
+               "STATIC-CALL-NAMED" "STATIC-MULTIPLE-CALL-NAMED" "STATIC-TAIL-CALL-NAMED"
+               "STORE-COVERAGE-DATA" "STORE-SOURCE-FORM"
                "TAIL-CALL" "TAIL-CALL-NAMED"
                "TAIL-CALL-VARIABLE" "TEMPLATE-OR-LOSE"
                "TN" "TN-OFFSET" "TN-P" "TN-REF" "TN-REF-ACROSS" "TN-REF-LOAD-TN"
                "TN-REF-NEXT" "TN-REF-NEXT-REF" "TN-REF-P" "TN-REF-TARGET"
-               "TN-REF-TN" "TN-REF-VOP" "TN-REF-WRITE-P" "TN-SC" "TN-VALUE"
-               "TYPE-CHECK-ERROR" "UNBIND" "UNBIND-TO-HERE"
+               "TN-REF-TN" "TN-REF-TYPE" "TN-REF-VOP" "TN-REF-WRITE-P" "TN-SC"
+               "TN-KIND" "TN-VALUE"
+               "TYPE-CHECK-ERROR" "UNBIND" "UNBIND-N" "UNBIND-TO-HERE"
                "UNSAFE" "UNSAFELY-FLUSHABLE" "UNWIND" "UWP-ENTRY"
+               "UNPACK-CODE-FIXUP-LOCS"
                "VERIFY-ARG-COUNT" "WRITE-PACKED-BIT-VECTOR"
                "WRITE-VAR-INTEGER" "WRITE-VAR-STRING" "XEP-ALLOCATE-FRAME"
+               "XEP-SETUP-SP"
                "LABEL-ID" "FIXUP" "FIXUP-FLAVOR" "FIXUP-NAME" "FIXUP-OFFSET"
                "FIXUP-P" "MAKE-FIXUP"
                "DEF-ALLOC"
@@ -354,7 +398,6 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "EMIT-NOP"
                "DEF-SETTER"
                "FIXED-ALLOC"
-               "MAKE-UNBOUND-MARKER"
                "MAKE-FUNCALLABLE-INSTANCE-TRAMP"
                "RETURN-SINGLE"
                "NOTE-NEXT-INSTRUCTION"
@@ -364,7 +407,6 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "BLOCK-NUMBER"
                "IR2-BLOCK-BLOCK"
                "VOP-BLOCK"
-               "*ASSEMBLY-OPTIMIZE*"
 
                "IMMEDIATE-CONSTANT-SC"
                "BOXED-IMMEDIATE-SC-P"
@@ -375,9 +417,14 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "PRIMITIVE-TYPE"
                "MAKE-CALL-OUT-TNS"
                "STANDARD-ARG-LOCATION"
+               "STANDARD-ARG-LOCATION-SC"
+               "ARG-COUNT-SC"
+               "CLOSURE-SC"
                "MAKE-RETURN-PC-PASSING-LOCATION"
                "MAKE-OLD-FP-PASSING-LOCATION"
                "MAKE-OLD-FP-SAVE-LOCATION"
+               "RETURN-PC-PASSING-OFFSET"
+               "OLD-FP-PASSING-OFFSET"
                "MAKE-RETURN-PC-SAVE-LOCATION"
                "MAKE-ARG-COUNT-LOCATION"
                "MAKE-NFP-TN"
@@ -393,18 +440,28 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "LOCATION-NUMBER"
                "WITH-COMPILER-ERROR-RESIGNALLING"
                "WITH-SOURCE-LOCATION"
-               "*SOURCE-LOCATION-THUNKS*"
+               "XDEFUN" ; extended defun for defstruct
 
-               "BRANCH-IF"))
+               "BRANCH-IF"
+
+               ;; for SB-COVER
+               "*CODE-COVERAGE-INFO*" "CODE-COVERAGE-RECORD-MARKED"
+               "CLEAR-CODE-COVERAGE" "RESET-CODE-COVERAGE"
+               "+CODE-COVERAGE-UNMARKED+"
+               ;; for SB-INTROSPECT
+               "MAP-PACKED-XREF-DATA" "MAP-SIMPLE-FUNS"
+
+               "DO-BLOCKS" "DO-BLOCKS-BACKWARDS"
+               "DO-NODES" "DO-NODES-BACKWARDS"))
 
    #s(sb-cold:package-data
-      :name "SB!DEBUG"
+      :name "SB-DEBUG"
       :doc
       "sorta public: Eventually this should become the debugger interface, with
 basic stuff like BACKTRACE and ARG. For now, the actual supported interface
 is still mixed indiscriminately with low-level internal implementation stuff
 like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
-      :use ("CL" "SB!EXT" "SB!INT" "SB!SYS" "SB!KERNEL")
+      :use ("CL" "SB-EXT" "SB-INT" "SB-SYS" "SB-KERNEL" "SB-DI")
       :reexport ("*DEBUG-PRINT-VARIABLE-ALIST*")
       :export ("*BACKTRACE-FRAME-COUNT*"
                "*DEBUG-BEGINNER-HELP-P*"
@@ -420,24 +477,24 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "FRAME-HAS-DEBUG-TAG-P"
                "UNWIND-TO-FRAME-AND-CALL"
                ;; Deprecated
-               "BACKTRACE" "BACKTRACE-AS-LIST" "*SHOW-ENTRY-POINT-DETAILS*"
+               "BACKTRACE" "BACKTRACE-AS-LIST"
                ;; Replaced by
                "PRINT-BACKTRACE" "LIST-BACKTRACE"))
 
    #s(sb-cold:package-data
-      :name "SB!DI"
+      :name "SB-DI"
       :doc "private: primitives used to write debuggers"
-      :use ("CL" "SB!EXT" "SB!INT" "SB!KERNEL" "SB!SYS" "SB!VM")
-      :import-from (("SB!C"
-                     "DEBUG-SOURCE-FORM" "DEBUG-SOURCE-NAMESTRING"
+      :use ("CL" "SB-EXT" "SB-INT" "SB-KERNEL" "SB-SYS" "SB-VM")
+      :import-from (("SB-C"
+                     "DEBUG-SOURCE-NAMESTRING"
                      "DEBUG-SOURCE-CREATED" "DEBUG-SOURCE-COMPILED"
-                     "DEBUG-SOURCE-START-POSITIONS" "MAKE-DEBUG-SOURCE"
-                     "DEBUG-SOURCE" "DEBUG-SOURCE-P"))
-      :reexport ("DEBUG-SOURCE-FORM"
-                 "DEBUG-SOURCE-NAMESTRING"
+                     "MAKE-DEBUG-SOURCE"
+                     "DEBUG-SOURCE" "DEBUG-SOURCE-P"
+                     "CORE-DEBUG-SOURCE" "CORE-DEBUG-SOURCE-P"
+                     "CORE-DEBUG-SOURCE-FORM"))
+      :reexport ("DEBUG-SOURCE-NAMESTRING"
                  "DEBUG-SOURCE-CREATED" "DEBUG-SOURCE-COMPILED"
-                 "DEBUG-SOURCE-START-POSITIONS" "DEBUG-SOURCE"
-                 "DEBUG-SOURCE-P")
+                 "DEBUG-SOURCE" "DEBUG-SOURCE-P")
       :export ("ACTIVATE-BREAKPOINT"
                "AMBIGUOUS-DEBUG-VARS" "AMBIGUOUS-VAR-NAME" "BREAKPOINT"
                "BREAKPOINT-ACTIVE-P" "BREAKPOINT-HOOK-FUN" "BREAKPOINT-INFO"
@@ -445,21 +502,22 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "CODE-LOCATION-DEBUG-BLOCK" "CODE-LOCATION-DEBUG-FUN"
                "CODE-LOCATION-DEBUG-SOURCE" "CODE-LOCATION-FORM-NUMBER"
                "CODE-LOCATION-P" "CODE-LOCATION-TOPLEVEL-FORM-OFFSET"
+               "CODE-LOCATION-CONTEXT"
                "CODE-LOCATION-UNKNOWN-P" "CODE-LOCATION=" "DEACTIVATE-BREAKPOINT"
                "DEBUG-BLOCK" "DEBUG-BLOCK-ELSEWHERE-P" "DEBUG-BLOCK-P"
-               "DEBUG-BLOCK-SUCCESSORS" "DEBUG-CONDITION" "DEBUG-ERROR"
+               "DEBUG-CONDITION" "DEBUG-ERROR"
                "DEBUG-FUN" "DEBUG-FUN-FUN" "DEBUG-FUN-KIND"
                "DEBUG-FUN-LAMBDA-LIST" "DEBUG-FUN-NAME" "DEBUG-FUN-CLOSURE-NAME"
                "DEBUG-FUN-P" "DEBUG-FUN-START-LOCATION"
                "DEBUG-FUN-SYMBOL-VARS"
-               "DEBUG-SOURCE-ROOT-NUMBER" "DEBUG-VAR"
-               "DEBUG-VAR-ID" "DEBUG-VAR-INFO-AVAILABLE"
+               "DEBUG-VAR" "DEBUG-VAR-ID" "DEBUG-VAR-INFO-AVAILABLE"
                "DEBUG-VAR-SYMBOL-NAME" "DEBUG-VAR-P" "DEBUG-VAR-PACKAGE-NAME"
                "DEBUG-VAR-SYMBOL" "DEBUG-VAR-VALID-VALUE"
                "DEBUG-VAR-VALIDITY" "DEBUG-VAR-VALUE"
                "DELETE-BREAKPOINT"
                "DO-DEBUG-BLOCK-LOCATIONS" "DO-DEBUG-FUN-BLOCKS"
                "DO-DEBUG-FUN-VARS"
+               "ERROR-CONTEXT"
                "FORM-NUMBER-TRANSLATIONS"
                "FRAME" "FRAME-CATCHES" "FRAME-CODE-LOCATION"
                "FRAME-DEBUG-FUN" "FRAME-DOWN"
@@ -476,18 +534,19 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "CODE-LOCATION-KIND" "FLUSH-FRAMES-ABOVE"))
 
    #s(sb-cold:package-data
-      :name "SB!DISASSEM"
+      :name "SB-DISASSEM"
       :doc "private: stuff related to the implementation of the disassembler"
-      :use ("CL" "SB!EXT" "SB!INT")
-      :export ("*DISASSEM-INST-ALIGNMENT-BYTES*"
-               "*DISASSEM-NOTE-COLUMN*" "*DISASSEM-OPCODE-COLUMN-WIDTH*"
+      :use ("CL" "SB-EXT" "SB-INT" "SB-SYS" "SB-KERNEL" "SB-DI")
+      :export ("*DISASSEM-NOTE-COLUMN*" "*DISASSEM-OPCODE-COLUMN-WIDTH*"
                "*DISASSEM-LOCATION-COLUMN-WIDTH*"
+               "ALIGN" ;;  prevent it from being removed, older Slime versions are using it
                "ARG-VALUE" "DISASSEM-STATE"
                "DISASSEMBLE-CODE-COMPONENT"
                "DISASSEMBLE-FUN" "DISASSEMBLE-MEMORY"
                "DISASSEMBLE-SEGMENT" "DISASSEMBLE-SEGMENTS"
-               "DSTATE-GET-INST-PROP"
-               "DSTATE-GET-PROP" "DSTATE-PUT-INST-PROP"
+               "DSTATE-BYTE-ORDER"
+               "DSTATE-GETPROP"
+               "DSTATE-SETPROP"
                "DSTATE-SEGMENT-SAP"
                "FIND-INST"
                "GET-CODE-SEGMENTS" "GET-FUN-SEGMENTS"
@@ -500,36 +559,37 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "MAYBE-NOTE-SINGLE-STORAGE-REF"
                "MAYBE-NOTE-STATIC-SYMBOL"
                "NOTE"
-               "NOTE-CODE-CONSTANT" "PARAMS" "PRIN1-QUOTED-SHORT"
+               "NOTE-CODE-CONSTANT" "NOTE-CODE-CONSTANT-ABSOLUTE"
+               "PRIN1-QUOTED-SHORT"
                "PRIN1-SHORT" "PRINT-BYTES"
                "PRINT-CURRENT-ADDRESS" "PRINT-INST"
                "PRINT-NOTES-AND-NEWLINE"
-               "PRINT-WORDS" "SAP-REF-DCHUNK"
-               "SEG-LENGTH" "SEGMENT"
+               "PRINT-WORDS" "SAP-REF-DCHUNK" "SAP-REF-INT"
+               "SEG-CODE" "SEG-LENGTH" "SEGMENT"
                "SIGN-EXTEND"
                "GEN-PRINTER-DEF-FORMS-DEF-FORM" "MAKE-DSTATE"
                "DEFINE-ARG-TYPE"
-               "READ-SIGNED-SUFFIX" "ADD-OFFS-HOOK"
+               "READ-SIGNED-SUFFIX"
                "MAKE-MEMORY-SEGMENT"
                "MAKE-SEGMENT" "SEG-VIRTUAL-LOCATION"
-               "DCHUNK" "*DEFAULT-DSTATE-HOOKS*"
+               "DCHUNK" "DCHUNK-ZERO" "*DEFAULT-DSTATE-HOOKS*"
                "MAKE-CODE-SEGMENT" "MAKE-OFFS-HOOK"
                "DSTATE-SEGMENT" "DSTATE-CUR-OFFS"
                "PRINC16" "INSTRUCTION" "DEFINE-INSTRUCTION-FORMAT"
-               "DSTATE-NEXT-OFFS" "INSTALL-INST-FLAVORS"
+               "DSTATE-NEXT-OFFS"
                "SEG-SAP-MAKER" "DISASSEMBLE-ASSEM-SEGMENT"
                "READ-SUFFIX"
                "MAP-SEGMENT-INSTRUCTIONS"
                "SET-LOCATION-PRINTING-RANGE" "MAKE-VECTOR-SEGMENT"
-               "ADD-OFFS-NOTE-HOOK" "ADD-OFFS-COMMENT-HOOK"
-               "DSTATE-CUR-ADDR" "DSTATE-NEXT-ADDR"))
+               "DSTATE-CUR-ADDR" "DSTATE-NEXT-ADDR"
+               "SNARF-ERROR-JUNK"))
 
-   #!+sb-dyncount
+   #+sb-dyncount
    #s(sb-cold:package-data
-      :name "SB!DYNCOUNT"
+      :name "SB-DYNCOUNT"
       :doc "private: some somewhat-stale code for collecting runtime statistics"
-      :use ("CL" "SB!ALIEN-INTERNALS" "SB!ALIEN" "SB!BIGNUM"
-                 "SB!EXT" "SB!INT" "SB!KERNEL" "SB!ASSEM" "SB!SYS")
+      :use ("CL" "SB-ALIEN-INTERNALS" "SB-ALIEN" "SB-BIGNUM"
+                 "SB-EXT" "SB-INT" "SB-KERNEL" "SB-ASSEM" "SB-SYS")
       :export ("*COLLECT-DYNAMIC-STATISTICS*"
                "COUNT-ME"
                "DYNCOUNT-INFO-COUNTS" "DYNCOUNT-INFO-COSTS"
@@ -537,58 +597,67 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "DYNCOUNT-INFO" "DYNCOUNT-INFO-P"))
 
    #s(sb-cold:package-data
-      :name "SB!FASL"
+      :name "SB-FASL"
       :doc "private: stuff related to FASL load/dump logic (and GENESIS)"
-      :use ("CL" "SB!ALIEN" "SB!ASSEM" "SB!BIGNUM" "SB!C"
-                 "SB!EXT" "SB!INT" "SB!KERNEL" "SB!SYS")
+      :use ("CL" "SB-ALIEN" "SB-ASSEM" "SB-BIGNUM" "SB-C"
+                 "SB-EXT" "SB-INT" "SB-KERNEL" "SB-SYS")
+      :import-from (("SB-VM" "+FIXUP-KINDS+"))
       :export ("*ASSEMBLER-ROUTINES*"
+               "GET-ASM-ROUTINE"
                "+BACKEND-FASL-FILE-IMPLEMENTATION+"
-               "BUILD-ID-CORE-ENTRY-TYPE-CODE"
                "*FASL-FILE-TYPE*"
                "CLOSE-FASL-OUTPUT"
-               "DEFLATED-CORE-SPACE-ID-FLAG"
                "DUMP-ASSEMBLER-ROUTINES"
-               "DUMP-OBJECT"
-               "DYNAMIC-CORE-SPACE-ID"
-               "END-CORE-ENTRY-TYPE-CODE"
+               "DUMP-FOP" "DUMP-OBJECT"
+               "DUMPABLE-LAYOUT-P"
                "FASL-CONSTANT-ALREADY-DUMPED-P"
                "+FASL-FILE-VERSION+"
                "FASL-DUMP-COMPONENT"
                "FASL-DUMP-COLD-FSET"
                "FASL-DUMP-LOAD-TIME-VALUE" "FASL-DUMP-LOAD-TIME-VALUE-LAMBDA"
-               "FASL-DUMP-SOURCE-INFO" "FASL-DUMP-TOPLEVEL-LAMBDA-CALL"
+               "FASL-DUMP-TOPLEVEL-LAMBDA-CALL"
                "FASL-NOTE-HANDLE-FOR-CONSTANT"
                "FASL-OUTPUT" "FASL-OUTPUT-P"
                "FASL-OUTPUT-ENTRY-TABLE" "FASL-OUTPUT-STREAM"
-               "FASL-VALIDATE-STRUCTURE"
-               "INITIAL-FUN-CORE-ENTRY-TYPE-CODE"
+               "FASL-NOTE-DUMPABLE-INSTANCE"
+               "LOAD-FORM-IS-DEFAULT-MLFSS-P"
                "*!LOAD-TIME-VALUES*"
-               "MAX-CORE-SPACE-ID"
-               ;; FIXME: this are listed here so that genesis
-               ;; puts them into .h files, but they are not present in the resulting core
-               "NEW-DIRECTORY-CORE-ENTRY-TYPE-CODE"
-               "OPEN-FASL-OUTPUT" "PAGE-TABLE-CORE-ENTRY-TYPE-CODE"
-               "READ-ONLY-CORE-SPACE-ID"
-               "*!REVERSED-COLD-TOPLEVELS*"
-               "STATIC-CORE-SPACE-ID"))
+               "OPEN-FASL-OUTPUT"
+               "*!COLD-DEFSYMBOLS*" "*!COLD-DEFUNS*"
+               "*!COLD-SETF-MACROS*"  "*!COLD-TOPLEVELS*"
+               "COLD-CONS" "COLD-INTERN" "COLD-PUSH" "COLD-TARGET-PUSH"))
 
    ;; This package is a grab bag for things which used to be internal
    ;; symbols in package COMMON-LISP. Lots of these symbols are accessed
-   ;; with explicit SB!IMPL:: prefixes in the code. It would be nice to
+   ;; with explicit SB-IMPL:: prefixes in the code. It would be nice to
    ;; reduce the use of this practice, so if symbols from here which are
    ;; accessed that way are found to belong more appropriately in an
-   ;; existing package (e.g. SB!KERNEL or SB!SYS or SB!EXT or SB!FASL),
+   ;; existing package (e.g. SB-KERNEL or SB-SYS or SB-EXT or SB-FASL),
    ;; I (WHN 19990223) encourage maintainers to move them there..
    #s(sb-cold:package-data
-      :name "SB!IMPL"
+      :name "SB-IMPL"
       :doc "private: a grab bag of implementation details"
-      :use ("CL" "SB!ALIEN" "SB!BIGNUM" "SB!DEBUG" "SB!EXT"
-                 "SB!FASL" "SB!GRAY" "SB!INT" "SB!KERNEL" "SB!SYS"))
+      :import-from (("SB-KERNEL" "*PACKAGE-NAMES*"))
+      :export ("FORMAT-MICROSECONDS" "FORMAT-MILLISECONDS" ; for ~/fmt/
+               "PRINT-TYPE" "PRINT-TYPE-SPECIFIER"
+               ;; symbols used by sb-simple-streams
+               "ANSI-STREAM-CLEAR-INPUT"
+               "ANSI-STREAM-FRESH-LINE" "ANSI-STREAM-LISTEN"
+               "ANSI-STREAM-READ-BYTE" "ANSI-STREAM-READ-CHAR"
+               "ANSI-STREAM-READ-CHAR-NO-HANG" "ANSI-STREAM-READ-LINE"
+               "ANSI-STREAM-READ-SEQUENCE" "ANSI-STREAM-PEEK-CHAR"
+               "ANSI-STREAM-UNREAD-CHAR" "ANSI-STREAM-WRITE-SEQUENCE"
+               "ANSI-STREAM-WRITE-STRING" "DISPATCH-TABLES"
+               "TOKEN-DELIMITERP" "WHITESPACE[2]P" "WITH-READ-BUFFER"
+               ;; other
+               "%MAKUNBOUND")
+      :use ("CL" "SB-ALIEN" "SB-BIGNUM" "SB-DEBUG" "SB-EXT"
+                 "SB-FASL" "SB-GRAY" "SB-INT" "SB-KERNEL" "SB-SYS"))
 
    #s(sb-cold:package-data
-      :name "SB!EXT"
+      :name "SB-EXT"
       :doc "public: miscellaneous supported extensions to the ANSI Lisp spec"
-      :use ("CL" "SB!ALIEN" "SB!INT" "SB!SYS" "SB!GRAY")
+      :use ("CL" "SB-ALIEN" "SB-INT" "SB-SYS" "SB-GRAY")
       :export ( ;; Information about how the program was invoked is
                ;; nonstandard but very useful.
                "*POSIX-ARGV*" "*CORE-PATHNAME*" "*RUNTIME-PATHNAME*"
@@ -625,6 +694,8 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "GET-TIME-OF-DAY"
 
                ;; People have various good reasons to mess with the GC.
+               "HEAP-ALLOCATED-P"
+               "STACK-ALLOCATED-P"
                "*AFTER-GC-HOOKS*"
                "BYTES-CONSED-BETWEEN-GCS"
                "GC" "GET-BYTES-CONSED"
@@ -647,6 +718,8 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                ;; Customizing printing of compiler and debugger messages
                "*COMPILER-PRINT-VARIABLE-ALIST*"
                "*DEBUG-PRINT-VARIABLE-ALIST*"
+               "COMPILE-FILE-LINE"
+               "COMPILE-FILE-POSITION"
 
                ;; Hooks into init & save sequences
                "*INIT-HOOKS*" "*SAVE-HOOKS*" "*EXIT-HOOKS*"
@@ -672,6 +745,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                ;; and for dedicated users who really want to customize
                ;; error reporting, we have
                "DEFINE-SOURCE-CONTEXT"
+               "WITH-CURRENT-SOURCE-FORM"
 
                ;; and given how many users dislike strict treatment of
                ;; DEFCONSTANT, let's give them enough rope to escape by
@@ -683,21 +757,30 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "DEFINE-LOAD-TIME-GLOBAL"
                "SYMBOL-GLOBAL-VALUE"
 
+               "FILE-EXISTS"
+               "FILE-DOES-NOT-EXIST"
+               "DELETE-FILE-ERROR"
+               "SUPERSEDE"
+               "OVERWRITE"
+               "RENAME"
+               "CREATE"
+               "RETRY"
+
                ;; package extensions
                ;;
                ;; locks
-               #!+sb-package-locks("PACKAGE-LOCKED-P"
-                                   "LOCK-PACKAGE"
-                                   "UNLOCK-PACKAGE"
-                                   "PACKAGE-IMPLEMENTED-BY-LIST"
-                                   "PACKAGE-IMPLEMENTS-LIST"
-                                   "ADD-IMPLEMENTATION-PACKAGE"
-                                   "REMOVE-IMPLEMENTATION-PACKAGE"
-                                   "WITH-UNLOCKED-PACKAGES"
-                                   "PACKAGE-LOCK-VIOLATION"
-                                   "PACKAGE-LOCKED-ERROR"
-                                   "SYMBOL-PACKAGE-LOCKED-ERROR"
-                                   "PACKAGE-LOCKED-ERROR-SYMBOL")
+               "PACKAGE-LOCKED-P"
+               "LOCK-PACKAGE"
+               "UNLOCK-PACKAGE"
+               "PACKAGE-IMPLEMENTED-BY-LIST"
+               "PACKAGE-IMPLEMENTS-LIST"
+               "ADD-IMPLEMENTATION-PACKAGE"
+               "REMOVE-IMPLEMENTATION-PACKAGE"
+               "WITH-UNLOCKED-PACKAGES"
+               "PACKAGE-LOCK-VIOLATION"
+               "PACKAGE-LOCKED-ERROR"
+               "SYMBOL-PACKAGE-LOCKED-ERROR"
+               "PACKAGE-LOCKED-ERROR-SYMBOL"
                "WITHOUT-PACKAGE-LOCKS"
                "DISABLE-PACKAGE-LOCKS"
                "ENABLE-PACKAGE-LOCKS"
@@ -706,6 +789,8 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "REMOVE-PACKAGE-LOCAL-NICKNAME"
                "PACKAGE-LOCAL-NICKNAMES"
                "PACKAGE-LOCALLY-NICKNAMED-BY-LIST"
+
+               "PACKAGE-DOES-NOT-EXIST" "READER-PACKAGE-DOES-NOT-EXIST"
                ;; behaviour on DEFPACKAGE variance
                "*ON-PACKAGE-VARIANCE*"
 
@@ -715,15 +800,29 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "IMPLICIT-GENERIC-FUNCTION-NAME"
                "IMPLICIT-GENERIC-FUNCTION-WARNING"
                "INVALID-FASL"
-               "DEPRECATION-CONDITION"
 
                "NAME-CONFLICT" "NAME-CONFLICT-FUNCTION"
                "NAME-CONFLICT-DATUM" "NAME-CONFLICT-SYMBOLS"
                "RESOLVE-CONFLICT"
 
+               ;; Deprecation stuff
+               "DEPRECATED" ; declaration
+               "DEPRECATION-CONDITION"
+               "DEPRECATION-CONDITION-NAMESPACE"
+               "DEPRECATION-CONDITION-NAME"
+               "DEPRECATION-CONDITION-SOFTWARE"
+               "DEPRECATION-CONDITION-VERSION"
+               "DEPRECATION-CONDITION-REPLACEMENTS"
+               "DEPRECATION-CONDITION-RUNTIME-ERROR"
+               "EARLY-DEPRECATION-WARNING"
+               "LATE-DEPRECATION-WARNING"
+               "FINAL-DEPRECATION-WARNING"
+               "DEPRECATION-ERROR" ; condition and function
+
                "PRINT-UNREADABLY"
 
                ;; Readtable normalization control
+               "READTABLE-BASE-CHAR-PREFERENCE"
                "READTABLE-NORMALIZATION"
 
                ;; and a mechanism for controlling same at compile time
@@ -747,6 +846,7 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "DESCRIBE-COMPILER-POLICY"
                "RESTRICT-COMPILER-POLICY"
                "SET-MACRO-POLICY"
+               "FOLD-IDENTICAL-CODE" ; this is a verb, not a compiler policy
 
                ;; a special form for breaking out of our "declarations
                ;; are assertions" default
@@ -772,6 +872,8 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "WEAK-POINTER"
                "WEAK-POINTER-P"
                "WEAK-POINTER-VALUE"
+               "MAKE-WEAK-VECTOR"
+               "WEAK-VECTOR-P"
 
                ;; Hash table extensions
                "DEFINE-HASH-TABLE-TEST"
@@ -792,10 +894,6 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "DOUBLE-FLOAT-POSITIVE-INFINITY"
                "LONG-FLOAT-NEGATIVE-INFINITY"
                "LONG-FLOAT-POSITIVE-INFINITY"
-
-               ;; hacks to work around system limitations
-               "*INTEXP-MAXIMUM-EXPONENT*" ; since we crash hard when
-                                        ; memory is exhausted
 
                ;; saving Lisp images
                "SAVE-LISP-AND-DIE"
@@ -826,6 +924,9 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "SET-SBCL-SOURCE-LOCATION"
                "*DISASSEMBLE-ANNOTATE*"
                "PRINT-SYMBOL-WITH-PREFIX"
+               "*PRINT-VECTOR-LENGTH*"
+               "DECIMAL-WITH-GROUPED-DIGITS-WIDTH"
+               ;;"OBJECT-SIZE"
 
                ;; stepping interface
                "STEP-CONDITION" "STEP-FORM-CONDITION" "STEP-FINISHED-CONDITION"
@@ -864,32 +965,46 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "SCHEDULE-TIMER" "UNSCHEDULE-TIMER" "LIST-ALL-TIMERS"
 
                ;; SIMD pack
-               #!+sb-simd-pack("SIMD-PACK"
-                               "SIMD-PACK-P"
-                               "%MAKE-SIMD-PACK-UB32"
-                               "%MAKE-SIMD-PACK-UB64"
-                               "%MAKE-SIMD-PACK-DOUBLE"
-                               "%MAKE-SIMD-PACK-SINGLE"
-                               "%SIMD-PACK-UB32S"
-                               "%SIMD-PACK-UB64S"
-                               "%SIMD-PACK-DOUBLES"
-                               "%SIMD-PACK-SINGLES")
+               #+sb-simd-pack
+               ("SIMD-PACK"
+                "SIMD-PACK-P"
+                "%MAKE-SIMD-PACK-UB32"
+                "%MAKE-SIMD-PACK-UB64"
+                "%MAKE-SIMD-PACK-DOUBLE"
+                "%MAKE-SIMD-PACK-SINGLE"
+                "%SIMD-PACK-UB32S"
+                "%SIMD-PACK-UB64S"
+                "%SIMD-PACK-DOUBLES"
+                "%SIMD-PACK-SINGLES")
+               #+sb-simd-pack-256
+               ("SIMD-PACK-256"
+                "SIMD-PACK-256-P"
+                "%MAKE-SIMD-PACK-256-UB32"
+                "%MAKE-SIMD-PACK-256-UB64"
+                "%MAKE-SIMD-PACK-256-DOUBLE"
+                "%MAKE-SIMD-PACK-256-SINGLE"
+                "%SIMD-PACK-256-UB32S"
+                "%SIMD-PACK-256-UB64S"
+                "%SIMD-PACK-256-DOUBLES"
+                "%SIMD-PACK-256-SINGLES")
 
                ;; versioning utility
-               "ASSERT-VERSION->="))
+               "ASSERT-VERSION->="
+               "UNKNOWN-KEYWORD-ARGUMENT"
+               "UNKNOWN-KEYWORD-ARGUMENT-NAME"))
 
    #s(sb-cold:package-data
-      :name "SB!FORMAT"
+      :name "SB-FORMAT"
       :doc "private: implementation of FORMAT and friends"
-      :use ("CL" "SB!EXT" "SB!INT" "SB!KERNEL")
-      :export ("%COMPILER-WALK-FORMAT-STRING" "FORMAT-ERROR"))
+      :use ("CL" "SB-EXT" "SB-INT" "SB-KERNEL")
+      :export ("%COMPILER-WALK-FORMAT-STRING" "FORMAT-ERROR" "TOKENS"))
 
    #s(sb-cold:package-data
-      :name "SB!GRAY"
+      :name "SB-GRAY"
       :doc
       "public: an implementation of the stream-definition-by-user
 Lisp extension proposal by David N. Gray"
-      :use ("CL" "SB!EXT" "SB!INT" "SB!KERNEL")
+      :use ("CL" "SB-EXT" "SB-INT" "SB-KERNEL")
       :export ("FUNDAMENTAL-BINARY-STREAM"
                "FUNDAMENTAL-BINARY-INPUT-STREAM"
                "FUNDAMENTAL-BINARY-OUTPUT-STREAM" "FUNDAMENTAL-CHARACTER-STREAM"
@@ -908,12 +1023,12 @@ Lisp extension proposal by David N. Gray"
                "STREAM-WRITE-STRING"))
 
    #s(sb-cold:package-data
-      :name "SB!INT"
+      :name "SB-INT"
       :doc
       "private: miscellaneous unsupported extensions to the ANSI spec. Much of
 the stuff in here originated in CMU CL's EXTENSIONS package and is retained,
 possibly temporarily, because it might be used internally."
-      :use ("CL" "SB!ALIEN" "SB!GRAY" "SB!FASL" "SB!SYS")
+      :use ("CL" "SB-ALIEN" "SB-GRAY" "SB-FASL" "SB-SYS")
       :export (;; lambda list keyword extensions
                "&MORE"
 
@@ -921,13 +1036,16 @@ possibly temporarily, because it might be used internally."
                "FP-ZERO-P"
                "NEG-FP-ZERO"
 
+               ;; Advice to the compiler that it doesn't need to assert types.
+               "EXPLICIT-CHECK"
                ;; Stack allocation without any questions asked
                "TRULY-DYNAMIC-EXTENT"
 
                ;; Like WITH-LOCKED-HASH-TABLE, but disabled interrupts
                "WITH-LOCKED-SYSTEM-TABLE"
 
-               ;; generic set implementation
+               ;; generic set implementation backed by a list that upgrades
+               ;; to a hashtable if a certain size is exceeded.
                "ADD-TO-XSET"
                "ALLOC-XSET"
                "MAP-XSET"
@@ -940,28 +1058,64 @@ possibly temporarily, because it might be used internally."
                "XSET-SUBSET-P"
                "XSET-UNION"
 
+               ;; sparse set implementation backed by a lightweight hashtable
+               "COPY-SSET"
+               "DO-SSET-ELEMENTS"
+               "MAKE-SSET"
+               "SSET" "SSET-ELEMENT"
+               "SSET-ADJOIN" "SSET-DELETE" "SSET-EMPTY" "SSET-COUNT"
+               "SSET-MEMBER"
+
+               ;; Treaps
+               ;; the finders/accesors are for a generic binary-search-tree
+               ;; (in the event that we have more than one), but the mutators
+               ;; refer specifically to what flavor of tree it is.
+               "BST-FIND" "BST-FIND<=" "BST-NODE-DATA"
+               "TREAP-INSERT" "TREAP-DELETE"
+
                ;; communication between the runtime and Lisp
                "*CORE-STRING*"
 
                ;; INFO stuff doesn't belong in a user-visible package, we
                ;; should be able to change it without apology.
                "*INFO-ENVIRONMENT*"
+               "*RECOGNIZED-DECLARATIONS*"
                "+INFOS-PER-WORD+"
-               "+FDEFN-TYPE-NUM+"
+               "+FDEFN-INFO-NUM+"
+               "+NIL-PACKED-INFOS+"
+               "ATOMIC-SET-INFO-VALUE"
+               "CALL-WITH-EACH-GLOBALDB-NAME"
                "CLEAR-INFO"
+               "CLEAR-INFO-VALUES"
+               "DEFINE-INFO-TYPE"
                "FIND-FDEFN"
+               "SYMBOL-FDEFN"
                "GET-INFO-VALUE-INITIALIZING"
+               "GLOBALDB-SXHASHOID"
+               "GLOBAL-FTYPE"
                "INFO"
                "INFO-FIND-AUX-KEY/PACKED"
                "INFO-GETHASH"
+               "INFO-MAPHASH"
+               "INFO-NUMBER"
+               "INFO-NUMBER-BITS"
                "INFO-VECTOR-FDEFN"
+               "MAKE-INFO-HASHTABLE"
+               "META-INFO"
+               "META-INFO-NUMBER"
                "PACKED-INFO-FIELD"
+               "PACKED-INFO-INSERT"
+               "PCL-METHODFN-NAME-P"
+               "SET-INFO-VALUE"
+               "SHOW-INFO"
                "UPDATE-SYMBOL-INFO"
                "WITH-GLOBALDB-NAME"
+               "%BOUNDP"
+               "FUN-SRC" "FUN-SRC-DOC" "FUN-SRC-FORM" "FUN-SRC-XREFS"
+               "MAKE-FUN-SRC"
 
                ;; Calling a list of hook functions, plus error handling.
                "CALL-HOOKS"
-
                ;; Constant form evaluation
                "CONSTANT-FORM-VALUE"
                "CONSTANT-TYPEP"
@@ -973,16 +1127,12 @@ possibly temporarily, because it might be used internally."
                "*KEYWORD-PACKAGE*" "*CL-PACKAGE*"
 
                ;; hash mixing operations
-               "MIX" "MIXF"
+               "MIX" "MIXF" "WORD-MIX"
 
                ;; Macroexpansion that doesn't touch special forms
                "%MACROEXPAND"
                "%MACROEXPAND-1"
 
-               ;; I'm not convinced that FDEFINITIONs are the ideal
-               ;; solution, so exposing ways to peek into the system
-               ;; seems undesirable, since it makes it harder to get
-               ;; rid of FDEFINITIONs entirely later.
                "*SETF-FDEFINITION-HOOK*"
 
                ;; error-reporting facilities
@@ -992,12 +1142,12 @@ possibly temporarily, because it might be used internally."
                "COMPILED-PROGRAM-ERROR"
                "COMPILER-MACRO-KEYWORD-PROBLEM"
                "ENCAPSULATED-CONDITION"
-               "INTERPRETED-PROGRAM-ERROR"
                "INVALID-ARRAY-ERROR"
                "INVALID-ARRAY-INDEX-ERROR"
                "INVALID-ARRAY-P"
                "SIMPLE-CONTROL-ERROR" "SIMPLE-FILE-ERROR"
-               "SIMPLE-PARSE-ERROR" "SIMPLE-PROGRAM-ERROR"
+               "SIMPLE-PARSE-ERROR"
+               "SIMPLE-PROGRAM-ERROR" "%PROGRAM-ERROR"
                "SIMPLE-READER-ERROR"
                "SIMPLE-READER-PACKAGE-ERROR"
                "SIMPLE-REFERENCE-ERROR"
@@ -1005,7 +1155,10 @@ possibly temporarily, because it might be used internally."
                "SIMPLE-STREAM-ERROR"
                "SIMPLE-STORAGE-CONDITION"
                "SIMPLE-STYLE-WARNING"
+               "STREAM-ERROR-POSITION-INFO"
                "TRY-RESTART"
+
+               "BROKEN-PIPE"
 
                ;; error-signalling facilities
                "STANDARD-READTABLE-MODIFIED-ERROR"
@@ -1019,7 +1172,7 @@ possibly temporarily, because it might be used internally."
                "TWO-ARG-CHAR-LESSP" "TWO-ARG-CHAR-NOT-LESSP"
                "TWO-ARG-CHAR-GREATERP" "TWO-ARG-CHAR-NOT-GREATERP"
                "CHAR-EQUAL-CONSTANT" "CHAR-CASE-INFO"
-               ;; FIXME: potential SB!EXT exports
+               ;; FIXME: potential SB-EXT exports
                "CHARACTER-CODING-ERROR"
                "CHARACTER-DECODING-ERROR" "CHARACTER-DECODING-ERROR-OCTETS"
                "CHARACTER-ENCODING-ERROR" "CHARACTER-ENCODING-ERROR-CODE"
@@ -1031,17 +1184,23 @@ possibly temporarily, because it might be used internally."
                ;; bootstrapping magic, to make things happen both in
                ;; the cross-compilation host compiler's environment and
                ;; in the cross-compiler's environment
-               "DEF!CONSTANT" "DEF!MACRO" "DEF!METHOD" "DEF!STRUCT" "DEF!TYPE"
+               "DEF!STRUCT" "DEF!TYPE"
                ;; bootstrapping magic of a different kind, wherein things happen
                ;; as they ordinarily do, plus during second genesis.
-               "!DEFGLOBAL" "!DEFPARAMETER" "!DEFVAR"
+               "!DEFINE-LOAD-TIME-GLOBAL"
+               "!DEFINE-THREAD-LOCAL"
+               "*!REMOVABLE-SYMBOLS*"
+
+               ;; bootstrapping macro whose effect is to delay until warm load.
+               "DEF*METHOD"
+               "!SET-LOAD-FORM-METHOD"
 
                ;; stuff for hinting to the compiler
+               "NAMED-DS-BIND"
                "NAMED-LAMBDA"
 
                ;; other variations on DEFFOO stuff useful for bootstrapping
                ;; and cross-compiling
-               "DEFMACRO-MUNDANELY"
                "DEFCONSTANT-EQX"
                "DEFINE-UNSUPPORTED-FUN"
 
@@ -1051,52 +1210,67 @@ possibly temporarily, because it might be used internally."
                "SANE-DEFAULT-PATHNAME-DEFAULTS"
                "SBCL-HOMEDIR-PATHNAME"
                "SIMPLIFY-NAMESTRING"
+               "DEBUG-SOURCE-NAMESTRING"
+               "DEBUG-SOURCE-CREATED"
 
                "*N-BYTES-FREED-OR-PURIFIED*"
 
                ;; Deprecating stuff
                "DEFINE-DEPRECATED-FUNCTION"
                "DEFINE-DEPRECATED-VARIABLE"
-               "CHECK-DEPRECATED-VARIABLE"
-               "EARLY-DEPRECATION-WARNING"
-               "LATE-DEPRECATION-WARNING"
-               "FINAL-DEPRECATION-WARNING"
-               "DEPRECATION-WARNING"
-               "DEPRECATION-ERROR"
+               "DEPRECATION-STATE"
+               "DEPRECATION-INFO" "MAKE-DEPRECATION-INFO"
+               "DEPRECATION-INFO-STATE"
+               "DEPRECATION-INFO-SOFTWARE"
+               "DEPRECATION-INFO-VERSION"
+               "DEPRECATION-INFO-REPLACEMENTS"
+               "PRINT-DEPRECATION-MESSAGE"
+               "CHECK-DEPRECATED-THING" "CHECK-DEPRECATED-TYPE"
+               "DEPRECATED-THING-P"
+               "DEPRECATION-WARN"
+               "LOADER-DEPRECATION-WARN"
 
                ;; miscellaneous non-standard but handy user-level functions..
-               "ASSQ" "DELQ" "MEMQ" "POSQ" "NEQ"
+               "ASSQ" "DELQ" "DELQ1" "MEMQ" "POSQ" "NEQ"
                "ADJUST-LIST"
+               "ALIGN-UP"
                "%FIND-PACKAGE-OR-LOSE" "FIND-UNDELETED-PACKAGE-OR-LOSE"
                "SANE-PACKAGE"
-               "MAYBE-CYCLIC-P"
+               "COALESCE-TREE-P"
                "COMPOUND-OBJECT-P"
                "SWAPPED-ARGS-FUN"
                "AND/TYPE" "NOT/TYPE"
                "ANY/TYPE" "EVERY/TYPE"
                "EQUAL-BUT-NO-CAR-RECURSION"
-               "TYPE-BOUND-NUMBER"
+               "TYPE-BOUND-NUMBER" "COERCE-NUMERIC-BOUND"
                "CONSTANTLY-T" "CONSTANTLY-NIL" "CONSTANTLY-0"
                "PSXHASH"
                "%BREAK"
-               "NTH-BUT-WITH-SANE-ARG-ORDER"
                "BIT-VECTOR-="
                "PATHNAME="
+               "%HASH-TABLE-ALIST"
                "HASH-TABLE-EQUALP"
-               "READ-EVALUATED-FORM"
+               "READ-EVALUATED-FORM" "READ-EVALUATED-FORM-OF-TYPE"
+
                "MAKE-UNPRINTABLE-OBJECT"
+               "POSSIBLY-BASE-STRINGIZE"
                "POWER-OF-TWO-CEILING"
                "PRINT-NOT-READABLE-ERROR"
                "REPLACE/EQL-HASH-TABLE"
+               "RECONS"
+               "SET-CLOSURE-NAME"
 
                ;; ..and macros..
                "COLLECT"
+               "COPY-LIST-MACRO"
                "DO-ANONYMOUS" "DOVECTOR" "DOHASH" "DOPLIST"
+               "ENSURE-GETHASH"
                "NAMED-LET"
                "ONCE-ONLY"
                "DEFENUM"
                "DEFPRINTER"
-               "AVER" "ENFORCE-TYPE"
+               "*PRINT-IR-NODES-PRETTY*"
+               "AVER"
                "DX-FLET" "DX-LET"
                "AWHEN" "ACOND" "IT"
                "BINDING*" "EXTRACT-VAR-DECLS"
@@ -1120,6 +1294,7 @@ possibly temporarily, because it might be used internally."
                "BOOTSTRAP-PACKAGE-NAME"
                "BOOTSTRAP-PACKAGE-NOT-FOUND"
                "DEBOOTSTRAP-PACKAGE"
+               "SYSTEM-PACKAGE-P"
 
                "REFERENCE-CONDITION" "REFERENCE-CONDITION-REFERENCES"
                "*PRINT-CONDITION-REFERENCES*"
@@ -1136,7 +1311,7 @@ possibly temporarily, because it might be used internally."
                "STRUCTURE-INITARG-NOT-KEYWORD" "CONSTANT-MODIFIED"
 
                ;; ..and DEFTYPEs..
-               "MAX-HASH" "HASH"
+               "HASH"
                "INDEX" "LOAD/STORE-INDEX"
                "SIGNED-BYTE-WITH-A-BITE-OUT"
                "UNSIGNED-BYTE-WITH-A-BITE-OUT"
@@ -1149,8 +1324,10 @@ possibly temporarily, because it might be used internally."
                "SHORT-FLOAT-P"
                "SINGLE-FLOAT-P"
                "FIXNUMP"
+               "FIXNUMP-INSTANCE-REF" "FIXNUMP-CAR" "FIXNUMP-CDR"
                "BIGNUMP"
                "RATIOP"
+               "UNBOUND-MARKER-P"
 
                ;; encapsulation
                "ENCAPSULATE" "ENCAPSULATED-P"
@@ -1162,20 +1339,19 @@ possibly temporarily, because it might be used internally."
                "RETURN-CHAR-CODE" "RUBOUT-CHAR-CODE" "TAB-CHAR-CODE"
 
                ;; symbol-hacking idioms
-               "GENSYMIFY" "KEYWORDICATE" "SYMBOLICATE"
+               "GENSYMIFY" "GENSYMIFY*" "KEYWORDICATE" "SYMBOLICATE"
+               "INTERNED-SYMBOL-P" "PACKAGE-SYMBOLICATE"
+               "LOGICALLY-READONLYIZE"
 
                ;; certainly doesn't belong in public extensions
                ;; FIXME: maybe belongs in %KERNEL with other typesystem stuff?
                "CONSTANT-ARG"
 
                ;; various internal defaults
-               "*DEFAULT-INIT-CHAR-FORM*"
                "*LOAD-SOURCE-DEFAULT-TYPE*" "BASE-CHAR-CODE-LIMIT"
 
                ;; hash caches
-               "DEFINE-HASH-CACHE"
                "DEFUN-CACHED"
-               "DEFINE-CACHED-SYNONYM"
                "DROP-ALL-HASH-CACHES"
 
                ;; time
@@ -1189,17 +1365,15 @@ possibly temporarily, because it might be used internally."
                "STRERROR" "SIMPLE-PERROR"
 
                ;; debuggers' little helpers
-               #!+sb-show("*/SHOW*"
+               #+sb-show("*/SHOW*"
                           "HEXSTR")
                "/SHOW"  "/NOSHOW"
-               "/XHOW"  "/NOXHOW"
                "/SHOW0" "/NOSHOW0"
-               "/HEXSTR" "/NOHEXSTR"
-               "/PRIMITIVE-PRINT"
 
                ;; cross-compilation bootstrap hacks which turn into
                ;; placeholders in a target system
                "UNCROSS"
+               "!UNCROSS-FORMAT-CONTROL"
 
                ;; might as well be shared among the various files which
                ;; need it:
@@ -1212,18 +1386,26 @@ possibly temporarily, because it might be used internally."
                "C-STRINGS->STRING-LIST"
 
                ;; misc. utilities used internally
-               "DEFINE-FUNCTION-NAME-SYNTAX" "VALID-FUNCTION-NAME-P" ; should be SB!EXT?
+               "ADDRESS-BASED-COUNTER-VAL"
+               "DEFINE-FUNCTION-NAME-SYNTAX" "VALID-FUNCTION-NAME-P" ; should be SB-EXT?
+               "LEGAL-VARIABLE-NAME-P"
                "LEGAL-FUN-NAME-P" "LEGAL-FUN-NAME-OR-TYPE-ERROR"
                "FUN-NAME-BLOCK-NAME"
                "FUN-NAME-INLINE-EXPANSION"
                "LISTEN-SKIP-WHITESPACE"
                "PACKAGE-INTERNAL-SYMBOL-COUNT" "PACKAGE-EXTERNAL-SYMBOL-COUNT"
-               "PARSE-BODY" "PARSE-LAMBDA-LIST" "PARSE-LAMBDA-LIST-LIKE-THING"
+               "PARSE-BODY" "PARSE-LAMBDA-LIST" "MAKE-LAMBDA-LIST"
+               "CHECK-DESIGNATOR"
+               "CHECK-LAMBDA-LIST-NAMES"
+               "LAMBDA-LIST-KEYWORD-MASK"
+               "PARSE-KEY-ARG-SPEC" "PARSE-OPTIONAL-ARG-SPEC"
+               "LL-KWDS-RESTP" "LL-KWDS-KEYP" "LL-KWDS-ALLOWP"
+               "MAKE-MACRO-LAMBDA"
                "PROPER-LIST-OF-LENGTH-P" "PROPER-LIST-P"
-               "LIST-OF-LENGTH-AT-LEAST-P"
+               "LIST-OF-LENGTH-AT-LEAST-P" "SEQUENCE-OF-LENGTH-AT-LEAST-P"
                "LIST-WITH-LENGTH-P"
-               "SINGLETON-P"
-              "MISSING-ARG"
+               "SINGLETON-P" "ENSURE-LIST"
+               "MISSING-ARG"
                "FEATUREP"
                "FLUSH-STANDARD-OUTPUT-STREAMS"
                "WITH-UNIQUE-NAMES" "MAKE-GENSYM-LIST"
@@ -1238,8 +1420,15 @@ possibly temporarily, because it might be used internally."
                "FORCE" "DELAY" "PROMISE-READY-P"
                "FIND-RESTART-OR-CONTROL-ERROR"
                "LOAD-AS-SOURCE"
+               "DESCRIPTOR-SAP"
+               "DO-PACKED-VARINTS"
 
-               ;; These could be moved back into SB!EXT if someone has
+               "CLOSURE-EXTRA-VALUES"
+               "PACK-CLOSURE-EXTRA-VALUES"
+               "SET-CLOSURE-EXTRA-VALUES"
+               "+CLOSURE-NAME-INDEX+"
+
+               ;; These could be moved back into SB-EXT if someone has
                ;; compelling reasons, but hopefully we can get by
                ;; without supporting them, at least not as publicly
                ;; accessible things with fixed interfaces.
@@ -1260,9 +1449,18 @@ possibly temporarily, because it might be used internally."
                "FAST-READ-U-INTEGER"
                "FAST-READ-VAR-U-INTEGER"
                "FILE-NAME"
-               "INTERN*"
+               "FORM-TRACKING-STREAM"
+               "FORM-TRACKING-STREAM-OBSERVER"
+               "FORM-TRACKING-STREAM-P"
+               "FORM-TRACKING-STREAM-FORM-START-BYTE-POS"
+               "FORM-TRACKING-STREAM-FORM-START-CHAR-POS"
+               "LINE/COL-FROM-CHARPOS"
+               "%INTERN"
                "WITH-FAST-READ-BYTE"
                "PREPARE-FOR-FAST-READ-CHAR"
+               "OUT-STREAM-FROM-DESIGNATOR"
+               "STRINGIFY-OBJECT"
+               "%WRITE"
 
                ;; hackery to help set up for cold init
                "!BEGIN-COLLECTING-COLD-INIT-FORMS"
@@ -1273,14 +1471,8 @@ possibly temporarily, because it might be used internally."
                ;; catch tags
                "TOPLEVEL-CATCHER"
 
-               ;; Constructors for arrays whose element-type is recoverable
-               ;; even if the host Lisp upgrades it to something unexpected.
-               "!MAKE-SPECIALIZED-ARRAY"
-               "!COERCE-TO-SPECIALIZED"
-               "!SPECIALIZED-ARRAY-ELEMENT-TYPE"
-
                ;; hooks for contrib/ stuff we're insufficiently sure
-               ;; about to add to SB!EXT
+               ;; about to add to SB-EXT
                "*REPL-PROMPT-FUN*"
                "*REPL-READ-FORM-FUN*"
 
@@ -1313,8 +1505,8 @@ possibly temporarily, because it might be used internally."
    ;; FIXME: This package is awfully huge. It'd probably be good to
    ;; split it. There's at least one natural way to split it: the
    ;; implementation of the Lisp type system (e.g. TYPE-INTERSECTION and
-   ;; SPECIFIER-TYPE) could move to a separate package SB!TYPE. (There's
-   ;; lots of stuff which currently uses the SB!KERNEL package which
+   ;; SPECIFIER-TYPE) could move to a separate package SB-TYPE. (There's
+   ;; lots of stuff which currently uses the SB-KERNEL package which
    ;; doesn't actually use the type system stuff.) And maybe other
    ;; possible splits too:
    ;;   * Pull GC stuff (*GC-INHIBIT*, *GC-PENDING*, etc.)
@@ -1324,7 +1516,7 @@ possibly temporarily, because it might be used internally."
    ;;     other sequence function implementation grot into SB-SEQ.
    ;;   * Pull all the math stuff (%ACOS, %COSH, WORD-LOGICAL-AND...)
    ;;     into SB-MATH.
-   ;;   * Pull all the array stuff (%ARRAY-DATA-VECTOR,
+   ;;   * Pull all the array stuff (%ARRAY-DATA,
    ;;     WITH-ARRAY-DATA, ALLOCATE-VECTOR, HAIRY-DATA-VECTOR-REF...)
    ;;     into SB-ARRAY.
    ;;   * Pull all the streams stuff out into SB-STREAM.
@@ -1335,16 +1527,14 @@ possibly temporarily, because it might be used internally."
    ;;     for the ~18 errors that are _not_ object-not-<x>, stop naming them.
    ;;     C just needs a map from number -> string-to-show.
    #s(sb-cold:package-data
-      :name "SB!KERNEL"
+      :name "SB-KERNEL"
       :doc
       "private: Theoretically this 'hides state and types used for package
 integration' (said CMU CL architecture.tex) and that probably was and
 is a good idea, but see SB-SYS re. blurring of boundaries."
-      :use ("CL" "SB!ALIEN" "SB!ALIEN-INTERNALS" "SB!BIGNUM"
-                 "SB!EXT" "SB!FASL" "SB!INT" "SB!SYS" "SB!GRAY")
-      :reexport ("DEF!STRUCT"
-                 "DEF!MACRO"
-                 #!+sb-simd-pack("SIMD-PACK"
+      :use ("CL" "SB-ALIEN" "SB-ALIEN-INTERNALS" "SB-BIGNUM"
+                 "SB-EXT" "SB-FASL" "SB-INT" "SB-SYS" "SB-GRAY")
+      :reexport (#+sb-simd-pack("SIMD-PACK"
                                  "SIMD-PACK-P"
                                  "%MAKE-SIMD-PACK-UB32"
                                  "%MAKE-SIMD-PACK-UB64"
@@ -1354,7 +1544,9 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                                  "%SIMD-PACK-UB64S"
                                  "%SIMD-PACK-DOUBLES"
                                  "%SIMD-PACK-SINGLES"))
-      :export ("%ACOS"
+      :export ("%%DATA-VECTOR-REFFERS%%"
+               "%%DATA-VECTOR-SETTERS%%"
+               "%ACOS"
                "%ACOSH"
                "%ADJOIN"
                "%ADJOIN-EQ"
@@ -1364,14 +1556,15 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%ADJOIN-KEY-TEST-NOT"
                "%ADJOIN-TEST"
                "%ADJOIN-TEST-NOT"
-               "%ARRAY-AVAILABLE-ELEMENTS" "%ARRAY-DATA-VECTOR"
+               "%ARRAY-AVAILABLE-ELEMENTS"
+               "%ARRAY-DATA"
+               "%ARRAY-DATA-VECTOR" ; DO NOT USE !!!
                "%ARRAY-DIMENSION" "%ARRAY-DISPLACED-P"
                "%ARRAY-DISPLACED-FROM"
                "%ARRAY-DISPLACEMENT" "%ARRAY-FILL-POINTER"
-               "%ARRAY-FILL-POINTER-P" "%ARRAY-RANK"
-               #!+(or x86 x86-64 ppc)
+               "%ARRAY-FILL-POINTER-P" "%ARRAY-RANK" "%ARRAY-RANK="
                "%ARRAY-ATOMIC-INCF/WORD"
-               #!+ash-right-vops "%ASH/RIGHT"
+               "%ASH/RIGHT"
                "%ASSOC"
                "%ASSOC-EQ"
                "%ASSOC-IF"
@@ -1392,21 +1585,23 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%ATOMIC-INC-SYMBOL-GLOBAL-VALUE"
                "%CALLER-FRAME"
                "%CALLER-PC"
-               "%CHECK-BOUND"
+               "%CHECK-BOUND" "CHECK-BOUND"
                "%CHECK-GENERIC-SEQUENCE-BOUNDS"
                "%CHECK-VECTOR-SEQUENCE-BOUNDS"
+               "%CAS-SYMBOL-GLOBAL-VALUE"
                "%COMPARE-AND-SWAP-CAR"
                "%COMPARE-AND-SWAP-CDR"
-               "%COMPARE-AND-SWAP-INSTANCE-REF"
                "%COMPARE-AND-SWAP-SVREF"
                "%COMPARE-AND-SWAP-SYMBOL-INFO"
                "%COMPARE-AND-SWAP-SYMBOL-VALUE"
                "%CONCATENATE-TO-BASE-STRING"
                "%CONCATENATE-TO-STRING"
+               "%CONCATENATE-TO-SIMPLE-VECTOR"
+               "%CONCATENATE-TO-LIST" "%CONCATENATE-TO-VECTOR"
                "CONTAINS-UNKNOWN-TYPE-P"
                "%COS" "%COS-QUICK"
                "%COSH" "%DATA-VECTOR-AND-INDEX" "%DEPOSIT-FIELD"
-               "%DOUBLE-FLOAT" "%DPB" "%EQL"
+               "%DOUBLE-FLOAT" "%DPB" "%EQL" "%EQL/INTEGER"
                "%EXIT"
                "%EXP" "%EXPM1"
                "%FIND-POSITION"
@@ -1414,19 +1609,24 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%FIND-POSITION-IF-VECTOR-MACRO" "%FIND-POSITION-IF-NOT"
                "%FIND-POSITION-IF-NOT-VECTOR-MACRO"
                "FIXNUM-MOD-P"
-               "%HYPOT" "%LDB" "%LOG" "%LOGB" "%LOG10"
+               "%HYPOT"
+               "%INSTANCE-CAS"
+               "%LDB" "%LOG" "%LOGB" "%LOG10"
                "%LAST0"
                "%LAST1"
                "%LASTN/FIXNUM"
                "%LASTN/BIGNUM"
                "%LOG1P"
-               #!+long-float "%LONG-FLOAT"
+               #+long-float "%LONG-FLOAT"
                "%MAKE-ARRAY"
                "%MAKE-COMPLEX" "%MAKE-FUNCALLABLE-INSTANCE"
                "%MAKE-FUNCALLABLE-STRUCTURE-INSTANCE-ALLOCATOR"
-               "%MAKE-RATIO" "%MAKE-LISP-OBJ"
                "%MAKE-INSTANCE"
-               #!+sb-simd-pack "%MAKE-SIMD-PACK"
+               "%MAKE-LISP-OBJ"
+               "%MAKE-LIST"
+               "%MAKE-RATIO"
+               #+sb-simd-pack "%MAKE-SIMD-PACK"
+               #+sb-simd-pack-256 "%MAKE-SIMD-PACK-256"
                "%MAKE-STRUCTURE-INSTANCE"
                "%MAKE-STRUCTURE-INSTANCE-ALLOCATOR"
                "%MAP" "%MAP-FOR-EFFECT-ARITY-1"
@@ -1462,9 +1662,10 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%RASSOC-TEST-NOT"
                "%VECTOR-RAW-BITS"
                "%SCALB" "%SCALBN"
-               #!+(or x86 x86-64 ppc)
                "%RAW-INSTANCE-ATOMIC-INCF/WORD"
+               "%RAW-INSTANCE-CAS/WORD"
                "%RAW-INSTANCE-REF/WORD" "%RAW-INSTANCE-SET/WORD"
+               "%RAW-INSTANCE-REF/SIGNED-WORD" "%RAW-INSTANCE-SET/SIGNED-WORD"
                "%RAW-INSTANCE-REF/SINGLE" "%RAW-INSTANCE-SET/SINGLE"
                "%RAW-INSTANCE-REF/DOUBLE" "%RAW-INSTANCE-SET/DOUBLE"
                "%RAW-INSTANCE-REF/COMPLEX-SINGLE"
@@ -1482,11 +1683,17 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%SET-SIGNED-SAP-REF-8" "%SET-STACK-REF"
                "%SET-SYMBOL-HASH"
                "%SIN" "%SIN-QUICK" "%SINGLE-FLOAT"
-               "%SINH" "%SQRT" "%SXHASH-SIMPLE-STRING"
-               #!+sb-simd-pack("%SIMD-PACK-TAG"
-                               "%SIMD-PACK-LOW"
-                               "%SIMD-PACK-HIGH")
+               "%SINH" "%SQRT" "%SXHASH-STRING" "%SXHASH-SIMPLE-STRING"
+               #+sb-simd-pack
+               ("%SIMD-PACK-TAG"
+                "%SIMD-PACK-LOW"
+                "%SIMD-PACK-HIGH")
+               #+sb-simd-pack-256
+               ("%SIMD-PACK-256-TAG"
+                "%SIMD-PACK-256-0" "%SIMD-PACK-256-1"
+                "%SIMD-PACK-256-2" "%SIMD-PACK-256-3")
                "%SXHASH-SIMPLE-SUBSTRING" "%TAN" "%TAN-QUICK" "%TANH"
+               "THE*"
                "%UNARY-ROUND"
                "%UNARY-TRUNCATE"
                "%UNARY-TRUNCATE/SINGLE-FLOAT"
@@ -1496,67 +1703,81 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%WITH-ARRAY-DATA/FP"
                "%WITH-ARRAY-DATA-MACRO"
                "*APPROXIMATE-NUMERIC-UNIONS*"
+               "*CURRENT-INTERNAL-ERROR-CONTEXT*"
                "*CURRENT-LEVEL-IN-PRINT*"
                "*EMPTY-TYPE*"
                "*EVAL-CALLS*"
                "*GC-INHIBIT*" "*GC-PENDING*"
-               #!+sb-thread "*STOP-FOR-GC-PENDING*"
+               #+sb-thread "*STOP-FOR-GC-PENDING*"
+               "*IN-WITHOUT-GCING*"
                "*UNIVERSAL-TYPE*"
                "*UNIVERSAL-FUN-TYPE*" "*UNPARSE-FUN-TYPE-SIMPLIFY*"
                "*WILD-TYPE*" "WORD-LOGICAL-AND" "WORD-LOGICAL-ANDC1"
                "WORD-LOGICAL-ANDC2" "WORD-LOGICAL-EQV"
                "WORD-LOGICAL-NAND" "WORD-LOGICAL-NOR" "WORD-LOGICAL-NOT"
                "WORD-LOGICAL-OR" "WORD-LOGICAL-ORC1" "WORD-LOGICAL-ORC2"
-               "WORD-LOGICAL-XOR" "ALIEN-TYPE-TYPE"
-               "ALIEN-TYPE-TYPE-ALIEN-TYPE" "ALIEN-TYPE-TYPE-P"
+               "WORD-LOGICAL-XOR"
+               "ALLOW-NON-RETURNING-TAIL-CALL"
+               "ALIEN-TYPE-TYPE" "ALIEN-TYPE-TYPE-ALIEN-TYPE" "ALIEN-TYPE-TYPE-P"
                "ALLOCATE-VECTOR" "ALLOCATE-STATIC-VECTOR"
                "ASSERT-SYMBOL-HOME-PACKAGE-UNLOCKED"
+               "BUILD-RATIO"
                "PROGRAM-ASSERT-SYMBOL-HOME-PACKAGE-UNLOCKED"
                "DISABLED-PACKAGE-LOCKS"
                "WITH-SINGLE-PACKAGE-LOCKED-ERROR"
                "ALWAYS-SUBTYPEP"
                "ARGS-TYPE" "ARGS-TYPE-ALLOWP" "ARGS-TYPE-KEYP"
                "ARGS-TYPE-KEYWORDS" "ARGS-TYPE-OPTIONAL" "ARGS-TYPE-P"
-               "ARGS-TYPE-REQUIRED" "ARGS-TYPE-REST" "ARRAY-HEADER-P"
+               "ARGS-TYPE-REQUIRED" "ARGS-TYPE-REST"
+               "ARRAY-HEADER-P" "SIMPLE-ARRAY-HEADER-P"
                "ARRAY-TYPE" "ARRAY-TYPE-COMPLEXP"
                "ARRAY-TYPE-DIMENSIONS" "ARRAY-TYPE-ELEMENT-TYPE"
                "ARRAY-TYPE-P" "ARRAY-TYPE-SPECIALIZED-ELEMENT-TYPE"
+               "ARRAY-UNDERLYING-WIDETAG"
                "ASSERT-ERROR"
-               #!+sb-unicode "BASE-CHAR-P"
+               #+sb-unicode "BASE-CHAR-P"
                "BASE-STRING-P"
-               "BINDING-STACK-POINTER-SAP" "BIT-INDEX"
+               "BIND" "BINDING-STACK-POINTER-SAP" "BIT-INDEX" "BIT-LENGTH"
                "BOGUS-ARG-TO-VALUES-LIST-ERROR" "BOOLE-CODE"
                "BOUNDING-INDICES-BAD-ERROR" "BYTE-SPECIFIER" "%BYTE-BLT"
-               "CALLABLE" "CASE-BODY-ERROR"
+               "CALLABLE" "FUNCTION-DESIGNATOR"
+               "CASE-BODY-ERROR"
                "CHARACTER-SET" "CHARACTER-SET-TYPE"
                "CHARACTER-SET-TYPE-PAIRS"
-               #!+sb-unicode "CHARACTER-STRING-P"
+               #+sb-unicode "CHARACTER-STRING-P"
                "CHARPOS"
                "CHECK-FOR-CIRCULARITY" "CHECK-TYPE-ERROR" "CLOSED-FLAME"
                "CODE-COMPONENT" "CODE-COMPONENT-P"
-               "CODE-HEADER-REF" "CODE-HEADER-SET" "CODE-INSTRUCTIONS"
+               "CODE-HEADER-REF" "CODE-HEADER-SET" "CODE-HEADER-WORDS"
+               "CODE-INSTRUCTIONS" "CODE-N-UNBOXED-DATA-BYTES"
+               "CODE-OBJECT-SIZE" "CODE-TRAILER-REF"
                "COERCE-SYMBOL-TO-FUN"
                "COERCE-TO-FUN" "COERCE-TO-LEXENV" "COERCE-TO-LIST"
                "COERCE-TO-VALUES" "COERCE-TO-VECTOR"
-               "*COLD-INIT-COMPLETE-P*" "COMPLEX-DOUBLE-FLOAT-P"
+               "*COLD-INIT-COMPLETE-P*"
+               "COMPLEX-DOUBLE-FLOAT" "COMPLEX-DOUBLE-FLOAT-P"
                "COMPLEX-FLOAT-P"
-               #!+long-float "COMPLEX-LONG-FLOAT-P"
-               "COMPLEX-RATIONAL-P" "COMPLEX-SINGLE-FLOAT-P"
+               #+long-float ("COMPLEX-LONG-FLOAT" "COMPLEX-LONG-FLOAT-P")
+               "COMPLEX-RATIONAL-P"
+               "COMPLEX-SINGLE-FLOAT" "COMPLEX-SINGLE-FLOAT-P"
                "COMPLEX-VECTOR-P" "COMPOUND-TYPE" "COMPOUND-TYPE-P"
-               "COMPOUND-TYPE-TYPES" "CONS-TYPE" "CONS-TYPE-CAR-TYPE"
+               "COMPOUND-TYPE-TYPES"
+               "CONDITION-DESIGNATOR-HEAD"
+               "CONS-TYPE" "CONS-TYPE-CAR-TYPE"
                "CONS-TYPE-CDR-TYPE" "CONS-TYPE-P" "CONSED-SEQUENCE"
                "CONSTANT" "CONSTANT-TYPE" "CONSTANT-TYPE-P"
                "CONSTANT-TYPE-TYPE" "CONTAINING-INTEGER-TYPE"
-               "CONTROL-STACK-POINTER-SAP" "COPY-BYTE-VECTOR-TO-SYSTEM-AREA"
+               "CONTROL-STACK-POINTER-SAP"
                "CSUBTYPEP" "CTYPE" "TYPE-HASH-VALUE" "CTYPE-OF"
-               "CTYPE-P" "CTYPEP" "CURRENT-FP" "CURRENT-SP"
-               "CURRENT-DYNAMIC-SPACE-START"
+               "CTYPE-P" "CTYPEP"
+               "CTYPE-ARRAY-DIMENSIONS" "CTYPE-ARRAY-SPECIALIZED-ELEMENT-TYPES"
+               "CURRENT-FP" "CURRENT-SP" "CURRENT-DYNAMIC-SPACE-START"
                "DATA-NIL-VECTOR-REF"
                "DATA-VECTOR-REF" "DATA-VECTOR-REF-WITH-OFFSET"
                "DATA-VECTOR-SET" "DATA-VECTOR-SET-WITH-OFFSET"
                "DECLARATION-TYPE-CONFLICT-ERROR"
                "DECODE-DOUBLE-FLOAT"
-               #!+long-float "DECODE-LONG-FLOAT"
+               #+long-float "DECODE-LONG-FLOAT"
                "DECODE-SINGLE-FLOAT"
                "DEFINE-STRUCTURE-SLOT-ADDRESSOR"
                "DEFINED-FTYPE-MATCHES-DECLARED-FTYPE-P"
@@ -1565,61 +1786,71 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "DO-REST-ARG"
                "DO-INSTANCE-TAGGED-SLOT"
                "DOUBLE-FLOAT-EXPONENT"
+               "DOUBLE-FLOAT-BITS"
                "DOUBLE-FLOAT-HIGH-BITS" "DOUBLE-FLOAT-INT-EXPONENT"
                "DOUBLE-FLOAT-LOW-BITS" "DOUBLE-FLOAT-SIGNIFICAND"
+               "DYNBIND"
                "FLOAT-WAIT" "DYNAMIC-SPACE-FREE-POINTER" "DYNAMIC-USAGE"
                "EFFECTIVE-FIND-POSITION-TEST"
                "EFFECTIVE-FIND-POSITION-KEY"
                "ENSURE-SYMBOL-HASH"
                "ENSURE-SYMBOL-TLS-INDEX"
                "ERROR-NUMBER-OR-LOSE"
+               "EVAL-WHEN-COMPILE-TOPLEVEL"
                "EXTENDED-CHAR-P" "EXTERNAL-FORMAT-DESIGNATOR"
-               "FDOCUMENTATION" "FILENAME"
+               "FAST-&REST-NTH"
+               "FILENAME"
+               "FILL-ARRAY"
+               "FILL-DATA-VECTOR"
                "FIND-AND-INIT-OR-CHECK-LAYOUT"
                "FIND-DEFSTRUCT-DESCRIPTION"
                "FIND-OR-CREATE-FDEFN"
                "FLOAT-EXPONENT"
                "FLOAT-FORMAT-DIGITS" "FLOAT-FORMAT-NAME"
                "FLOAT-FORMAT-MAX" "FLOAT-INT-EXPONENT"
+               "FLOAT-INFINITY-OR-NAN-P"
+               "FLOAT-SIGN-BIT"
                "FLOATING-POINT-EXCEPTION" "FORM" "FORMAT-CONTROL"
                "*FREE-INTERRUPT-CONTEXT-INDEX*" "FUNCALLABLE-INSTANCE-P"
-               "FUN-CODE-HEADER" "FUN-TYPE" "FUN-TYPE-ALLOWP"
+               "%FUN-CODE-OFFSET" "FUN-CODE-HEADER"
+               "FUN-DESIGNATOR-TYPE" "FUN-DESIGNATOR-TYPE-P"
+               "FUN-TYPE" "FUN-TYPE-ALLOWP"
                "FUN-TYPE-KEYP" "FUN-TYPE-KEYWORDS" "FUN-TYPE-NARGS"
                "FUN-TYPE-OPTIONAL" "FUN-TYPE-P" "FUN-TYPE-REQUIRED"
                "FUN-TYPE-REST" "FUN-TYPE-RETURNS" "FUN-TYPE-WILD-ARGS"
                "FUN-WORD-OFFSET" "GENERALIZED-BOOLEAN"
                "GENERIC-ABSTRACT-TYPE-FUNCTION"
-               "GET-CLOSURE-LENGTH" "GET-HEADER-DATA"
-               "GET-LISP-OBJ-ADDRESS" "LOWTAG-OF" "WIDETAG-OF"
+               "GET-CLOSURE-LENGTH" "GET-HEADER-DATA" "FUN-HEADER-DATA"
+               "GET-LISP-OBJ-ADDRESS" "GENERATION-OF"
+               "LOWTAG-OF" "WIDETAG-OF" "WIDETAG="
                "HAIRY-DATA-VECTOR-REF"
                "HAIRY-DATA-VECTOR-REF/CHECK-BOUNDS"  "HAIRY-DATA-VECTOR-SET"
-               "HAIRY-DATA-VECTOR-SET/CHECK-BOUNDS""HAIRY-TYPE"
-               "HAIRY-TYPE-CHECK-TEMPLATE-NAME" "HAIRY-TYPE-SPECIFIER"
-               "HANDLE-CIRCULARITY" "HOST" "IGNORE-IT" "ILL-BIN"
+               "HAIRY-DATA-VECTOR-SET/CHECK-BOUNDS"
+               "HAIRY-TYPE" "HAIRY-TYPE-P" "HAIRY-TYPE-SPECIFIER"
+               "HANDLE-CIRCULARITY" "HOST" "ILL-BIN"
                "ILL-BOUT" "ILL-IN" "ILL-OUT" "INDEX-OR-MINUS-1"
                "INDEX-TOO-LARGE-ERROR" "*!INITIAL-ASSEMBLER-ROUTINES*"
                "*!INITIAL-DEBUG-SOURCES*"
                "*!INITIAL-FDEFN-OBJECTS*" "*!INITIAL-FOREIGN-SYMBOLS*"
                "*!INITIAL-LAYOUTS*" "*!INITIAL-SYMBOLS*"
                "INTEGER-DECODE-DOUBLE-FLOAT"
-               #!+long-float "INTEGER-DECODE-LONG-FLOAT"
+               #+long-float "INTEGER-DECODE-LONG-FLOAT"
                "INTEGER-DECODE-SINGLE-FLOAT" "INTERNAL-ERROR"
-               #!+win32 "HANDLE-WIN32-EXCEPTION"
-               "INTERNAL-TIME" "INTERSECTION-TYPE" "INTERSECTION-TYPE-P"
+               #+win32 "HANDLE-WIN32-EXCEPTION"
+               "INTERNAL-TIME" "INTERNAL-SECONDS"
+               "INTERNAL-SECONDS-LIMIT" "SAFE-INTERNAL-SECONDS-LIMIT"
+               "INTERPRETED-FUNCTION"
+               "INTERSECTION-TYPE" "INTERSECTION-TYPE-P"
                "INTERSECTION-TYPE-TYPES" "INVALID-ARG-COUNT-ERROR"
+               "LOCAL-INVALID-ARG-COUNT-ERROR"
                "INVALID-UNWIND-ERROR"
                "IRRATIONAL" "JUST-DUMP-IT-NORMALLY" "KEY-INFO"
                "KEY-INFO-NAME" "KEY-INFO-P" "KEY-INFO-TYPE"
+               "LAYOUT-BITMAP" "LAYOUT-CLASSOID-NAME"
                "LAYOUT-DEPTHOID" "LAYOUT-EQUALP-TESTS" "LAYOUT-INVALID-ERROR"
-               ;; -METADATA is the wrapper over one or the other of the two
-               ;; 'untagged' accessors, not both of which are present.
-               ;; There's not need to featurize out, because Genesis will dtrt
-               ;; and dump only the present symbols.
-               "LAYOUT-RAW-SLOT-METADATA"
-               "LAYOUT-N-UNTAGGED-SLOTS" "LAYOUT-UNTAGGED-BITMAP"
                "LAYOUT-FOR-STD-CLASS-P"
                "LAYOUT-SLOT-LIST" "LAYOUT-SLOT-TABLE"
-               #!+(or x86-64 x86) "%LEA"
+               #+(or x86-64 x86) "%LEA"
                "LEXENV" "LEXENV-DESIGNATOR" "LINE-LENGTH"
                "LIST-ABSTRACT-TYPE-FUNCTION"
                "LIST-COPY-SEQ*"
@@ -1638,24 +1869,27 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "COMPLEX-VECTOR"
                "LIST-TO-VECTOR*"
                "LOGICAL-HOST" "LOGICAL-HOST-DESIGNATOR"
-               #!+long-float "LONG-FLOAT-EXPONENT"
-               #!+long-float "LONG-FLOAT-EXP-BITS"
-               #!+long-float "LONG-FLOAT-HIGH-BITS"
-               #!+long-float "LONG-FLOAT-LOW-BITS"
-               #!+long-float "LONG-FLOAT-MID-BITS"
+               #+long-float ("LONG-FLOAT-EXPONENT" "LONG-FLOAT-EXP-BITS"
+                              "LONG-FLOAT-HIGH-BITS""LONG-FLOAT-LOW-BITS"
+                              "LONG-FLOAT-MID-BITS")
                "LRA" "LRA-CODE-HEADER" "LRA-P"
                "MAKE-ALIEN-TYPE-TYPE"
                "MAKE-ARRAY-HEADER" "MAKE-ARRAY-TYPE" "MAKE-CONS-TYPE"
+               "%MAKE-DOUBLE-FLOAT"
                "MAKE-DOUBLE-FLOAT" "MAKE-FUN-TYPE" "MAKE-KEY-INFO"
                "MAKE-LISP-OBJ"
-               #!+long-float "MAKE-LONG-FLOAT"
-               "MAKE-MEMBER-TYPE" "MAKE-NAMED-TYPE" "MAKE-NULL-LEXENV"
+               #+long-float "MAKE-LONG-FLOAT"
+               "MAKE-MEMBER-TYPE" "MAKE-NULL-LEXENV"
+               "MAKE-EQL-TYPE" "MEMBER-TYPE-FROM-LIST"
+               "MAKE-NEGATION-TYPE" "TYPE-NEGATION"
                "MAKE-NUMERIC-TYPE"
                "MAKE-SINGLE-FLOAT"
+               "MAKE-UNBOUND-MARKER"
                "MAKE-UNPORTABLE-FLOAT"
                "MAKE-SHORT-VALUES-TYPE" "MAKE-SINGLE-VALUE-TYPE"
                "MAKE-VALUE-CELL" "MAKE-VALUES-TYPE"
                "MAPC-MEMBER-TYPE-MEMBERS" "MAPCAR-MEMBER-TYPE-MEMBERS"
+               "MAXIMUM-BIGNUM-LENGTH"
                "MEMBER-TYPE" "MEMBER-TYPE-MEMBERS" "MEMBER-TYPE-P"
                "MEMBER-TYPE-SIZE"
                "MODIFIED-NUMERIC-TYPE"
@@ -1667,6 +1901,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "NEGATE" "NEGATION-TYPE" "NEGATION-TYPE-TYPE"
                "NIL-ARRAY-ACCESSED-ERROR"
                "NIL-FUN-RETURNED-ERROR"
+               "NON-NULL-SYMBOL-P"
                "NUMERIC-CONTAGION" "NUMERIC-TYPE"
                "NUMERIC-TYPE-CLASS" "NUMERIC-TYPE-COMPLEXP"
                "NUMERIC-TYPE-EQUAL" "NUMERIC-TYPE-FORMAT"
@@ -1674,11 +1909,11 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "OBJECT-NOT-ARRAY-ERROR" "OBJECT-NOT-CHARACTER-ERROR"
                "OBJECT-NOT-BASE-STRING-ERROR" "OBJECT-NOT-BIGNUM-ERROR"
                "OBJECT-NOT-BIT-VECTOR-ERROR"
-               #!+sb-unicode "OBJECT-NOT-CHARACTER-STRING-ERROR"
+               #+sb-unicode "OBJECT-NOT-CHARACTER-STRING-ERROR"
                "OBJECT-NOT-COMPLEX-ERROR"
                "OBJECT-NOT-COMPLEX-FLOAT-ERROR"
                "OBJECT-NOT-COMPLEX-SINGLE-FLOAT-ERROR"
-               #!+long-float "OBJECT-NOT-COMPLEX-LONG-FLOAT-ERROR"
+               #+long-float "OBJECT-NOT-COMPLEX-LONG-FLOAT-ERROR"
                "OBJECT-NOT-COMPLEX-DOUBLE-FLOAT-ERROR"
                "OBJECT-NOT-COMPLEX-RATIONAL-ERROR"
                ;; FIXME: It's confusing using "complex" to mean both
@@ -1690,20 +1925,22 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "OBJECT-NOT-FLOAT-ERROR" "OBJECT-NOT-FUNCTION-ERROR"
                "OBJECT-NOT-INSTANCE-ERROR" "OBJECT-NOT-INTEGER-ERROR"
                "OBJECT-NOT-LIST-ERROR"
-               #!+long-float "OBJECT-NOT-LONG-FLOAT-ERROR"
+               #+long-float "OBJECT-NOT-LONG-FLOAT-ERROR"
                "OBJECT-NOT-NUMBER-ERROR" "OBJECT-NOT-RATIO-ERROR"
                "OBJECT-NOT-RATIONAL-ERROR" "OBJECT-NOT-REAL-ERROR"
                "OBJECT-NOT-SAP-ERROR" "OBJECT-NOT-SIGNED-BYTE-32-ERROR"
                "OBJECT-NOT-SIGNED-BYTE-64-ERROR"
                "OBJECT-NOT-SIMPLE-ARRAY-COMPLEX-DOUBLE-FLOAT-ERROR"
-               #!+long-float
+               #+long-float
                "OBJECT-NOT-SIMPLE-ARRAY-COMPLEX-LONG-FLOAT-ERROR"
-               #!+sb-simd-pack
+               #+sb-simd-pack
                "OBJECT-NOT-SIMD-PACK-ERROR"
+               #+sb-simd-pack-256
+               "OBJECT-NOT-SIMD-PACK-256-ERROR"
                "OBJECT-NOT-SIMPLE-ARRAY-COMPLEX-SINGLE-FLOAT-ERROR"
                "OBJECT-NOT-SIMPLE-ARRAY-DOUBLE-FLOAT-ERROR"
                "OBJECT-NOT-SIMPLE-ARRAY-ERROR"
-               #!+long-float "OBJECT-NOT-SIMPLE-ARRAY-LONG-FLOAT-ERROR"
+               #+long-float "OBJECT-NOT-SIMPLE-ARRAY-LONG-FLOAT-ERROR"
                "OBJECT-NOT-SIMPLE-ARRAY-NIL-ERROR"
                "OBJECT-NOT-SIMPLE-ARRAY-SINGLE-FLOAT-ERROR"
                "OBJECT-NOT-SIMPLE-ARRAY-UNSIGNED-BYTE-15-ERROR"
@@ -1737,7 +1974,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "OBJECT-NOT-SIMPLE-ARRAY-SIGNED-BYTE-8-ERROR"
                "OBJECT-NOT-SIMPLE-BIT-VECTOR-ERROR"
                "OBJECT-NOT-SIMPLE-BASE-STRING-ERROR"
-               #!+sb-unicode "OBJECT-NOT-SIMPLE-CHARACTER-STRING-ERROR"
+               #+sb-unicode "OBJECT-NOT-SIMPLE-CHARACTER-STRING-ERROR"
                "OBJECT-NOT-SIMPLE-STRING-ERROR"
                "OBJECT-NOT-SIMPLE-VECTOR-ERROR"
                "OBJECT-NOT-SINGLE-FLOAT-ERROR" "OBJECT-NOT-STRING-ERROR"
@@ -1752,10 +1989,11 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "PACKAGE-DESIGNATOR" "PACKAGE-DOC-STRING"
                "PACKAGE-HASHTABLE-SIZE" "PACKAGE-HASHTABLE-FREE"
                "PACKAGE-INTERNAL-SYMBOLS" "PACKAGE-EXTERNAL-SYMBOLS"
-               "PARSE-DEFMACRO" "PARSE-UNKNOWN-TYPE"
-               "PARSE-UNKNOWN-TYPE-SPECIFIER" "PATHNAME-DESIGNATOR"
+               "PARSE-UNKNOWN-TYPE"
+               "PARSE-UNKNOWN-TYPE-SPECIFIER"
+               "PATHNAME-DESIGNATOR" "PATHNAME-COMPONENT-CASE"
                "POINTER-HASH"
-               #!+(or x86 x86-64) "*PSEUDO-ATOMIC-BITS*"
+               #+(or x86 x86-64) "*PSEUDO-ATOMIC-BITS*"
                "PUNT-PRINT-IF-TOO-LONG"
                "RANDOM-DOCUMENTATION"
                "RAW-INSTANCE-SLOTS-EQUALP"
@@ -1764,21 +2002,23 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "RESTART-DESIGNATOR"
                "RUN-PENDING-FINALIZERS"
                "SCALE-DOUBLE-FLOAT"
-               #!+long-float "SCALE-LONG-FLOAT"
+               #+long-float "SCALE-LONG-FLOAT"
                "SCALE-SINGLE-FLOAT"
-               "SCHWARTZIAN-STABLE-SORT-LIST"
+               "SCHWARTZIAN-STABLE-SORT-LIST" "SCHWARTZIAN-STABLE-SORT-VECTOR"
                "SCRUB-POWER-CACHE"
                "SEQUENCEP" "SEQUENCE-COUNT" "SEQUENCE-END"
                "SEQUENCE-OF-CHECKED-LENGTH-GIVEN-TYPE"
-               "SET-ARRAY-HEADER" "SET-HEADER-DATA" "SHIFT-TOWARDS-END"
+               "SET-ARRAY-HEADER" "SET-HEADER-BITS" "SET-HEADER-DATA"
+               "UNSET-HEADER-BITS"
+               "SHIFT-TOWARDS-END"
                "SHIFT-TOWARDS-START" "SHRINK-VECTOR" "%SHRINK-VECTOR"
                "SIGNED-BYTE-32-P" "SIGNED-BYTE-64-P"
                "SIMPLE-RANK-1-ARRAY-*-P"
                "SIMPLE-ARRAY-COMPLEX-DOUBLE-FLOAT-P"
-               #!+long-float "SIMPLE-ARRAY-COMPLEX-LONG-FLOAT-P"
+               #+long-float "SIMPLE-ARRAY-COMPLEX-LONG-FLOAT-P"
                "SIMPLE-ARRAY-COMPLEX-SINGLE-FLOAT-P"
                "SIMPLE-ARRAY-DOUBLE-FLOAT-P"
-               #!+long-float "SIMPLE-ARRAY-LONG-FLOAT-P"
+               #+long-float "SIMPLE-ARRAY-LONG-FLOAT-P"
                "SIMPLE-ARRAY-NIL-P" "SIMPLE-ARRAY-P"
                "SIMPLE-ARRAY-SINGLE-FLOAT-P"
                "SIMPLE-ARRAY-UNSIGNED-BYTE-15-P"
@@ -1797,36 +2037,55 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "SIMPLE-ARRAY-SIGNED-BYTE-32-P"
                "SIMPLE-ARRAY-SIGNED-BYTE-64-P"
                "SIMPLE-ARRAY-SIGNED-BYTE-8-P" "SIMPLE-BASE-STRING-P"
-               #!+sb-unicode "SIMPLE-CHARACTER-STRING-P"
+               "SIMPLE-CHARACTER-STRING"
+               #+sb-unicode "SIMPLE-CHARACTER-STRING-P"
                "SIMPLE-PACKAGE-ERROR" "SIMPLE-UNBOXED-ARRAY"
                "SINGLE-FLOAT-BITS" "SINGLE-FLOAT-EXPONENT"
                "SINGLE-FLOAT-INT-EXPONENT" "SINGLE-FLOAT-SIGNIFICAND"
+               "SINGLE-FLOAT-SIGN" "SINGLE-FLOAT-COPYSIGN"
                "SINGLE-VALUE-TYPE" "SINGLE-VALUE-SPECIFIER-TYPE"
                "SPECIFIER-TYPE"
-               #!+sb-simd-pack("SIMD-PACK-SINGLE"
+               #+sb-simd-pack("SIMD-PACK-SINGLE"
                                "SIMD-PACK-DOUBLE"
                                "SIMD-PACK-INT"
                                "SIMD-PACK-TYPE"
                                "SIMD-PACK-TYPE-ELEMENT-TYPE"
                                "*SIMD-PACK-ELEMENT-TYPES*")
+               #+sb-simd-pack-256("SIMD-PACK-256-SINGLE"
+                                   "SIMD-PACK-256-DOUBLE"
+                                   "SIMD-PACK-256-INT"
+                                   "SIMD-PACK-256-TYPE"
+                                   "SIMD-PACK-256-TYPE-ELEMENT-TYPE")
                "STACK-REF" "STREAM-DESIGNATOR" "STRING-DESIGNATOR"
                "STRING-FILL*"
+               "STRUCTURE-CTOR-LAMBDA-PARTS"
+               "STRUCTURE-INSTANCE-ACCESSOR-P"
                "SUB-GC"
+               "SYMBOL-TLS-INDEX"
                "SYMBOLS-DESIGNATOR"
+               "SYMEVAL"
+               "SYM-GLOBAL-VAL"
                "%INSTANCE-LENGTH"
-               "%INSTANCE-REF"
+               "%INSTANCE-REF" "%INSTANCE-REF-EQ"
                "%INSTANCE-SET"
+               "TESTABLE-TYPE-P"
                "TLS-EXHAUSTED-ERROR"
+               "*TOP-LEVEL-FORM-P*"
                "TWO-ARG-*" "TWO-ARG-+" "TWO-ARG--" "TWO-ARG-/"
                "TWO-ARG-/=" "TWO-ARG-<" "TWO-ARG-<=" "TWO-ARG-="
                "TWO-ARG->" "TWO-ARG->=" "TWO-ARG-AND" "TWO-ARG-EQV"
                "TWO-ARG-GCD" "TWO-ARG-IOR" "TWO-ARG-LCM" "TWO-ARG-XOR"
+               "TWO-ARG-STRING=" "TWO-ARG-STRING-EQUAL" "TWO-ARG-STRING<"
+               "TWO-ARG-STRING>" "TWO-ARG-STRING<=" "TWO-ARG-STRING>="
+               "TWO-ARG-STRING/=" "TWO-ARG-STRING-LESSP" "TWO-ARG-STRING-GREATERP"
+               "TWO-ARG-STRING-NOT-LESSP" "TWO-ARG-STRING-NOT-GREATERP" "TWO-ARG-STRING-NOT-EQUAL"
                "TYPE-*-TO-T"
                "TYPE-DIFFERENCE" "TYPE-INTERSECTION"
                "TYPE-INTERSECTION2" "TYPE-APPROX-INTERSECTION2"
                "TYPE-SINGLETON-P"
                "TYPE-SINGLE-VALUE-P" "TYPE-SPECIFIER" "TYPE-UNION"
                "TYPE/=" "TYPE=" "TYPES-EQUAL-OR-INTERSECT"
+               "TYPE-OR-NIL-IF-UNKNOWN"
                "UNBOUND-SYMBOL-ERROR" "UNBOXED-ARRAY"
                "UNDEFINED-FUN-ERROR" "UNDEFINED-ALIEN-FUN-ERROR"
                "UNION-TYPE" "UNION-TYPE-P"
@@ -1835,6 +2094,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "UNKNOWN-TYPE-SPECIFIER" "UNSEEN-THROW-TAG-ERROR"
                "UNSIGNED-BYTE-32-P" "UNSIGNED-BYTE-64-P"
                "UPDATE-OBJECT-LAYOUT-OR-INVALID"
+               "VALID-MACROEXPAND-HOOK"
                "VALUE-CELL-REF" "VALUE-CELL-SET" "VALUES-SPECIFIER-TYPE"
                "VALUES-SPECIFIER-TYPE-CACHE-CLEAR" "VALUES-SUBTYPEP"
                "VALUES-TYPE" "VALUES-TYPE-IN"
@@ -1859,7 +2119,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "VECTOR-COMPLEX-DOUBLE-FLOAT-P" "VECTOR-T-P"
 
                "VECTOR-NIL-P"
-               "VECTOR-FILL*"
+               "VECTOR-FILL*" "VECTOR-FILL/T"
                "VECTOR-SUBSEQ*"
                "VECTOR-TO-VECTOR*"
                "VECTOR-OF-CHECKED-LENGTH-GIVEN-LENGTH" "WITH-ARRAY-DATA"
@@ -1892,9 +2152,9 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "COPY-UB64-TO-SYSTEM-AREA" "COPY-UB64-FROM-SYSTEM-AREA"
 
                ;; Bit bashing position for bit-vectors
-               "%BIT-POSITION"
-               "%BIT-POSITION/0"
-               "%BIT-POSITION/1"
+               "%BIT-POSITION" "%BIT-POS-FWD" "%BIT-POS-REV"
+               "%BIT-POSITION/0" "%BIT-POS-FWD/0" "%BIT-POS-REV/0"
+               "%BIT-POSITION/1" "%BIT-POS-FWD/1" "%BIT-POS-REV/1"
 
                ;; SIMPLE-FUN type and accessors
                "SIMPLE-FUN"
@@ -1902,11 +2162,15 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%SIMPLE-FUN-ARGLIST"
                "%SIMPLE-FUN-DOC"
                "%SIMPLE-FUN-INFO"
+               "%SIMPLE-FUN-LEXPR"
                "%SIMPLE-FUN-NAME"
-               "%SIMPLE-FUN-NEXT"
-               "%SIMPLE-FUN-SELF"
+               "%SIMPLE-FUN-NEXT" ; FIXME: remove
+               "%SIMPLE-FUN-SELF" ; FIXME: don't export
+               "%SIMPLE-FUN-TEXT-LEN"
+               "%SIMPLE-FUN-SOURCE"
                "%SIMPLE-FUN-TYPE"
                "%SIMPLE-FUN-XREFS"
+               "SET-SIMPLE-FUN-INFO"
 
                ;; CLOSURE type and accessors
                "CLOSURE"
@@ -1917,47 +2181,61 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%CLOSURE-VALUES"
 
                ;; Abstract function accessors
-               "%FUN-DOC"
                "%FUN-FUN"
                "%FUN-LAMBDA-LIST"
                "%FUN-NAME"
 
                "FDEFN" "MAKE-FDEFN" "FDEFN-P" "FDEFN-NAME" "FDEFN-FUN"
                "FDEFN-MAKUNBOUND"
-               "%COERCE-CALLABLE-TO-FUN" "FUN-SUBTYPE"
+               "%COERCE-CALLABLE-TO-FUN"
+               "%COERCE-CALLABLE-FOR-CALL"
+               "FUN-SUBTYPE"
                "*MAXIMUM-ERROR-DEPTH*" "%SET-SYMBOL-PLIST"
                "INFINITE-ERROR-PROTECT"
                "FIND-CALLER-OF-NAMED-FRAME"
-               "FIND-CALLER-NAME-AND-FRAME"
-               "FIND-INTERRUPTED-NAME-AND-FRAME"
+               "FIND-CALLER-FRAME"
+               "FIND-INTERRUPTED-FRAME"
                "%SET-SYMBOL-VALUE" "%SET-SYMBOL-GLOBAL-VALUE" "%SET-SYMBOL-PACKAGE"
                "SET-SYMBOL-GLOBAL-VALUE"
-               "OUTPUT-SYMBOL-NAME" "%COERCE-NAME-TO-FUN"
+               "OUTPUT-SYMBOL" "%COERCE-NAME-TO-FUN"
                "DEFAULT-STRUCTURE-PRINT"
                "LAYOUT" "LAYOUT-LENGTH" "LAYOUT-PURE" "DSD-RAW-TYPE"
                "DEFSTRUCT-DESCRIPTION" "UNDECLARE-STRUCTURE"
                "UNDEFINE-FUN-NAME" "DD-TYPE" "CLASSOID-STATE" "INSTANCE"
                "*TYPE-SYSTEM-INITIALIZED*" "FIND-LAYOUT" "DSD-NAME"
-               "%TYPEP" "DD-NAME" "CLASSOID-SUBCLASSES"
+               "%TYPEP" "%%TYPEP" "DD-NAME" "CLASSOID-SUBCLASSES"
                "CLASSOID-LAYOUT" "CLASSOID-NAME" "CLASSOID-P"
-               "DD-RAW-LENGTH" "NOTE-NAME-DEFINED" "%CODE-CODE-SIZE"
+               "DD-RAW-LENGTH" "NOTE-NAME-DEFINED"
+               "%CODE-CODE-SIZE" "%CODE-TEXT-SIZE"
+               "%CODE-SERIALNO"
                "DD-SLOTS" "DD-INCLUDE" "SLOT-SETTER-LAMBDA-FORM"
+               "SLOT-ACCESS-TRANSFORM"
                "%IMAGPART" "DSD-ACCESSOR-NAME" "%CODE-DEBUG-INFO"
                "LAYOUT-CLASSOID" "LAYOUT-INVALID"
+               "LAYOUT-FLAGS" "LAYOUT-%BITS"
                "DSD-TYPE" "%INSTANCEP" "DEFSTRUCT-SLOT-DESCRIPTION"
                "DD-PREDICATE-NAME"
                "CLASSOID-PROPER-NAME" "%NOTE-TYPE-DEFINED" "LAYOUT-INFO"
                "%SET-INSTANCE-LAYOUT"
                "DD-CONSTRUCTORS" "DD-DEFAULT-CONSTRUCTOR"
                "LAYOUT-OF" "%REALPART"
-               "STRUCTURE-CLASSOID-P" "DSD-INDEX" "STRUCTURE-CLASSOID"
+               "STRUCTURE-CLASSOID" "STRUCTURE-CLASSOID-P"
+               "DSD-INDEX" "GET-DSD-INDEX"
                "%INSTANCE-LAYOUT" "LAYOUT-CLOS-HASH"
                "PROCLAIM-AS-FUN-NAME" "BECOME-DEFINED-FUN-NAME"
                "%NUMERATOR" "CLASSOID-TYPEP" "DSD-READ-ONLY"
                "DSD-DEFAULT" "LAYOUT-INHERITS" "DD-LENGTH"
-               "%CODE-ENTRY-POINTS" "%DENOMINATOR"
+               "%CODE-ENTRY-POINT"
+               "%CODE-FUN-OFFSET"
+               "CODE-ENTRY-POINTS" ; new accessor - returns a vector
+               "CODE-N-ENTRIES"
+               "CODE-OBJ-IS-FILLER-P"
+               "%CODE-ENTRY-POINTS" ; prefer %CODE-ENTRY-POINT instead of this
+               "%DENOMINATOR"
                "%OTHER-POINTER-P"
                "%OTHER-POINTER-SUBTYPE-P"
+               "IMMOBILE-SPACE-ADDR-P"
+               "IMMOBILE-SPACE-OBJ-P"
 
                "STANDARD-CLASSOID" "CLASSOID-OF"
                "MAKE-STANDARD-CLASSOID"
@@ -1968,7 +2246,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%CLEAR-CLASSOID"
                "FIND-CLASSOID-CELL"
                "%RANDOM-DOUBLE-FLOAT"
-               #!+long-float "%RANDOM-LONG-FLOAT"
+               #+long-float "%RANDOM-LONG-FLOAT"
                "%RANDOM-SINGLE-FLOAT" "STATIC-CLASSOID"
                "%FUNCALLABLE-INSTANCE-INFO" "RANDOM-CHUNK" "BIG-RANDOM-CHUNK"
                "N-RANDOM-CHUNK-BITS"
@@ -1976,13 +2254,13 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "BUILT-IN-CLASSOID-DIRECT-SUPERCLASSES"
                "BUILT-IN-CLASSOID-TRANSLATION" "RANDOM-LAYOUT-CLOS-HASH"
                "CLASSOID-PCL-CLASS" "FUNCALLABLE-STRUCTURE"
-               "FUNCALLABLE-INSTANCE-FUN" "%FUNCALLABLE-INSTANCE-LAYOUT"
+               "%FUNCALLABLE-INSTANCE-LAYOUT"
                "%SET-FUNCALLABLE-INSTANCE-LAYOUT"
                "REGISTER-LAYOUT"
                "FUNCALLABLE-INSTANCE"
                "MAKE-STATIC-CLASSOID"
                "%MAKE-SYMBOL"
-               "%FUNCALLABLE-INSTANCE-FUNCTION" "SYMBOL-HASH"
+               "%FUNCALLABLE-INSTANCE-FUN" "SYMBOL-HASH"
                "SYMBOL-INFO" "SYMBOL-INFO-VECTOR"
 
                "EXTENDED-SEQUENCE" "*EXTENDED-SEQUENCE-TYPE*"
@@ -1994,19 +2272,25 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "MAKE-LAYOUT" "REDEFINE-LAYOUT-WARNING"
                "INSURED-FIND-CLASSOID" "ORDER-LAYOUT-INHERITS"
                "STD-COMPUTE-CLASS-PRECEDENCE-LIST"
+               "+STRUCTURE-LAYOUT-FLAG+"
+               "+PCL-OBJECT-LAYOUT-FLAG+"
+               "+CONDITION-LAYOUT-FLAG+"
+               "+PATHNAME-LAYOUT-FLAG+"
+               "**PRIMITIVE-OBJECT-LAYOUTS**"
 
-               ;; symbols from former SB!CONDITIONS
                "*HANDLER-CLUSTERS*" "*RESTART-CLUSTERS*"
-
-               "CASE-FAILURE" "NAMESTRING-PARSE-ERROR"
+               "WITH-SIMPLE-CONDITION-RESTARTS"
+               "CASE-FAILURE" "ECASE-FAILURE" "ETYPECASE-FAILURE"
+               "NAMESTRING-PARSE-ERROR"
                "NAMESTRING-PARSE-ERROR-OFFSET"
+               "NO-NAMESTRING-ERROR" "NO-NATIVE-NAMESTRING-ERROR"
                "MAKE-RESTART" "RESTART-ASSOCIATED-CONDITIONS"
                "COERCE-TO-CONDITION"
 
                "ALLOCATE-CONDITION"
 
-               "CONDITION-READER-FUNCTION"
-               "CONDITION-WRITER-FUNCTION"
+               "CONDITION-SLOT-VALUE"
+               "SET-CONDITION-SLOT-VALUE"
 
                "CONDITION-SLOT-ALLOCATION"
                "CONDITION-SLOT-DOCUMENTATION"
@@ -2031,8 +2315,9 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "DUBIOUS-ASTERISKS-AROUND-VARIABLE-NAME"
                "ASTERISKS-AROUND-LEXICAL-VARIABLE-NAME"
                "ASTERISKS-AROUND-CONSTANT-VARIABLE-NAME"
+               "&OPTIONAL-AND-&KEY-IN-LAMBDA-LIST"
                "UNDEFINED-ALIEN-STYLE-WARNING"
-               #!+sb-eval
+               #+(or sb-eval sb-fasteval)
                "LEXICAL-ENVIRONMENT-TOO-COMPLEX"
                "CHARACTER-DECODING-ERROR-IN-COMMENT"
                "DEPRECATED-EVAL-WHEN-SITUATIONS"
@@ -2048,7 +2333,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "FTYPE-PROCLAMATION-MISMATCH-WARN"
                "FTYPE-PROCLAMATION-MISMATCH-ERROR"
 
-               "!COLD-INIT" "!UNINTERN-INIT-ONLY-STUFF"
+               "!COLD-INIT"
                "!GLOBALDB-COLD-INIT"
                "!FOREIGN-COLD-INIT"
                "!TYPE-CLASS-COLD-INIT" "!TYPEDEFS-COLD-INIT"
@@ -2064,7 +2349,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "!VM-TYPE-COLD-INIT" "!BACKQ-COLD-INIT"
                "!SHARPM-COLD-INIT" "!EARLY-PROCLAIM-COLD-INIT"
                "!LATE-PROCLAIM-COLD-INIT" "!CLASS-FINALIZE"
-               "!CONSTANTP-COLD-INIT"
+               "!CONSTANTP-COLD-INIT" "!CONSTANTP2-COLD-INIT"
                "!WORLD-LOCK-COLD-INIT"
 
                "FLOAT-COLD-INIT-OR-REINIT"
@@ -2083,10 +2368,10 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                ;; internal symbols in package "CL" imported
                ;; into package "C", as opposed to what we're
                ;; doing here, defining them as external symbols
-               ;; in a package which is used by both "SB!C" and
-               ;; "SB!IMPL". (SBCL's "SB!C" is directly
+               ;; in a package which is used by both "SB-C" and
+               ;; "SB-IMPL". (SBCL's "SB-C" is directly
                ;; analogous to CMU CL's "C"; and for this
-               ;; purpose, SBCL's "SB!IMPL" is analogous to CMU
+               ;; purpose, SBCL's "SB-IMPL" is analogous to CMU
                ;; CL's "CL".) As far as I know there's nothing
                ;; special about them, so they could be merged
                ;; into the same order as everything else in the
@@ -2096,11 +2381,12 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "%SP-STRING-COMPARE" "%SETNTH" "%SETELT"
                "%SET-ROW-MAJOR-AREF" "%SET-FILL-POINTER"
                "%SET-FDEFINITION" "%SCHARSET"
-               "%RPLACD" "%RPLACA" "%PUT" "%CHARSET"))
+               "%RPLACD" "%RPLACA" "%PUT" "%CHARSET"
+               "WITH-SIMPLE-OUTPUT-TO-STRING"))
 
    #s(sb-cold:package-data
-      :name "SB!THREAD"
-      :use ("CL" "SB!ALIEN" "SB!INT" "SB!SYS" "SB!KERNEL")
+      :name "SB-THREAD"
+      :use ("CL" "SB-ALIEN" "SB-INT" "SB-SYS" "SB-KERNEL")
       :doc "public (but low-level): native thread support"
       :export ("*CURRENT-THREAD*"
                "DESTROY-THREAD"
@@ -2114,6 +2400,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "JOIN-THREAD"
                "JOIN-THREAD-ERROR"
                "JOIN-THREAD-ERROR-THREAD"
+               "JOIN-THREAD-ERROR-PROBLEM"
                "LIST-ALL-THREADS"
                "MAKE-THREAD"
                "SYMBOL-VALUE-IN-THREAD"
@@ -2129,7 +2416,7 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "THREAD-NAME"
                "THREAD-YIELD"
                "FOREIGN-THREAD"
-               #!+(and sb-safepoint-strictly (not win32))
+               #+(and sb-safepoint-strictly (not win32))
                "SIGNAL-HANDLING-THREAD"
                ;; Memory barrier
                "BARRIER"
@@ -2171,13 +2458,13 @@ is a good idea, but see SB-SYS re. blurring of boundaries."
                "SEMAPHORE-NOTIFICATION-STATUS"))
 
    #s(sb-cold:package-data
-      :name "SB!LOOP"
+      :name "SB-LOOP"
       :doc "private: implementation details of LOOP"
-      :use ("CL")
+      :use ("CL" "SB-INT" "SB-KERNEL")
       :export ())
 
    #s(sb-cold:package-data
-      :name "SB!MOP"
+      :name "SB-MOP"
       :doc
       "public: the MetaObject Protocol interface, as defined by
 The Art of the Metaobject Protocol, by Kiczales, des Rivieres and Bobrow:
@@ -2278,20 +2565,20 @@ ISBN 0-262-61074-4, with exceptions as noted in the User Manual."
                "WRITER-METHOD-CLASS"))
 
    #s(sb-cold:package-data
-      :name "SB!REGALLOC"
+      :name "SB-REGALLOC"
       :doc "private: implementation of the compiler's register allocator"
-      :use ("CL" "SB!ALIEN-INTERNALS" "SB!ALIEN" "SB!ASSEM" "SB!BIGNUM"
-                 #!+sb-dyncount "SB-DYNCOUNT" "SB!EXT" "SB!FASL" "SB!INT"
-                 "SB!KERNEL" "SB!SYS"
-                 "SB!C")
-      :import-from (("SB!C"
+      :use ("CL" "SB-ALIEN-INTERNALS" "SB-ALIEN" "SB-ASSEM" "SB-BIGNUM"
+                 #+sb-dyncount "SB-DYNCOUNT" "SB-EXT" "SB-FASL" "SB-INT"
+                 "SB-KERNEL" "SB-SYS"
+                 "SB-C")
+      :import-from (("SB-C"
                      "*LOOP-ANALYZE*"
                      "BLOCK-INFO" "BLOCK-LAST" "BLOCK-LOOP" "BLOCK-NEXT"
                      "CLEAR-BIT-VECTOR" "COMPONENT-HEAD" "COMPONENT-TAIL"
                      "DEFEVENT" "DELETE-VOP" "DO-IR2-BLOCKS" "DO-LIVE-TNS"
                      "EMIT-LOAD-TEMPLATE" "EVENT" "FIND-IN"
                      "FINITE-SB" "FINITE-SB-ALWAYS-LIVE"
-                     "FINITE-SB-ALWAYS-LIVE-COUNT" "FINITE-SB-CONFLICTS"
+                     "FINITE-SB-WIRED-MAP" "FINITE-SB-CONFLICTS"
                      "FINITE-SB-CURRENT-SIZE" "FINITE-SB-LAST-BLOCK-COUNT"
                      "FINITE-SB-LAST-OFFSET" "FINITE-SB-LIVE-TNS"
                      "FINITE-SB-SIZE-ALIGNMENT" "FINITE-SB-SIZE-INCREMENT"
@@ -2315,24 +2602,25 @@ ISBN 0-262-61074-4, with exceptions as noted in the User Manual."
                      "OPERAND-PARSE-NAME" "POSITION-IN"
                      "PRIMITIVE-TYPE-SCS" "PRINT-TN-GUTS"
                      "SB-KIND" "SB-SIZE"
+                     "SC-LOCATIONS" "MAKE-SC-LOCATIONS" "SC-OFFSET-TO-SC-LOCATIONS"
+                     "SC-LOCATIONS-COUNT" "SC-LOCATIONS-FIRST" "SC-LOCATIONS-MEMBER"
+                     "DO-SC-LOCATIONS"
                      "SC-ALIGNMENT" "SC-ALLOWED-BY-PRIMITIVE-TYPE"
                      "SC-ALTERNATE-SCS" "SC-CONSTANT-SCS" "SC-ELEMENT-SIZE"
                      "SC-LOCATIONS" "SC-MOVE-FUNS" "SC-RESERVE-LOCATIONS"
                      "SC-SAVE-P" "SC-VECTOR"
                      "SET-BIT-VECTOR"
-                     "SSET" "SSET-ELEMENT" "SSET-ADJOIN" "SSET-DELETE"
-                     "SSET-MEMBER" "SSET-EMPTY" "COPY-SSET"
                      "TEMPLATE-NAME"
                      "TN" "TN-COST" "TN-GLOBAL-CONFLICTS" "TN-KIND" "TN-LEAF"
                      "TN-LOCAL" "TN-LOCAL-CONFLICTS" "TN-LOCAL-NUMBER"
-                     "TN-LOOP-DEPTH" "TN-NEXT" "TN-NUMBER" "TN-PRIMITIVE-TYPE"
-                     "TN-READS" "TN-SAVE-TN" "TN-WRITES"
+                     "TN-NEXT" "TN-NUMBER" "TN-PRIMITIVE-TYPE"
+                     "TN-READS" "TN-SAVE-TN" "TN-VERTEX" "TN-WRITES"
                      "TNS-CONFLICT" "TNS-CONFLICT-GLOBAL-GLOBAL"
                      "TNS-CONFLICT-LOCAL-GLOBAL"
                      "VOP" "VOP-ARGS" "VOP-INFO" "VOP-INFO-ARG-LOAD-SCS"
                      "VOP-INFO-MOVE-ARGS" "VOP-INFO-NAME"
                      "VOP-INFO-RESULT-LOAD-SCS" "VOP-INFO-SAVE-P"
-                     "VOP-INFO-TARGET-FUN" "VOP-NEXT" "VOP-NODE"
+                     "VOP-NEXT" "VOP-NODE"
                      "VOP-PARSE-OR-LOSE" "VOP-PARSE-TEMPS" "VOP-PREV"
                      "VOP-REFS" "VOP-RESULTS" "VOP-SAVE-SET" "VOP-TEMPS"))
       :export ("PACK" "TARGET-IF-DESIRABLE" "*REGISTER-ALLOCATION-METHOD*"
@@ -2341,22 +2629,32 @@ ISBN 0-262-61074-4, with exceptions as noted in the User Manual."
                "*TN-WRITE-COST*" "*TN-LOOP-DEPTH-MULTIPLIER*"))
 
    #s(sb-cold:package-data
-      :name "SB!PCL"
+      :name "SB-PCL"
       :doc
       "semi-public: This package includes useful meta-object protocol
 extensions, but even they are not guaranteed to be present in later
 versions of SBCL, and the other stuff in here is definitely not
 guaranteed to be present in later versions of SBCL.  Use of this
 package is deprecated in favour of SB-MOP."
-      :use ("CL" "SB!MOP" "SB!INT" "SB!EXT" "SB!WALKER" "SB!KERNEL")
+      :use ("CL" "SB-MOP" "SB-INT" "SB-EXT" "SB-WALKER" "SB-KERNEL")
       ;; experimental SBCL-only (for now) symbols
       :export ("SYSTEM-CLASS"
+
+               "MAKE-METHOD-LAMBDA-USING-SPECIALIZERS"
                "MAKE-METHOD-SPECIALIZERS-FORM"
+
+               "SPECIALIZER-TYPE-SPECIFIER"
+               "MAKE-SPECIALIZER-FORM-USING-CLASS"
                "PARSE-SPECIALIZER-USING-CLASS"
                "UNPARSE-SPECIALIZER-USING-CLASS"
+
                "+SLOT-UNBOUND+"
 
-               "ENSURE-CLASS-FINALIZED")
+               "ENSURE-CLASS-FINALIZED"
+
+               "ILLEGAL-CLASS-NAME-ERROR"
+               "CLASS-NOT-FOUND-ERROR"
+               "SPECIALIZER-NAME-SYNTAX-ERROR")
       ;; FIXME: After a little while, these reexports can probably go
       ;; away, as they're superseded by the use of SB-MOP as the
       ;; publically-accessible package.
@@ -2451,9 +2749,9 @@ package is deprecated in favour of SB-MOP."
                  "WRITER-METHOD-CLASS"))
 
    #s(sb-cold:package-data
-      :name "SB!PRETTY"
+      :name "SB-PRETTY"
       :doc "private: implementation of pretty-printing"
-      :use ("CL" "SB!EXT" "SB!INT" "SB!KERNEL")
+      :use ("CL" "SB-EXT" "SB-INT" "SB-KERNEL")
       :export ("OUTPUT-PRETTY-OBJECT"
                "PRETTY-STREAM" "PRETTY-STREAM-P"
                "PPRINT-DISPATCH-TABLE"
@@ -2461,17 +2759,20 @@ package is deprecated in favour of SB-MOP."
                "!PPRINT-COLD-INIT"))
 
    #s(sb-cold:package-data
-      :name "SB!PROFILE"
+      :name "SB-PROFILE"
       :doc "public: the interface to the profiler"
-      :use ("CL" "SB!EXT" "SB!INT" "SB!KERNEL")
+      :use ("CL" "SB-EXT" "SB-INT" "SB-KERNEL")
       :export ("PROFILE" "REPORT" "RESET" "UNPROFILE"))
 
    #s(sb-cold:package-data
-      :name "SB!SEQUENCE"
+      :name "SB-SEQUENCE"
       :doc "semi-public: implements something which might eventually
 be submitted as a CDR"
       :use ()
-      :export ("DOSEQUENCE"
+      :export ("PROTOCOL-UNIMPLEMENTED"
+               "PROTOCOL-UNIMPLEMENTED-OPERATION"
+
+               "DOSEQUENCE"
 
                "MAKE-SEQUENCE-ITERATOR" "MAKE-SIMPLE-SEQUENCE-ITERATOR"
 
@@ -2501,7 +2802,7 @@ be submitted as a CDR"
                "SORT" "STABLE-SORT" "MERGE"))
 
    #s(sb-cold:package-data
-      :name "SB!SYS"
+      :name "SB-SYS"
       :doc
       "private: In theory, this \"contains functions and information
 necessary for system interfacing\" (said cmu-user.tex at the time
@@ -2510,10 +2811,10 @@ practice, the distinctions between this package and SB-KERNEL
 and even SB-VM seem to have become somewhat blurred over the years.
 Some anomalies (e.g. FIND-IF-IN-CLOSURE being in SB-SYS instead of
 SB-KERNEL) have been undone, but probably more remain."
-      :use ("CL" "SB!EXT" "SB!INT")
+      :use ("CL" "SB-EXT" "SB-INT")
       :export (;; FIXME: %PRIMITIVE shouldn't be here. (I now know that %SYS
                ;; is for OS-dependent stuff. %PRIMITIVE should probably be in
-               ;; SB!KERNEL.)
+               ;; SB-KERNEL.)
                "%PRIMITIVE"
                "%STANDARD-CHAR-P"
                "*EXIT-ERROR-HANDLER*"
@@ -2521,7 +2822,7 @@ SB-KERNEL) have been undone, but probably more remain."
                "*ALLOW-WITH-INTERRUPTS*"
                "*INTERRUPTS-ENABLED*"
                "*INTERRUPT-PENDING*"
-               #!+sb-thruption "*THRUPTION-PENDING*"
+               #+sb-thruption "*THRUPTION-PENDING*"
                "*LINKAGE-INFO*"
                "*LONG-SITE-NAME*" "*SHORT-SITE-NAME*"
                "*MACHINE-VERSION*"
@@ -2529,7 +2830,7 @@ SB-KERNEL) have been undone, but probably more remain."
                "*PERIODIC-POLLING-PERIOD*"
                "*RUNTIME-DLHANDLE*"
                "*SHARED-OBJECTS*"
-               #!-sb-dynamic-core
+               #-sb-dynamic-core
                "*STATIC-FOREIGN-SYMBOLS*"
                "*STDERR*" "*STDIN*"
                "*STDOUT*"
@@ -2549,7 +2850,6 @@ SB-KERNEL) have been undone, but probably more remain."
                "DEFER-DEADLINE"
                "DYNAMIC-FOREIGN-SYMBOLS-P"
                "DLOPEN-OR-LOSE"
-               "FROB-DO-BODY"
                "ENABLE-INTERRUPT"
                "ENSURE-DYNAMIC-FOREIGN-SYMBOL-ADDRESS"
                "EXTERN-ALIEN-NAME"
@@ -2573,9 +2873,11 @@ SB-KERNEL) have been undone, but probably more remain."
                "MACRO" "MAKE-FD-STREAM"
                "MEMORY-FAULT-ERROR"
                "MEMMOVE"
+               "NLX-PROTECT"
                "OS-EXIT"
                "OS-COLD-INIT-OR-REINIT" "OS-DEINIT"
                "OS-CONTEXT-T" "OUTPUT-RAW-BYTES"
+               "READ-CYCLE-COUNTER" "ELAPSED-CYCLES"
                "READ-N-BYTES"
                "REMOVE-FD-HANDLER"
                "REOPEN-SHARED-OBJECTS"
@@ -2593,7 +2895,7 @@ SB-KERNEL) have been undone, but probably more remain."
                "SERVE-EVENT"
                "SIGNED-SAP-REF-16" "SIGNED-SAP-REF-32"
                "SIGNED-SAP-REF-64" "SIGNED-SAP-REF-WORD" "SIGNED-SAP-REF-8"
-               ;; FIXME: STRUCTURE!OBJECT stuff probably belongs in SB!KERNEL.
+               ;; FIXME: STRUCTURE!OBJECT stuff probably belongs in SB-KERNEL.
                "STRUCTURE!OBJECT" "STRUCTURE!OBJECT-MAKE-LOAD-FORM"
                "SYSTEM-AREA-POINTER" "SYSTEM-AREA-POINTER-P"
                "SYSTEM-CONDITION" "SYSTEM-CONDITION-ADDRESS"
@@ -2608,13 +2910,12 @@ SB-KERNEL) have been undone, but probably more remain."
                "WITH-INTERRUPTS" "WITH-LOCAL-INTERRUPTS"
                "WITH-PINNED-OBJECTS" "WITHOUT-GCING"
                "WITHOUT-INTERRUPTS"
-               "WITH-INTERRUPT-BINDINGS"
-               "WORDS"))
+               "WITH-INTERRUPT-BINDINGS"))
 
    #s(sb-cold:package-data
-      :name "SB!UNICODE"
+      :name "SB-UNICODE"
       :doc "public: algorithms for Unicode data"
-      :use ("CL" "SB!INT")
+      :use ("CL" "SB-INT")
       :export ("GENERAL-CATEGORY"
                "BIDI-CLASS"
                "COMBINING-CLASS"
@@ -2664,7 +2965,7 @@ SB-KERNEL) have been undone, but probably more remain."
                "CONFUSABLE-P"))
 
    #s(sb-cold:package-data
-      :name "SB!UNIX"
+      :name "SB-UNIX"
       :doc
       "private: a wrapper layer for SBCL itself to use when talking
 with an underlying Unix-y operating system.
@@ -2674,7 +2975,7 @@ stable Unix interface suitable for the end user.
 This package only tries to implement what happens to be
 needed by the current implementation of SBCL, and makes
 no guarantees of interface stability."
-      :use ("CL" "SB!ALIEN" "SB!EXT" "SB!INT" "SB!SYS")
+      :use ("CL" "SB-ALIEN" "SB-EXT" "SB-INT" "SB-SYS")
       :reexport ("OFF-T"
                  "SIZE-T")
       :export ( ;; wrappers around Unix stuff to give just what Lisp needs
@@ -2727,7 +3028,8 @@ no guarantees of interface stability."
                "UNIX-UNLINK" "UNIX-WRITE"
                "WINSIZE"
                "WRITEGRP" "WRITEOTH" "WRITEOWN" "WS-COL" "WS-ROW" "WS-XPIXEL"
-               "WS-YPIXEL" "WNOHANG" "WSTOPPED" "WUNTRACED" "W_OK" "X_OK"
+               "WS-YPIXEL" "WCONTINUED" "WNOHANG" "WSTOPPED" "WUNTRACED"
+               "W_OK" "X_OK"
 
                ;; signals
                "SIGALRM" "SIGBUS" "SIGCHLD" "SIGCONT" "SIGEMT" "SIGFPE"
@@ -2750,7 +3052,8 @@ no guarantees of interface stability."
                "ENOTCONN" "ENOTEMPTY" "ENOTSOCK" "ENOTTY" "ENXIO"
                "EOPNOTSUPP" "EPERM" "EPFNOSUPPORT" "EPIPE" "EPROCLIM"
                "EPROTONOSUPPORT" "EPROTOTYPE" "ERANGE" "EREMOTE"
-               "ERESTART" "EROFS" "ESHUTDOWN" "ESOCKTNOSUPPORT" "ESPIPE"
+               "ERESTART" "EROFS" "ESHUTDOWN" "ESOCKTNOSUPPORT"
+               "EPIPE" "ESPIPE"
                "ESRCH" "ESUCCESS" "ETIMEDOUT" "ETOOMANYREFS" "ETXTBSY"
                "EUSERS" "EVICEERR" "EVICEOP" "EWOULDBLOCK" "EXDEV"
 
@@ -2761,52 +3064,54 @@ no guarantees of interface stability."
                "FD-ZERO" "FD-CLR" "UNIX-RESOLVE-LINKS"
                "FD-SETSIZE" "UNIX-FAST-GETRUSAGE"
                "UNIX-KILLPG"
-               #!+(or svr4 linux)
+               #+(or svr4 linux)
                ("EADDRINUSE"
                 "EADDRNOTAVAIL" "EADV"
                 "EAFNOSUPPORT" "EALREADY" "EBADE" "EBADFD"
                 "EBADMSG" "EBADR" "EBADRQC"
-                "EBADSLT" "EBFONT" #!+svr4 "ECANCELED"
+                "EBADSLT" "EBFONT" #+svr4 "ECANCELED"
                 "ECHRNG" "ECOMM" "ECONNABORTED"
                 "ECONNREFUSED" "ECONNRESET" "EDEADLK"
-                "EDEADLOCK" "EDESTADDRREQ" #!+linux "EDOTDOT"
-                #!+linux "EDQUOT" "EHOSTDOWN" "EHOSTUNREACH"
+                "EDEADLOCK" "EDESTADDRREQ" #+linux "EDOTDOT"
+                #+linux "EDQUOT" "EHOSTDOWN" "EHOSTUNREACH"
                 "EIDRM" "EILSEQ" "EINPROGRESS"
-                "EISCONN" #!+linux "EISNAM" "EL2HLT"
+                "EISCONN" #+linux "EISNAM" "EL2HLT"
                 "EL2NSYNC" "EL3HLT" "EL3RST" "ELIBACC"
                 "ELIBBAD" "ELIBEXEC" "ELIBMAX" "ELIBSCN"
                 "ELNRNG" "ELOOP" "EMSGSIZE" "EMULTIHOP"
-                "ENAMETOOLONG" #!+linux "ENAVAIL"
+                "ENAMETOOLONG" #+linux "ENAVAIL"
                 "ENETDOWN" "ENETRESET" "ENETUNREACH" "ENOANO"
                 "ENOBUFS" "ENOCSI" "ENODATA" "ENOLCK"
                 "ENOLINK" "ENOMSG" "ENONET" "ENOPKG"
                 "ENOPROTOOPT" "ENOSR" "ENOSTR" "ENOSYS"
-                "ENOTCONN" "ENOTEMPTY" #!+linux "ENOTNAM"
-                "ENOTSOCK" #!+svr4 "ENOTSUP" "ENOTUNIQ"
+                "ENOTCONN" "ENOTEMPTY" #+linux "ENOTNAM"
+                "ENOTSOCK" #+svr4 "ENOTSUP" "ENOTUNIQ"
                 "EOPNOTSUPP" "EOVERFLOW" "EPFNOSUPPORT"
                 "EPROTO" "EPROTONOSUPPORT" "EPROTOTYPE"
-                "EREMCHG" "EREMOTE" #!+linux "EREMOTEIO"
+                "EREMCHG" "EREMOTE" #+linux "EREMOTEIO"
                 "ERESTART" "ESHUTDOWN" "ESOCKTNOSUPPORT"
                 "ESRMNT" "ESTALE" "ESTRPIPE" "ETIME"
-                "ETIMEDOUT" "ETOOMANYREFS" #!+linux "EUCLEAN"
+                "ETIMEDOUT" "ETOOMANYREFS" #+linux "EUCLEAN"
                 "EUNATCH" "EUSERS" "EWOULDBLOCK" "EXFULL")))
 
    #s(sb-cold:package-data
-      :name "SB!VM"
+      :name "SB-VM"
       :doc
       "internal: the default place to hide information about the hardware and data
 structure representations"
-      :use ("CL" "SB!ALIEN" "SB!ALIEN-INTERNALS" "SB!ASSEM" "SB!C"
-                 "SB!EXT" "SB!FASL" "SB!INT" "SB!KERNEL" "SB!SYS" "SB!UNIX")
+      :use ("CL" "SB-ALIEN" "SB-ALIEN-INTERNALS" "SB-ASSEM" "SB-C"
+                 "SB-EXT" "SB-FASL" "SB-INT" "SB-KERNEL" "SB-SYS" "SB-UNIX")
       :reexport ("WORD")
       :export ("*ALLOC-SIGNAL*"
                "*PRIMITIVE-OBJECTS*"
                "+HIGHEST-NORMAL-GENERATION+"
                "+PSEUDO-STATIC-GENERATION+"
+               "+VECTOR-SHAREABLE+"
+               "+VECTOR-SHAREABLE-NONSTD+"
                "%COMPILER-BARRIER" "%DATA-DEPENDENCY-BARRIER"
                "%MEMORY-BARRIER" "%READ-BARRIER" "%WRITE-BARRIER"
                "AFTER-BREAKPOINT-TRAP"
-               #!+(and gencgc sparc) "ALLOCATION-TRAP"
+               #+(and gencgc sparc) "ALLOCATION-TRAP"
                "ANY-REG-SC-NUMBER" "ARRAY-DATA-SLOT" "ARRAY-DIMENSIONS-OFFSET"
                "ARRAY-DISPLACED-P-SLOT" "ARRAY-DISPLACEMENT-SLOT"
                "ARRAY-DISPLACED-FROM-SLOT"
@@ -2817,51 +3122,62 @@ structure representations"
                "BIGNUM-DIGITS-OFFSET" "BIGNUM-WIDETAG" "BINDING-SIZE"
                "BINDING-SYMBOL-SLOT" "BINDING-VALUE-SLOT" "BREAKPOINT-TRAP"
                "N-BYTE-BITS" "BYTE-REG-SC-NUMBER"
-               "CATCH-BLOCK-CURRENT-CODE-SLOT"
-               "CATCH-BLOCK-CURRENT-CONT-SLOT" "CATCH-BLOCK-CURRENT-UWP-SLOT"
+               "CATCH-BLOCK-CODE-SLOT"
+               "CATCH-BLOCK-CFP-SLOT" "CATCH-BLOCK-UWP-SLOT"
                "CATCH-BLOCK-ENTRY-PC-SLOT" "CATCH-BLOCK-PREVIOUS-CATCH-SLOT"
                "CATCH-BLOCK-SC-NUMBER" "CATCH-BLOCK-SIZE"
                "CATCH-BLOCK-TAG-SLOT" "CERROR-TRAP"
                "CLOSURE-FUN-SLOT"
-               "CLOSURE-HEADER-WIDETAG" "CLOSURE-INFO-OFFSET"
-               "CODE-CODE-SIZE-SLOT" "CODE-CONSTANTS-OFFSET"
-               "CODE-DEBUG-INFO-SLOT" "CODE-ENTRY-POINTS-SLOT"
+               "CLOSURE-WIDETAG"
+               "CLOSURE-INFO-OFFSET"
+               "CODE-BOXED-SIZE-SLOT"
+               "CODE-CONSTANTS-OFFSET" "CODE-SLOTS-PER-SIMPLE-FUN"
+               "CODE-DEBUG-INFO-SLOT"
+               "CODE-HEADER-SIZE-SHIFT"
                "CODE-HEADER-WIDETAG" "COMPLEX-ARRAY-WIDETAG"
                "COMPLEX-BIT-VECTOR-WIDETAG" "COMPLEX-DOUBLE-FLOAT-FILLER-SLOT"
                "COMPLEX-DOUBLE-FLOAT-IMAG-SLOT" "COMPLEX-DOUBLE-FLOAT-REAL-SLOT"
                "COMPLEX-DOUBLE-FLOAT-SIZE" "COMPLEX-DOUBLE-FLOAT-WIDETAG"
                "COMPLEX-DOUBLE-REG-SC-NUMBER" "COMPLEX-DOUBLE-STACK-SC-NUMBER"
                "COMPLEX-IMAG-SLOT" "COMPLEX-REAL-SLOT"
-               #!+long-float("COMPLEX-LONG-FLOAT-IMAG-SLOT"
+               #+long-float("COMPLEX-LONG-FLOAT-IMAG-SLOT"
                              "COMPLEX-LONG-FLOAT-REAL-SLOT"
                              "COMPLEX-LONG-FLOAT-SIZE"
                              "COMPLEX-LONG-FLOAT-WIDETAG"
                              "COMPLEX-LONG-REG-SC-NUMBER"
                              "COMPLEX-LONG-STACK-SC-NUMBER")
-               #!+sb-simd-pack("SIMD-PACK-TAG-SLOT"
+               #+sb-simd-pack("SIMD-PACK-TAG-SLOT"
                                "SIMD-PACK-HI-VALUE-SLOT"
                                "SIMD-PACK-LO-VALUE-SLOT"
                                "SIMD-PACK-SIZE"
                                "SIMD-PACK-WIDETAG")
-               #!-x86-64
+               #+sb-simd-pack-256("SIMD-PACK-256-TAG-SLOT"
+                                   "SIMD-PACK-256-P0-SLOT"
+                                   "SIMD-PACK-256-P1-SLOT"
+                                   "SIMD-PACK-256-P2-SLOT"
+                                   "SIMD-PACK-256-P3-SLOT"
+                                   "SIMD-PACK-256-SIZE"
+                                   "SIMD-PACK-256-WIDETAG")
+               #-64-bit
                ("COMPLEX-SINGLE-FLOAT-IMAG-SLOT" "COMPLEX-SINGLE-FLOAT-REAL-SLOT")
-               #!+x86-64
+               #+64-bit
                "COMPLEX-SINGLE-FLOAT-DATA-SLOT"
                "COMPLEX-SINGLE-FLOAT-SIZE" "COMPLEX-SINGLE-FLOAT-WIDETAG"
                "COMPLEX-SINGLE-REG-SC-NUMBER" "COMPLEX-SINGLE-STACK-SC-NUMBER"
                "COMPLEX-SIZE" "COMPLEX-BASE-STRING-WIDETAG"
-               #!+sb-unicode "COMPLEX-CHARACTER-STRING-WIDETAG"
+               #+sb-unicode "COMPLEX-CHARACTER-STRING-WIDETAG"
                "COMPLEX-WIDETAG"
                "COMPLEX-VECTOR-NIL-WIDETAG"
                "COMPLEX-VECTOR-WIDETAG" "CONS-CAR-SLOT" "CONS-CDR-SLOT"
                "CONS-SIZE" "CONSTANT-SC-NUMBER"
                "CONTEXT-FLOATING-POINT-MODES" "CONTEXT-FLOAT-REGISTER"
-               "CONTEXT-PC" "CONTEXT-REGISTER"
+               "CONTEXT-PC" "CONTEXT-REGISTER" "BOXED-CONTEXT-REGISTER"
                "CONTROL-STACK-SC-NUMBER" "COUNT-NO-OPS"
-               #!+sb-safepoint "CSP-SAFEPOINT-TRAP"
+               #+sb-safepoint "CSP-SAFEPOINT-TRAP"
                "*CURRENT-CATCH-BLOCK*"
                "CURRENT-FLOAT-TRAP"
                "DESCRIPTOR-REG-SC-NUMBER" "DESCRIPTOR-VS-NON-DESCRIPTOR-STORAGE"
+               "DO-REFERENCED-OBJECT"
                "DOUBLE-FLOAT-EXPONENT-BYTE" "DOUBLE-FLOAT-BIAS"
                "DOUBLE-FLOAT-DIGITS" "DOUBLE-FLOAT-EXPONENT-BYTE"
                "DOUBLE-FLOAT-HIDDEN-BIT"
@@ -2873,70 +3189,82 @@ structure representations"
                "DOUBLE-STACK-SC-NUMBER"
                "EMIT-LONG-NOP" "ERROR-TRAP" "EVEN-FIXNUM-LOWTAG"
                "FDEFN-FUN-SLOT" "FDEFN-NAME-SLOT" "FDEFN-RAW-ADDR-SLOT"
-               "FDEFN-SIZE" "FDEFN-WIDETAG" "FIXNUMIZE"
+               "FDEFN-SIZE" "FDEFN-WIDETAG"
+               "FILLER-WIDETAG"
+               "FIXNUMIZE"
                "FIXNUM-TAG-MASK"
                "FIXUP-CODE-OBJECT" "FLOAT-DENORMAL-TRAP-BIT"
                "FLOAT-DIVIDE-BY-ZERO-TRAP-BIT"
                "FLOAT-INVALID-TRAP-BIT"
                "FLOAT-OVERFLOW-TRAP-BIT" "FLOAT-SIGN-SHIFT"
                "FLOAT-UNDERFLOW-TRAP-BIT" "FLOATING-POINT-MODES"
+               "FLOAT-STICKY-BITS"
+               "FLOAT-TRAPS-BYTE"
                "FP-CONSTANT-SC-NUMBER"
                "FP-DOUBLE-ZERO-SC-NUMBER" "FP-SINGLE-ZERO-SC-NUMBER"
                "FUNCALLABLE-INSTANCE-TRAMPOLINE-SLOT"
-               "FUNCALLABLE-INSTANCE-HEADER-WIDETAG"
+               "FUNCALLABLE-INSTANCE-WIDETAG"
                "FUNCALLABLE-INSTANCE-INFO-OFFSET"
-               "SIMPLE-FUN-ARGLIST-SLOT" "SIMPLE-FUN-CODE-OFFSET"
+               "SIMPLE-FUN-ARGLIST-SLOT" "SIMPLE-FUN-INSTS-OFFSET"
                "FUN-END-BREAKPOINT-TRAP"
-               "SIMPLE-FUN-HEADER-WIDETAG"
+               "SIMPLE-FUN-WIDETAG"
                "SIMPLE-FUN-NAME-SLOT"
-               "SIMPLE-FUN-NEXT-SLOT"
+               "SIMPLE-FUN-ENTRY-SAP"
                "FUN-POINTER-LOWTAG"
+               "FUNCTION-LAYOUT"
+               "SIMPLE-FUN-INFO-SLOT"
                "SIMPLE-FUN-SELF-SLOT"
-               "SIMPLE-FUN-TYPE-SLOT"
+               "SIMPLE-FUN-SOURCE-SLOT"
                "GENCGC-CARD-BYTES"
                "GENCGC-ALLOC-GRANULARITY"
                "GENCGC-RELEASE-GRANULARITY"
-               #!+(or ppc sparc) "PSEUDO-ATOMIC-INTERRUPTED-FLAG"
-               #!+(or ppc sparc) "PSEUDO-ATOMIC-FLAG"
-               #!+sb-safepoint "GLOBAL-SAFEPOINT-TRAP"
-               "GENESIS" "HALT-TRAP" "IGNORE-ME-SC-NUMBER"
+               #+(or arm64 ppc ppc64 sparc) "PSEUDO-ATOMIC-INTERRUPTED-FLAG"
+               #+(or arm64 ppc ppc64 sparc) "PSEUDO-ATOMIC-FLAG"
+               #+sb-safepoint "GLOBAL-SAFEPOINT-TRAP"
+               "HALT-TRAP" "IGNORE-ME-SC-NUMBER"
                "IMMEDIATE-SC-NUMBER"
-               #!+inline-constants("CANONICALIZE-INLINE-CONSTANT"
-                                   "INLINE-CONSTANT-VALUE"
-                                   "EMIT-CONSTANT-SEGMENT-HEADER"
-                                   "SORT-INLINE-CONSTANTS"
-                                   "EMIT-INLINE-CONSTANT")
-               "INSTANCE-HEADER-WIDETAG" "INSTANCE-POINTER-LOWTAG"
+               ("CANONICALIZE-INLINE-CONSTANT"
+                "INLINE-CONSTANT-VALUE"
+                "SORT-INLINE-CONSTANTS"
+                "EMIT-INLINE-CONSTANT")
+               "HEXDUMP"
+               "INSTANCE-DATA-START"
+               "INSTANCE-WIDETAG" "INSTANCE-POINTER-LOWTAG"
                "INSTANCE-SLOTS-OFFSET" "INSTANCE-USAGE"
                "INTERIOR-REG-SC-NUMBER" "INTERNAL-ERROR-ARGS"
-               "INTERRUPTED-FLAG" "LIST-ALLOCATED-OBJECTS" "LIST-POINTER-LOWTAG"
+               "INTERRUPTED-FLAG"
+               "IS-LISP-POINTER"
+               #+gencgc "LARGE-OBJECT-SIZE"
+               "LAYOUT-ALIGN"
+               "LIST-ALLOCATED-OBJECTS" "LIST-POINTER-LOWTAG"
                ;; FIXME: Possibly these other parameters (see
                ;; compiler/{x86,sparc}/parms.lisp) should be defined
-               ;; conditionally on #!+LONG-FLOAT)
+               ;; conditionally on #+LONG-FLOAT)
                "LONG-FLOAT-BIAS" "LONG-FLOAT-DIGITS" "LONG-FLOAT-EXPONENT-BYTE"
                "LONG-FLOAT-HIDDEN-BIT" "LONG-FLOAT-NORMAL-EXPONENT-MAX"
                "LONG-FLOAT-NORMAL-EXPONENT-MIN" "LONG-FLOAT-SIGNIFICAND-BYTE"
-               #!+long-float "LONG-FLOAT-SIZE"
+               #+long-float "LONG-FLOAT-SIZE"
                "LONG-FLOAT-TRAPPING-NAN-BIT"
-               #!+long-float("LONG-FLOAT-WIDETAG"
+               #+long-float("LONG-FLOAT-WIDETAG"
                              "LONG-FLOAT-VALUE-SLOT"
                              "LONG-REG-SC-NUMBER"
                              "LONG-STACK-SC-NUMBER")
                "LOWTAG-LIMIT" "LOWTAG-MASK"
                "LRA-SAVE-OFFSET"
+               "MAP-ALLOCATED-OBJECTS"
                "MAX-INTERRUPTS"
+               #+c-stack-is-control-stack "MEMORY-FAULT-EMULATION-TRAP"
                "MEMORY-USAGE"
                "N-LOWTAG-BITS"
                "N-FIXNUM-TAG-BITS"
                "N-FIXNUM-BITS"
                "N-POSITIVE-FIXNUM-BITS"
+               "NIL-VALUE"
                "NFP-SAVE-OFFSET"
                "NON-DESCRIPTOR-REG-SC-NUMBER"
                "NULL-SC-NUMBER"
-               "OBJECT-NOT-LIST-TRAP" "OBJECT-NOT-INSTANCE-TRAP"
                "OCFP-SAVE-OFFSET"
                "ODD-FIXNUM-LOWTAG"
-               "OFFSET-STATIC-SYMBOL"
                "OTHER-IMMEDIATE-0-LOWTAG"
                "OTHER-IMMEDIATE-1-LOWTAG"
                "OTHER-IMMEDIATE-2-LOWTAG"
@@ -2948,32 +3276,37 @@ structure representations"
                "PRIMITIVE-OBJECT" "PRIMITIVE-OBJECT-WIDETAG"
                "PRIMITIVE-OBJECT-LOWTAG" "PRIMITIVE-OBJECT-NAME"
                "PRIMITIVE-OBJECT-OPTIONS" "PRIMITIVE-OBJECT-P"
-               "PRIMITIVE-OBJECT-SIZE" "PRIMITIVE-OBJECT-SLOTS"
+               "PRIMITIVE-OBJECT-LENGTH" "PRIMITIVE-OBJECT-SLOTS"
                "PRIMITIVE-OBJECT-VARIABLE-LENGTH-P"
                "PRINT-ALLOCATED-OBJECTS"
                "RATIO-DENOMINATOR-SLOT" "RATIO-NUMERATOR-SLOT"
                "RATIO-SIZE" "RATIO-WIDETAG"
                "*READ-ONLY-SPACE-FREE-POINTER*"
-               "RETURN-PC-HEADER-WIDETAG"
+               "RETURN-PC-WIDETAG"
                "RETURN-PC-RETURN-POINT-OFFSET" "RETURN-PC-SAVE-OFFSET"
                "SAETP-CTYPE" "SAETP-INITIAL-ELEMENT-DEFAULT"
                "SAETP-N-BITS" "SAETP-TYPECODE" "SAETP-PRIMITIVE-TYPE-NAME"
-               "SAETP-N-PAD-ELEMENTS" "SAETP-SPECIFIER"
+               "SAETP-N-PAD-ELEMENTS" "SAETP-N-BITS-SHIFT"
+               "SAETP-SPECIFIER"
                "SAETP-COMPLEX-TYPECODE" "SAETP-IMPORTANCE"
                "SAETP-FIXNUM-P"
                "VALID-BIT-BASH-SAETP-P"
                "*SPECIALIZED-ARRAY-ELEMENT-TYPE-PROPERTIES*"
-               #!-(or x86 x86-64)
                "SANCTIFY-FOR-EXECUTION"
                "SAP-POINTER-SLOT" "SAP-REG-SC-NUMBER" "SAP-SIZE"
                "SAP-STACK-SC-NUMBER" "SAP-WIDETAG"
+               "SC-NUMBER-LIMIT" "SC-NUMBER-BITS" ; SC-NUMBER in package "SB-C"
+               "SC-OFFSET-LIMIT" "SC-OFFSET-BITS" "SC-OFFSET"
+               "FINITE-SC-OFFSET-LIMIT" "FINITE-SC-OFFSET-BITS" "FINITE-SC-OFFSET"
+               "FINITE-SC-OFFSET-MAP"
+               "SHORT-HEADER-MAX-WORDS"
                "SIGFPE-HANDLER" "SIGNED-REG-SC-NUMBER" "SIGNED-STACK-SC-NUMBER"
                "SIGNED-WORD"
                "SIMPLE-ARRAY-COMPLEX-DOUBLE-FLOAT-WIDETAG"
-               #!+long-float "SIMPLE-ARRAY-COMPLEX-LONG-FLOAT-WIDETAG"
+               #+long-float "SIMPLE-ARRAY-COMPLEX-LONG-FLOAT-WIDETAG"
                "SIMPLE-ARRAY-COMPLEX-SINGLE-FLOAT-WIDETAG"
                "SIMPLE-ARRAY-DOUBLE-FLOAT-WIDETAG"
-               #!+long-float "SIMPLE-ARRAY-LONG-FLOAT-WIDETAG"
+               #+long-float "SIMPLE-ARRAY-LONG-FLOAT-WIDETAG"
                "SIMPLE-ARRAY-NIL-WIDETAG"
                "SIMPLE-ARRAY-SINGLE-FLOAT-WIDETAG"
                "SIMPLE-ARRAY-WIDETAG"
@@ -2995,84 +3328,93 @@ structure representations"
                "SIMPLE-ARRAY-SIGNED-BYTE-8-WIDETAG"
                "SIMPLE-BIT-VECTOR-WIDETAG"
                "SIMPLE-BASE-STRING-WIDETAG"
-               #!+sb-unicode "SIMPLE-CHARACTER-STRING-WIDETAG"
+               #+sb-unicode "SIMPLE-CHARACTER-STRING-WIDETAG"
                "SIMPLE-VECTOR-WIDETAG" "SINGLE-FLOAT-BIAS"
                "SINGLE-FLOAT-DIGITS" "SINGLE-FLOAT-EXPONENT-BYTE"
                "SINGLE-FLOAT-HIDDEN-BIT" "SINGLE-FLOAT-NORMAL-EXPONENT-MAX"
                "SINGLE-FLOAT-NORMAL-EXPONENT-MIN" "SINGLE-FLOAT-SIGNIFICAND-BYTE"
                "SINGLE-FLOAT-SIZE" "SINGLE-FLOAT-TRAPPING-NAN-BIT"
-               "SINGLE-FLOAT-WIDETAG" "SINGLE-FLOAT-VALUE-SLOT"
+               "SINGLE-FLOAT-WIDETAG"
+               #-64-bit "SINGLE-FLOAT-VALUE-SLOT"
                "SINGLE-REG-SC-NUMBER" "SINGLE-STACK-SC-NUMBER"
                "SINGLE-STEP-AROUND-TRAP"
                "SINGLE-STEP-BEFORE-TRAP"
+               "SINGLE-STEP-BREAKPOINT-TRAP"
+               "INVALID-ARG-COUNT-TRAP"
                "SINGLE-VALUE-RETURN-BYTE-OFFSET" "SLOT-DOCS"
                "SLOT-NAME" "SLOT-OFFSET" "SLOT-OPTIONS"
                "SLOT-SPECIAL"
-               "SLOT-REST-P" "*STATIC-FUNS*" "STATIC-FUN-OFFSET"
+               "SLOT-REST-P" "+STATIC-FDEFNS+" "STATIC-FUN-OFFSET"
+               "%SPACE-BOUNDS" "SPACE-BYTES"
                "STATIC-SYMBOL-OFFSET" "STATIC-SYMBOL-P"
-               "*STATIC-SPACE-FREE-POINTER*" "*STATIC-SYMBOLS*"
-               "SYMBOL-HASH-SLOT" "SYMBOL-HEADER-WIDETAG" "SYMBOL-NAME-SLOT"
+               "*STATIC-SPACE-FREE-POINTER*" "+STATIC-SYMBOLS+"
+               "SYMBOL-HASH-SLOT" "SYMBOL-WIDETAG" "SYMBOL-NAME-SLOT"
                "SYMBOL-PACKAGE-SLOT" "SYMBOL-INFO-SLOT"
-               "SYMBOL-SIZE" "SYMBOL-VALUE-SLOT"
-               #!+sb-thread "SYMBOL-TLS-INDEX-SLOT" "SYMBOL-TLS-INDEX"
+               "SYMBOL-SIZE" "SYMBOL-VALUE-SLOT" "SYMBOL-TLS-INDEX-SLOT"
+               "EXTENDED-SYMBOL-SIZE"
                "*BINDING-STACK-START*"
                "*CONTROL-STACK-START*" "*CONTROL-STACK-END*"
                "CONTROL-STACK-POINTER-VALID-P"
                "DYNAMIC-SPACE-START" "DYNAMIC-SPACE-END"
-               #!+gencgc "MAX-DYNAMIC-SPACE-END"
-               #!-gencgc("DYNAMIC-0-SPACE-START"
-                         "DYNAMIC-0-SPACE-END"
-                         "DYNAMIC-1-SPACE-START"
-                         "DYNAMIC-1-SPACE-END")
+               #+gencgc("MAX-DYNAMIC-SPACE-END"
+                         "PAGE-TABLE"
+                         "FIND-PAGE-INDEX"
+                         "NEXT-FREE-PAGE")
+               #-gencgc("DYNAMIC-0-SPACE-START"
+                         "DYNAMIC-0-SPACE-END")
+               #+immobile-space("IMMOBILE-CARD-BYTES"
+                                 "FIXEDOBJ-SPACE-START" "FIXEDOBJ-SPACE-SIZE"
+                                 "VARYOBJ-SPACE-START" "VARYOBJ-SPACE-SIZE"
+                                 "*FIXEDOBJ-SPACE-FREE-POINTER*"
+                                 "*VARYOBJ-SPACE-FREE-POINTER*")
                "READ-ONLY-SPACE-START" "READ-ONLY-SPACE-END"
                "STATIC-SPACE-START" "STATIC-SPACE-END"
-               #!+linkage-table("LINKAGE-TABLE-SPACE-START"
+               #+linkage-table("LINKAGE-TABLE-SPACE-START"
                                 "LINKAGE-TABLE-SPACE-END"
                                 "LINKAGE-TABLE-ENTRY-SIZE")
-               #!+sb-safepoint "GC-SAFEPOINT-PAGE-ADDR"
+               #+sb-safepoint "GC-SAFEPOINT-PAGE-ADDR"
+               #+sb-safepoint "GC-SAFEPOINT-TRAP-OFFSET"
                "TLS-SIZE" "N-WIDETAG-BITS" "WIDETAG-MASK"
                "UNBOUND-MARKER-WIDETAG"
+               "UNDEFINED-FUNCTION-TRAP"
                "NO-TLS-VALUE-MARKER-WIDETAG"
                "UNSIGNED-REG-SC-NUMBER" "UNSIGNED-STACK-SC-NUMBER"
-               "UNWIND-BLOCK-CURRENT-CODE-SLOT" "UNWIND-BLOCK-CURRENT-CONT-SLOT"
-               "UNWIND-BLOCK-CURRENT-UWP-SLOT" "UNWIND-BLOCK-ENTRY-PC-SLOT"
-               "UNWIND-BLOCK-SIZE" "VALUE-CELL-HEADER-WIDETAG" "VALUE-CELL-SIZE"
+               "UNWIND-BLOCK-CODE-SLOT" "UNWIND-BLOCK-CFP-SLOT"
+               "UNWIND-BLOCK-UWP-SLOT" "UNWIND-BLOCK-ENTRY-PC-SLOT"
+               "UNWIND-BLOCK-SIZE" "VALUE-CELL-WIDETAG" "VALUE-CELL-SIZE"
                "VALUE-CELL-VALUE-SLOT" "VECTOR-DATA-OFFSET" "VECTOR-LENGTH-SLOT"
                "VECTOR-NORMAL-SUBTYPE"
-               "VECTOR-VALID-HASHING-SUBTYPE"
-               "WEAK-POINTER-BROKEN-SLOT" "WEAK-POINTER-NEXT-SLOT"
+               "VECTOR-WEAK-SUBTYPE"
+               "VECTOR-WEAK-VISITED-SUBTYPE"
+               "VECTOR-HASHING-SUBTYPE"
+               "VECTOR-ADDR-HASHING-SUBTYPE"
+               "WEAK-POINTER-NEXT-SLOT"
                "WEAK-POINTER-SIZE" "WEAK-POINTER-WIDETAG"
                "WEAK-POINTER-VALUE-SLOT"
-               "N-WORD-BITS" "N-WORD-BYTES" "N-MACHINE-WORD-BITS"
+               "N-WORD-BITS" "N-WORD-BYTES" "N-MACHINE-WORD-BITS" "N-MACHINE-WORD-BYTES"
                "WORD-REG-SC-NUMBER" "WORD-SHIFT"
-               #!+win32 "CONTEXT-RESTORE-TRAP"
+               #+win32 "CONTEXT-RESTORE-TRAP"
                "ZERO-SC-NUMBER"))
 
    #s(sb-cold:package-data
-      :name "SB!WALKER"
-      :doc "internal: a code walker used by PCL"
-      :use ("CL" "SB!INT" "SB!EXT")
-      :export ("DEFINE-WALKER-TEMPLATE"
-               "WALK-FORM"
-               "*WALK-FORM-EXPAND-MACROS-P*"
-               "VAR-LEXICAL-P" "VAR-SPECIAL-P"
-               "VAR-GLOBALLY-SPECIAL-P"
-               "VAR-DECLARATION"
+      :name "SB-RBTREE"
+      :doc "internal: red/black tree"
+      :use ("CL" "SB-INT" "SB-EXT")
+      :shadow ("DELETE")
+      :export ("INSERT" "DELETE" "FIND=" "FIND<="))
 
-               ;; These were exported from the original PCL version of this
-               ;; package, but aren't used in SBCL.
-               ;;"NESTED-WALK-FORM" "MACROEXPAND-ALL"
-               ))
-
-   #!+sb-eval
    #s(sb-cold:package-data
-      :name "SB!EVAL"
+      :name "SB-WALKER"
+      :doc "internal: a code walker used by PCL"
+      :use ("CL" "SB-INT" "SB-EXT"))
+
+   #+sb-eval
+   #s(sb-cold:package-data
+      :name "SB-EVAL"
       :doc "internal: the evaluator implementation used to execute code without compiling it."
-      :use ("CL" "SB!KERNEL" "SB!EXT")
+      :use ("CL" "SB-KERNEL" "SB-EXT" "SB-INT")
       :reexport ("*EVAL-CALLS*")
-      :export ("INTERPRETED-FUNCTION"
-               "INTERPRETED-FUNCTION-P"
-               "INTERPRETED-FUNCTION-NAME"
+      :export ("INTERPRETED-FUNCTION-NAME"
                "INTERPRETED-FUNCTION-DEBUG-NAME"
                "INTERPRETED-FUNCTION-LAMBDA-LIST"
                "INTERPRETED-FUNCTION-DEBUG-LAMBDA-LIST"
@@ -3083,23 +3425,55 @@ structure representations"
                "EVAL-IN-ENVIRONMENT"
                "MAKE-NULL-ENVIRONMENT"
                "EVAL-IN-NATIVE-ENVIRONMENT"
-               "PREPARE-FOR-COMPILE"
                "*EVAL-LEVEL*"))
 
-   #!+win32
+   #+sb-fasteval
    #s(sb-cold:package-data
-      :name "SB!WIN32"
+      :name "SB-INTERPRETER"
+      :doc "internal: a new EVAL implementation with semantic preprocessing."
+      :use ("CL" "SB-KERNEL" "SB-EXT" "SB-INT")
+      :export ("BASIC-ENV"
+               "ENV-POLICY"
+               "EVAL-IN-ENVIRONMENT"
+               "FIND-LEXICAL-FUN"
+               "FIND-LEXICAL-VAR"
+               "FUN-LAMBDA-EXPRESSION"
+               "FUN-LAMBDA-LIST"
+               "FUN-PROTO-FN"
+               "FUN-SOURCE-LOCATION"
+               "%FUN-TYPE" ; to avoid conflict with SB-KERNEL:FUN-TYPE
+               "LEXENV-FROM-ENV"
+               "LIST-LOCALS"
+               "PROTO-FN-DOCSTRING"
+               "PROTO-FN-NAME"
+               "PROTO-FN-PRETTY-ARGLIST"
+               "TYPE-CHECK")
+      :import-from (("SB-C"
+                     "PARSE-EVAL-WHEN-SITUATIONS"
+                     "MAKE-GLOBAL-VAR" "MAKE-LAMBDA-VAR"
+                     "*LEXENV*")
+                    ("SB-VM" "SYMBOL-EXTRA-SLOT-P" "SYMBOL-EXTRA")
+                    ("SB-ALIEN" "%HEAP-ALIEN" "ALIEN-VALUE")
+                    ("SB-KERNEL" "%%TYPEP")))
+
+   #+win32
+   #s(sb-cold:package-data
+      :name "SB-WIN32"
       :doc "private: a wrapper layer for Win32 functions needed by
 SBCL itself"
-      :use ("CL" "SB!ALIEN" "SB!EXT" "SB!INT" "SB!SYS")
+      :use ("CL" "SB-ALIEN" "SB-EXT" "SB-INT" "SB-SYS")
       :export ("BOOL"
                "CLOSE-HANDLE"
                "CREATE-FILE"
                "CREATE-FILE-MAPPING"
                "CRYPT-GEN-RANDOM"
                "DWORD"
-               "FD-CLEAR-INPUT"
-               "FD-LISTEN"
+               "HANDLE-CLEAR-INPUT"
+               "HANDLE-LISTEN"
+               "EXCEPTION"
+               "EXCEPTION-RECORD"
+               "EXCEPTION-CONTEXT"
+               "EXCEPTION-CODE"
                "FILE-CREATE-ALWAYS"
                "FILE-CREATE-NEW"
                "FILE-OPEN-ALWAYS"
@@ -3131,3 +3505,141 @@ SBCL itself"
                "WAIT-OBJECT-OR-SIGNAL"
                "WRITE-FILE"
                "WITH-PROCESS-TIMES")))
+
+;;; The following symbols may be referenced without seeing a definition
+;;; during make-host-2. No warning will result.
+;;; This list is read after packages are created from the data above.
+((;; CL, EXT, KERNEL
+  allocate-instance
+  compute-applicable-methods
+  slot-makunbound
+  make-load-form-saving-slots
+  sb-vm::remove-static-links)
+ ;; CLOS implementation
+ (sb-mop:class-finalized-p
+  sb-mop:class-prototype
+  sb-mop:class-slots
+  sb-mop:eql-specializer-object
+  sb-mop:finalize-inheritance
+  sb-mop:generic-function-name
+  (setf sb-mop:generic-function-name)
+  sb-mop:slot-definition-allocation
+  sb-mop:slot-definition-name
+  sb-pcl::%force-cache-flushes
+  sb-pcl::check-wrapper-validity
+  sb-pcl::class-has-a-forward-referenced-superclass-p
+  sb-pcl::class-wrapper
+  sb-pcl::compute-gf-ftype
+  sb-pcl::definition-source
+  sb-pcl::ensure-accessor
+  sb-pcl:ensure-class-finalized)
+ ;; CLOS-based packages
+ (sb-gray:stream-clear-input
+  sb-gray:stream-clear-output
+  sb-gray:stream-file-position
+  sb-gray:stream-finish-output
+  sb-gray:stream-force-output
+  sb-gray:stream-fresh-line
+  sb-gray:stream-line-column
+  sb-gray:stream-line-length
+  sb-gray:stream-listen
+  sb-gray:stream-peek-char
+  sb-gray:stream-read-byte
+  sb-gray:stream-read-char
+  sb-gray:stream-read-char-no-hang
+  sb-gray:stream-read-line
+  sb-gray:stream-read-sequence
+  sb-gray:stream-terpri
+  sb-gray:stream-unread-char
+  sb-gray:stream-write-byte
+  sb-gray:stream-write-char
+  sb-gray:stream-write-sequence
+  sb-gray:stream-write-string
+  sb-sequence:concatenate
+  sb-sequence:copy-seq
+  sb-sequence:count
+  sb-sequence:count-if
+  sb-sequence:count-if-not
+  sb-sequence:delete
+  sb-sequence:delete-duplicates
+  sb-sequence:delete-if
+  sb-sequence:delete-if-not
+  (setf sb-sequence:elt)
+  sb-sequence:elt
+  sb-sequence:emptyp
+  sb-sequence:fill
+  sb-sequence:find
+  sb-sequence:find-if
+  sb-sequence:find-if-not
+  (setf sb-sequence:iterator-element)
+  sb-sequence:iterator-endp
+  sb-sequence:iterator-step
+  sb-sequence:length
+  sb-sequence:make-sequence-iterator
+  sb-sequence:make-sequence-like
+  sb-sequence:map
+  sb-sequence:merge
+  sb-sequence:mismatch
+  sb-sequence:nreverse
+  sb-sequence:nsubstitute
+  sb-sequence:nsubstitute-if
+  sb-sequence:nsubstitute-if-not
+  sb-sequence:position
+  sb-sequence:position-if
+  sb-sequence:position-if-not
+  sb-sequence:reduce
+  sb-sequence:remove
+  sb-sequence:remove-duplicates
+  sb-sequence:remove-if
+  sb-sequence:remove-if-not
+  sb-sequence:replace
+  sb-sequence:reverse
+  sb-sequence:search
+  sb-sequence:sort
+  sb-sequence:stable-sort
+  sb-sequence:subseq
+  sb-sequence:substitute
+  sb-sequence:substitute-if
+  sb-sequence:substitute-if-not)
+ ;; Fast interpreter
+ #+sb-fasteval
+ (sb-interpreter:%fun-type
+  sb-interpreter:env-policy
+  sb-interpreter:eval-in-environment
+  sb-interpreter:find-lexical-fun
+  sb-interpreter:find-lexical-var
+  sb-interpreter::flush-everything
+  sb-interpreter::fun-lexically-notinline-p
+  sb-interpreter:lexenv-from-env
+  sb-interpreter::lexically-unlocked-symbol-p
+  sb-interpreter:list-locals
+  sb-interpreter::reconstruct-syntactic-closure-env)
+ ;; Other
+ (sb-debug::find-interrupted-name-and-frame
+  sb-impl::encapsulate-generic-function
+  sb-impl::encapsulated-generic-function-p
+  sb-impl::get-processes-status-changes
+  sb-impl::step-form
+  sb-impl::step-values
+  sb-impl::stringify-package-designator
+  sb-impl::stringify-string-designator
+  sb-impl::stringify-string-designators
+  sb-impl::unencapsulate-generic-function)
+ ;; The following functions are in fact defined during make-host-2
+ ;; but they are non-toplevel so they appear to be undefined.
+ (sb-int:gensymify*
+  sb-int:keywordicate
+  sb-int:package-symbolicate
+  sb-int:symbolicate
+  sb-kernel::preinform-compiler-about-accessors
+  sb-kernel::preinform-compiler-about-slot-functions
+  sb-impl::bytes-per-utf8-character-aref
+  sb-impl::bytes-per-utf8-character-sap-ref-8
+  sb-impl::user-homedir-namestring
+  sb-c::apply-core-fixups
+  sb-c::compiled-debug-info-char-offset
+  sb-c::compiled-debug-info-tlf-number
+  sb-c::fopcompilable-p
+  sb-c::pack-xref-data
+  sb-c::prepare-for-compile
+  sb-sys:reinit-internal-real-time))

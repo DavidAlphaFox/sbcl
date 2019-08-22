@@ -49,34 +49,26 @@
 
 ;;; Used for interning parts of SLOT-NAME-LISTS, as part of
 ;;; PV-TABLE interning -- just to save space.
-(defvar *slot-name-lists* (make-hash-table :test 'equal))
+(define-load-time-global *slot-name-lists* (make-hash-table :test 'equal))
 
 ;;; Used for interning PV-TABLES, keyed by the SLOT-NAME-LISTS
 ;;; used.
-(defvar *pv-tables* (make-hash-table :test 'equal))
+(define-load-time-global *pv-tables* (make-hash-table :test 'equal))
 
 ;;; ...and one lock to rule them. Lock because for certain (rare)
 ;;; cases this lock might be grabbed in the course of method dispatch
 ;;; -- and mostly this is already under the *world-lock*
-(defvar *pv-lock*
+(define-load-time-global *pv-lock*
   (sb-thread:make-mutex :name "pv table index lock"))
 
 (defun intern-pv-table (&key slot-name-lists)
   (flet ((intern-slot-names (slot-names)
-           ;; FIXME: NIL at the head of the list is a remnant from
-           ;; old purged code, that hasn't been quite cleaned up yet.
-           ;; ...but as long as we assume it is there, we may as well
-           ;; assert it.
-           (aver (not (car slot-names)))
-           (or (gethash slot-names *slot-name-lists*)
-               (setf (gethash slot-names *slot-name-lists*) slot-names)))
+           (ensure-gethash slot-names *slot-name-lists* slot-names))
          (%intern-pv-table (snl)
-           (or (gethash snl *pv-tables*)
-               (setf (gethash snl *pv-tables*)
-                     (make-pv-table :slot-name-lists snl
-                                    :pv-size (* 2 (reduce #'+ snl
-                                                          :key (lambda (slots)
-                                                                 (length (cdr slots))))))))))
+           (ensure-gethash
+            snl *pv-tables*
+            (make-pv-table :slot-name-lists snl
+                           :pv-size (* 2 (reduce #'+ snl :key #'length))))))
     (sb-thread:with-mutex (*pv-lock*)
       (%intern-pv-table (mapcar #'intern-slot-names slot-name-lists)))))
 
@@ -88,39 +80,33 @@
                   (slot-accessor-std-p slotd type))))))
 
 (defun slot-missing-info (class slot-name)
-  (flet ((missing (operation)
-           (lambda (object)
-             (slot-missing class object slot-name operation))))
-    (make-slot-info
-     :reader (missing 'slot-value)
-     :boundp (missing 'slot-boundp)
-     :writer (lambda (new-value object)
-               (slot-missing class object slot-name 'setf new-value)))))
+  (make-slot-info
+   :reader (lambda (object)
+             (values (slot-missing class object slot-name 'slot-value)))
+   :boundp (lambda (object)
+             (and (slot-missing class object slot-name 'slot-boundp) t))
+   :writer (lambda (new-value object)
+             (slot-missing class object slot-name 'setf new-value)
+             new-value)))
 
 (defun compute-pv (slot-name-lists wrappers)
-  (unless (listp wrappers)
-    (setq wrappers (list wrappers)))
-  (let (elements)
-    (dolist (slot-names slot-name-lists)
-      (when slot-names
-        (let* ((wrapper (pop wrappers))
-               (std-p (layout-for-std-class-p wrapper))
-               (class (wrapper-class* wrapper)))
-          (dolist (slot-name (cdr slot-names))
-            (let ((cell
-                   (or (find-slot-cell wrapper slot-name)
-                       (cons nil (slot-missing-info class slot-name)))))
-              (push (when (and std-p (use-standard-slot-access-p class slot-name 'all))
-                      (car cell))
-                  elements)
-              (push (or (cdr cell)
-                        (bug "No SLOT-INFO for ~S in ~S" slot-name class))
-                  elements))))))
-    (let* ((n (length elements))
-           (pv (make-array n)))
-      (loop for i from (1- n) downto 0
-         do (setf (svref pv i) (pop elements)))
-      pv)))
+  (let ((wrappers (ensure-list wrappers)))
+    (collect ((pv))
+      (dolist (slot-names slot-name-lists)
+        (when slot-names
+          (let* ((wrapper (pop wrappers))
+                 (std-p (layout-for-std-class-p wrapper))
+                 (class (wrapper-class* wrapper)))
+            (dolist (slot-name slot-names)
+              (destructuring-bind (location . info)
+                  (or (find-slot-cell wrapper slot-name)
+                      (cons nil (slot-missing-info class slot-name)))
+                (unless info
+                  (bug "No SLOT-INFO for ~S in ~S" slot-name class))
+                (pv (when (and std-p (use-standard-slot-access-p class slot-name 'all))
+                      location))
+                (pv info))))))
+      (coerce (pv) 'vector))))
 
 (defun pv-table-lookup (pv-table pv-wrappers)
   (let* ((slot-name-lists (pv-table-slot-name-lists pv-table))
@@ -156,7 +142,8 @@
       (finalize-inheritance class)
       t)))
 
-(declaim (ftype (sfunction (class) class) ensure-class-finalized))
+(declaim (ftype (sfunction (class) class) ensure-class-finalized)
+         (maybe-inline ensure-class-finalized))
 (defun ensure-class-finalized (class)
   (unless (class-finalized-p class)
     (finalize-inheritance class))
@@ -179,11 +166,10 @@
                                                        parameter-or-nil
                                                        env)))
                    (class (find-class class-name nil)))
-              (cond ((not (eq **boot-state** 'complete))
-                     (setq class nil))
+              (cond ((or (not (eq **boot-state** 'complete))
+                         (forward-referenced-class-p class))
+                     (setf class nil))
                     ((and class (not (class-finalized-p class)))
-                     ;; The class itself is never forward-referenced
-                     ;; here, but its superclasses may be.
                      (unless (try-finalize-inheritance class)
                        (when (boundp 'sb-c:*lexenv*)
                          (sb-c:compiler-notify
@@ -414,7 +400,7 @@
                                 `((cons (cdr ,index))))
                         (t
                          +slot-unbound+)))
-         (if (eq ,value +slot-unbound+)
+         (if (unbound-marker-p ,value)
              ,default
              ,value)))))
 
@@ -504,10 +490,10 @@
          (typecase ,index
            ,@(when (or (null kind) (eq kind :instance))
                    `((fixnum (not (and ,slots
-                                       (eq (clos-slots-ref ,slots ,index)
-                                           +slot-unbound+))))))
+                                       (unbound-marker-p
+                                        (clos-slots-ref ,slots ,index)))))))
            ,@(when (or (null kind) (eq kind :class))
-                   `((cons (not (eq (cdr ,index) +slot-unbound+)))))
+                   `((cons (not (unbound-marker-p (cdr ,index))))))
            (t ,default))))))
 
 (defmacro instance-boundp-custom (pv pv-offset parameter)
@@ -526,20 +512,15 @@
 ;;; the correct offset into the pv.
 ;;;
 ;;; But first, oh but first, we sort <slots> a bit so that for each
-;;; argument we have the slots in alphabetical order. This
-;;; canonicalizes the PV-TABLE's a bit and will hopefully lead to
-;;; having fewer PV's floating around. Even if the gain is only
-;;; modest, it costs nothing.
+;;; argument we have the slots in an order defined by
+;;; SYMBOL-OR-CONS-LESSP. This canonicalizes the PV-TABLEs a bit and
+;;; will hopefully lead to having fewer PVs floating around. Even if
+;;; the gain is only modest, it costs nothing.
 (defun slot-name-lists-from-slots (slots)
-  (let ((slots (mutate-slots slots)))
-    (let* ((slot-name-lists
-            (mapcar (lambda (parameter-entry)
-                      (cons nil (mapcar #'car (cdr parameter-entry))))
-                    slots)))
-      (mapcar (lambda (r+snl)
-                (when (or (car r+snl) (cdr r+snl))
-                  r+snl))
-              slot-name-lists))))
+  (mapcar (lambda (parameter-entry)
+            (when (cdr parameter-entry)
+              (mapcar #'car (cdr parameter-entry))))
+          (mutate-slots slots)))
 
 (defun mutate-slots (slots)
   (let ((sorted-slots (sort-slots slots))
@@ -553,34 +534,10 @@
         (incf pv-offset)))
     sorted-slots))
 
-(defun symbol-pkg-name (sym)
-  (let ((pkg (symbol-package sym)))
-    (if pkg (package-name pkg) "")))
-
-;;; FIXME: Because of the existence of UNINTERN and RENAME-PACKAGE,
-;;; the part of this ordering which is based on SYMBOL-PKG-NAME is not
-;;; stable. This ordering is only used in to
-;;; SLOT-NAME-LISTS-FROM-SLOTS, where it serves to "canonicalize the
-;;; PV-TABLE's a bit and will hopefully lead to having fewer PV's
-;;; floating around", so it sounds as though the instability won't
-;;; actually lead to bugs, just small inefficiency. But still, it
-;;; would be better to reimplement this function as a comparison based
-;;; on SYMBOL-HASH:
-;;;   * stable comparison
-;;;   * smaller code (here, and in being able to discard SYMBOL-PKG-NAME)
-;;;   * faster code.
-(defun symbol-lessp (a b)
-  (if (eq (symbol-package a)
-          (symbol-package b))
-      (string-lessp (symbol-name a)
-                    (symbol-name b))
-      (string-lessp (symbol-pkg-name a)
-                    (symbol-pkg-name b))))
-
 (defun symbol-or-cons-lessp (a b)
   (etypecase a
     (symbol (etypecase b
-              (symbol (symbol-lessp a b))
+              (symbol (< (symbol-hash a) (symbol-hash b)))
               (cons t)))
     (cons   (etypecase b
               (symbol nil)
@@ -590,10 +547,9 @@
 
 (defun sort-slots (slots)
   (mapcar (lambda (parameter-entry)
-            (cons (car parameter-entry)
-                  (sort (cdr parameter-entry)   ;slot entries
-                        #'symbol-or-cons-lessp
-                        :key #'car)))
+            (destructuring-bind (name . entries) parameter-entry
+              (cons name (stable-sort entries #'symbol-or-cons-lessp
+                                      :key #'car))))
           slots))
 
 
@@ -809,7 +765,7 @@
                                 ,@(cdddr lmf-params))
                             ,@inner-decls
                             ,@body-sans-decls))))
-                 (mf (%make-method-function fmf nil)))
+                 (mf (%make-method-function fmf)))
             (set-funcallable-instance-function
              mf (method-function-from-fast-function fmf ',(getf initargs 'plist)))
             mf)
@@ -872,8 +828,7 @@
   (pv-table-lookup pv-table (pv-wrappers-from-pv-args pv-parameters)))
 
 (defun pv-wrappers-from-pv-args (&rest args)
-  (loop for arg in args
-        collect (valid-wrapper-of arg)))
+  (mapcar #'valid-wrapper-of args))
 
 (defun pv-wrappers-from-all-args (pv-table args)
   (loop for snl in (pv-table-slot-name-lists pv-table)
@@ -884,6 +839,7 @@
 ;;; Return the subset of WRAPPERS which is used in the cache
 ;;; of PV-TABLE.
 (defun pv-wrappers-from-all-wrappers (pv-table wrappers)
-  (loop for snl in (pv-table-slot-name-lists pv-table) and w in wrappers
+  (loop for snl in (pv-table-slot-name-lists pv-table)
+        and w in wrappers
         when snl
         collect w))

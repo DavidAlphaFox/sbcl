@@ -15,6 +15,13 @@
 (defmethod host-ent-address ((host-ent host-ent))
   (car (host-ent-addresses host-ent)))
 
+(declaim (inline naturalize-unsigned-byte-8-array))
+(defun naturalize-unsigned-byte-8-array (array length)
+  (let ((addr (make-array length :element-type '(unsigned-byte 8))))
+    (dotimes (i length)
+      (setf (elt addr i) (sb-alien:deref array i)))
+    addr))
+
 #-sb-bsd-sockets-addrinfo
 (defun make-host-ent (h &optional errno)
   (when (sb-alien:null-alien h)
@@ -49,13 +56,6 @@
                    :type (sockint::hostent-type h)
                    :aliases aliases
                    :addresses addresses)))
-
-(declaim (inline naturalize-unsigned-byte-8-array)) ; FIXME: out-of-order
-(defun naturalize-unsigned-byte-8-array (array length)
-  (let ((addr (make-array length :element-type '(unsigned-byte 8))))
-    (dotimes (i length)
-      (setf (elt addr i) (sb-alien:deref array i)))
-    addr))
 
 ;;; Resolving
 
@@ -145,12 +145,10 @@ weird stuff - see getaddrinfo(3) for the details."
 \(integer 0 255) with 4 elements in case of an IPv4 address and 16
 elements in case of an IPv6 address, or signals a NAME-SERVICE-ERROR.
 See gethostbyaddr(3) for details."
-    (declare (optimize speed)
-             (vector address))
-    (assert (member (length address) '(4 16) :test #'=))
+    (declare (optimize speed))
     (multiple-value-bind (sockaddr sockaddr-free sockaddr-size address-family)
-        (case (length address)
-          (4
+        (etypecase address
+          ((vector (unsigned-byte 8) 4)
            (let ((sockaddr (sb-alien:make-alien sockint::sockaddr-in)))
              #+darwin (setf (sockint::sockaddr-in-len sockaddr) 16)
              (setf (sockint::sockaddr-in-family sockaddr) sockint::af-inet)
@@ -160,7 +158,7 @@ See gethostbyaddr(3) for details."
              (values sockaddr #'sockint::free-sockaddr-in
                      (sb-alien:alien-size sockint::sockaddr-in :bytes)
                      sockint::af-inet)))
-          (16
+          ((vector (unsigned-byte 8) 16)
            (let ((sockaddr (sb-alien:make-alien sockint::sockaddr-in6)))
              (setf (sockint::sockaddr-in6-family sockaddr) sockint::af-inet6)
              (dotimes (i (length address))
@@ -194,9 +192,6 @@ See gethostbyaddr(3) for details."
 GET-NAME-SERVICE-ERRNO")
 
 (defun name-service-error (where &optional errno)
-  ;; There was a dummy docstring here for the texinfo extractor, but I
-  ;; see no reason for this to be documented in the manual, and removed
-  ;; it. -- JES
   (let ((*name-service-errno* (get-name-service-errno errno)))
     ;; Comment next to NETDB_INTERNAL in netdb.h says "See errno.".
     ;; This special case treatment hasn't actually been tested yet.
@@ -295,7 +290,9 @@ GET-NAME-SERVICE-ERRNO")
              (sb-alien:extern-alien "WSAGetLastError" (function integer))))))
 
 (defun get-name-service-error-message (errno error-code)
+  (declare (ignorable errno error-code))
   #-win32
   (if errno
       (sockint::h-strerror errno)
+      #+sb-bsd-sockets-addrinfo
       (sockint::gai-strerror error-code)))

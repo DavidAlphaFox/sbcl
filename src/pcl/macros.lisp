@@ -26,28 +26,24 @@
 
 (in-package "SB-PCL")
 
-(/show "starting pcl/macros.lisp")
+(defglobal *optimize-speed*
+  '(optimize (speed 3) (safety 0) (sb-ext:inhibit-warnings 3) (debug 0)))
 
 (declaim (declaration
           ;; These nonstandard declarations seem to be used privately
           ;; within PCL itself to pass information around, so we can't
           ;; just delete them.
           %class
+          %parameter
           ;; This declaration may also be used within PCL to pass
           ;; information around, I'm not sure. -- WHN 2000-12-30
           %variable-rebinding))
-
-(/show "done with DECLAIM DECLARATION")
 
 (defun get-declaration (name declarations &optional default)
   (dolist (d declarations default)
     (dolist (form (cdr d))
       (when (and (consp form) (eq (car form) name))
         (return-from get-declaration (cdr form))))))
-
-(/show "pcl/macros.lisp 85")
-
-(/show "pcl/macros.lisp 101")
 
 (defmacro dolist-carefully ((var list improper-list-handler) &body body)
   `(let ((,var nil)
@@ -63,13 +59,35 @@
 ;;;;
 ;;;; This is documented in the CLOS specification.
 
-(/show "pcl/macros.lisp 119")
+(define-condition illegal-class-name-error (error)
+  ((name :initarg :name :reader illegal-class-name-error-name))
+  (:default-initargs :name (missing-arg))
+  (:report (lambda (condition stream)
+             (format stream "~@<~S is not a legal class name.~@:>"
+                     (illegal-class-name-error-name condition)))))
 
-(declaim (inline legal-class-name-p))
-(defun legal-class-name-p (x)
-  (symbolp x))
+(declaim (inline legal-class-name-p check-class-name))
+(defun legal-class-name-p (thing)
+  (symbolp thing))
 
-(defvar *create-classes-from-internal-structure-definitions-p* t)
+(defun check-class-name (thing &optional (allow-nil t))
+  ;; Apparently, FIND-CLASS and (SETF FIND-CLASS) accept any symbol,
+  ;; but DEFCLASS only accepts non-NIL symbols.
+  (if (or (not (legal-class-name-p thing))
+          (and (null thing) (not allow-nil)))
+      (error 'illegal-class-name-error :name thing)
+      thing))
+
+(define-condition class-not-found-error (sb-kernel::cell-error)
+  ((sb-kernel::name :type (satisfies legal-class-name-p)))
+  (:report (lambda (condition stream)
+             (format stream "~@<There is no class named ~
+                             ~/sb-ext:print-symbol-with-prefix/.~@:>"
+                     (sb-kernel::cell-error-name condition)))))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defvar *create-classes-from-internal-structure-definitions-p* t))
+(declaim (always-bound *create-classes-from-internal-structure-definitions-p*))
 
 (declaim (ftype function ensure-non-standard-class))
 (defun find-class-from-cell (symbol cell &optional (errorp t))
@@ -81,28 +99,17 @@
                            (or (condition-classoid-p classoid)
                                (defstruct-classoid-p classoid)))
                   (ensure-non-standard-class symbol classoid))))))
-      (cond ((null errorp) nil)
-            ((legal-class-name-p symbol)
-             (error "There is no class named ~
-                     ~/sb-impl::print-symbol-with-prefix/." symbol))
-            (t
-             (error "~S is not a legal class name." symbol)))))
+      (when errorp
+        (check-class-name symbol)
+        (error 'class-not-found-error :name symbol))))
 
 (defun find-class (symbol &optional (errorp t) environment)
-  (declare (ignore environment))
+  (declare (ignore environment) (explicit-check))
   (find-class-from-cell symbol
                         (find-classoid-cell symbol)
                         errorp))
 
 
-;;; This DEFVAR was originally in defs.lisp, now moved here.
-;;;
-;;; Possible values are NIL, EARLY, BRAID, or COMPLETE.
-(declaim (type (member nil early braid complete) **boot-state**))
-(defglobal **boot-state** nil)
-
-(/show "pcl/macros.lisp 187")
-
 (define-compiler-macro find-class (&whole form
                                    symbol &optional (errorp t) environment)
   (declare (ignore environment))
@@ -112,56 +119,74 @@
            (member **boot-state** '(braid complete)))
       (let ((errorp (not (null (constant-form-value errorp))))
             (cell (make-symbol "CLASSOID-CELL")))
-        `(let ((,cell (load-time-value (find-classoid-cell ',symbol :create t))))
+        `(let ((,cell ,(find-classoid-cell symbol :create t)))
            (or (classoid-cell-pcl-class ,cell)
                ,(if errorp
-                    `(find-class-from-cell ',symbol ,cell t)
+                    `(find-class-from-cell ',symbol ,cell)
                     `(when (classoid-cell-classoid ,cell)
                        (find-class-from-cell ',symbol ,cell nil))))))
       form))
 
-(declaim (ftype function class-wrapper))
-(declaim (inline class-classoid))
-(defun class-classoid (class)
-  (layout-classoid (class-wrapper class)))
-
-(declaim (ftype function %set-class-type-translation update-ctors))
+(declaim (ftype function update-ctors))
 (defun (setf find-class) (new-value name &optional errorp environment)
   (declare (ignore errorp environment))
-  (cond ((legal-class-name-p name)
-         (with-single-package-locked-error
-             (:symbol name "Using ~A as the class-name argument in ~
-                           (SETF FIND-CLASS)"))
-         (with-world-lock ()
-           (let ((cell (find-classoid-cell name :create new-value)))
-             (cond (new-value
-                    (setf (classoid-cell-pcl-class cell) new-value)
-                    (when (eq **boot-state** 'complete)
-                      (let ((classoid (class-classoid new-value)))
-                        (setf (find-classoid name) classoid)
-                        (%set-class-type-translation new-value classoid))))
-                   (cell
-                    (%clear-classoid name cell)))
-             (when (or (eq **boot-state** 'complete)
-                       (eq **boot-state** 'braid))
-               (update-ctors 'setf-find-class :class new-value :name name))
-             new-value)))
-        (t
-         (error "~S is not a legal class name." name))))
+  (check-class-name name)
+  (with-single-package-locked-error
+      (:symbol name "Using ~A as the class-name argument in ~
+                     (SETF FIND-CLASS)"))
+  (with-world-lock ()
+    (let ((cell (find-classoid-cell name :create new-value)))
+      (cond (new-value
+             (setf (classoid-cell-pcl-class cell) new-value)
+             (when (eq **boot-state** 'complete)
+               (let ((classoid (class-classoid new-value)))
+                 (setf (find-classoid name) classoid))))
+            (cell
+             (%clear-classoid name cell)))
+      (when (or (eq **boot-state** 'complete)
+                (eq **boot-state** 'braid))
+        (update-ctors 'setf-find-class :class new-value :name name))
+      new-value)))
 
-(/show "pcl/macros.lisp 241")
+(flet ((call-gf (gf-nameize object slot-name env &optional newval)
+         (aver (constantp slot-name env))
+         `(funcall #',(funcall gf-nameize (constant-form-value slot-name env))
+                   ,@newval ,object)))
+  (defmacro accessor-slot-boundp (object slot-name &environment env)
+    (call-gf 'slot-boundp-name object slot-name env))
+
+  (defmacro accessor-slot-value (object slot-name &environment env)
+    `(truly-the (values t &optional)
+                ,(call-gf 'slot-reader-name object slot-name env)))
+
+  (defmacro accessor-set-slot-value (object slot-name new-value &environment env)
+    ;; Expand NEW-VALUE before deciding not to bind a temp var for OBJECT,
+    ;; which should be eval'd first. We skip the binding if either new-value
+    ;; is constant or a plain variable. This is still subtly wrong if NEW-VALUE
+    ;; is a special, because we'll read it more than once.
+    (setq new-value (%macroexpand new-value env))
+    (let ((bind-object (unless (or (constantp new-value env) (atom new-value))
+                         (let* ((object-var (gensym))
+                                (bind `((,object-var ,object))))
+                           (setf object object-var)
+                           bind)))
+          ;; What's going on by not assuming that #'(SETF x) returns NEW-VALUE?
+          ;; It seems wrong to return anything other than what the SETF fun
+          ;; yielded. By analogy, when the SETF macro changes (SETF (F x) v)
+          ;; into (funcall #'(setf F) ...), it does not insert any code to
+          ;; enforce V as the overall value. So we do we do that here???
+          (form `(let ((.new-value. ,new-value))
+                   ,(call-gf 'slot-writer-name object slot-name env '(.new-value.))
+                   .new-value.)))
+      (if bind-object
+          `(let ,bind-object ,form)
+          form))))
 
 (defmacro function-funcall (form &rest args)
   `(funcall (the function ,form) ,@args))
 
 (defmacro function-apply (form &rest args)
   `(apply (the function ,form) ,@args))
-
-(/show "pcl/macros.lisp 249")
 
 (defun get-setf-fun-name (name)
   `(setf ,name))
-
-(defsetf slot-value set-slot-value)
-
-(/show "finished with pcl/macros.lisp")

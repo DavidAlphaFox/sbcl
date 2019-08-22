@@ -1,13 +1,14 @@
 \input texinfo   @c -*-texinfo-*-
 @c %**start of header
 @setfilename sbcl.info
-@settitle SBCL User Manual
+@documentencoding UTF-8
 @c %**end of header
 @afourwide
+@fonttextsize 10
 @include texinfo-macros.texinfo
 @include variables.texinfo
 @set EDITION 0.1
-@settitle SBCL @value{VERSION} User Manual 
+@settitle SBCL @value{VERSION} User Manual
 
 @c for install-info
 @dircategory Software development
@@ -17,8 +18,9 @@
 
 @copying
 @quotation
-This manual is part of the SBCL software system. See the
-@file{README} file for more information.
+This manual@inlinefmtifelse{info, @comma{} for SBCL version
+@value{VERSION}@comma{}@ , @ }is part of the SBCL software system. See
+the @file{README} file for more information.
 
 This manual is largely derived from the manual for the CMUCL system,
 which was produced at Carnegie Mellon University and later released
@@ -78,25 +80,26 @@ provided with absolutely no warranty. See the @file{COPYING} and
 * Getting Support and Reporting Bugs::
 * Introduction::
 * Starting and Stopping::
-* Compiler::                    
-* Debugger::                    
-* Efficiency::                  
-* Beyond the ANSI Standard::    
-* Foreign Function Interface::  
+* Compiler::
+* Debugger::
+* Efficiency::
+* Beyond the ANSI Standard::
+* External Formats::
+* Foreign Function Interface::
 * Pathnames::
-* Streams::          
-* Package Locks::               
+* Streams::
+* Package Locks::
 * Threading::
 * Timers::
 * Networking::
-* Profiling::                   
-* Contributed Modules::         
-* Deprecated Interfaces::         
-* Concept Index::               
-* Function Index::              
-* Variable Index::              
-* Type Index::                  
-* Colophon::                    
+* Profiling::
+* Contributed Modules::
+* Deprecation::
+* Concept Index::
+* Function Index::
+* Variable Index::
+* Type Index::
+* Colophon::
 @end menu
 
 @end ifnottex
@@ -108,16 +111,17 @@ provided with absolutely no warranty. See the @file{COPYING} and
 @include debugger.texinfo
 @include efficiency.texinfo
 @include beyond-ansi.texinfo
+@include external-formats.texinfo
 @include ffi.texinfo
 @include pathnames.texinfo
 @include streams.texinfo
-@include package-locks.texi-temp
+@include package-locks.texinfo
 @include threading.texinfo
 @include timers.texinfo
 @include sb-bsd-sockets/sb-bsd-sockets.texinfo
 @include profiling.texinfo
 @include contrib-modules.texinfo
-@include deprecated.texinfo
+@include deprecation.texinfo
 @include backmatter.texinfo
 
 @bye

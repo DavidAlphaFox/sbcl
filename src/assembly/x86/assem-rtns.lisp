@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; RETURN-MULTIPLE
 
@@ -226,7 +226,7 @@
   LOOP
 
   (let ((error (gen-label)))
-    (assemble (*elsewhere*)
+    (assemble (:elsewhere)
       (emit-label error)
 
       ;; Fake up a stack frame so that backtraces come out right.
@@ -248,11 +248,13 @@
   EXIT
 
   ;; Here EAX points to catch block containing symbol pointed to by EDX.
+  ;; An extra RET gets stuffed after the JMP, but oh well. You can't just change
+  ;; the :return-style to :none because that also affects the call sequence.
   (inst jmp (make-fixup 'unwind :assembly-routine)))
 
 ;;;; non-local exit noise
 
-#!-win32
+#-win32
 (define-assembly-routine (unwind
                           (:return-style :none)
                           (:translate %continue-unwind)
@@ -272,7 +274,7 @@
   ;; Does *CURRENT-UNWIND-PROTECT-BLOCK* match the value stored in
   ;; argument's CURRENT-UWP-SLOT?
   (inst cmp uwp
-        (make-ea-for-object-slot block unwind-block-current-uwp-slot 0))
+        (make-ea-for-object-slot block unwind-block-uwp-slot 0))
   ;; If a match, return to context in arg block.
   (inst jmp :e DO-EXIT)
 
@@ -281,14 +283,14 @@
   (move edx-tn block)
   (move block uwp)
   ;; Set next unwind protect context.
-  (loadw uwp uwp unwind-block-current-uwp-slot)
+  (loadw uwp uwp unwind-block-uwp-slot)
   ;; we're about to reload ebp anyway, so let's borrow it here as a
   ;; temporary.  Hope this works
   (store-tl-symbol-value uwp *current-unwind-protect-block* ebp-tn)
 
   DO-EXIT
 
-  (loadw ebp-tn block unwind-block-current-cont-slot)
+  (loadw ebp-tn block unwind-block-cfp-slot)
 
   ;; Uwp-entry expects some things in known locations so that they can
   ;; be saved on the stack: the block in edx-tn, start in ebx-tn, and
@@ -299,7 +301,7 @@
 
 ;;;; Win32 non-local exit noise
 
-#!+win32
+#+win32
 (define-assembly-routine (unwind
                           (:return-style :none)
                           (:policy :fast-safe))
@@ -324,12 +326,8 @@
   (dotimes (i 8)
     (inst fstp fr0-tn))
 
-  ;; I'm unlikely to ever forget this again.
+  ;; ABI requires this
   (inst cld)
-
-  ;; Set up a bogus stack frame for RtlUnwind to pick its return
-  ;; address from.  (Yes, this is how RtlUnwind works.)
-  (inst push (make-fixup 'win32-unwind-tail :assembly-routine))
   (inst push ebp-tn)
   (inst mov ebp-tn esp-tn)
 
@@ -338,22 +336,10 @@
   (inst push 0)
   (inst push 0)
   (inst push ecx-tn)
-  (inst call (make-fixup "RtlUnwind" :foreign)))
 
-;; We want no VOP for this one and for it to only happen on Win32
-;; targets.  Hence the following disaster.
-#!+#.(cl:if (cl:member sb-assembling cl:*features*) win32 '(or))
-(define-assembly-routine
-    (win32-unwind-tail (:return-style :none))
-    ((:temp block unsigned-reg eax-offset))
+  (inst call (make-fixup "RtlUnwind" :foreign))
 
-  ;; The unwind returns here.  Had to use a VOP for this because
-  ;; PUSH won't accept a label as an argument.
-
-  ;; Clean up the bogus stack frame we pushed for the unwind.
   (inst pop ebp-tn)
-  (inst pop esi-tn) ;; Random scratch register.
-
   ;; This section based on VOP CALL-OUT.
   ;; Restore the NPX for lisp; ensure no regs are empty
   (dotimes (i 8)
@@ -364,18 +350,17 @@
 
   ;; By now we've unwound all the UWP frames required, so we
   ;; just jump to our target block.
-  (loadw ebp-tn block unwind-block-current-cont-slot)
+  (loadw ebp-tn block unwind-block-cfp-slot)
 
   ;; Nlx-entry expects the arg start in ebx-tn and the arg count
   ;; in ecx-tn.  Fortunately, that's where they are already.
   (inst jmp (make-ea-for-object-slot block unwind-block-entry-pc-slot 0)))
 
-
 ;;;; Win32 UWP block SEH interface.
 
 ;; We want no VOP for this one and for it to only happen on Win32
-;; targets.  Hence the following disaster.
-#!+#.(cl:if (cl:member sb-assembling cl:*features*) win32 '(or))
+;; targets.
+#+(and sb-assembling win32)
 (define-assembly-routine
     (uwp-seh-handler (:return-style :none))
     ((:temp block unsigned-reg eax-offset))
@@ -439,7 +424,7 @@
                                        n-word-bytes))))
 
   ;; Update *CURRENT-UNWIND-PROTECT-BLOCK*.
-  (loadw ebx-tn block unwind-block-current-uwp-slot)
+  (loadw ebx-tn block unwind-block-uwp-slot)
   (store-tl-symbol-value ebx-tn *current-unwind-protect-block* ecx-tn)
 
   ;; Uwp-entry expects some things in known locations so that they can
@@ -451,10 +436,10 @@
   (inst xor ebx-tn ebx-tn)
   (inst xor ecx-tn ecx-tn)
   (inst mov ebx-tn ebp-tn)
-  (loadw ebp-tn block unwind-block-current-cont-slot)
+  (loadw ebp-tn block unwind-block-cfp-slot)
   (inst jmp (make-ea-for-object-slot block unwind-block-entry-pc-slot 0)))
 
-#!+win32
+#+win32
 (define-assembly-routine (continue-unwind
                           (:return-style :none)
                           (:translate %continue-unwind)
@@ -490,3 +475,78 @@
   ;; And we're done.
   (inst mov eax-tn 1) ;; exception-continue-search
   (inst ret))
+
+#+sb-assembling
+(define-assembly-routine (code-header-set (:return-style :none)) ()
+  (inst push eax-tn)
+  (inst push edx-tn)
+  (inst push edi-tn)
+  ;; stack: spill[3], ret-pc, object, index, value-to-store
+
+  (symbol-macrolet ((object (make-ea :dword :base esp-tn :disp 16))
+                    (word-index (make-ea :dword :base esp-tn :disp 20))
+                    (newval (make-ea :dword :base esp-tn :disp 24))
+                    (prefix #+(and sb-thread (not win32)) :fs
+                            #-(and sb-thread (not win32)) nil))
+    (flet ((thread-slot-ea (slot-index)
+             (make-ea :dword
+                      #+(or (not sb-thread) win32) :base #+(or (not sb-thread) win32) edi-tn
+                      :disp (ash slot-index word-shift))))
+      #-sb-thread
+      (progn
+        ;; Load 'all_threads' into EDI (which was already spilled)
+        ;; as the register with which to access thread slots.
+        #+sb-dynamic-core
+        (progn
+          (inst mov edi-tn
+                (make-ea :dword :disp (make-fixup "all_threads" :foreign-dataref)))
+          (inst mov edi-tn (make-ea :dword :base edi-tn)))
+        #-sb-dynamic-core
+        (inst mov edi-tn (make-ea :dword :disp (make-fixup "all_threads" :foreign))))
+      #+(and win32 sb-thread)
+      (inst mov edi-tn (make-ea :dword :disp +win32-tib-arbitrary-field-offset+) :fs)
+
+      (inst mov eax-tn object) ; object
+      (inst sub eax-tn (thread-slot-ea thread-dynspace-addr-slot) prefix)
+      (inst shr eax-tn (1- (integer-length gencgc-card-bytes)))
+      (pseudo-atomic ()
+        (assemble ()
+          (inst cmp eax-tn (thread-slot-ea thread-dynspace-card-count-slot)
+                prefix)
+          (inst jmp :ae STORE) ; not dynamic space
+          ;; sizeof (struct page) depends on GENCGC-CARD-BYTES
+          ;; It's 4+2+1+1 = 8 bytes if GENCGC-CARD-BYTES is (unsigned-byte 16),
+          ;; or   4+4+1+1 = 10 bytes (rounded to 12) if wider than (unsigned-byte 16).
+          ;; See the corresponding alien structure definition in 'room.lisp'
+          (cond ((typep gencgc-card-bytes '(unsigned-byte 16))
+                 (inst shl eax-tn 3) ; multiply by 8
+                 (inst add eax-tn (thread-slot-ea thread-dynspace-pte-base-slot)
+                       prefix)
+                 ;; clear WP - bit index 5 of flags byte
+                 (inst and (make-ea :byte :base eax-tn :disp 6) (lognot (ash 1 5))
+                       :lock))
+                (t
+                 (inst lea eax-tn ; multiply by 3
+                       (make-ea :dword :base eax-tn :index eax-tn :scale 2))
+                 (inst shl eax-tn 2) ; then by 4, = 12
+                 (inst add eax-tn (thread-slot-ea thread-dynspace-pte-base-slot)
+                       prefix)
+                 ;; clear WP
+                 (inst and (make-ea :byte :base eax-tn :disp 8) (lognot (ash 1 5))
+                       :lock)))
+          STORE
+          (inst mov edi-tn object)
+          (inst mov edx-tn word-index)
+          (inst mov eax-tn newval)
+          ;; set 'written' flag in the code header
+          (inst or (make-ea :byte :base edi-tn :disp (- 3 other-pointer-lowtag))
+                #x40 :lock)
+          ;; store newval into object
+          (inst mov (make-ea :dword :base edi-tn
+                             :index edx-tn :scale (ash 1 word-shift)
+                             :disp (- other-pointer-lowtag))
+                eax-tn)))))
+  (inst pop edi-tn) ; restore
+  (inst pop edx-tn)
+  (inst pop eax-tn)
+  (inst ret 12)) ; remove 3 stack args

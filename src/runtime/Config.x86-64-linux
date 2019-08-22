@@ -13,7 +13,7 @@ NM = ./linux-nm
 
 ASSEM_SRC = x86-64-assem.S ldso-stubs.S
 ARCH_SRC = x86-64-arch.c
-OS_SRC = linux-os.c x86-64-linux-os.c
+OS_SRC = linux-os.c linux-mman.c x86-64-linux-os.c
 
 # The "--Wl,--export-dynamic" flags are here to help people
 # experimenting with callbacks from C to SBCL, by allowing linkage to
@@ -42,9 +42,19 @@ ifdef LISP_FEATURE_SB_CORE_COMPRESSION
   OS_LIBS += -lz
 endif
 
-CFLAGS += -fno-omit-frame-pointer
+CFLAGS += -Wunused-parameter -fno-omit-frame-pointer -momit-leaf-frame-pointer
+CPPFLAGS += -include memcpy.h
 
-GC_SRC = gencgc.c
+ifdef LISP_FEATURE_IMMOBILE_SPACE
+  GC_SRC = fullcgc.c gencgc.c traceroot.c immobile-space.c elf.c
+else
+  GC_SRC = fullcgc.c gencgc.c traceroot.c
+endif
+
+ifdef LISP_FEATURE_SB_LINKABLE_RUNTIME
+  LIBSBCL = sbcl.o
+  USE_LIBSBCL = sbcl.o
+endif
 
 # Nothing to do for after-grovel-headers.
 .PHONY: after-grovel-headers

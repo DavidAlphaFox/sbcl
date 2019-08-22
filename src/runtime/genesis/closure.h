@@ -11,8 +11,8 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_CLOSURE
-#define SBCL_GENESIS_CLOSURE 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_CLOSURE
+#ifndef __ASSEMBLER__
 
 struct closure {
     lispobj header;
@@ -20,14 +20,15 @@ struct closure {
     lispobj info[1];
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
 #define CLOSURE_FUN_OFFSET -3
 #define CLOSURE_INFO_OFFSET 5
+#define CLOSURE_SIZE 2
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_CLOSURE */
+#endif

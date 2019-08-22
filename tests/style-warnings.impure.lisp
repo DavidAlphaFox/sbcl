@@ -16,6 +16,9 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
+;; These tests don't work unless compiling
+#+interpreter (sb-ext:exit :code 104)
+
 (defun f-with-macro (arg) (list arg))
 (defun f2-with-macro (a b) (list a b))
 (defun map-f-with-macro (l) (mapcar #'f-with-macro l))
@@ -39,10 +42,12 @@
 (test-util:with-test (:name :compiler-macro-order-bug)
   ;; There is one explicit NOTINLINE, but we still get a warning.
   (assert-signal
-   (define-compiler-macro f-with-macro (arg) `(list ,arg)))
+   (define-compiler-macro f-with-macro (arg) `(list ,arg))
+   sb-c:compiler-macro-application-missed-warning)
   ;; To exercise both cases of the ~:P directive in the warning message.
   (assert-signal
-   (define-compiler-macro f2-with-macro (a b) `(list ,a ,b)))
+   (define-compiler-macro f2-with-macro (a b) `(list ,a ,b))
+   sb-c:compiler-macro-application-missed-warning)
 
   ;; There is a local notinline decl, so no warning about a compiler-macro.
   (assert-no-signal
@@ -57,7 +62,7 @@
 (defun use-h (x) (list (h x) (h x)))
 (with-test (:name :inline-failure-1)
   (assert-signal (declaim (inline g h))
-                 sb-c:inlining-dependency-failure))
+                 sb-c:inlining-dependency-failure 2))
 
 (declaim (inline fast-guy))
 (with-test (:name :inline-failure-2a)
@@ -66,10 +71,19 @@
 
 (defun zippy (y) y)
 (with-test (:name :inline-failure-2b)
-  (defun baz (arg) (declare (inline zippy)) (zippy arg)))
+  (assert-signal
+   (eval '(defun baz (arg) (declare (inline zippy)) (zippy arg)))
+   sb-c:inlining-dependency-failure))
+
+(locally (declare (muffle-conditions style-warning))
+  (defun foofy1 (x) (and (somestruct-p x) 'hi)))
+
+(test-util:with-test (:name :structure-pred-inline-failure)
+ (assert-signal (defstruct somestruct a b)
+                sb-c:inlining-dependency-failure))
 
 (test-util:with-test (:name :redef-macro-same-file)
-  (let* ((lisp "compiler-impure-tmp.lisp")
+  (let* ((lisp (scratch-file-name "lisp"))
          (fasl (compile-file-pathname lisp)))
     (unwind-protect
          (let ((redef-count 0))

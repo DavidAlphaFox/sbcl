@@ -14,20 +14,29 @@
 all: targets tags
 TARGET=sbcl
 
+# Allow using paxctl(8) or similar programs to adjust PaX permissions
+# of src/runtime/sbcl during the build.
+SBCL_PAXCTL ?= :
+
 # Defaults which might be overridden or modified by values in the
 # Config file. Most of them are same on most systems right now.
 # If you need to override one of these, do it in Config.
-LD = ld
-LINKFLAGS = -g
+LINKFLAGS += -g
 NM = nm -gp
 DEPEND_FLAGS = -MM
 GREP = grep
+LD = ld
+
+# By default, don't make and use a library, just use the object files.
+LIBSBCL = $(OBJS)
+USE_LIBSBCL = $(OBJS)
+__LDFLAGS__ =
 
 include ../../output/prefix.def
 
-CFLAGS = -g -Wall -Wsign-compare -O3
-ASFLAGS = $(CFLAGS)
-CPPFLAGS = -I. -DSBCL_PREFIX=\"$(SBCL_PREFIX)\"
+CFLAGS += -g -Wall -Wundef -Wsign-compare -Wpointer-arith -O3
+ASFLAGS += $(CFLAGS)
+CPPFLAGS += -I. -DSBCL_PREFIX=\"$(SBCL_PREFIX)\"
 
 # Give make access to the target Lisp features.
 include genesis/Makefile.features
@@ -37,28 +46,101 @@ include genesis/Makefile.features
 # Config-foo file for setup foo, then arrange for Config to be a
 # symlink to Config-foo.
 # Commonly used variables in Config are: ARCH_SRC, ASSEM_SRC, GC_SRC,
-# OS_SRC, OS_LIBS, OS_OBJS, OS_CLEAN_FILES
+# OS_SRC, OS_LIBS, OS_CLEAN_FILES
 include Config
 
-COMMON_SRC = alloc.c backtrace.c breakpoint.c coreparse.c \
-	dynbind.c funcall.c gc-common.c globals.c interr.c interrupt.c \
-	largefile.c monitor.c os-common.c parse.c print.c purify.c \
-	pthread-futex.c \
-	regnames.c run-program.c runtime.c safepoint.c save.c search.c \
-	thread.c time.c util.c validate.c vars.c wrap.c
+# Disable PIE when possible
+ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]no-pie'),)
+CFLAGS += -fno-pie
+LINKFLAGS += -no-pie
+LDFLAGS += -no-pie
+__LDFLAGS__ += -no-pie
+endif
+ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]nopie'),)
+CFLAGS += -fno-pie
+LINKFLAGS += -nopie
+LDFLAGS += -nopie
+__LDFLAGS__ += -nopie
+endif
+
+COMMON_SRC = alloc.c backtrace.c breakpoint.c coalesce.c coreparse.c    \
+	dynbind.c funcall.c gc-common.c globals.c hopscotch.c           \
+	interr.c interrupt.c largefile.c main.c                         \
+	monitor.c murmur_hash.c os-common.c parse.c print.c             \
+	purify.c pthread-futex.c regnames.c run-program.c runtime.c     \
+	safepoint.c save.c sc-offset.c search.c thread.c time.c         \
+	validate.c var-io.c vars.c wrap.c
 
 C_SRC = $(COMMON_SRC) ${ARCH_SRC} ${OS_SRC} ${GC_SRC}
 
 SRCS = $(C_SRC) ${ASSEM_SRC}
 
-OBJS = $(C_SRC:.c=.o) $(ASSEM_SRC:.S=.o) ${OS_OBJS}
+OBJS = $(C_SRC:.c=.o) $(ASSEM_SRC:.S=.o)
 
 LIBS = ${OS_LIBS} -lm
 
-targets: $(TARGET) sbcl.nm
+targets: $(TARGET) $(OBJTARGET) sbcl.nm sbcl.mk
 
-$(TARGET): $(OBJS)
-	$(CC) ${LINKFLAGS} -o $@ $^ $(LIBS)
+$(TARGET): $(LIBSBCL)
+	$(CC) ${LINKFLAGS} -o $@ $(USE_LIBSBCL) $(LIBS)
+	$(SBCL_PAXCTL) $@
+
+# Enable compiling gencgc with even more assertions and/or
+# data collection, with COMPILING_TESTS. Not really used yet.
+gc-unit-tests.o: CFLAGS=-DCOMPILING_TESTS
+unit-tests: gc-unit-tests.o libsbcl.a
+	cc -g -no-pie -o $@ $^ -ldl -lpthread -lm
+
+# ld -r -o sbcl.o works on Linux, but not on other platforms.
+# On macOS, it fails to keep debug sections.
+# On mingw64, it leads to an executable that cannot be executed.
+sbcl.o: $(OBJS)
+	$(LD) $(__LDFLAGS__) -r -o $@ $^
+
+libsbcl.a: $(OBJS)
+	rm -f $@ ; ar rcs $@ $^
+
+PIC_OBJS = $(subst .o,.pic.o,$(filter-out ldso-stubs.o,$(OBJS)))
+libsbcl.so: $(PIC_OBJS)
+	cc -shared -o $@ $^ -ldl -lpthread -lm
+# for this to work, you must have with-gcc-tls in your build features already.
+# can't define it here because then it conflicts if you have it in both places.
+%.pic.o: %.c
+	$(CC) -fPIC -c $(filter-out -fno-pie,$(CFLAGS)) $< -o $@
+%.pic.o: %.S # (-fPIC doesn't affect hand-written assembly source)
+	$(CC) -DPOSITION_INDEPENDENT_ASM -c $(CFLAGS) $< -o $@
+testmain: testmain.c libsbcl.so -ldl
+
+SHRINKWRAP_DEPS = ../../output/sbcl.core ../../tools-for-build/editcore.lisp
+shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o: $(SHRINKWRAP_DEPS)
+	../../run-sbcl.sh --script ../../tools-for-build/editcore.lisp split \
+		../../output/sbcl.core shrinkwrap-sbcl.s
+pie-shrinkwrap-sbcl.s pie-shrinkwrap-sbcl-core.o: $(SHRINKWRAP_DEPS)
+	../../run-sbcl.sh --script ../../tools-for-build/editcore.lisp split --pie \
+		../../output/sbcl.core pie-shrinkwrap-sbcl.s
+comma := , # "Commas ... cannot appear in the text of an argument as written"
+shrinkwrap-sbcl: shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o $(LIBSBCL)
+	$(CC) $(filter-out -Wl$(comma)--export-dynamic, $(LINKFLAGS)) \
+ $(CFLAGS) -o $@ $(filter-out ldso-stubs.o, $^) $(LIBS)
+pie-shrinkwrap-sbcl: pie-shrinkwrap-sbcl.s pie-shrinkwrap-sbcl-core.o $(PIC_OBJS)
+	$(CC) -pie -o $@ $^ $(LIBS)
+semiwrap-sbcl: shrinkwrap-sbcl.s $(LIBSBCL)
+	$(CC) $(LINKFLAGS) $(CFLAGS) -o $@ $^ $(LIBS)
+
+sbcl.mk: Config
+	( echo 'CC=$(CC)' ; \
+	  echo 'LD=$(LD)' ; \
+	  echo 'CFLAGS=$(CFLAGS)' ; \
+	  echo 'ASFLAGS=$(ASFLAGS)' ; \
+	  echo 'LINKFLAGS=$(LINKFLAGS)' ; \
+	  echo 'LDFLAGS=$(LDFLAGS)' ; \
+	  echo '__LDFLAGS__=$(__LDFLAGS__)' ; \
+	  echo 'LIBS=$(LIBS)' ; \
+	  if [ -n '$(LISP_FEATURE_SB_LINKABLE_RUNTIME)' ] ; then \
+	    echo 'LIBSBCL=$(LIBSBCL)' ; \
+	    echo 'USE_LIBSBCL=$(USE_LIBSBCL)' ; \
+	  fi ; \
+	  : ) > $@
 
 sbcl.nm: $(TARGET)
 	$(NM) $(TARGET) | $(GREP) -v " [FUw] " > ,$@
@@ -70,8 +152,9 @@ sbcl.h: $(wildcard genesis/*.h)
 
 # || true because we don't want the build to break if etags isn't there.
 # ...but it's still nice to have it done by default.
-TAGS tags: $(SRCS)
-	etags $(SRCS) || true
+HEADERS=$(wildcard *.h genesis/*.h)
+TAGS tags: $(SRCS) $(HEADERS)
+	@etags $(SRCS) $(HEADERS) || true
 
 clean:
 	-rm -f *.[do] $(TARGET) sbcl.nm sbcl.h core *.tmp $(OS_CLEAN_FILES)

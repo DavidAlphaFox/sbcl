@@ -1,7 +1,7 @@
 ;;;
 ;;; Written by William Lott.
 ;;;
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 
@@ -13,7 +13,7 @@
   (:arg-types list)
   (:temporary (:scs (descriptor-reg) :from (:argument 0)) ptr)
   (:temporary (:scs (non-descriptor-reg)) temp)
-  (:temporary (:scs (any-reg) :type fixnum :to (:result 0) :target result)
+  (:temporary (:scs (any-reg) :to (:result 0) :target result)
               count)
   (:results (result :scs (any-reg descriptor-reg)))
   (:policy :fast-safe)
@@ -31,7 +31,7 @@
 
       (emit-label loop)
 
-      (test-type ptr not-list t (list-pointer-lowtag) :temp temp)
+      (test-type ptr temp not-list t (list-pointer-lowtag))
 
       (loadw ptr ptr cons-cdr-slot list-pointer-lowtag)
       (inst addi count count (fixnumize 1))
@@ -41,7 +41,3 @@
 
       (emit-label done)
       (move result count))))
-
-
-(define-static-fun length (object) :translate length)
-

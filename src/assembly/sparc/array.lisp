@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-assembly-routine (allocate-vector
                           (:policy :fast-safe)
@@ -51,6 +51,6 @@
   ;; branch to figure out whether to do it.  Until and unless someone
   ;; demonstrates that gencgc actually gives us uncommitted memory, I'm
   ;; just not doing it at all:  -- DFL
-  #!-gencgc
+  #-gencgc
   (storew zero-tn alloc-tn 0)
   (move result vector))

@@ -9,13 +9,44 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (defknown %load-time-value (t) t (flushable movable))
 
+;;; Compile FORM and arrange for it to be called at load-time. Return
+;;; the dumper handle and our best guess at the type of the object.
+;;; It would be nice if L-T-V forms were generally eligible
+;;; for fopcompilation, as it could eliminate special cases below.
+(defun compile-load-time-value (form &optional no-skip)
+  (acond ((typecase form
+            ;; This case is important for dumping packages as constants
+            ;; in cold-init, but works fine in the normal target too.
+            ((cons (eql find-package) (cons string null)) 'package)
+            ;; Another similar case - this allows the printer to work
+            ;; immediately in cold-init. (See SETUP-PRINTER-STATE.)
+            ((cons (eql function)
+                   (cons (satisfies legal-fun-name-p) null))
+             'function)
+            ;; We want to construct cold classoid cells, but in general
+            ;; FIND-CLASSOID-CELL could be called with :CREATE NIL
+            ;; which can not be handled in cold-load.
+            #+sb-xc-host
+            ((cons (eql find-classoid-cell) (cons (cons (eql quote))))
+             (aver (eq (getf (cddr form) :create) t))
+             'sb-kernel::classoid-cell))
+          (fopcompile form nil t)
+          (values (sb-fasl::dump-pop *compile-object*) (specifier-type it)))
+         (t
+          (let ((lambda (compile-load-time-stuff form t)))
+            (values (fasl-dump-load-time-value-lambda lambda *compile-object*
+                                                      no-skip)
+                    (let ((type (leaf-type lambda)))
+                      (if (fun-type-p type)
+                          (single-value-type (fun-type-returns type))
+                          *wild-type*)))))))
+
 (def-ir1-translator load-time-value
     ((form &optional read-only-p) start next result)
-  #!+sb-doc
   "Arrange for FORM to be evaluated at load-time and use the value produced as
 if it were a constant. If READ-ONLY-P is non-NIL, then the resultant object is
 guaranteed to never be modified, so it can be put in read-only storage."
@@ -35,7 +66,7 @@ guaranteed to never be modified, so it can be put in read-only storage."
                                       (specifier-type 'function))
                                      ((and (legal-fun-name-p op)
                                            (eq :declared (info :function :where-from op)))
-                                      (let ((ftype (info :function :type op)))
+                                      (let ((ftype (global-ftype op)))
                                         (if (fun-type-p ftype)
                                             (fun-type-returns ftype)
                                             *wild-type*)))
@@ -54,33 +85,51 @@ guaranteed to never be modified, so it can be put in read-only storage."
       (setf read-only-p t))
     (if (producing-fasl-file)
         (multiple-value-bind (handle type)
-            ;; Value cells are allocated for non-READ-ONLY-P stop the
-            ;; compiler from complaining about constant modification
-            ;; -- it seems that we should be able to elide them all
-            ;; the time if we had a way of telling the compiler that
-            ;; "this object isn't really a constant the way you
-            ;; think". --NS 2009-06-28
-            (compile-load-time-value (if read-only-p
-                                         form
-                                         `(make-value-cell ,form)))
+            (compile-load-time-value
+             ;; KLUDGE: purify on cheneygc moves everything in code
+             ;; constants into read-only space, value-cell breaks the
+             ;; chain.
+             (cond #-gencgc
+                   ((not read-only-p)
+                    `(make-value-cell ,form))
+                   (t
+                    form)))
           (unless (csubtypep type source-type)
             (setf type source-type))
           (let ((value-form
-                  (if read-only-p
-                      `(%load-time-value ',handle)
-                      `(value-cell-ref (%load-time-value ',handle)))))
-            (the-in-policy type value-form '((type-check . 0))
+                  (cond #-gencgc
+                        ((not read-only-p)
+                         `(value-cell-ref (%load-time-value ',handle)))
+                        (t
+                         `(%load-time-value ',handle)))))
+            (the-in-policy type value-form **zero-typecheck-policy**
                            start next result)))
-        (let* ((value
-                 (handler-case (eval form)
-                   (error (condition)
-                     (compiler-error "(during EVAL of LOAD-TIME-VALUE)~%~A"
-                                     condition)))))
+        ;; When compiling to memory, L-T-V is almost like `(quote ,(eval form)),
+        ;; though see the :COMPILE-LOAD-TIME-VALUE-INTERPRETED-MODE regression test
+        ;; to understand why that is wrong: minimal compilation must occur.
+        ;; Incidentally, it is an extremely subtle issue as to whether ANSI intended
+        ;; to perform compile-time semantic processing of the L-T-V form in the
+        ;; current environment, but then execute in the null environment (obviously)
+        ;; versus do both in the null environment. The distinction is in whether
+        ;;  (LET ((X 3)) (MACROLET ((M () (HAIR))) (LOAD-TIME-VALUE (THING)))
+        ;; can make use of M. We choose to say that it can't.
+        (let ((value (let ((thunk ; Pass T for the EPHEMERAL flag.
+                            (compile-in-lexenv `(lambda () ,form) (make-null-lexenv)
+                                               nil nil nil t nil)))
+                       (handler-case (funcall thunk)
+                         (error (condition)
+                           (compiler-error "(during EVAL of LOAD-TIME-VALUE)~%~A"
+                                           condition))))))
           (if read-only-p
-              (ir1-convert start next result `',value nil)
-              (the-in-policy (ctype-of value) `(value-cell-ref ,(make-value-cell value))
-                             '((type-check . 0))
-                             start next result))))))
+              (ir1-convert start next result `',value)
+              #-gencgc
+              (the-in-policy (ctype-of value)
+                             `(value-cell-ref ,(make-value-cell value))
+                             **zero-typecheck-policy**
+                             start next result)
+              #+gencgc
+              ;; Avoid complaints about constant modification
+              (ir1-convert start next result `(ltv-wrapper ',value)))))))
 
 (defoptimizer (%load-time-value ir2-convert) ((handle) node block)
   (aver (constant-lvar-p handle))

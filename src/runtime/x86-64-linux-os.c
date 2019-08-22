@@ -64,12 +64,16 @@ int arch_os_thread_init(struct thread *thread) {
     /* Signal handlers are run on the control stack, so if it is exhausted
      * we had better use an alternate stack for whatever signal tells us
      * we've exhausted it */
-    sigstack.ss_sp=((void *) thread)+dynamic_values_bytes;
-    sigstack.ss_flags=0;
-    sigstack.ss_size = 32*SIGSTKSZ;
+    sigstack.ss_sp    = calc_altstack_base(thread);
+    sigstack.ss_flags = 0;
+    sigstack.ss_size  = calc_altstack_size(thread);
     if(sigaltstack(&sigstack,0)<0) {
         lose("Cannot sigaltstack: %s\n",strerror(errno));
     }
+#endif
+#ifdef MEMORY_SANITIZER
+    asm("movq %%fs:0, %0\n\tleaq __msan_param_tls@TPOFF(%0), %0"
+        : "=r" (thread->msan_param_tls));
 #endif
     return 1;
 }
@@ -78,7 +82,7 @@ int arch_os_thread_init(struct thread *thread) {
  * defunct.  Not called on live threads
  */
 
-int arch_os_thread_cleanup(struct thread *thread) {
+int arch_os_thread_cleanup(struct thread __attribute__((unused)) *thread) {
     return 1;
 }
 
@@ -86,31 +90,13 @@ int arch_os_thread_cleanup(struct thread *thread) {
 os_context_register_t *
 os_context_register_addr(os_context_t *context, int offset)
 {
-#define RCASE(name) case reg_ ## name: return \
- (os_context_register_t*)&context->uc_mcontext.gregs[REG_ ## name];
-    switch(offset) {
-        RCASE(RAX)
-        RCASE(RCX)
-        RCASE(RDX)
-        RCASE(RBX)
-        RCASE(RSP)
-        RCASE(RBP)
-        RCASE(RSI)
-        RCASE(RDI)
-        RCASE(R8)
-        RCASE(R9)
-        RCASE(R10)
-        RCASE(R11)
-        RCASE(R12)
-        RCASE(R13)
-        RCASE(R14)
-        RCASE(R15)
-      default:
-        if(offset<NGREG)
-            return (os_context_register_t*)&context->uc_mcontext.gregs[offset/2+4];
-        else return 0;
-    }
-    return (os_context_register_t*)&context->uc_mcontext.gregs[offset];
+    static unsigned char regmap[16] = {
+       REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+       REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15
+    };
+    if (offset >= 0 && offset < 16)
+        return (os_context_register_t*)&context->uc_mcontext.gregs[regmap[offset]];
+    return 0;
 }
 
 os_context_register_t *
@@ -134,11 +120,14 @@ os_context_fp_addr(os_context_t *context)
 unsigned long
 os_context_fp_control(os_context_t *context)
 {
-    /* return the x87 exception flags ored in with the sse2
-     * control+status flags */
-    unsigned int result = (context->uc_mcontext.fpregs->swd & 0x3F) | context->uc_mcontext.fpregs->mxcsr;
-    /* flip exception mask bits */
-    return result ^ (0x3F << 7);
+    return (uintptr_t)&context->uc_mcontext.gregs[REG_RSP];
+
+}
+
+os_context_register_t *
+os_context_float_register_addr(os_context_t *context, int offset)
+{
+    return (os_context_register_t*)&context->uc_mcontext.fpregs->_xmm[offset];
 }
 
 sigset_t *
@@ -160,7 +149,7 @@ os_restore_fp_control(os_context_t *context)
 }
 
 void
-os_flush_icache(os_vm_address_t address, os_vm_size_t length)
+os_flush_icache(os_vm_address_t __attribute__((unused)) address,
+                os_vm_size_t __attribute__((unused)) length)
 {
 }
-

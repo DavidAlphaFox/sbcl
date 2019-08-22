@@ -8,7 +8,7 @@
 ;;;; public domain. The software is in the public domain and is
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Handy macro for defining top-level forms that depend on the compile
 ;;; environment.
@@ -24,7 +24,6 @@
 ;;; Instruction-like macros.
 
 (defmacro move (dst src &optional (always-emit-code-p nil))
-  #!+sb-doc
   "Move SRC into DST (unless they are location= and ALWAYS-EMIT-CODE-P
 is nil)."
   (once-only ((n-dst dst)
@@ -62,7 +61,6 @@ is nil)."
             (- other-pointer-lowtag))))
 
 (defmacro load-type (target source &optional (offset 0))
-  #!+sb-doc
   "Loads the type bits of a pointer into target independent of
 byte-ordering issues."
   (once-only ((n-target target)
@@ -79,16 +77,14 @@ byte-ordering issues."
 ;;; return instructions.
 
 (defmacro lisp-jump (function lip)
-  #!+sb-doc
   "Jump to the lisp function FUNCTION.  LIP is an interior-reg temporary."
   `(progn
-     (inst addu ,lip ,function (- (ash simple-fun-code-offset word-shift)
+     (inst addu ,lip ,function (- (ash simple-fun-insts-offset word-shift)
                                    fun-pointer-lowtag))
      (inst j ,lip)
      (move code-tn ,function t)))
 
 (defmacro lisp-return (return-pc lip &key (offset 0) (frob-code t))
-  #!+sb-doc
   "Return to RETURN-PC.  LIP is an interior-reg temporary."
   `(progn
      (inst addu ,lip ,return-pc
@@ -100,7 +96,6 @@ byte-ordering issues."
 
 
 (defmacro emit-return-pc (label)
-  #!+sb-doc
   "Emit a return-pc header word.  LABEL is the label to use for this return-pc."
   `(progn
      (emit-alignment n-lowtag-bits)
@@ -129,7 +124,6 @@ byte-ordering issues."
           (storew reg cfp-tn offset))))))
 
 (defmacro maybe-load-stack-tn (reg reg-or-stack)
-  #!+sb-doc
   "Move the TN Reg-Or-Stack into Reg if it isn't already there."
   (once-only ((n-reg reg)
               (n-stack reg-or-stack))
@@ -147,7 +141,6 @@ byte-ordering issues."
                                   size dynamic-extent-p
                                   &key (lowtag other-pointer-lowtag))
                                  &body body)
-  #!+sb-doc
   "Do stuff to allocate an other-pointer object of fixed Size with a single
 word header having the specified Type-Code.  The result is placed in
 Result-TN, Flag-Tn must be wired to NL4-OFFSET, and Temp-TN is a non-
@@ -163,7 +156,7 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
          (pseudo-atomic (,flag-tn)
            (align-csp ,temp-tn)
            (inst or ,result-tn csp-tn ,lowtag)
-           (inst li ,temp-tn (logior (ash (1- ,size) n-widetag-bits) ,type-code))
+           (inst li ,temp-tn (compute-object-header ,size ,type-code))
            (inst addu csp-tn (pad-data-block ,size))
            (storew ,temp-tn ,result-tn 0 ,lowtag)
            ,@body)
@@ -172,8 +165,8 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
            ;; has a 1 bit in the same position, we're all set.  Otherwise,
            ;; we need to subtract the pseudo-atomic bit.
            (inst or ,result-tn alloc-tn ,lowtag)
-           (unless (logbitp 0 ,lowtag) (inst sub ,result-tn 1))
-           (inst li ,temp-tn (logior (ash (1- ,size) n-widetag-bits) ,type-code))
+           (unless (logbitp 0 ,lowtag) (inst subu ,result-tn 1))
+           (inst li ,temp-tn (compute-object-header ,size ,type-code))
            (storew ,temp-tn ,result-tn 0 ,lowtag)
            ,@body))))
 
@@ -218,67 +211,24 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
 
 
 ;;;; Error Code
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (defun emit-error-break (vop kind code values)
-    (let ((vector (gensym)))
-      `((let ((vop ,vop))
-          (when vop
-            (note-this-location vop :internal-error)))
-        (inst break 0 ,kind)
-        (with-adjustable-vector (,vector)
-          (write-var-integer (error-number-or-lose ',code) ,vector)
-          ,@(mapcar #'(lambda (tn)
-                        `(let ((tn ,tn))
-                           (write-var-integer (make-sc-offset (sc-number
-                                                               (tn-sc tn))
-                                                              (tn-offset tn))
-                                              ,vector)))
-                    values)
-          (inst byte (length ,vector))
-          (dotimes (i (length ,vector))
-            (inst byte (aref ,vector i))))
-        (emit-alignment word-shift)))))
+(defun emit-error-break (vop kind code values)
+  (assemble ()
+    (when vop
+      (note-this-location vop :internal-error))
+    (emit-internal-error kind code values
+                         :trap-emitter (lambda (tramp-number)
+                                         (inst break 0 tramp-number)))
+    (emit-alignment word-shift)))
 
-(defmacro error-call (vop error-code &rest values)
-  #!+sb-doc
-  "Cause an error.  ERROR-CODE is the error to cause."
-  (cons 'progn
-        (emit-error-break vop error-trap error-code values)))
-
-
-(defmacro cerror-call (vop label error-code &rest values)
-  #!+sb-doc
-  "Cause a continuable error.  If the error is continued, execution resumes at
-  LABEL."
-  `(progn
-     (without-scheduling ()
-       (inst b ,label)
-       ,@(emit-error-break vop cerror-trap error-code values))))
-
-(defmacro generate-error-code (vop error-code &rest values)
-  #!+sb-doc
+(defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
-  `(assemble (*elsewhere*)
-     (let ((start-lab (gen-label)))
-       (emit-label start-lab)
-       (error-call ,vop ,error-code ,@values)
-       start-lab)))
+  (assemble (:elsewhere)
+    (let ((start-lab (gen-label)))
+      (emit-label start-lab)
+      (apply #'error-call vop error-code values)
+      start-lab)))
 
-(defmacro generate-cerror-code (vop error-code &rest values)
-  #!+sb-doc
-  "Generate-CError-Code Error-code Value*
-  Emit code for a continuable error with the specified Error-Code and
-  context Values.  If the error is continued, execution resumes after
-  the GENERATE-CERROR-CODE form."
-  (with-unique-names (continue error)
-    `(let ((,continue (gen-label)))
-       (emit-label ,continue)
-       (assemble (*elsewhere*)
-         (let ((,error (gen-label)))
-           (emit-label ,error)
-           (cerror-call ,vop ,continue ,error-code ,@values)
-           ,error)))))
 
 ;;;; PSEUDO-ATOMIC
 
@@ -295,13 +245,13 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
        (let ((label (gen-label)))
          (inst bgez ,flag-tn label)
          (inst addu alloc-tn (1- ,extra))
-         (inst break 0 16)
+         (inst break 0 pending-interrupt-trap)
          (emit-label label)))))
 
 ;;;; memory accessor vop generators
 
-(deftype load/store-index (scale lowtag min-offset
-                                 &optional (max-offset min-offset))
+(sb-xc:deftype load/store-index (scale lowtag min-offset
+                                  &optional (max-offset min-offset))
   `(integer ,(- (truncate (+ (ash 1 16)
                              (* min-offset n-word-bytes)
                              (- lowtag))
@@ -460,13 +410,3 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
                  value object
                  (- (+ (* ,offset n-word-bytes) (* index ,scale)) ,lowtag))
            (move result value))))))
-
-
-(def!macro with-pinned-objects ((&rest objects) &body body)
-  "Arrange with the garbage collector that the pages occupied by
-OBJECTS will not be moved in memory for the duration of BODY.
-Useful for e.g. foreign calls where another thread may trigger
-garbage collection.  This is currently implemented by disabling GC"
-  (declare (ignore objects))            ;should we eval these for side-effect?
-  `(without-gcing
-    ,@body))

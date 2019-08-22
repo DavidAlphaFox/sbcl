@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; moves and coercions
 
@@ -44,8 +44,6 @@
             :load-if (not (location= x y))))
   (:results (y :scs (sap-reg)
                :load-if (not (location= x y))))
-  (:effects)
-  (:affected)
   (:generator 0
     (move x y)))
 (define-move-vop sap-move :move
@@ -219,10 +217,7 @@
                                     (:single
                                      '((inst lds result offset object)))
                                     (:double
-                                     '((inst ldt
-                                             result
-                                             (+ offset n-word-bytes)
-                                             object))))))
+                                     '((inst ldt result offset object))))))
                   (define-vop (,set-name)
                     (:translate ,set-name)
                     (:policy :fast-safe)

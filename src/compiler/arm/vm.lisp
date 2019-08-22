@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; register specs
@@ -20,7 +20,7 @@
 (macrolet ((defreg (name offset)
              (let ((offset-sym (symbolicate name "-OFFSET")))
                `(eval-when (:compile-toplevel :load-toplevel :execute)
-                  (def!constant ,offset-sym ,offset)
+                  (defconstant ,offset-sym ,offset)
                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
 
            (defregset (name &rest regs)
@@ -55,10 +55,14 @@
   (defregset non-descriptor-regs
       ocfp nfp nargs nl2 nl3)
 
+  ;; OAOOM: Same as runtime/arm-lispregs.h
+  (defregset boxed-regs
+      r0 r1 r2 lexenv r8 code)
+
   ;; registers used to pass arguments
   ;;
   ;; the number of arguments/return values passed in registers
-  (def!constant  register-arg-count 3)
+  (defconstant register-arg-count 3)
   ;; names and offsets for registers used to pass arguments
   (defregset *register-arg-offsets*  r0 r1 r2)
   (defparameter *register-arg-names* '(r0 r1 r2)))
@@ -66,40 +70,22 @@
 
 ;;;; SB and SC definition:
 
+(!define-storage-bases
 (define-storage-base registers :finite :size 16)
 (define-storage-base control-stack :unbounded :size 2 :size-increment 1)
 (define-storage-base non-descriptor-stack :unbounded :size 0)
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
-#!+arm-vfp
+#+arm-vfp
 (define-storage-base float-registers :finite :size 32)
 ;; NOTE: If you fix the following, please to so with its own feature
 ;; conditional, and also adjust the definitions of the
 ;; {,COMPLEX-}{SINGLE,DOUBLE}-REG SCs below.
-#!-arm-vfp
+#-arm-vfp
 (error "Don't know how many float registers for non-VFP systems")
+)
 
-;;;
-;;; Handy macro so we don't have to keep changing all the numbers whenever
-;;; we insert a new storage class.
-;;;
-(defmacro define-storage-classes (&rest classes)
-  (do ((forms (list 'progn)
-              (let* ((class (car classes))
-                     (sc-name (car class))
-                     (constant-name (intern (concatenate 'simple-string
-                                                         (string sc-name)
-                                                         "-SC-NUMBER"))))
-                (list* `(define-storage-class ,sc-name ,index
-                          ,@(cdr class))
-                       `(def!constant ,constant-name ,index)
-                       forms)))
-       (index 0 (1+ index))
-       (classes classes (cdr classes)))
-      ((null classes)
-       (nreverse forms))))
-
-(define-storage-classes
+(!define-storage-classes
 
     ;; Non-immediate contstants in the constant pool
     (constant constant)
@@ -215,8 +201,8 @@
                       :save-p t
                       :alternate-scs (complex-double-stack))
 
-  ;; A catch or unwind block.
-  (catch-block control-stack :element-size catch-block-size))
+  (catch-block control-stack :element-size catch-block-size)
+  (unwind-block control-stack :element-size unwind-block-size))
 
 ;;;; Make some random tns for important registers.
 
@@ -243,34 +229,33 @@
 (defun immediate-constant-sc (value)
   (typecase value
     (null
-     (sc-number-or-lose 'null))
-    ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
+     null-sc-number)
+    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
          character)
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
     (symbol
      (if (static-symbol-p value)
-         (sc-number-or-lose 'immediate)
+         immediate-sc-number
          nil))))
 
 (defun boxed-immediate-sc-p (sc)
-  (or (eql sc (sc-number-or-lose 'null))
-      (eql sc (sc-number-or-lose 'immediate))))
+  (or (eql sc null-sc-number)
+      (eql sc immediate-sc-number)))
 
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values
-(def!constant register-arg-scn (sc-number-or-lose 'descriptor-reg))
-(def!constant immediate-arg-scn (sc-number-or-lose 'any-reg))
-(def!constant control-stack-arg-scn (sc-number-or-lose 'control-stack))
+(defconstant immediate-arg-scn any-reg-sc-number)
+(defconstant control-stack-arg-scn control-stack-sc-number)
 
 ;;; offsets of special stack frame locations
-(def!constant ocfp-save-offset 0)
-(def!constant lra-save-offset 1)
-(def!constant nfp-save-offset 2)
+(defconstant ocfp-save-offset 0)
+(defconstant lra-save-offset 1)
+(defconstant nfp-save-offset 2)
 
 ;;; This is used by the debugger.
 ;;; < nyef> Ah, right. So, SINGLE-VALUE-RETURN-BYTE-OFFSET doesn't apply to x86oids or ARM.
-(def!constant single-value-return-byte-offset 0)
+(defconstant single-value-return-byte-offset 0)
 
 
 ;;; A list of TN's describing the register arguments.
@@ -299,10 +284,10 @@
 
 (defun combination-implementation-style (node)
   (flet ((valid-funtype (args result)
-           (sb!c::valid-fun-use node
-                                (sb!c::specifier-type
+           (sb-c::valid-fun-use node
+                                (sb-c::specifier-type
                                  `(function ,args ,result)))))
-    (case (sb!c::combination-fun-source-name node)
+    (case (sb-c::combination-fun-source-name node)
       (logtest
        (cond
          ((valid-funtype '(fixnum fixnum) '*)

@@ -9,14 +9,14 @@
 # provided with absolutely no warranty. See the COPYING and CREDITS
 # files for more information.
 
-LD = ld -taso
+#LD = ld -taso ;; $LD is no longer used anywhere, should that be moved below?
 LINKFLAGS += -dynamic -v -Wl,-T -Wl,ld-script.alpha-linux -rdynamic
 NM = ./linux-nm
 
 ASSEM_SRC = alpha-assem.S ldso-stubs.S
 ARCH_SRC = alpha-arch.c
 
-OS_SRC = linux-os.c alpha-linux-os.c
+OS_SRC = linux-os.c linux-mman.c alpha-linux-os.c
 OS_LIBS = -ldl
 
 ifdef LISP_FEATURE_SB_CORE_COMPRESSION

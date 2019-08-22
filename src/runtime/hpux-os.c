@@ -34,7 +34,7 @@ os_init(char *argv[], char *envp[])
 }
 
 os_vm_address_t
-os_validate(os_vm_address_t addr, os_vm_size_t len)
+os_validate(int movable, os_vm_address_t addr, os_vm_size_t len)
 {
     os_vm_address_t actual;
     int flags = MAP_PRIVATE | MAP_ANONYMOUS;
@@ -65,50 +65,12 @@ os_invalidate(os_vm_address_t addr, os_vm_size_t len)
     }
 }
 
-os_vm_address_t
-os_map(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
-{
-    os_vm_address_t actual;
-    actual = mmap(addr, len,
-                OS_VM_PROT_ALL,
-                MAP_PRIVATE | MAP_FILE | MAP_FIXED,
-                fd, (off_t) offset);
-    if (actual == MAP_FAILED || (addr && (addr != actual))) {
-        perror("mmap");
-        lose("os_map(): mmap() failure\n");
-    }
-    return actual;
-}
-
 void
 os_protect(os_vm_address_t addr, os_vm_size_t len, os_vm_prot_t prot)
 {
     if (mprotect(addr, len, prot) == -1) {
         perror("mprotect");
     }
-}
-
-boolean
-is_valid_lisp_addr(os_vm_address_t addr)
-{
-    struct thread *th;
-    size_t ad = (size_t) addr;
-
-    if ((READ_ONLY_SPACE_START <= ad && ad < READ_ONLY_SPACE_END)
-        || (STATIC_SPACE_START <= ad && ad < STATIC_SPACE_END)
-        || (DYNAMIC_0_SPACE_START <= ad && ad < DYNAMIC_0_SPACE_END)
-        || (DYNAMIC_1_SPACE_START <= ad && ad < DYNAMIC_1_SPACE_END)
-        )
-        return 1;
-    for_each_thread(th) {
-        if((size_t)(th->control_stack_start) <= ad
-           && ad < (size_t)(th->control_stack_end))
-            return 1;
-        if((size_t)(th->binding_stack_start) <= ad
-           && ad < (size_t)(th->binding_stack_start + BINDING_STACK_SIZE))
-            return 1;
-    }
-    return 0;
 }
 
 /*

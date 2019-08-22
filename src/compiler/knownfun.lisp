@@ -12,170 +12,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (/show0 "knownfun.lisp 17")
 
-;;; IR1 boolean function attributes
-;;;
-;;; There are a number of boolean attributes of known functions which
-;;; we like to have in IR1. This information is mostly side effect
-;;; information of a sort, but it is different from the kind of
-;;; information we want in IR2. We aren't interested in a fine
-;;; breakdown of side effects, since we do very little code motion on
-;;; IR1. We are interested in some deeper semantic properties such as
-;;; whether it is safe to pass stack closures to.
-;;;
-;;; FIXME: This whole notion of "bad" explicit attributes is bad for
-;;; maintenance. How confident are we that we have no defknowns for functions
-;;; with functional arguments that are missing the CALL attribute? Much better
-;;; to have NO-CALLS, as it is much less likely to break accidentally.
-(!def-boolean-attribute ir1
-  ;; may call functions that are passed as arguments. In order to
-  ;; determine what other effects are present, we must find the
-  ;; effects of all arguments that may be functions.
-  call
-  ;; may fail to return during correct execution. Errors are O.K.
-  ;; UNUSED, BEWARE OF BITROT.
-  unwind
-  ;; the (default) worst case. Includes all the other bad things, plus
-  ;; any other possible bad thing. If this is present, the above bad
-  ;; attributes will be explicitly present as well.
-  any
-  ;; all arguments are safe for dynamic extent.
-  ;; (We used to have an UNSAFE attribute, which was basically the inverse
-  ;; of this, but it was unused and bitrotted, so when we started making
-  ;; use of the information we flipped the name and meaning the safe way
-  ;; around.)
-  dx-safe
-  ;; may be constant-folded. The function has no side effects, but may
-  ;; be affected by side effects on the arguments. e.g. SVREF, MAPC.
-  ;; Functions that side-effect their arguments are not considered to
-  ;; be foldable. Although it would be "legal" to constant fold them
-  ;; (since it "is an error" to modify a constant), we choose not to
-  ;; mark these functions as foldable in this database.
-  foldable
-  ;; may be eliminated if value is unused. The function has no side
-  ;; effects except possibly cons. If a function might signal errors,
-  ;; then it is not flushable even if it is movable, foldable or
-  ;; unsafely-flushable. Implies UNSAFELY-FLUSHABLE. (In safe code
-  ;; type checking of arguments is always performed by the caller, so
-  ;; a function which SHOULD signal an error if arguments are not of
-  ;; declared types may be FLUSHABLE.)
-  flushable
-  ;; unsafe call may be eliminated if value is unused. The function
-  ;; has no side effects except possibly cons and signalling an error
-  ;; in the safe code. If a function MUST signal errors, then it is
-  ;; not unsafely-flushable even if it is movable or foldable.
-  unsafely-flushable
-  ;; return value is important, and ignoring it is probably a mistake.
-  ;; Unlike the other attributes, this is used only for style
-  ;; warnings and has no effect on optimization.
-  important-result
-  ;; may be moved with impunity. Has no side effects except possibly
-  ;; consing, and is affected only by its arguments.
-  ;; UNUSED, BEWARE OF BITROT.
-  movable
-  ;; The function is a true predicate likely to be open-coded. Convert
-  ;; any non-conditional uses into (IF <pred> T NIL). Not usually
-  ;; specified to DEFKNOWN, since this is implementation dependent,
-  ;; and is usually automatically set by the DEFINE-VOP :CONDITIONAL
-  ;; option.
-  predicate
-  ;; Inhibit any warning for compiling a recursive definition.
-  ;; (Normally the compiler warns when compiling a recursive
-  ;; definition for a known function, since it might be a botched
-  ;; interpreter stub.)
-  recursive
-  ;; The function does explicit argument type checking, so the
-  ;; declared type should not be asserted when a definition is
-  ;; compiled.
-  explicit-check
-  ;; The function should always be translated by a VOP (i.e. it should
-  ;; should never be converted into a full call).  This is used strictly
-  ;; as a consistency checking mechanism inside the compiler during IR2
-  ;; transformation.
-  always-translatable
-  ;; If a function is called with two arguments and the first one is a
-  ;; constant, then the arguments will be swapped.
-  commutative)
-
-(defstruct (fun-info #-sb-xc-host (:pure t))
-  ;; boolean attributes of this function.
-  (attributes (missing-arg) :type attributes)
-  ;; TRANSFORM structures describing transforms for this function
-  (transforms () :type list)
-  ;; a function which computes the derived type for a call to this
-  ;; function by examining the arguments. This is null when there is
-  ;; no special method for this function.
-  (derive-type nil :type (or function null))
-  ;; a function that does various unspecified code transformations by
-  ;; directly hacking the IR. Returns true if further optimizations of
-  ;; the call shouldn't be attempted.
-  ;;
-  ;; KLUDGE: This return convention (non-NIL if you shouldn't do
-  ;; further optimiz'ns) is backwards from the return convention for
-  ;; transforms. -- WHN 19990917
-  (optimizer nil :type (or function null))
-  ;; a function computing the constant or literal arguments which are
-  ;; destructively modified by the call.
-  (destroyed-constant-args nil :type (or function null))
-  ;; If true, a special-case LTN annotation method that is used in
-  ;; place of the standard type/policy template selection. It may use
-  ;; arbitrary code to choose a template, decide to do a full call, or
-  ;; conspire with the IR2-CONVERT method to do almost anything. The
-  ;; COMBINATION node is passed as the argument.
-  (ltn-annotate nil :type (or function null))
-  ;; If true, the special-case IR2 conversion method for this
-  ;; function. This deals with funny functions, and anything else that
-  ;; can't be handled using the template mechanism. The COMBINATION
-  ;; node and the IR2-BLOCK are passed as arguments.
-  (ir2-convert nil :type (or function null))
-  ;; If true, the function can stack-allocate the result. The
-  ;; COMBINATION node is passed as an argument.
-  (stack-allocate-result nil :type (or function null))
-  ;; If true, the function can add flow-sensitive type information
-  ;; about the state of the world after its execution. The COMBINATION
-  ;; node is passed as an argument, along with the current set of
-  ;; active constraints for the block.  The function returns a
-  ;; sequence of constraints; a constraint is a triplet of a
-  ;; constraint kind (a symbol, see (defstruct (constraint ...)) in
-  ;; constraint.lisp) and arguments, either LVARs, LAMBDA-VARs, or
-  ;; CTYPEs.  If any of these arguments is NIL, the constraint is
-  ;; skipped. This simplifies integration with OK-LVAR-LAMBDA-VAR,
-  ;; which maps LVARs to LAMBDA-VARs.  An optional fourth value in
-  ;; each constraint flips the meaning of the constraint if it is
-  ;; non-NIL.
-  (constraint-propagate nil :type (or function null))
-  ;; If true, the function can add flow-sensitive type information
-  ;; depending on the truthiness of its return value.  Returns two
-  ;; values, a LVAR and a CTYPE. The LVAR is of that CTYPE iff the
-  ;; function returns true.
-  ;; It may also return additional third and fourth values. Each is
-  ;; a sequence of constraints (see CONSTRAINT-PROPAGATE), for the
-  ;; consequent and alternative branches, respectively.
-  (constraint-propagate-if nil :type (or function null))
-  ;; all the templates that could be used to translate this function
-  ;; into IR2, sorted by increasing cost.
-  (templates nil :type list)
-  ;; If non-null, then this function is a unary type predicate for
-  ;; this type.
-  (predicate-type nil :type (or ctype null))
-  ;; If non-null, the index of the argument which becomes the result
-  ;; of the function.
-  (result-arg nil :type (or index null)))
-
-(defprinter (fun-info)
-  (attributes :test (not (zerop attributes))
-              :prin1 (decode-ir1-attributes attributes))
-  (transforms :test transforms)
-  (derive-type :test derive-type)
-  (optimizer :test optimizer)
-  (ltn-annotate :test ltn-annotate)
-  (ir2-convert :test ir2-convert)
-  (templates :test templates)
-  (predicate-type :test predicate-type))
-
 ;;;; interfaces to defining macros
 
 ;;; an IR1 transform
@@ -194,55 +34,53 @@
   ;; string used in efficiency notes
   (note (missing-arg) :type string)
   ;; T if we should emit a failure note even if SPEED=INHIBIT-WARNINGS.
-  (important nil :type (member nil :slightly t)))
+  (important nil :type (member nil :slightly t))
+  ;; A function with NODE as an argument that checks wheteher the
+  ;; transform applies in its policy.
+  ;; It used to be checked in the FUNCTION body but it would produce
+  ;; notes about failed transformation due to types even though it
+  ;; wouldn't have been applied with the right types anyway,
+  ;; or if another transform could be applied with the right policy.
+  (policy nil :type (or null function))
+  (extra-type nil))
 
 (defprinter (transform) type note important)
 
 ;;; Grab the FUN-INFO and enter the function, replacing any old
 ;;; one with the same type and note.
-(declaim (ftype (function (t list function &optional (or string null)
-                             (member nil :slightly t))
-                          *)
-                %deftransform))
-(defun %deftransform (name type fun &optional note important)
+(defun %deftransform (name type fun &optional note important policy)
   (let* ((ctype (specifier-type type))
          (note (or note "optimize"))
          (info (fun-info-or-lose name))
-         (old (find-if (lambda (x)
-                         (and (type= (transform-type x) ctype)
-                              (string-equal (transform-note x) note)
-                              (eq (transform-important x) important)))
-                       (fun-info-transforms info))))
+         (old (find ctype (fun-info-transforms info)
+                    :test #'type=
+                    :key #'transform-type)))
     (cond (old
            (style-warn 'redefinition-with-deftransform
                        :transform old)
            (setf (transform-function old) fun
-                 (transform-note old) note))
+                 (transform-note old) note
+                 (transform-important old) important
+                 (transform-policy old) policy))
           (t
            (push (make-transform :type ctype :function fun :note note
-                                 :important important)
+                                 :important important
+                                 :policy policy)
                  (fun-info-transforms info))))
     name))
 
 ;;; Make a FUN-INFO structure with the specified type, attributes
 ;;; and optimizers.
-(declaim (ftype (function (list list attributes &key
-                                (:derive-type (or function null))
-                                (:optimizer (or function null))
-                                (:destroyed-constant-args (or function null))
-                                (:result-arg (or index null))
-                                (:overwrite-fndb-silently boolean))
-                          *)
-                %defknown))
-(defun %defknown (names type attributes
-                  &key derive-type optimizer destroyed-constant-args result-arg
-                    overwrite-fndb-silently)
-  (let ((ctype (specifier-type type))
-        (info (make-fun-info :attributes attributes
-                             :derive-type derive-type
-                             :optimizer optimizer
-                             :destroyed-constant-args destroyed-constant-args
-                             :result-arg result-arg)))
+(defun %defknown (names type attributes location
+                  &key derive-type optimizer result-arg
+                       overwrite-fndb-silently
+                       call-type-deriver
+                       annotation)
+  (let* ((ctype (specifier-type type))
+         (type-to-store (if (contains-unknown-type-p ctype)
+                            ;; unparse it, so SFUNCTION -> FUNCTION
+                            (type-specifier ctype)
+                            ctype)))
     (dolist (name names)
       (unless overwrite-fndb-silently
         (let ((old-fun-info (info :function :info name)))
@@ -259,37 +97,171 @@
             (cerror "Go ahead, overwrite it."
                     "~@<overwriting old FUN-INFO ~2I~_~S ~I~_for ~S~:>"
                     old-fun-info name))))
-      (setf (info :function :type name) ctype)
+      (setf (info :function :type name) type-to-store)
       (setf (info :function :where-from name) :declared)
       (setf (info :function :kind name) :function)
-      (setf (info :function :info name) info)))
+      (setf (info :function :info name)
+            (make-fun-info :attributes attributes
+                           :derive-type derive-type
+                           :optimizer optimizer
+                           :result-arg result-arg
+                           :call-type-deriver call-type-deriver
+                           :annotation annotation))
+      (if location
+          (setf (getf (info :source-location :declaration name) 'defknown)
+                location)
+          (remf (info :source-location :declaration name) 'defknown))))
   names)
 
-;;; Return the FUN-INFO for NAME or die trying. Since this is
-;;; used by callers who want to modify the info, and the info may be
-;;; shared, we copy it. We don't have to copy the lists, since each
-;;; function that has generators or transforms has already been
-;;; through here.
+
+;;; This macro should be the way that all implementation independent
+;;; information about functions is made known to the compiler.
 ;;;
-;;; Note that this operation is somewhat garbage-producing in the current
-;;; globaldb implementation.  Setting a piece of INFO for a name makes
-;;; a shallow copy of the name's info-vector. FUN-INFO-OR-LOSE sounds
-;;; like a data reader, and you might be disinclined to think that it
-;;; copies at all, but:
-;;;   (TIME (LOOP REPEAT 1000 COUNT (FUN-INFO-OR-LOSE '*)))
-;;;   294,160 bytes consed
-;;; whereas just copying the info per se is not half as bad:
-;;;   (LET ((X (INFO :FUNCTION :INFO '*)))
-;;;     (TIME (LOOP REPEAT 1000 COUNT (COPY-FUN-INFO X))))
-;;;   130,992 bytes consed
+;;; FIXME: The comment above suggests that perhaps some of my added
+;;; FTYPE declarations are in poor taste. Should I change my
+;;; declarations, or change the comment, or what?
 ;;;
+;;; FIXME: DEFKNOWN is needed only at build-the-system time. Figure
+;;; out some way to keep it from appearing in the target system.
+;;;
+;;; Declare the function NAME to be a known function. We construct a
+;;; type specifier for the function by wrapping (FUNCTION ...) around
+;;; the ARG-TYPES and RESULT-TYPE. ATTRIBUTES is an unevaluated list
+;;; of boolean attributes of the function. See their description in
+;;; (!DEF-BOOLEAN-ATTRIBUTE IR1). NAME may also be a list of names, in
+;;; which case the same information is given to all the names. The
+;;; keywords specify the initial values for various optimizers that
+;;; the function might have.
+(defmacro defknown (name arg-types result-type &optional (attributes '(any))
+                    &body keys)
+  #-sb-xc-host
+  (when (member 'unsafe attributes)
+    (style-warn "Ignoring legacy attribute UNSAFE. Replaced by its inverse: DX-SAFE.")
+    (setf attributes (remove 'unsafe attributes)))
+  (when (and (intersection attributes '(any call unwind))
+             (intersection attributes '(movable)))
+    (error "function cannot have both good and bad attributes: ~S" attributes))
+
+  (when (member 'any attributes)
+    (setq attributes (union '(unwind) attributes)))
+  (when (member 'flushable attributes)
+    (pushnew 'unsafely-flushable attributes))
+  (multiple-value-bind (type annotation)
+      (split-type-info arg-types result-type)
+    `(%defknown ',(if (and (consp name)
+                           (not (legal-fun-name-p name)))
+                      name
+                      (list name))
+                ',type
+                (ir1-attributes ,@attributes)
+                (source-location)
+                :annotation ,annotation
+                ,@keys)))
+
+(defstruct (fun-type-annotation
+            (:copier nil))
+  positional ;; required and &optional
+  rest
+  key
+  returns)
+
+(defun split-type-info (arg-types result-type)
+  (if (eq arg-types '*)
+      `(sfunction ,arg-types ,result-type)
+      (multiple-value-bind (llks required optional rest keys)
+          (parse-lambda-list
+           arg-types
+           :context :function-type
+           :accept (lambda-list-keyword-mask
+                    '(&optional &rest &key &allow-other-keys))
+           :silent t)
+        (let ((i -1)
+              positional-annotation
+              rest-annotation
+              key-annotation
+              return-annotation)
+          (labels ((annotation-p (x)
+                     (typep x '(or (cons (member function function-designator modifying
+                                          inhibit-flushing))
+                                (member type-specifier proper-sequence proper-list
+                                 proper-or-dotted-list proper-or-circular-list))))
+                   (strip-annotation (x)
+                     (if (consp x)
+                         (ecase (car x)
+                           ((function function-designator) (car x))
+                           ((modifying inhibit-flushing) (cadr x)))
+                         (case x
+                           (proper-sequence 'sequence)
+                           ((proper-list proper-or-dotted-list proper-or-circular-list) 'list)
+                           (t x))))
+                   (process-positional (type)
+                     (incf i)
+                     (cond ((annotation-p type)
+                            (push (cons i (ensure-list type)) positional-annotation)
+                            (strip-annotation type))
+                           (t
+                            type)))
+                   (process-key (pair)
+                     (cond ((annotation-p (cadr pair))
+                            (destructuring-bind (key value) pair
+                              (setf (getf key-annotation key) (ensure-list value))
+                              (list key (strip-annotation value))))
+                           (t
+                            pair)))
+                   (process-rest (type)
+                     (cond ((annotation-p type)
+                            (setf rest-annotation (ensure-list type))
+                            (strip-annotation type))
+                           (t
+                            type)))
+                   (process-return (type)
+                     (cond ((annotation-p type)
+                            (setf return-annotation (ensure-list type))
+                            (strip-annotation type))
+                           (t
+                            type))))
+            (let ((required (mapcar #'process-positional required))
+                  (optional (mapcar #'process-positional optional))
+                  (rest (process-rest (car rest)))
+                  (key (mapcar #'process-key keys))
+                  (return (process-return result-type)))
+              (values
+               `(sfunction
+                 (,@required
+                  ,@(and optional `(&optional ,@optional))
+                  ,@(and (ll-kwds-restp llks) `(&rest ,rest))
+                  ,@(and (ll-kwds-keyp llks) `(&key ,@key))
+                  ,@(and (ll-kwds-allowp llks) '(&allow-other-keys)))
+                 ,return)
+               (when (or positional-annotation rest-annotation
+                         key-annotation return-annotation)
+                 `(make-fun-type-annotation :positional ',positional-annotation
+                                            :rest ',rest-annotation
+                                            :key ',key-annotation
+                                            :returns ',return-annotation)))))))))
+
+;;; Return the FUN-INFO for NAME or die trying.
 (declaim (ftype (sfunction (t) fun-info) fun-info-or-lose))
 (defun fun-info-or-lose (name)
-    (let ((old (info :function :info name)))
-      (unless old (error "~S is not a known function." name))
-      (setf (info :function :info name) (copy-fun-info old))))
+  (or (info :function :info name) (error "~S is not a known function." name)))
 
 ;;;; generic type inference methods
+
+(defun symeval-derive-type (node &aux (args (basic-combination-args node))
+                                      (lvar (pop args)))
+  (unless (and lvar (endp args))
+    (return-from symeval-derive-type))
+  (if (constant-lvar-p lvar)
+      (let* ((sym (lvar-value lvar))
+             (var (maybe-find-free-var sym))
+             (local-type (when var
+                           (let ((*lexenv* (node-lexenv node)))
+                             (lexenv-find var type-restrictions))))
+             (global-type (info :variable :type sym)))
+        (if local-type
+            (type-intersection local-type global-type)
+            global-type))
+      *universal-type*))
 
 ;;; Derive the type to be the type of the xxx'th arg. This can normally
 ;;; only be done when the result value is that argument.
@@ -311,21 +283,45 @@
           :key #'lvar-type
           :initial-value (specifier-type 'single-float)))
 
+(defun simplify-list-type (type &key preserve-dimensions)
+  ;; Preserve all the list types without dragging
+  ;; (cons (eql 10)) stuff in.
+  (let ((cons-type (specifier-type 'cons))
+        (list-type (specifier-type 'list))
+        (null-type (specifier-type 'null)))
+    (cond ((and preserve-dimensions
+                (csubtypep type cons-type))
+           cons-type)
+          ((and preserve-dimensions
+                (csubtypep type null-type))
+           null-type)
+          ((csubtypep type list-type)
+           list-type))))
+
 ;;; Return a closure usable as a derive-type method for accessing the
 ;;; N'th argument. If arg is a list, result is a list. If arg is a
 ;;; vector, result is a vector with the same element type.
-(defun sequence-result-nth-arg (n)
+(defun sequence-result-nth-arg (n &key preserve-dimensions
+                                       preserve-vector-type)
   (lambda (call)
     (declare (type combination call))
     (let ((lvar (nth (1- n) (combination-args call))))
       (when lvar
         (let ((type (lvar-type lvar)))
-          (if (array-type-p type)
-              (specifier-type
-               `(vector ,(type-specifier (array-type-element-type type))))
-              (let ((ltype (specifier-type 'list)))
-                (when (csubtypep type ltype)
-                  ltype))))))))
+          (cond ((simplify-list-type type
+                                     :preserve-dimensions preserve-dimensions))
+                ((not (csubtypep type (specifier-type 'vector)))
+                 nil)
+                (preserve-vector-type
+                 type)
+                (t
+                 (let ((simplified (simplify-vector-type type)))
+                   (if (and preserve-dimensions
+                            (csubtypep simplified (specifier-type 'simple-array)))
+                       (type-intersection (specifier-type
+                                           `(simple-array * ,(ctype-array-dimensions type)))
+                                          simplified)
+                       simplified)))))))))
 
 ;;; Derive the type to be the type specifier which is the Nth arg.
 (defun result-type-specifier-nth-arg (n)
@@ -368,54 +364,21 @@
                 `(simple-array character ,@(if size (list size) '((*)))))))
             (t
              (let ((ctype (careful-specifier-type specifier)))
-               (if (and (array-type-p ctype)
-                        (eq (array-type-specialized-element-type ctype)
-                            *wild-type*))
-                   (make-array-type (array-type-dimensions ctype)
-                    :complexp (array-type-complexp ctype)
-                    :element-type *universal-type*
-                    :specialized-element-type *universal-type*)
-                   ctype)))))))))
-
-(defun remove-non-constants-and-nils (fun)
-  (lambda (list)
-    (remove-if-not #'lvar-value
-                   (remove-if-not #'constant-lvar-p (funcall fun list)))))
-
-;;; FIXME: bad name (first because it uses 1-based indexing; second
-;;; because it doesn't get the nth constant arguments)
-(defun nth-constant-args (&rest indices)
-  (lambda (list)
-    (let (result)
-      (do ((i 1 (1+ i))
-           (list list (cdr list))
-           (indices indices))
-          ((null indices) (nreverse result))
-        (when (= i (car indices))
-          (when (constant-lvar-p (car list))
-            (push (car list) result))
-          (setf indices (cdr indices)))))))
-
-;;; FIXME: a number of the sequence functions not only do not destroy
-;;; their argument if it is empty, but also leave it alone if :start
-;;; and :end bound a null sequence, or if :count is 0.  This test is a
-;;; bit complicated to implement, verging on the impossible, but for
-;;; extra points (fill #\1 "abc" :start 0 :end 0) should not cause a
-;;; warning.
-(defun nth-constant-nonempty-sequence-args (&rest indices)
-  (lambda (list)
-    (let (result)
-      (do ((i 1 (1+ i))
-           (list list (cdr list))
-           (indices indices))
-          ((null indices) (nreverse result))
-        (when (= i (car indices))
-          (when (constant-lvar-p (car list))
-            (let ((value (lvar-value (car list))))
-              (unless (or (typep value 'null)
-                          (typep value '(vector * 0)))
-                (push (car list) result))))
-          (setf indices (cdr indices)))))))
+               (cond ((not (array-type-p ctype))
+                      ctype)
+                     ((unknown-type-p (array-type-element-type ctype))
+                      (make-array-type (array-type-dimensions ctype)
+                                       :complexp (array-type-complexp ctype)
+                                       :element-type *wild-type*
+                                       :specialized-element-type *wild-type*))
+                     ((eq (array-type-specialized-element-type ctype)
+                          *wild-type*)
+                      (make-array-type (array-type-dimensions ctype)
+                                       :complexp (array-type-complexp ctype)
+                                       :element-type *universal-type*
+                                       :specialized-element-type *universal-type*))
+                     (t
+                      ctype))))))))))
 
 (defun read-elt-type-deriver (skip-arg-p element-type-spec no-hang)
   (lambda (call)
@@ -439,14 +402,102 @@
           (type-union unexceptional-type null-type)
           unexceptional-type))))
 
-(defun position-derive-type (call)
-  (declare (type combination call))
-  (let ((seq (second (combination-args call))))
-    ;; Could possibly constrain the result more highly if
-    ;; the :start/:end were provided and of known types.
-    (when (constant-lvar-p seq)
-      (let ((seq (lvar-value seq)))
-        (when (typep seq '(simple-array * (*)))
-          (specifier-type `(or (integer 0 (,(length seq))) null)))))))
+;;; Return MAX MIN
+(defun sequence-lvar-dimensions (lvar)
+  (if (constant-lvar-p lvar)
+      (let ((value (lvar-value lvar)))
+        (and (proper-sequence-p value)
+             (let ((length (length value)))
+               (values length length))))
+      (let ((max 0) (min sb-xc:array-total-size-limit))
+        (block nil
+          (labels ((max-dim (type)
+                     ;; This can deal with just enough hair to handle type STRING,
+                     ;; but might be made to use GENERIC-ABSTRACT-TYPE-FUNCTION
+                     ;; if we really want to be more clever.
+                     (typecase type
+                       (union-type
+                        (mapc #'max-dim (union-type-types type)))
+                       (array-type (if (array-type-complexp type)
+                                       (return '*)
+                                       (process-dim (array-type-dimensions type))))
+                       (t (return '*))))
+                   (process-dim (dim)
+                     (let ((length (car dim)))
+                       (if (and (singleton-p dim)
+                                (integerp length))
+                           (setf max (max max length)
+                                 min (min min length))
+                           (return '*)))))
+            ;; If type derivation were able to notice that non-simple arrays can
+            ;; be mutated (changing the type), we could safely use LVAR-TYPE on
+            ;; any vector type. But it doesn't notice.
+            ;; We could use LVAR-CONSERVATIVE-TYPE to get a conservative answer.
+            ;; However that's probably not an important use, so the above
+            ;; logic restricts itself to simple arrays.
+            (max-dim (lvar-type lvar))
+            (values max min))))))
 
-(/show0 "knownfun.lisp end of file")
+(defun position-derive-type (call)
+  (let ((dim (sequence-lvar-dimensions (second (combination-args call)))))
+    (when (integerp dim)
+      (specifier-type `(or (integer 0 (,dim)) null)))))
+
+(defun count-derive-type (call)
+  (let ((dim (sequence-lvar-dimensions (second (combination-args call)))))
+    (when (integerp dim)
+      (specifier-type `(integer 0 ,dim)))))
+
+;;; This used to be done in DEFOPTIMIZER DERIVE-TYPE, but
+;;; ASSERT-CALL-TYPE already asserts the ARRAY type, so it gets an extra
+;;; assertion that may not get eliminated and requires extra work.
+(defun array-call-type-deriver (call trusted &optional set row-major-aref)
+  (let* ((fun (combination-fun call))
+         (type (lvar-fun-type fun))
+         (policy (lexenv-policy (node-lexenv call)))
+         (args (combination-args call)))
+    (when (fun-type-p type)
+      (flet ((assert-type (arg type &optional set index)
+               (when (cond (index
+                            (assert-array-index-lvar-type arg type policy))
+                           (t
+                            (when set
+                              (add-annotation arg
+                                              (make-lvar-modified-annotation :caller (lvar-fun-name fun))))
+                            (assert-lvar-type arg type policy)))
+                 (unless trusted (reoptimize-lvar arg)))))
+        (let ((required (fun-type-required type)))
+          (when set
+            (assert-type (pop args)
+                         (pop required)))
+          (assert-type (pop args)
+                       (if row-major-aref
+                           (pop required)
+                           (type-intersection
+                            (pop required)
+                            (specifier-type `(array * ,(length args)))))
+                       set)
+          (loop for type in required
+                do
+                (assert-type (pop args) type nil (or (not (and set row-major-aref))
+                                                     args)))
+          (loop for type in (fun-type-optional type)
+                do (assert-type (pop args) type nil t))
+          (loop for subscript in args
+                do (assert-type subscript (fun-type-rest type) nil t)))))))
+
+(defun append-call-type-deriver (call trusted)
+  (let* ((policy (lexenv-policy (node-lexenv call)))
+         (args (combination-args call))
+         (list-type (specifier-type 'list)))
+    ;; All but the last argument should be proper lists
+    (loop for (arg next) on args
+          while next
+          do
+          (add-annotation
+           arg
+           (make-lvar-proper-sequence-annotation
+            :kind 'proper-list))
+          (when (and (assert-lvar-type arg list-type policy)
+                     (not trusted))
+            (reoptimize-lvar arg)))))

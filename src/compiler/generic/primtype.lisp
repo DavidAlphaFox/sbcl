@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; primitive type definitions
 
@@ -18,42 +18,41 @@
 
 (!def-primitive-type t (descriptor-reg))
 (/show0 "primtype.lisp 20")
-(setf *backend-t-primitive-type* (primitive-type-or-lose t))
 
 ;;; primitive integer types that fit in registers
 (/show0 "primtype.lisp 24")
 (!def-primitive-type positive-fixnum (any-reg signed-reg unsigned-reg)
-  :type (unsigned-byte #.sb!vm:n-positive-fixnum-bits))
+  :type (unsigned-byte #.sb-vm:n-positive-fixnum-bits))
 (/show0 "primtype.lisp 27")
-#!+#.(cl:if (cl:= sb!vm::n-machine-word-bits 32) '(and) '(or))
+#-64-bit-registers
 (!def-primitive-type unsigned-byte-31 (signed-reg unsigned-reg descriptor-reg)
   :type (unsigned-byte 31))
 (/show0 "primtype.lisp 31")
-#!+#.(cl:if (cl:= sb!vm::n-machine-word-bits 32) '(and) '(or))
+#-64-bit-registers
 (!def-primitive-type unsigned-byte-32 (unsigned-reg descriptor-reg)
   :type (unsigned-byte 32))
 (/show0 "primtype.lisp 35")
-#!+#.(cl:if (cl:= sb!vm::n-machine-word-bits 64) '(and) '(or))
+#+64-bit-registers
 (!def-primitive-type unsigned-byte-63 (signed-reg unsigned-reg descriptor-reg)
   :type (unsigned-byte 63))
-#!+#.(cl:if (cl:= sb!vm::n-machine-word-bits 64) '(and) '(or))
+#+64-bit-registers
 (!def-primitive-type unsigned-byte-64 (unsigned-reg descriptor-reg)
   :type (unsigned-byte 64))
 (!def-primitive-type fixnum (any-reg signed-reg)
   :type (signed-byte #.(1+ n-positive-fixnum-bits)))
-#!+#.(cl:if (cl:= sb!vm::n-machine-word-bits 32) '(and) '(or))
+#-64-bit-registers
 (!def-primitive-type signed-byte-32 (signed-reg descriptor-reg)
   :type (signed-byte 32))
-#!+#.(cl:if (cl:= sb!vm::n-machine-word-bits 64) '(and) '(or))
+#+64-bit-registers
 (!def-primitive-type signed-byte-64 (signed-reg descriptor-reg)
   :type (signed-byte 64))
 
-(defvar *fixnum-primitive-type* (primitive-type-or-lose 'fixnum))
+(define-load-time-global *fixnum-primitive-type* (primitive-type-or-lose 'fixnum))
 
 (/show0 "primtype.lisp 53")
 (!def-primitive-type-alias tagged-num '(:or positive-fixnum fixnum))
 (multiple-value-bind (unsigned signed)
-    (case sb!vm::n-machine-word-bits
+    (case sb-vm:n-machine-word-bits
       (64 (values '(unsigned-byte-64 unsigned-byte-63 positive-fixnum)
                   '(signed-byte-64 fixnum unsigned-byte-63 positive-fixnum)))
       (32 (values '(unsigned-byte-32 unsigned-byte-31 positive-fixnum)
@@ -92,7 +91,7 @@
 (/show0 "about to !DEF-PRIMITIVE-TYPE COMPLEX-DOUBLE-FLOAT")
 (!def-primitive-type complex-double-float (complex-double-reg descriptor-reg)
   :type (complex double-float))
-#!+sb-simd-pack
+#+sb-simd-pack
 (progn
   (/show0 "about to !DEF-PRIMITIVE-TYPE SIMD-PACK")
   (!def-primitive-type simd-pack-single (single-sse-reg descriptor-reg)
@@ -103,6 +102,16 @@
    :type (simd-pack integer))
   (!def-primitive-type-alias simd-pack
    '(:or simd-pack-single simd-pack-double simd-pack-int)))
+#+sb-simd-pack-256
+(progn
+  (!def-primitive-type simd-pack-256-single (single-avx2-reg descriptor-reg)
+    :type (simd-pack-256 single-float))
+  (!def-primitive-type simd-pack-256-double (double-avx2-reg descriptor-reg)
+    :type (simd-pack-256 double-float))
+  (!def-primitive-type simd-pack-256-int (int-avx2-reg descriptor-reg)
+   :type (simd-pack-256 integer))
+  (!def-primitive-type-alias simd-pack-256
+   '(:or simd-pack-256-single simd-pack-256-double simd-pack-256-int)))
 
 ;;; primitive other-pointer array types
 (/show0 "primtype.lisp 96")
@@ -125,6 +134,7 @@
 
 ;;; miscellaneous primitive types that don't exist at the LISP level
 (!def-primitive-type catch-block (catch-block) :type nil)
+(!def-primitive-type unwind-block (unwind-block) :type nil)
 
 ;;;; PRIMITIVE-TYPE-OF and friends
 
@@ -151,7 +161,7 @@
 ;;; !DEF-VM-SUPPORT-ROUTINE and DEFUN-CACHED.
 (/show0 "primtype.lisp 188")
 (defun primitive-type (type)
-  (sb!kernel::maybe-reparse-specifier! type)
+  (sb-kernel::maybe-reparse-specifier! type)
   (primitive-type-aux type))
 (/show0 "primtype.lisp 191")
 (defun-cached (primitive-type-aux
@@ -223,7 +233,7 @@
                 (integer
                  (cond ((and hi lo)
                         (dolist (spec
-                                  `((positive-fixnum 0 ,sb!xc:most-positive-fixnum)
+                                  `((positive-fixnum 0 ,sb-xc:most-positive-fixnum)
                                     ,@(ecase n-machine-word-bits
                                         (32
                                          `((unsigned-byte-31
@@ -235,8 +245,8 @@
                                             0 ,(1- (ash 1 63)))
                                            (unsigned-byte-64
                                             0 ,(1- (ash 1 64))))))
-                                    (fixnum ,sb!xc:most-negative-fixnum
-                                            ,sb!xc:most-positive-fixnum)
+                                    (fixnum ,sb-xc:most-negative-fixnum
+                                            ,sb-xc:most-positive-fixnum)
                                     ,(ecase n-machine-word-bits
                                        (32
                                         `(signed-byte-32 ,(ash -1 31)
@@ -244,8 +254,8 @@
                                        (64
                                         `(signed-byte-64 ,(ash -1 63)
                                                          ,(1- (ash 1 63))))))
-                                 (if (or (< hi sb!xc:most-negative-fixnum)
-                                         (> lo sb!xc:most-positive-fixnum))
+                                 (if (or (< hi sb-xc:most-negative-fixnum)
+                                         (> lo sb-xc:most-positive-fixnum))
                                      (part-of bignum)
                                      (any)))
                           (let ((type (car spec))
@@ -255,8 +265,8 @@
                               (return (values
                                        (primitive-type-or-lose type)
                                        (and (= lo min) (= hi max))))))))
-                       ((or (and hi (< hi sb!xc:most-negative-fixnum))
-                            (and lo (> lo sb!xc:most-positive-fixnum)))
+                       ((or (and hi (< hi sb-xc:most-negative-fixnum))
+                            (and lo (> lo sb-xc:most-positive-fixnum)))
                         (part-of bignum))
                        (t
                         (any))))
@@ -289,19 +299,18 @@
              (t
               (any)))))
         (array-type
-         (if (array-type-complexp type)
+         (if (or (array-type-complexp type)
+                 (not (singleton-p (array-type-dimensions type))))
              (any)
-             (let* ((dims (array-type-dimensions type))
-                    (etype (array-type-specialized-element-type type))
-                    (type-spec (type-specifier etype))
-                    ;; FIXME: We're _WHAT_?  Testing for type equality
-                    ;; with a specifier and #'EQUAL?  *BOGGLE*.  --
-                    ;; CSR, 2003-06-24
-                    (ptype (cdr (assoc type-spec *simple-array-primitive-types*
-                                       :test #'equal))))
-               (if (and (consp dims) (null (rest dims)) ptype)
-                   (values (primitive-type-or-lose ptype)
-                           (eq (first dims) '*))
+             ;; EQ is ok to compare by because all CTYPEs representing
+             ;; array specializations are interned objects.
+             (let ((saetp (find (array-type-specialized-element-type type)
+                                *specialized-array-element-type-properties*
+                                :key #'saetp-ctype :test #'eq)))
+               (if saetp
+                   (values (primitive-type-or-lose
+                            (saetp-primitive-type-name saetp))
+                           (eq (first (array-type-dimensions type)) '*))
                    (any)))))
         (union-type
          (if (type= type (specifier-type 'list))
@@ -332,6 +341,9 @@
            ;; primitive type.  (And NIL is the conservative answer,
            ;; anyway).  -- CSR, 2006-09-14
            (dolist (type types (values res nil))
+             (when (csubtypep type (specifier-type 'function))
+               ;; Things like (AND STANDARD-OBJECT FUNCTION) are callable as functions.
+               (part-of function))
              (multiple-value-bind (ptype)
                  (primitive-type type)
                (cond
@@ -372,13 +384,10 @@
            ((extended-sequence) (any))
            ((nil) (any))))
         (character-set-type
-         (let ((pairs (character-set-type-pairs type)))
-           (if (and (= (length pairs) 1)
-                    (= (caar pairs) 0)
-                    (= (cdar pairs) (1- sb!xc:char-code-limit)))
-               (exactly character)
-               (part-of character))))
-        #!+sb-simd-pack
+         (if (eq type (specifier-type 'character))
+             (exactly character)
+             (part-of character)))
+        #+sb-simd-pack
         (simd-pack-type
          (let ((eltypes (simd-pack-type-element-type type)))
            (cond ((member 'integer eltypes)
@@ -387,18 +396,32 @@
                   (exactly simd-pack-single))
                  ((member 'double-float eltypes)
                   (exactly simd-pack-double)))))
+        #+sb-simd-pack-256
+        (simd-pack-256-type
+         (let ((eltypes (simd-pack-256-type-element-type type)))
+           (cond ((member 'integer eltypes)
+                  (exactly simd-pack-256-int))
+                 ((member 'single-float eltypes)
+                  (exactly simd-pack-256-single))
+                 ((member 'double-float eltypes)
+                  (exactly simd-pack-256-double)))))
         (built-in-classoid
          (case (classoid-name type)
-           #!+sb-simd-pack
+           #+sb-simd-pack
            ;; Can't tell what specific type; assume integers.
            (simd-pack
             (exactly simd-pack-int))
+           #+sb-simd-pack-256
+           (simd-pack-256
+            (exactly simd-pack-256-int))
            ((complex function system-area-pointer weak-pointer)
             (values (primitive-type-or-lose (classoid-name type)) t))
            (cons-type
             (part-of list))
            (t
             (any))))
+        (fun-designator-type
+         (any))
         (fun-type
          (exactly function))
         (classoid

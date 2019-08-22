@@ -12,18 +12,18 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!BIGNUM")
+(in-package "SB-BIGNUM")
 
 ;;; Return T if the least significant N-BITS bits of BIGNUM are all
 ;;; zero, else NIL. If the integer-length of BIGNUM is less than N-BITS,
 ;;; the result is NIL, too.
 (declaim (inline bignum-lower-bits-zero-p))
 (defun bignum-lower-bits-zero-p (bignum n-bits)
-  (declare (type bignum-type bignum)
+  (declare (type bignum bignum)
            (type bit-index n-bits))
   (multiple-value-bind (n-full-digits n-bits-partial-digit)
       (floor n-bits digit-size)
-    (declare (type bignum-index n-full-digits))
+    (declare (type bignum-length n-full-digits))
     (when (> (%bignum-length bignum) n-full-digits)
       (dotimes (index n-full-digits)
         (declare (type bignum-index index))
@@ -56,14 +56,14 @@
 (declaim (inline concatenate-random-bignum))
 (defun concatenate-random-bignum (random-chunk bit-count state)
   (declare (type bignum-element-type random-chunk)
-           (type (integer 0 #.sb!xc:most-positive-fixnum) bit-count)
+           (type (integer 0 #.sb-xc:most-positive-fixnum) bit-count)
            (type random-state state))
   (let* ((n-total-bits (+ 1 n-random-chunk-bits bit-count)) ; sign bit
          (length (ceiling n-total-bits digit-size))
          (bignum (%allocate-bignum length)))
     (multiple-value-bind (n-random-digits n-random-bits)
         (floor bit-count digit-size)
-      (declare (type bignum-index n-random-digits))
+      (declare (type bignum-length n-random-digits))
       (dotimes (index n-random-digits)
         (setf (%bignum-ref bignum index)
               (random-bignum-digit state)))
@@ -89,10 +89,10 @@
   (let* ((n-total-bits (1+ n-bits)) ; sign bit
          (length (ceiling n-total-bits digit-size))
          (bignum (%allocate-bignum length)))
-    (declare (type bignum-index length))
+    (declare (type bignum-length length))
     (multiple-value-bind (n-digits n-bits-partial-digit)
         (floor n-bits digit-size)
-      (declare (type bignum-index n-digits))
+      (declare (type bignum-length n-digits))
       (dotimes (index n-digits)
         (setf (%bignum-ref bignum index)
               (random-bignum-digit state)))
@@ -133,11 +133,11 @@
 ;;;   generate and compare the complete random number and risk to reject
 ;;;   it.
 (defun %random-bignum (arg state)
-  (declare (type (integer #.(1+ sb!xc:most-positive-fixnum)) arg)
+  (declare (type (integer #.(1+ sb-xc:most-positive-fixnum)) arg)
            (type random-state state)
            (inline bignum-lower-bits-zero-p))
   (let ((n-bits (bignum-integer-length arg)))
-    (declare (type (integer #.sb!vm:n-fixnum-bits) n-bits))
+    (declare (type (integer #.sb-vm:n-fixnum-bits) n-bits))
     ;; Don't use (ZEROP (LOGAND ARG (1- ARG))) to test if ARG is a power
     ;; of two as that would cons.
     (cond ((bignum-lower-bits-zero-p arg (1- n-bits))

@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Data object ref/set stuff.
 
@@ -31,7 +31,9 @@
   (:generator 1
     (storew value object offset lowtag)))
 
-(define-vop (init-slot set-slot))
+(define-vop (init-slot set-slot)
+  (:info name dx-p offset lowtag)
+  (:ignore name dx-p))
 
 ;;;; Symbol hacking VOPs:
 
@@ -52,11 +54,11 @@
 ;;; With Symbol-Value, we check that the value isn't the trap object.  So
 ;;; Symbol-Value of NIL is NIL.
 (define-vop (symbol-value checked-cell-ref)
-  (:translate symbol-value)
+  (:translate symeval)
   (:generator 9
     (move object obj-temp)
     (loadw value obj-temp symbol-value-slot other-pointer-lowtag)
-    (let ((err-lab (generate-error-code vop unbound-symbol-error obj-temp)))
+    (let ((err-lab (generate-error-code vop 'unbound-symbol-error obj-temp)))
       (inst li unbound-marker-widetag temp)
       (inst bc := nil value temp err-lab))))
 
@@ -79,7 +81,7 @@
 (define-vop (fast-symbol-value cell-ref)
   (:variant symbol-value-slot other-pointer-lowtag)
   (:policy :fast)
-  (:translate symbol-value))
+  (:translate symeval))
 
 (define-vop (symbol-hash)
   (:policy :fast-safe)
@@ -97,9 +99,9 @@
 ;;; On unithreaded builds these are just copies of the non-global versions.
 (define-vop (%set-symbol-global-value set))
 (define-vop (symbol-global-value symbol-value)
-  (:translate symbol-global-value))
+  (:translate sym-global-val))
 (define-vop (fast-symbol-global-value fast-symbol-value)
-  (:translate symbol-global-value))
+  (:translate sym-global-val))
 
 ;;;; Fdefinition (fdefn) objects.
 
@@ -107,6 +109,8 @@
   (:variant fdefn-fun-slot other-pointer-lowtag))
 
 (define-vop (safe-fdefn-fun)
+  (:translate safe-fdefn-fun)
+  (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :target obj-temp))
   (:results (value :scs (descriptor-reg any-reg)))
   (:vop-var vop)
@@ -115,7 +119,7 @@
   (:generator 10
     (move obj-temp object)
     (loadw value obj-temp fdefn-fun-slot other-pointer-lowtag)
-    (let ((err-lab (generate-error-code vop undefined-fun-error obj-temp)))
+    (let ((err-lab (generate-error-code vop 'undefined-fun-error obj-temp)))
       (inst bc := nil value null-tn err-lab))))
 
 (define-vop (set-fdefn-fun)
@@ -129,9 +133,9 @@
   (:generator 38
     (let ((normal-fn (gen-label)))
       (load-type type function (- fun-pointer-lowtag))
-      (inst addi (- simple-fun-header-widetag) type type)
+      (inst addi (- simple-fun-widetag) type type)
       (inst comb := type zero-tn normal-fn)
-      (inst addi (- (ash simple-fun-code-offset word-shift) fun-pointer-lowtag)
+      (inst addi (- (ash simple-fun-insts-offset word-shift) fun-pointer-lowtag)
             function lip)
       (inst li (make-fixup 'closure-tramp :assembly-routine) lip)
       (emit-label normal-fn)
@@ -147,7 +151,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 38
     (storew null-tn fdefn fdefn-fun-slot other-pointer-lowtag)
-    (inst li (make-fixup "undefined_tramp" :foreign) temp)
+    (inst li (make-fixup 'undefined-tramp :assembly-routine) temp)
     (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)
     (move fdefn result)))
 
@@ -160,7 +164,7 @@
 ;;;
 ;;; See the "Chapter 9: Specials" of the SBCL Internals Manual.
 
-(define-vop (bind)
+(define-vop (dynbind)
   (:args (val :scs (any-reg descriptor-reg))
          (symbol :scs (descriptor-reg)))
   (:temporary (:scs (descriptor-reg)) temp)
@@ -221,11 +225,19 @@
   funcallable-instance-info-offset fun-pointer-lowtag
   (descriptor-reg any-reg) * %funcallable-instance-info)
 
-(define-vop (closure-ref slot-ref)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-ref)
+  (:args (object :scs (descriptor-reg)))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (loadw value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
-(define-vop (closure-init slot-set)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-init)
+  (:args (object :scs (descriptor-reg))
+         (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (storew value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 (define-vop (closure-init-from-fp)
   (:args (object :scs (descriptor-reg)))
@@ -297,6 +309,7 @@
                   (error "inst fstx cant handle offset-register loaded with immediate ~s" ,imm))))
            (raw-instance ((type inc-offset-by set &optional complex)
                           &body body)
+             (declare (ignore inc-offset-by)) ; FIXME: remove
              (let ((name (symbolicate "RAW-INSTANCE-"
                                       (if set "SET/" "REF/")
                                       (if (eq type 'unsigned)
@@ -320,17 +333,14 @@
                            `((value :scs (,type-reg) :target result))))
                 (:arg-types * positive-fixnum ,@(if set `(,type-num)))
                 (:results (,(if set 'result 'value) :scs (,type-reg)))
-                (:temporary (:scs (non-descriptor-reg)) offset)
+                ;; Floating-point load/store might need an extra register
+                ;; since an immediate displacement is only 5 signed bits.
+                ,@(if (member type '(single double))
+                      '((:temporary (:scs (non-descriptor-reg)) offset)))
                 (:temporary (:scs (interior-reg)) lip)
                 (:result-types ,type-num)
                 (:generator 5
-                  (loadw offset object 0 instance-pointer-lowtag)
-                  (inst srl offset n-widetag-bits offset)
-                  (inst sll offset 2 offset)
-                  (inst sub offset index offset)
-                  (inst addi ,(* inc-offset-by n-word-bytes)
-                             offset offset)
-                  (inst add offset object lip)
+                  (inst add index object lip)
                   ,@body)))))
   (raw-instance (unsigned -1 nil)
     (inst ldw (- (* instance-slots-offset n-word-bytes)

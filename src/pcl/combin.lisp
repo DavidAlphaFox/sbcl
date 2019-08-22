@@ -118,8 +118,46 @@
                                               method-alist
                                               wrappers))))
 
+;;; methods-tracing TODO:
+;;;
+;;; 2. tracing method calls for non-fast-method-function calls
+;;;    - [DONE] the calls themselves
+;;;    - calls to the METHOD-FUNCTION of methods with fast functions
+;;;      (e.g. from something implementing CALL-NEXT-METHOD; handle this with
+;;;      some more smarts in %METHOD-FUNCTION objects?)
+;;;    - calls to the METHOD-FUNCTION of methods without fast functions
+;;;      (TRACE :METHODS T /could/ modify the METHOD-FUNCTION slot)
+;;; 4. tracing particular methods
+;;;    - need an interface.
+;;;      * (trace (method foo :around (t)))? [ how to trace the method and not
+;;;        the generic function as a whole?]
+;;;      * (trace :methods '((:around (t))) foo)? [probably not, interacts
+;;;        poorly with TRACE arg handling]
+;;; 5. supporting non-munged arguments as an option
+
+(defun method-trace-name (gf method)
+  ;; KLUDGE: we abuse NIL as second argument to mean that this is a
+  ;; combined method (i.e. something resulting from MAKE-METHOD in a
+  ;; method combination, rather than CALL-METHOD on a method object).
+  (if method
+      `(method ,(generic-function-name gf)
+               ,@(method-qualifiers method)
+               ,(unparse-specializers gf (method-specializers method)))
+      `(combined-method ,(generic-function-name gf))))
+
+(defun maybe-trace-method (gf method fun fmf-p)
+  (let ((info (gethash gf sb-debug::*traced-funs*)))
+    (if (and info (sb-debug::trace-info-methods info))
+        (let ((minfo (copy-structure info)))
+          (setf (sb-debug::trace-info-what minfo) (method-trace-name gf method))
+          (lambda (&rest args)
+            (apply #'sb-debug::trace-method-call minfo fun fmf-p args)))
+        fun)))
+
 (defun make-emf-from-method
-    (method cm-args &optional gf fmf-p method-alist wrappers)
+    (gf method cm-args fmf-p &optional method-alist wrappers)
+  ;; Avoid style-warning about compiler-macro being unavailable.
+  (declare (notinline make-instance))
   (multiple-value-bind (mf real-mf-p fmf pv)
       (get-method-function method method-alist wrappers)
     (if fmf
@@ -130,12 +168,13 @@
                       fmf-p method-alist wrappers))
                (arg-info (method-plist-value method :arg-info))
                (default (cons nil nil))
-               (value (method-plist-value method :constant-value default)))
+               (value (method-plist-value method :constant-value default))
+               (fun (maybe-trace-method gf method fmf t)))
           (if (eq value default)
-              (make-fast-method-call :function fmf :pv pv
-                                     :next-method-call next :arg-info arg-info)
+              (make-fast-method-call
+               :function fun :pv pv :next-method-call next :arg-info arg-info)
               (make-constant-fast-method-call
-               :function fmf :pv pv :next-method-call next
+               :function fun :pv pv :next-method-call next
                :arg-info arg-info :value value)))
         (if real-mf-p
             (flet ((frob-cm-arg (arg)
@@ -155,7 +194,7 @@
                                  (fast-method-call
                                   (let* ((fmf (fast-method-call-function emf))
                                          (fun (method-function-from-fast-method-call emf))
-                                         (mf (%make-method-function fmf nil)))
+                                         (mf (%make-method-function fmf)))
                                     (set-funcallable-instance-function mf fun)
                                     (make-instance 'standard-method
                                                    :specializers nil ; XXX
@@ -179,11 +218,12 @@
                      ;; user-defined class don't work at all.  -- CSR,
                      ;; 2006-08-05
                      (args (cons (mapcar #'frob-cm-arg (car cm-args))
-                                 (cdr cm-args))))
+                                 (cdr cm-args)))
+                     (fun (maybe-trace-method gf method mf nil)))
                 (if (eq value default)
-                    (make-method-call :function mf :call-method-args args)
-                    (make-constant-method-call :function mf :value value
-                                               :call-method-args args))))
+                    (make-method-call :function fun :call-method-args args)
+                    (make-constant-method-call
+                     :function fun :value value :call-method-args args))))
             mf))))
 
 (defun make-effective-method-function-simple1
@@ -192,7 +232,7 @@
     (if (if (listp method)
             (eq (car method) :early-method)
             (method-p method))
-        (make-emf-from-method method cm-args gf fmf-p method-alist wrappers)
+        (make-emf-from-method gf method cm-args fmf-p method-alist wrappers)
         (if (and (consp method) (eq (car method) 'make-method))
             (make-effective-method-function gf
                                             (cadr method)
@@ -216,12 +256,10 @@
 
 (defun expand-effective-method-function (gf effective-method &optional env)
   (declare (ignore env))
+  (declare (muffle-conditions code-deletion-note))
   (multiple-value-bind (nreq applyp)
       (get-generic-fun-info gf)
     (let ((ll (make-fast-method-call-lambda-list nreq applyp))
-          (check-applicable-keywords
-           (when (and applyp (gf-requires-emf-keyword-checks gf))
-             '((check-applicable-keywords))))
           (error-p (or (eq (first effective-method) '%no-primary-method)
                        (eq (first effective-method) '%invalid-qualifiers)))
           (mc-args-p
@@ -255,12 +293,10 @@
               (declare (ignore .pv. .next-method-call.))
               (let ((.gf-args. ,gf-args))
                 (declare (ignorable .gf-args.))
-                ,@check-applicable-keywords
                 ,effective-method))))
         (t
          `(named-lambda ,name ,ll
             (declare (ignore ,@(if error-p ll '(.pv. .next-method-call.))))
-            ,@check-applicable-keywords
             ,effective-method))))))
 
 (defun expand-emf-call-method (gf form metatypes applyp env)
@@ -326,7 +362,7 @@
                                          .valid-keys.
                                          .dfun-more-context.
                                          .dfun-more-count.)
-             '(.keyargs-start. .valid-keys.)))
+             '()))
     (t
      (default-code-converter form))))
 
@@ -343,11 +379,10 @@
                             generic-function form))
                          (cdr form)))))
     (check-applicable-keywords
-     '(.keyargs-start. .valid-keys.))
+     '())
     (t
      (default-constant-converter form))))
 
-(defvar *applicable-methods*)
 (defun make-effective-method-function-internal
     (generic-function effective-method method-alist-p wrappers-p)
   (multiple-value-bind (nreq applyp metatypes nkeys arg-info)
@@ -373,29 +408,23 @@
                     (lambda (form)
                       (memf-constant-converter form generic-function)))
         (lambda (method-alist wrappers)
-          (multiple-value-bind (valid-keys keyargs-start)
-              (when (memq '.valid-keys. constants)
-                (compute-applicable-keywords
-                 generic-function *applicable-methods*))
-            (flet ((compute-constant (constant)
-                     (if (consp constant)
-                         (case (car constant)
-                           (.meth.
-                            (funcall (cdr constant) method-alist wrappers))
-                           (.meth-list.
-                            (mapcar (lambda (fn)
-                                      (funcall fn method-alist wrappers))
-                                    (cdr constant)))
-                           (t constant))
-                         (case constant
-                           (.keyargs-start. keyargs-start)
-                           (.valid-keys. valid-keys)
-                           (t constant)))))
-              (let ((fun (apply cfunction
-                                (mapcar #'compute-constant constants))))
-                (set-fun-name fun `(combined-method ,name))
-                (make-fast-method-call :function fun
-                                       :arg-info arg-info)))))))))
+          (flet ((compute-constant (constant)
+                   (if (consp constant)
+                       (case (car constant)
+                         (.meth.
+                          (funcall (cdr constant) method-alist wrappers))
+                         (.meth-list.
+                          (mapcar (lambda (fn)
+                                    (funcall fn method-alist wrappers))
+                                  (cdr constant)))
+                         (t constant))
+                       (case constant
+                         (t constant)))))
+            (let ((fun (apply cfunction
+                              (mapcar #'compute-constant constants))))
+              (set-fun-name fun `(combined-method ,name))
+              (make-fast-method-call :function (maybe-trace-method generic-function nil fun t)
+                                     :arg-info arg-info))))))))
 
 (defmacro call-method-list (&rest calls)
   `(progn ,@calls))
@@ -406,6 +435,12 @@
 
 (defun gf-requires-emf-keyword-checks (generic-function)
   (member '&key (gf-lambda-list generic-function)))
+
+(defconstant-eqx +standard-method-combination-qualifiers+
+    '(:around :before :after) #'equal)
+
+(defun standard-method-combination-qualifier-p (qualifier)
+  (member qualifier +standard-method-combination-qualifiers+))
 
 (defun standard-compute-effective-method
     (generic-function combin applicable-methods)
@@ -439,8 +474,12 @@
            (let ((call-method
                   `(call-method ,(first (primary)) ,(rest (primary)))))
              (if (gf-requires-emf-keyword-checks generic-function)
-                 ;; the PROGN inhibits the above optimization
-                 `(progn ,call-method)
+                 (multiple-value-bind (valid-keys keyargs-start)
+                     (compute-applicable-keywords generic-function applicable-methods)
+                   `(let ((.valid-keys. ',valid-keys)
+                          (.keyargs-start. ',keyargs-start))
+                      (check-applicable-keywords)
+                      ,call-method))
                  call-method)))
           (t
            (let ((main-effective-method
@@ -457,17 +496,87 @@
                                (,@(rest (around))
                                   (make-method ,main-effective-method)))
                  main-effective-method))))))
+
+(defun short-method-combination-qualifiers (type-name)
+  (list type-name :around))
+
+(defun short-method-combination-qualifier-p (type-name qualifier)
+  (or (eq qualifier type-name) (eq qualifier :around)))
+
+(defun short-compute-effective-method
+    (generic-function combin applicable-methods)
+  (let ((type-name (method-combination-type-name combin))
+        (operator (short-combination-operator combin))
+        (ioa (short-combination-identity-with-one-argument combin))
+        (order (car (method-combination-options combin)))
+        (around ())
+        (primary ()))
+    (flet ((invalid (gf combin m)
+             (return-from short-compute-effective-method
+               `(%invalid-qualifiers ',gf ',combin ',m))))
+      (dolist (m applicable-methods)
+        (let ((qualifiers (method-qualifiers m)))
+          (cond ((null qualifiers) (invalid generic-function combin m))
+                ((cdr qualifiers) (invalid generic-function combin m))
+                ((eq (car qualifiers) :around)
+                 (push m around))
+                ((eq (car qualifiers) type-name)
+                 (push m primary))
+                (t (invalid generic-function combin m))))))
+    (setq around (nreverse around))
+    (ecase order
+      (:most-specific-last) ; nothing to be done, already in correct order
+      (:most-specific-first
+       (setq primary (nreverse primary))))
+    (let ((main-method
+            (if (and (null (cdr primary))
+                     (not (null ioa)))
+                `(call-method ,(car primary) ())
+                `(,operator ,@(mapcar (lambda (m) `(call-method ,m ()))
+                                      primary)))))
+      (cond ((null primary)
+             ;; As of sbcl-0.8.0.80 we don't seem to need to do
+             ;; anything messy like
+             ;;        `(APPLY (FUNCTION (IF AROUND
+             ;;                              'NO-PRIMARY-METHOD
+             ;;                              'NO-APPLICABLE-METHOD)
+             ;;                           ',GENERIC-FUNCTION
+             ;;                           .ARGS.)
+             ;; here because (for reasons I don't understand at the
+             ;; moment -- WHN) control will never reach here if there
+             ;; are no applicable methods, but instead end up
+             ;; in NO-APPLICABLE-METHODS first.
+             ;;
+             ;; FIXME: The way that we arrange for .ARGS. to be bound
+             ;; here seems weird. We rely on EXPAND-EFFECTIVE-METHOD-FUNCTION
+             ;; recognizing any form whose operator is %NO-PRIMARY-METHOD
+             ;; as magical, and carefully surrounding it with a
+             ;; LAMBDA form which binds .ARGS. But...
+             ;;   1. That seems fragile, because the magicalness of
+             ;;      %NO-PRIMARY-METHOD forms is scattered around
+             ;;      the system. So it could easily be broken by
+             ;;      locally-plausible maintenance changes like,
+             ;;      e.g., using the APPLY expression above.
+             ;;   2. That seems buggy w.r.t. to MOPpish tricks in
+             ;;      user code, e.g.
+             ;;         (DEFMETHOD COMPUTE-EFFECTIVE-METHOD :AROUND (...)
+             ;;           `(PROGN ,(CALL-NEXT-METHOD) (INCF *MY-CTR*)))
+             `(%no-primary-method ',generic-function .args.))
+            ((null around) main-method)
+            (t
+             `(call-method ,(car around)
+                           (,@(cdr around) (make-method ,main-method))))))))
 
 ;;; helper code for checking keywords in generic function calls.
 (defun compute-applicable-keywords (gf methods)
   (let ((any-keyp nil))
     (flet ((analyze (lambda-list)
-             (multiple-value-bind (nreq nopt keyp restp allowp keys)
+             (multiple-value-bind (llks nreq nopt keys)
                  (analyze-lambda-list lambda-list)
-               (declare (ignore nreq restp))
-               (when keyp
+               (declare (ignore nreq))
+               (when (ll-kwds-keyp llks)
                  (setq any-keyp t))
-               (values nopt allowp keys))))
+               (values nopt (ll-kwds-allowp llks) keys))))
       (multiple-value-bind (nopt allowp keys)
           (analyze (generic-function-lambda-list gf))
         (dolist (method methods)
@@ -496,18 +605,16 @@
         (loop
            (when (>= i more-count)
              (when (and (invalid) (not allow-other-keys))
-               (error 'simple-program-error
-                      :format-control "~@<invalid keyword argument~P: ~
-                                   ~{~S~^, ~} (valid keys are ~{~S~^, ~}).~@:>"
-                      :format-arguments (list (length (invalid)) (invalid) valid-keys)))
+               (%program-error "~@<invalid keyword argument~P: ~
+                                ~{~S~^, ~} (valid keys are ~{~S~^, ~}).~@:>"
+                               (length (invalid)) (invalid) valid-keys))
              (return))
            (let ((key (current-value)))
              (incf i)
              (cond
                ((not (symbolp key))
-                (error 'simple-program-error
-                       :format-control "~@<keyword argument not a symbol: ~S.~@:>"
-                       :format-arguments (list key)))
+                (%program-error "~@<keyword argument not a symbol: ~S.~@:>"
+                                key))
                ((= i more-count)
                 (sb-c::%odd-key-args-error))
                ((eq key :allow-other-keys)
@@ -537,14 +644,14 @@
                                      applicable-methods))
 
 (defun invalid-method-error (method format-control &rest format-arguments)
-  (let ((sb-debug:*stack-top-hint* (nth-value 1 (find-caller-name-and-frame))))
+  (let ((sb-debug:*stack-top-hint* (find-caller-frame)))
     (error "~@<invalid method error for ~2I~_~S ~I~_method: ~2I~_~?~:>"
            method
            format-control
            format-arguments)))
 
 (defun method-combination-error (format-control &rest format-arguments)
-  (let ((sb-debug:*stack-top-hint* (nth-value 1 (find-caller-name-and-frame))))
+  (let ((sb-debug:*stack-top-hint* (find-caller-frame)))
     (error "~@<method combination error in CLOS dispatch: ~2I~_~?~:>"
            format-control
            format-arguments)))

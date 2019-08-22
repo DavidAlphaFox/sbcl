@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; DEFKNOWNs
 
@@ -51,8 +51,6 @@
   ())
 (defknown %local-alien-addr (local-alien-info t) (alien (* t))
   (flushable movable))
-(defknown dispose-local-alien (local-alien-info t) t
-  ())
 
 (defknown %cast (alien-value alien-type) alien
   (flushable movable))
@@ -70,6 +68,14 @@
 
 (defknown alien-funcall (alien-value &rest *) *
   (any recursive))
+
+(defknown sb-alien::string-to-c-string (simple-string t) (or (simple-array (unsigned-byte 8) (*))
+                                                             simple-base-string)
+    (movable flushable))
+(defknown sb-alien::c-string-to-string (system-area-pointer t t) simple-string
+    (movable flushable))
+(defknown sb-alien::c-string-external-format * *
+        (movable flushable))
 
 ;;;; cosmetic transforms
 
@@ -116,7 +122,7 @@
         (return (make-alien-type-type slot-type))))
     *wild-type*))
 
-(deftransform slot ((alien slot) * * :important t)
+(deftransform slot ((alien slot))
   (multiple-value-bind (slot-offset slot-type)
       (find-slot-offset-and-type alien slot)
     `(%alien-value (alien-sap alien)
@@ -135,7 +141,7 @@
           (return type))))
     *wild-type*))
 
-(deftransform %set-slot ((alien slot value) * * :important t)
+(deftransform %set-slot ((alien slot value))
   (multiple-value-bind (slot-offset slot-type)
       (find-slot-offset-and-type alien slot)
     `(setf (%alien-value (alien-sap alien)
@@ -153,11 +159,11 @@
                  (make-alien-pointer-type :to slot-type)))))
     *wild-type*))
 
-(deftransform %slot-addr ((alien slot) * * :important t)
+(deftransform %slot-addr ((alien slot))
   (multiple-value-bind (slot-offset slot-type)
       (find-slot-offset-and-type alien slot)
     (/noshow "in DEFTRANSFORM %SLOT-ADDR, creating %SAP-ALIEN")
-    `(%sap-alien (sap+ (alien-sap alien) (/ ,slot-offset sb!vm:n-byte-bits))
+    `(%sap-alien (sap+ (alien-sap alien) (/ ,slot-offset sb-vm:n-byte-bits))
                  ',(make-alien-pointer-type :to slot-type))))
 
 ;;;; DEREF support
@@ -239,7 +245,7 @@
       (return (make-alien-type-type (find-deref-element-type alien))))
     *wild-type*))
 
-(deftransform deref ((alien &rest indices) * * :important t)
+(deftransform deref ((alien &rest indices))
   (multiple-value-bind (indices-args offset-expr element-type)
       (compute-deref-guts alien indices)
     `(lambda (alien ,@indices-args)
@@ -259,7 +265,7 @@
         (return type)))
     *wild-type*))
 
-(deftransform %set-deref ((alien value &rest indices) * * :important t)
+(deftransform %set-deref ((alien value &rest indices))
   (multiple-value-bind (indices-args offset-expr element-type)
       (compute-deref-guts alien indices)
     `(lambda (alien value ,@indices-args)
@@ -277,12 +283,12 @@
                 :to (find-deref-element-type alien)))))
     *wild-type*))
 
-(deftransform %deref-addr ((alien &rest indices) * * :important t)
+(deftransform %deref-addr ((alien &rest indices))
   (multiple-value-bind (indices-args offset-expr element-type)
       (compute-deref-guts alien indices)
     (/noshow "in DEFTRANSFORM %DEREF-ADDR, creating (LAMBDA .. %SAP-ALIEN)")
     `(lambda (alien ,@indices-args)
-       (%sap-alien (sap+ (alien-sap alien) (/ ,offset-expr sb!vm:n-byte-bits))
+       (%sap-alien (sap+ (alien-sap alien) (/ ,offset-expr sb-vm:n-byte-bits))
                    ',(make-alien-pointer-type :to element-type)))))
 
 ;;;; support for aliens on the heap
@@ -303,7 +309,7 @@
         (return (make-alien-type-type type))))
     *wild-type*))
 
-(deftransform %heap-alien ((info) ((constant-arg heap-alien-info)) * :important t)
+(deftransform %heap-alien ((info) ((constant-arg heap-alien-info)) *)
   (multiple-value-bind (sap type) (heap-alien-sap-and-type info)
     `(%alien-value ,sap 0 ',type)))
 
@@ -318,7 +324,7 @@
           (return type))))
     *wild-type*))
 
-(deftransform %set-heap-alien ((info value) (heap-alien-info *) * :important t)
+(deftransform %set-heap-alien ((info value) (heap-alien-info *) *)
   (multiple-value-bind (sap type) (heap-alien-sap-and-type info)
     `(setf (%alien-value ,sap 0 ',type) value)))
 
@@ -330,7 +336,7 @@
         (return (make-alien-type-type (make-alien-pointer-type :to type)))))
     *wild-type*))
 
-(deftransform %heap-alien-addr ((info) * * :important t)
+(deftransform %heap-alien-addr ((info))
   (multiple-value-bind (sap type) (heap-alien-sap-and-type info)
     (/noshow "in DEFTRANSFORM %HEAP-ALIEN-ADDR, creating %SAP-ALIEN")
     `(%sap-alien ,sap ',(make-alien-pointer-type :to type))))
@@ -342,7 +348,7 @@
   (unless (constant-lvar-p info)
     (abort-ir1-transform "Local alien info isn't constant?")))
 
-(deftransform make-local-alien ((info) * * :important t)
+(deftransform make-local-alien ((info))
   (alien-info-constant-or-abort info)
   (let* ((info (lvar-value info))
          (alien-type (local-alien-info-type info))
@@ -353,43 +359,41 @@
     (/noshow (local-alien-info-force-to-memory-p info))
     (/noshow alien-type (unparse-alien-type alien-type) (alien-type-bits alien-type))
     (if (local-alien-info-force-to-memory-p info)
-        #!+(or x86 x86-64)
+        #+(or x86 x86-64)
         `(%primitive alloc-alien-stack-space
                      ,(ceiling (alien-type-bits alien-type)
-                               sb!vm:n-byte-bits))
-        #!-(or x86 x86-64)
+                               sb-vm:n-byte-bits))
+        #-(or x86 x86-64)
         `(%primitive alloc-number-stack-space
                      ,(ceiling (alien-type-bits alien-type)
-                               sb!vm:n-byte-bits))
+                               sb-vm:n-byte-bits))
         (let* ((alien-rep-type-spec (compute-alien-rep-type alien-type))
                (alien-rep-type (specifier-type alien-rep-type-spec)))
           (cond ((csubtypep (specifier-type 'system-area-pointer)
                             alien-rep-type)
                  '(int-sap 0))
                 ((ctypep 0 alien-rep-type) 0)
-                ((ctypep 0.0f0 alien-rep-type) 0.0f0)
-                ((ctypep 0.0d0 alien-rep-type) 0.0d0)
+                ((ctypep $0.0f0 alien-rep-type) $0.0f0)
+                ((ctypep $0.0d0 alien-rep-type) $0.0d0)
                 (t
                  (compiler-error
                   "Aliens of type ~S cannot be represented immediately."
                   (unparse-alien-type alien-type))))))))
 
-(deftransform note-local-alien-type ((info var) * * :important t)
+(deftransform note-local-alien-type ((info var))
   (alien-info-constant-or-abort info)
   (let ((info (lvar-value info)))
-    (/noshow "in DEFTRANSFORM NOTE-LOCAL-ALIEN-TYPE" info)
-    (/noshow (local-alien-info-force-to-memory-p info))
     (unless (local-alien-info-force-to-memory-p info)
       (let ((var-node (lvar-uses var)))
-        (/noshow var-node (ref-p var-node))
-        (when (ref-p var-node)
+        (when (and (ref-p var-node)
+                   (constant-reference-p var-node))
           (propagate-to-refs (ref-leaf var-node)
                              (specifier-type
                               (compute-alien-rep-type
                                (local-alien-info-type info))))))))
   nil)
 
-(deftransform local-alien ((info var) * * :important t)
+(deftransform local-alien ((info var))
   (alien-info-constant-or-abort info)
   (let* ((info (lvar-value info))
          (alien-type (local-alien-info-type info)))
@@ -399,12 +403,12 @@
         `(%alien-value var 0 ',alien-type)
         `(naturalize var ',alien-type))))
 
-(deftransform %local-alien-forced-to-memory-p ((info) * * :important t)
+(deftransform %local-alien-forced-to-memory-p ((info))
   (alien-info-constant-or-abort info)
   (let ((info (lvar-value info)))
     (local-alien-info-force-to-memory-p info)))
 
-(deftransform %set-local-alien ((info var value) * * :important t)
+(deftransform %set-local-alien ((info var value))
   (alien-info-constant-or-abort info)
   (let* ((info (lvar-value info))
          (alien-type (local-alien-info-type info)))
@@ -420,7 +424,7 @@
         (make-alien-type-type (make-alien-pointer-type :to alien-type)))
       *wild-type*))
 
-(deftransform %local-alien-addr ((info var) * * :important t)
+(deftransform %local-alien-addr ((info var))
   (alien-info-constant-or-abort info)
   (let* ((info (lvar-value info))
          (alien-type (local-alien-info-type info)))
@@ -428,19 +432,6 @@
     (if (local-alien-info-force-to-memory-p info)
         `(%sap-alien var ',(make-alien-pointer-type :to alien-type))
         (error "This shouldn't happen."))))
-
-;; DISPOSE-LOCAL-ALIEN can't happens on x86[-64].
-;; A transform of it is just misdirection.
-#!-(or x86 x86-64)
-(deftransform dispose-local-alien ((info var) * * :important t)
-  (alien-info-constant-or-abort info)
-  (let* ((info (lvar-value info))
-         (alien-type (local-alien-info-type info)))
-    (if (local-alien-info-force-to-memory-p info)
-        `(%primitive dealloc-number-stack-space
-                          ,(ceiling (alien-type-bits alien-type)
-                                    sb!vm:n-byte-bits))
-      nil)))
 
 ;;;; %CAST
 
@@ -452,7 +443,7 @@
             (make-alien-type-type alien-type))))
       *wild-type*))
 
-(deftransform %cast ((alien target-type) * * :important t)
+(deftransform %cast ((alien target-type))
   (unless (constant-lvar-p target-type)
     (give-up-ir1-transform
      "The alien type is not constant, so access cannot be open coded."))
@@ -466,7 +457,7 @@
 
 ;;;; ALIEN-SAP, %SAP-ALIEN, %ADDR, etc.
 
-(deftransform alien-sap ((alien) * * :important t)
+(deftransform alien-sap ((alien))
   (let ((alien-node (lvar-uses alien)))
     (typecase alien-node
       (combination
@@ -483,12 +474,10 @@
       (make-alien-type-type (lvar-value type))
       *wild-type*))
 
-(deftransform %sap-alien ((sap type) * * :important t)
+(deftransform %sap-alien ((sap type))
+  "optimize away %SAP-ALIEN"
   (give-up-ir1-transform
-   ;; FIXME: The hardcoded newline here causes more-than-usually
-   ;; screwed-up formatting of the optimization note output.
-   "could not optimize away %SAP-ALIEN: forced to do runtime ~@
-    allocation of alien-value structure"))
+   "forced to do runtime allocation of alien-value structure"))
 
 ;;;; NATURALIZE/DEPORT/EXTRACT/DEPOSIT magic
 
@@ -503,15 +492,15 @@
                result)
            (error (condition)
                   (compiler-error "~A" condition)))))
-  (deftransform naturalize ((object type) * * :important t)
+  (deftransform naturalize ((object type))
     (%computed-lambda #'compute-naturalize-lambda type))
-  (deftransform deport ((alien type) * * :important t)
+  (deftransform deport ((alien type))
     (%computed-lambda #'compute-deport-lambda type))
-  (deftransform deport-alloc ((alien type) * * :important t)
+  (deftransform deport-alloc ((alien type))
     (%computed-lambda #'compute-deport-alloc-lambda type))
-  (deftransform %alien-value ((sap offset type) * * :important t)
+  (deftransform %alien-value ((sap offset type))
     (%computed-lambda #'compute-extract-lambda type))
-  (deftransform (setf %alien-value) ((value sap offset type) * * :important t)
+  (deftransform (setf %alien-value) ((value sap offset type))
     (%computed-lambda #'compute-deposit-lambda type)))
 
 ;;;; a hack to clean up divisions
@@ -526,7 +515,7 @@
      (case (let ((name (lvar-fun-name (combination-fun thing))))
              (or (modular-version-info name :untagged nil) name))
        ((+ -)
-        (let ((min most-positive-fixnum)
+        (let ((min sb-xc:most-positive-fixnum)
               (itype (specifier-type 'integer)))
           (dolist (arg (combination-args thing) min)
             (if (csubtypep (lvar-type arg) itype)
@@ -553,7 +542,7 @@
         0)))
     (integer
      (if (zerop thing)
-         most-positive-fixnum
+         sb-xc:most-positive-fixnum
          (do ((result 0 (1+ result))
               (num thing (ash num -1)))
              ((logbitp 0 num) result))))
@@ -604,14 +593,13 @@
 ;;;; ALIEN-FUNCALL support
 
 (deftransform alien-funcall ((function &rest args)
-                             ((alien (* t)) &rest *) *
-                             :important t)
+                             ((alien (* t)) &rest *) *)
   (let ((names (make-gensym-list (length args))))
     (/noshow "entering first DEFTRANSFORM ALIEN-FUNCALL" function args)
     `(lambda (function ,@names)
        (alien-funcall (deref function) ,@names))))
 
-(deftransform alien-funcall ((function &rest args) * * :node node :important t)
+(deftransform alien-funcall ((function &rest args) * * :node node)
   (let ((type (lvar-type function)))
     (unless (alien-type-type-p type)
       (give-up-ir1-transform "can't tell function type at compile time"))
@@ -619,7 +607,8 @@
     (let ((alien-type (alien-type-type-alien-type type)))
       (unless (alien-fun-type-p alien-type)
         (give-up-ir1-transform))
-      (let ((arg-types (alien-fun-type-arg-types alien-type)))
+      (let ((arg-types (alien-fun-type-arg-types alien-type))
+            (ignore-fun))
         (unless (= (length args) (length arg-types))
           (abort-ir1-transform
            "wrong number of arguments; expected ~W, got ~W"
@@ -634,9 +623,26 @@
           (let ((return-type (alien-fun-type-result-type alien-type))
                 ;; Innermost, we DEPORT the parameters (e.g. by taking SAPs
                 ;; to them) and do the call.
-                (body `(%alien-funcall (deport function ',alien-type)
-                                       ',alien-type
-                                       ,@(deports))))
+                (body
+                 ;; If FUNCTION's source looks like
+                 ;;  (%SAP-ALIEN (FOREIGN-SYMBOL-SAP "sym") #<anything>)
+                 ;; then snarf out the string and use it as the funarg
+                 ;; unless the backend lacks the CALL-OUT-NAMED vop.
+                 `(%alien-funcall
+                   ,(or (when (and (gethash 'call-out-named *backend-parsed-vops*)
+                                   (lvar-matches function :fun-names '(%sap-alien)
+                                                          :arg-count 2))
+                          (let ((sap (first (combination-args (lvar-use function)))))
+                            (when (lvar-matches sap :fun-names '(foreign-symbol-sap)
+                                                    :arg-count 1)
+                              (let ((sym (first (combination-args (lvar-use sap)))))
+                                (when (and (constant-lvar-p sym)
+                                           (stringp (lvar-value sym)))
+                                  (setq ignore-fun t)
+                                  (lvar-value sym))))))
+                        `(deport function ',alien-type))
+                   ',alien-type
+                   ,@(deports))))
             ;; Wrap that in a WITH-PINNED-OBJECTS to ensure the values
             ;; the SAPs are taken for won't be moved by the GC. (If
             ;; needed: some alien types won't need it).
@@ -668,21 +674,21 @@
             ;; Remember this frame to make sure that we can get back
             ;; to it later regardless of how the foreign stack looks
             ;; like.
-            #!+:c-stack-is-control-stack
+            #+c-stack-is-control-stack
             (when (policy node (= 3 alien-funcall-saves-fp-and-pc))
-              (setf body `(invoke-with-saved-fp-and-pc (lambda () ,body))))
+              (setf body `(invoke-with-saved-fp (lambda () ,body))))
             (/noshow "returning from DEFTRANSFORM ALIEN-FUNCALL" (params) body)
             `(lambda (function ,@(params))
+               ,@(when ignore-fun '((declare (ignore function))))
                (declare (optimize (let-conversion 3)))
                ,body)))))))
 
 (defoptimizer (%alien-funcall derive-type) ((function type &rest args))
   (declare (ignore function args))
-  (unless (constant-lvar-p type)
+  (unless (and (constant-lvar-p type)
+               (alien-fun-type-p (lvar-value type)))
     (error "Something is broken."))
   (let ((type (lvar-value type)))
-    (unless (alien-fun-type-p type)
-      (error "Something is broken."))
     (values-specifier-type
      (compute-alien-rep-type
       (alien-fun-type-result-type type)
@@ -693,7 +699,9 @@
   (declare (ignore type ltn-policy))
   (setf (basic-combination-info node) :funny)
   (setf (node-tail-p node) nil)
-  (annotate-ordinary-lvar function)
+  (unless (and (constant-lvar-p function)
+               (stringp function))
+    (annotate-ordinary-lvar function))
   (dolist (arg args)
     (annotate-ordinary-lvar arg)))
 
@@ -715,19 +723,24 @@
         ;; in reverse order here doesn't change the semantics, but we
         ;; deal with all of the stack arguments before the wired
         ;; register arguments become live.
-        (args #!-arm args #!+arm (reverse args))
-        #!+x86
+        (args #-arm args #+arm (reverse args))
+        #+c-stack-is-control-stack
         (stack-pointer (make-stack-pointer-tn)))
     (multiple-value-bind (nsp stack-frame-size arg-tns result-tns)
         (make-call-out-tns type)
-      #!+x86
-      (progn
-        (vop set-fpu-word-for-c call block)
-        (vop current-stack-pointer call block stack-pointer))
+      #+x86
+      (vop set-fpu-word-for-c call block)
+      ;; Save the stack pointer, it will get aligned and subtracting
+      ;; the size will not restore the original value, and some
+      ;; things, like SB-C::CALL-VARIABLE, use the stack pointer to
+      ;; calculate the number of saved values.
+      ;; See alien.impure.lisp/:stack-misalignment
+      #+c-stack-is-control-stack
+      (vop current-stack-pointer call block stack-pointer)
       (vop alloc-number-stack-space call block stack-frame-size nsp)
       ;; KLUDGE: This is where the second half of the ARM
       ;; register-pressure change lives (see above).
-      (dolist (tn #!-arm arg-tns #!+arm (reverse arg-tns))
+      (dolist (tn #-arm arg-tns #+arm (reverse arg-tns))
         ;; On PPC, TN might be a list. This is used to indicate
         ;; something special needs to happen. See below.
         ;;
@@ -740,15 +753,15 @@
           (aver arg)
           (unless (= (length move-arg-vops) 1)
             (error "no unique move-arg-vop for moves in SC ~S" (sc-name sc)))
-          #!+(or x86 x86-64) (emit-move-arg-template call
+          #+(or x86 x86-64) (emit-move-arg-template call
                                                      block
                                                      (first move-arg-vops)
                                                      (lvar-tn call block arg)
                                                      nsp
                                                      first-tn)
-          #!-(or x86 x86-64)
+          #-(or x86 x86-64)
           (cond
-            #!+arm-softfp
+            #+arm-softfp
             ((and (proper-list-of-length-p tn 3)
                   (symbolp (third tn)))
              (emit-template call block
@@ -768,7 +781,7 @@
                                        temp-tn
                                        nsp
                                        first-tn))))
-          #!+(and ppc darwin)
+          #+(and ppc darwin)
           (when (listp tn)
             ;; This means that we have a float arg that we need to
             ;; also copy to some int regs. The list contains the TN
@@ -777,33 +790,47 @@
             (destructuring-bind (float-tn i1-tn &optional i2-tn)
                 tn
               (if i2-tn
-                  (vop sb!vm::move-double-to-int-arg call block
+                  (vop sb-vm::move-double-to-int-arg call block
                        float-tn i1-tn i2-tn)
-                  (vop sb!vm::move-single-to-int-arg call block
+                  (vop sb-vm::move-single-to-int-arg call block
                        float-tn i1-tn))))))
       (aver (null args))
-      (unless (listp result-tns)
-        (setf result-tns (list result-tns)))
-      (let ((arg-tns (remove-if-not #'tn-p (flatten-list arg-tns)))
-            (result-tns (remove-if-not #'tn-p result-tns)))
-        (vop* call-out call block
-              ((lvar-tn call block function)
-               (reference-tn-list arg-tns nil))
-              ((reference-tn-list result-tns t))))
-      #!-x86
-      (vop dealloc-number-stack-space call block stack-frame-size)
-      #!+x86
-      (progn
+      (let* ((result-tns (ensure-list result-tns))
+             (arg-operands
+              (reference-tn-list (remove-if-not #'tn-p (flatten-list arg-tns)) nil))
+             (result-operands
+              (reference-tn-list (remove-if-not #'tn-p result-tns) t)))
+        (cond #+(vop-named sb-vm::call-out-named)
+              ((and (constant-lvar-p function) (stringp (lvar-value function)))
+               (vop* call-out-named call block (arg-operands) (result-operands)
+                     (lvar-value function)
+                     (sb-alien::alien-fun-type-varargs type)))
+              (t
+               (vop* call-out call block
+                     ((lvar-tn call block function) arg-operands)
+                     (result-operands))))
+        #-c-stack-is-control-stack
+        (vop dealloc-number-stack-space call block stack-frame-size)
+        #+c-stack-is-control-stack
         (vop reset-stack-pointer call block stack-pointer)
-        (vop set-fpu-word-for-lisp call block))
-      (cond
-        #!+arm-softfp
-        ((and lvar
-              (proper-list-of-length-p result-tns 3)
-              (symbolp (third result-tns)))
-         (emit-template call block
-                        (template-or-lose (third result-tns))
-                        (reference-tn-list (butlast result-tns) nil)
-                        (reference-tn (car (ir2-lvar-locs (lvar-info lvar))) t)))
-        (t
-         (move-lvar-result call block result-tns lvar))))))
+        #+x86
+        (vop set-fpu-word-for-lisp call block)
+        (cond
+          #+arm-softfp
+          ((and lvar
+                (proper-list-of-length-p result-tns 3)
+                (symbolp (third result-tns)))
+           (emit-template call block
+                          (template-or-lose (third result-tns))
+                          (reference-tn-list (butlast result-tns) nil)
+                          (reference-tn (car (ir2-lvar-locs (lvar-info lvar))) t)))
+          (t
+           (move-lvar-result call block result-tns lvar)))))))
+
+(deftransform sb-alien::c-string-external-format ((type)
+                                                  ((constant-arg sb-alien::alien-c-string-type)))
+  (let ((format (sb-alien::alien-c-string-type-external-format
+                 (lvar-value type))))
+    (if (eq format :default)
+        `(sb-alien::default-c-string-external-format)
+        `',format)))

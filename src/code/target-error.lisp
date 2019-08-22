@@ -10,19 +10,14 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (defun muffle-warning-p (warning)
   (declare (special *muffled-warnings*))
   (typep warning *muffled-warnings*))
 
-(defun initial-handler-clusters ()
-  `(((,#'(lambda (condition)
-           (typep condition 'warning))
-      .
-      ,#'(lambda (warning)
-           (when (muffle-warning-p warning)
-             (muffle-warning warning)))))))
+;; Host lisp does not need a value for this, so start it out as NIL.
+(define-load-time-global **initial-handler-clusters** nil)
 
 ;;; Each cluster is an alist of the form
 ;;;
@@ -38,42 +33,31 @@
 ;;;
 ;;; Lists to which *HANDLER-CLUSTERS* is bound generally have dynamic
 ;;; extent.
-(defvar *handler-clusters* (initial-handler-clusters))
+#+sb-thread (!define-thread-local *handler-clusters* **initial-handler-clusters**)
+#-sb-thread (defvar *handler-clusters* **initial-handler-clusters**)
 
 ;;; a list of lists of currently active RESTART instances. maintained
 ;;; by RESTART-BIND.
-(defvar *restart-clusters* '())
+(!define-thread-local *restart-clusters* nil)
 
-(defstruct (restart (:constructor make-restart
-                        ;; Having TEST-FUNCTION at the end allows
-                        ;; to not replicate its default value in RESTART-BIND.
-                        (name function
-                         &optional report-function
-                                   interactive-function
-                                   test-function))
-                    (:copier nil) (:predicate nil))
-  (name (missing-arg) :type symbol :read-only t)
-  (function (missing-arg) :type function :read-only t)
-  (report-function nil :type (or null function) :read-only t)
-  (interactive-function nil :type (or null function) :read-only t)
-  (test-function (lambda (cond) (declare (ignore cond)) t) :type function :read-only t)
-  ;; the list of conditions which are currently associated to the
-  ;; restart. maintained by WITH-CONDITION-RESTARTS in a neither
-  ;; thread- nor interrupt-safe way. This should not be a problem
-  ;; however, since safe uses of restarts have to assume dynamic
-  ;; extent.
-  (associated-conditions '() :type list))
+(defun !target-error-cold-init ()
+  (setq **initial-handler-clusters**
+        `(((,(find-classoid-cell 'warning :create t)
+            .
+            ,(named-lambda "MAYBE-MUFFLE" (warning)
+               (when (muffle-warning-p warning)
+                 (muffle-warning warning)))))))
+  ;;; If multithreaded, *HANDLER-CLUSTERS* is #<unbound> at this point.
+  ;;; This SETQ assigns to TLS since the value is not no-tls-value-marker.
+  (setq *handler-clusters* **initial-handler-clusters**))
 
-#!-sb-fluid (declaim (freeze-type restart))
-
-(def!method print-object ((restart restart) stream)
+(defmethod print-object ((restart restart) stream)
   (if *print-escape*
       (print-unreadable-object (restart stream :type t :identity t)
         (prin1 (restart-name restart) stream))
       (restart-report restart stream)))
 
-#!+sb-doc
-(setf (fdocumentation 'restart-name 'function)
+(setf (documentation 'restart-name 'function)
       "Return the name of the given restart object.")
 
 (defun restart-report (restart stream)
@@ -113,7 +97,6 @@
           (funcall function restart))))))
 
 (defun compute-restarts (&optional condition)
-  #!+sb-doc
   "Return a list of all the currently active restarts ordered from most recently
 established to less recently established. If CONDITION is specified, then only
 restarts associated with CONDITION (or with no condition) will be returned."
@@ -157,7 +140,6 @@ restarts associated with CONDITION (or with no condition) will be returned."
         (map-restarts #'named-restart-p condition call-test-p))))
 
 (defun find-restart (identifier &optional condition)
-  #!+sb-doc
   "Return the first restart identified by IDENTIFIER. If IDENTIFIER is a symbol,
 then the innermost applicable restart with that name is returned. If IDENTIFIER
 is a restart, it is returned if it is currently active. Otherwise NIL is
@@ -170,13 +152,13 @@ with that condition (or with no condition) will be returned."
 ;;; helper for the various functions which are ANSI-spec'ed to do
 ;;; something with a restart or signal CONTROL-ERROR if there is none
 (defun find-restart-or-control-error (identifier &optional condition (call-test-p t))
+  (declare (optimize allow-non-returning-tail-call))
   (or (%find-restart identifier condition call-test-p)
       (error 'simple-control-error
              :format-control "No restart ~S is active~@[ for ~S~]."
              :format-arguments (list identifier condition))))
 
 (defun invoke-restart (restart &rest values)
-  #!+sb-doc
   "Calls the function associated with the given restart, passing any given
    arguments. If the argument restart is not a restart or a currently active
    non-nil restart name, then a CONTROL-ERROR is signalled."
@@ -215,7 +197,6 @@ with that condition (or with no condition) will be returned."
         '())))
 
 (defun invoke-restart-interactively (restart)
-  #!+sb-doc
   "Calls the function associated with the given restart, prompting for any
    necessary arguments. If the argument restart is not a restart or a
    currently active non-NIL restart name, then a CONTROL-ERROR is signalled."
@@ -226,26 +207,49 @@ with that condition (or with no condition) will be returned."
          (args (interactive-restart-arguments real-restart)))
     (apply (restart-function real-restart) args)))
 
+;;; To reduce expansion size of RESTART-CASE
+(defun with-simple-condition-restarts (function cerror-arg datum &rest arguments)
+  (let ((sb-debug:*stack-top-hint* (or sb-debug:*stack-top-hint*
+                                       'with-simple-condition-restarts))
+        (condition (apply #'coerce-to-condition datum
+                          (case function
+                            (warn 'simple-warning)
+                            (signal 'simple-condition)
+                            (t 'simple-error))
+                          function
+                          arguments)))
+    (with-condition-restarts condition (car *restart-clusters*)
+      (if (eq function 'cerror)
+          (cerror cerror-arg condition)
+          (funcall function condition)))))
+
 
-(defun assert-error (assertion args-and-values places datum &rest arguments)
-  (let ((cond (if datum
-                  (coerce-to-condition
-                   datum arguments 'simple-error 'error)
-                  (make-condition
-                   'simple-error
-                   :format-control "~@<The assertion ~S failed~:[.~:; ~
-                                    with ~:*~{~{~S = ~S~}~^, ~}.~]~:@>"
-                   :format-arguments (list assertion args-and-values)))))
-    (restart-case
-        (error cond)
-      (continue ()
-        :report (lambda (stream)
-                  (format stream "Retry assertion")
-                  (if places
-                      (format stream " with new value~P for ~{~S~^, ~}."
-                              (length places) places)
-                      (format stream ".")))
-        nil))))
+(defun assert-error (assertion &rest rest)
+  (let* ((rest rest)
+         (n-args-and-values (if (fixnump (car rest))
+                                (* (pop rest) 2)
+                                0))
+         (args-and-values (subseq rest 0 n-args-and-values)))
+    (destructuring-bind (&optional places datum &rest arguments)
+        (subseq rest n-args-and-values)
+      (let ((cond (if datum
+                      (apply #'coerce-to-condition
+                             datum 'simple-error 'error arguments)
+                      (make-condition
+                       'simple-error
+                       :format-control "~@<The assertion ~S failed~:[.~:; ~
+                                           with ~:*~{~S = ~S~^, ~}.~]~:@>"
+                       :format-arguments (list assertion args-and-values)))))
+        (restart-case
+            (error cond)
+          (continue ()
+            :report (lambda (stream)
+                      (format stream "Retry assertion")
+                      (if places
+                          (format stream " with new value~P for ~{~S~^, ~}."
+                                  (length places) places)
+                          (format stream ".")))
+            nil))))))
 
 ;;; READ-EVALUATED-FORM is used as the interactive method for restart cases
 ;;; setup by the Common Lisp "casing" (e.g., CCASE and CTYPECASE) macros
@@ -253,12 +257,32 @@ with that condition (or with no condition) will be returned."
 (defun read-evaluated-form (&optional (prompt-control nil promptp)
                             &rest prompt-args)
   (apply #'format *query-io*
-         (if promptp prompt-control "~&Type a form to be evaluated: ")
+         (if promptp prompt-control "~&Enter a form to be evaluated: ")
          prompt-args)
   (finish-output *query-io*)
   (list (eval (read *query-io*))))
 
-(defun check-type-error (place place-value type type-string)
+(defun read-evaluated-form-of-type (type &optional (prompt-control nil promptp)
+                                    &rest prompt-args)
+  (loop (apply #'format *query-io*
+               (if promptp prompt-control "~&Enter a form evaluating to a value of type ~a: ")
+               (if promptp prompt-args (list type)))
+        (finish-output *query-io*)
+        (let ((result (eval (read *query-io*))))
+          (when (typep result type)
+            (return (list result)))
+          (format *query-io* "~s is not of type ~s" result type))))
+
+;;; Same as above but returns multiple values
+(defun mv-read-evaluated-form (&optional (prompt-control nil promptp)
+                               &rest prompt-args)
+  (apply #'format *query-io*
+         (if promptp prompt-control "~&Enter a form to be evaluated: ")
+         prompt-args)
+  (finish-output *query-io*)
+  (multiple-value-list (eval (read *query-io*))))
+
+(defun check-type-error (place place-value type &optional type-string)
   (let ((condition
          (make-condition
           'simple-type-error
@@ -274,13 +298,20 @@ with that condition (or with no condition) will be returned."
         :interactive read-evaluated-form
         value))))
 
-(defun case-failure (name value keys)
+(defun etypecase-failure (value keys)
+  (declare (optimize allow-non-returning-tail-call))
   (error 'case-failure
-         :name name
+         :name 'etypecase
          :datum value
-         :expected-type (if (eq name 'ecase)
-                            `(member ,@keys)
-                            `(or ,@keys))
+         :expected-type `(or ,@keys)
+         :possibilities keys))
+
+(defun ecase-failure (value keys)
+  (declare (optimize allow-non-returning-tail-call))
+  (error 'case-failure
+         :name 'ecase
+         :datum value
+         :expected-type `(member ,@keys)
          :possibilities keys))
 
 (defun case-body-error (name keyform keyform-value expected-type keys)

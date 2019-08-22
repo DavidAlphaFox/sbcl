@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; addition, subtraction, and multiplication
 
@@ -60,8 +60,8 @@
 
     (move ecx res)
 
-    (with-fixed-allocation (res bignum-widetag (1+ bignum-digits-offset))
-      (storew ecx res bignum-digits-offset other-pointer-lowtag))
+    (alloc-other res bignum-widetag (1+ bignum-digits-offset) nil)
+    (storew ecx res bignum-digits-offset other-pointer-lowtag)
 
     OKAY)
 
@@ -75,8 +75,8 @@
 
     (move ecx res)
 
-    (with-fixed-allocation (res bignum-widetag (1+ bignum-digits-offset))
-      (storew ecx res bignum-digits-offset other-pointer-lowtag))
+    (alloc-other res bignum-widetag (1+ bignum-digits-offset) nil)
+    (storew ecx res bignum-digits-offset other-pointer-lowtag)
     OKAY)
 
   (define-generic-arith-routine (* 30)
@@ -96,15 +96,15 @@
     (inst cmp x ecx)
     (inst jmp :e SINGLE-WORD-BIGNUM)
 
-    (with-fixed-allocation (res bignum-widetag (+ bignum-digits-offset 2))
-      (storew eax res bignum-digits-offset other-pointer-lowtag)
-      (storew ecx res (1+ bignum-digits-offset) other-pointer-lowtag))
+    (alloc-other res bignum-widetag (+ bignum-digits-offset 2) nil)
+    (storew eax res bignum-digits-offset other-pointer-lowtag)
+    (storew ecx res (1+ bignum-digits-offset) other-pointer-lowtag)
     (inst jmp DONE)
 
     SINGLE-WORD-BIGNUM
 
-    (with-fixed-allocation (res bignum-widetag (1+ bignum-digits-offset))
-      (storew eax res bignum-digits-offset other-pointer-lowtag))
+    (alloc-other res bignum-widetag (1+ bignum-digits-offset) nil)
+    (storew eax res bignum-digits-offset other-pointer-lowtag)
     (inst jmp DONE)
 
     OKAY
@@ -121,8 +121,6 @@
                           (:save-p t))
                          ((:arg x (descriptor-reg any-reg) edx-offset)
                           (:res res (descriptor-reg any-reg) edx-offset)
-
-                          (:temp eax unsigned-reg eax-offset)
                           (:temp ecx unsigned-reg ecx-offset))
   (inst test x fixnum-tag-mask)
   (inst jmp :z FIXNUM)
@@ -143,18 +141,20 @@
   (inst shr res n-fixnum-tag-bits)      ; sign bit is data - remove type bits
   (move ecx res)
 
-  (with-fixed-allocation (res bignum-widetag (1+ bignum-digits-offset))
-    (storew ecx res bignum-digits-offset other-pointer-lowtag))
+  (alloc-other res bignum-widetag (1+ bignum-digits-offset) nil)
+  (storew ecx res bignum-digits-offset other-pointer-lowtag)
 
   OKAY)
 
 ;;;; comparison
 
 (macrolet ((define-cond-assem-rtn (name translate static-fn test)
-             (declare (ignorable static-fn)) ; not used if #-sb-assembling
-             #+sb-assembling
              `(define-assembly-routine (,name
-                                        (:return-style :none))
+                                        (:translate ,translate)
+                                        (:policy :safe)
+                                        (:save-p t)
+                                        (:conditional ,test)
+                                        (:cost 10))
                 ((:arg x (descriptor-reg any-reg) edx-offset)
                  (:arg y (descriptor-reg any-reg) edi-offset)
 
@@ -193,34 +193,16 @@
                     (:l `((inst mov y (1+ nil-value))
                           (inst cmp y x)))
                     (:g `((inst cmp x (1+ nil-value)))))
-                (inst pop ebp-tn)
-                (inst ret))
-             #-sb-assembling
-             `(define-vop (,name)
-                (:translate ,translate)
-                (:policy :safe)
-                (:save-p t)
-                (:args (x :scs (descriptor-reg any-reg) :target edx)
-                       (y :scs (descriptor-reg any-reg) :target edi))
-
-                (:temporary (:sc unsigned-reg :offset edx-offset
-                                 :from (:argument 0))
-                            edx)
-                (:temporary (:sc unsigned-reg :offset edi-offset
-                                 :from (:argument 1))
-                            edi)
-                (:conditional ,test)
-                (:generator 10
-                   (move edx x)
-                   (move edi y)
-                   (inst call (make-fixup ',name :assembly-routine))))))
-
+                (inst pop ebp-tn))))
   (define-cond-assem-rtn generic-< < two-arg-< :l)
   (define-cond-assem-rtn generic-> > two-arg-> :g))
 
-#+sb-assembling
 (define-assembly-routine (generic-eql
-                          (:return-style :none))
+                          (:translate eql)
+                          (:policy :safe)
+                          (:save-p t)
+                          (:conditional :e)
+                          (:cost 10))
                          ((:arg x (descriptor-reg any-reg) edx-offset)
                           (:arg y (descriptor-reg any-reg) edi-offset)
 
@@ -260,33 +242,14 @@
                       :disp (+ nil-value (static-fun-offset 'eql))))
   (load-symbol y t)
   (inst cmp x y)
-  (inst pop ebp-tn)
-  (inst ret))
+  (inst pop ebp-tn))
 
-#-sb-assembling
-(define-vop (generic-eql)
-  (:translate eql)
-  (:policy :safe)
-  (:save-p t)
-  (:args (x :scs (descriptor-reg any-reg) :target edx)
-         (y :scs (descriptor-reg any-reg) :target edi))
-
-  (:temporary (:sc unsigned-reg :offset edx-offset
-               :from (:argument 0))
-              edx)
-  (:temporary (:sc unsigned-reg :offset edi-offset
-               :from (:argument 1))
-              edi)
-
-  (:conditional :e)
-  (:generator 10
-    (move edx x)
-    (move edi y)
-    (inst call (make-fixup 'generic-eql :assembly-routine))))
-
-#+sb-assembling
 (define-assembly-routine (generic-=
-                          (:return-style :none))
+                          (:translate =)
+                          (:policy :safe)
+                          (:save-p t)
+                          (:conditional :e)
+                          (:cost 10))
                          ((:arg x (descriptor-reg any-reg) edx-offset)
                           (:arg y (descriptor-reg any-reg) edi-offset)
 
@@ -320,29 +283,7 @@
                       :disp (+ nil-value (static-fun-offset 'two-arg-=))))
   (load-symbol y t)
   (inst cmp x y)
-  (inst pop ebp-tn)
-  (inst ret))
-
-#-sb-assembling
-(define-vop (generic-=)
-  (:translate =)
-  (:policy :safe)
-  (:save-p t)
-  (:args (x :scs (descriptor-reg any-reg) :target edx)
-         (y :scs (descriptor-reg any-reg) :target edi))
-
-  (:temporary (:sc unsigned-reg :offset edx-offset
-               :from (:argument 0))
-              edx)
-  (:temporary (:sc unsigned-reg :offset edi-offset
-               :from (:argument 1))
-              edi)
-
-  (:conditional :e)
-  (:generator 10
-    (move edx x)
-    (move edi y)
-    (inst call (make-fixup 'generic-= :assembly-routine))))
+  (inst pop ebp-tn))
 
 
 ;;; Support for the Mersenne Twister, MT19937, random number generator
@@ -422,5 +363,4 @@
   ;; Restore the temporary registers and return.
   (inst pop tmp)
   (inst pop y)
-  (inst pop k)
-  (inst ret))
+  (inst pop k))

@@ -11,29 +11,27 @@ FASL=$(DEST)/$(SYSTEM).fasl
 ASD=$(DEST)/$(SYSTEM).asd
 
 ifeq (SunOS,$(UNAME))
-  EXTRA_CFLAGS=-D_XOPEN_SOURCE=500 -D__EXTENSIONS__
+  EXTRA_CFLAGS+=-D_XOPEN_SOURCE=500 -D__EXTENSIONS__
   PATH:=/usr/xpg4/bin:${PATH}
 endif
 ifeq (CYGWIN,$(findstring CYGWIN,$(UNAME)))
-  EXTRA_CFLAGS=-mno-cygwin
-  # GCC 4.x doesn't accept -mno-cygwin.
-  CC:=gcc-3
   # SBCL can't read cygwin symlinks, and cygwin likes to symlink
   # gcc.  To further complicate things, SBCL can't handle cygwin
   # paths, either.
   CC:=$(shell cygpath -m $(shell readlink -fn $(shell which $(CC))))
 endif
 ifeq (Linux,$(UNAME))
-  EXTRA_CFLAGS=-D_GNU_SOURCE
+  EXTRA_CFLAGS+=-D_GNU_SOURCE
 endif
 
-export CC SBCL EXTRA_CFLAGS EXTRA_LDFLAGS
+export CC SBCL EXTRA_CFLAGS
 
-all: $(FASL) $(ASD) $(EXTRA_ALL_TARGETS)
+all: $(FASL) $(ASD)
 
 $(FASL)::
 	$(MAKE) -C ../asdf
-	$(SBCL) --load ../asdf-stub.lisp \
+	$(SBCL) --eval '(setf (sb-ext:readtable-base-char-preference *readtable*) :both)' \
+		--load ../asdf-stub.lisp \
 		--eval '(asdf::build-asdf-contrib "$(SYSTEM)")'
 
 $(ASD)::
@@ -45,5 +43,5 @@ test: $(FASL) $(ASD)
 
 # KLUDGE: There seems to be no portable way to tell tar to not to
 # preserve owner, so chown after installing for the current user.
-install: $(EXTRA_INSTALL_TARGETS)
+install:
 	cp $(FASL) $(ASD) "$(BUILD_ROOT)$(INSTALL_DIR)"

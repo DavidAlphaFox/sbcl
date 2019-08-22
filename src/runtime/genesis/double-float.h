@@ -11,21 +11,22 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_DOUBLE_FLOAT
-#define SBCL_GENESIS_DOUBLE_FLOAT 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_DOUBLE_FLOAT
+#ifndef __ASSEMBLER__
 
 struct double_float {
     lispobj header;
     double value;
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
 #define DOUBLE_FLOAT_VALUE_OFFSET -7
+#define DOUBLE_FLOAT_SIZE 2
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_DOUBLE-FLOAT */
+#endif

@@ -9,55 +9,46 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
-(macrolet ((def (name result access src-type &optional typep)
-             `(defun ,name (object ,@(if typep '(type) ()))
-                (declare (type ,(ecase src-type
-                                       (:list 'list)
-                                       (:vector 'vector)
-                                       (:sequence 'sequence)) object))
+(macrolet ((def (name constructor access src-type &optional explicit-check)
+             `(defun ,name (object type)
+                (declare (type ,src-type object))
+                ,@(when explicit-check `((declare (explicit-check))))
                 (do* ((index 0 (1+ index))
                       (length (length object))
-                      (result ,result)
+                      (result ,constructor)
                       (in-object object))
                      ((>= index length) result)
                   (declare (fixnum length index))
                   (declare (type vector result))
                   (setf (,access result index)
                         ,(ecase src-type
-                           (:list '(pop in-object))
-                           (:vector '(aref in-object index))
-                           (:sequence '(elt in-object index))))))))
+                           (list '(pop in-object))
+                           (vector '(aref in-object index))
+                           (sequence '(elt in-object index))))))))
 
-  (def list-to-vector* (make-sequence type length)
-    aref :list t)
+  (def list-to-vector* (make-sequence type length) aref list t)
 
-  (def vector-to-vector* (make-sequence type length)
-    aref :vector t)
+  (def vector-to-vector* (make-sequence type length) aref vector t)
 
-  (def sequence-to-vector* (make-sequence type length)
-    aref :sequence t))
+  (def sequence-to-vector* (make-sequence type length) aref sequence))
 
 (defun vector-to-list* (object)
   (declare (type vector object))
-  (let ((result (list nil))
-        (length (length object)))
-    (declare (fixnum length))
-    (do ((index 0 (1+ index))
-         (splice result (cdr splice)))
-        ((>= index length) (cdr result))
-      (declare (fixnum index))
-      (rplacd splice (list (aref object index))))))
+  (dx-let ((result (list nil)))
+    (let ((splice result))
+      (do-vector-data (elt object (cdr result))
+        (let ((cell (list elt)))
+          (setf (cdr splice) cell splice cell))))))
 
 (defun sequence-to-list (sequence)
   (declare (type sequence sequence))
-  (let* ((result (list nil))
-         (splice result))
-    (sb!sequence:dosequence (i sequence)
-      (rplacd splice (list i))
-      (setf splice (cdr splice)))
-    (cdr result)))
+  (dx-let ((result (list nil)))
+    (let ((splice result))
+      (sb-sequence:dosequence (elt sequence (cdr result))
+        (let ((cell (list elt)))
+          (setf (cdr splice) cell splice cell))))))
 
 ;;; These are used both by the full DEFUN function and by various
 ;;; optimization transforms in the constant-OUTPUT-TYPE-SPEC case.
@@ -68,26 +59,18 @@
 (declaim (inline coerce-to-list))
 (declaim (inline coerce-to-vector))
 
-(defun coerce-symbol-to-fun (object)
+(defun coerce-symbol-to-fun (symbol)
   ;; FIXME? I would think to use SYMBOL-FUNCTION here which does not strip off
   ;; encapsulations. But Stas wrote FDEFINITION so ...
   ;; [Also note, we won't encapsulate a macro or special-form, so this
   ;; introspective technique to decide what kind something is works either way]
-  (let* ((def (fdefinition object))
-         (widetag (fun-subtype def)))
-    (cond ((and (eq widetag sb!vm:closure-header-widetag)
-                (eq (%closure-fun def)
-                    (load-time-value
-                     ;; pick a macro, any macro...
-                     (%closure-fun (symbol-function 'with-unique-names))
-                     t)))
-           (error "~S names a macro." object))
-          ((and (eq widetag sb!vm:simple-fun-header-widetag)
-                (let ((name (%simple-fun-name def)))
-                  (and (listp name) (eq (car name) 'special-operator))))
-           (error "~S names a special operator." object))
-          (t
-           def))))
+  (let ((def (fdefinition symbol)))
+    (if (macro/special-guard-fun-p def)
+        (error (ecase (car (%fun-name def))
+                (:macro "~S names a macro.")
+                (:special "~S names a special operator."))
+               symbol)
+        def)))
 
 (defun coerce-to-fun (object)
   ;; (Unlike the other COERCE-TO-FOOs, this one isn't inline, because
@@ -132,18 +115,19 @@
 
 ;;; old working version
 (defun coerce (object output-type-spec)
-  #!+sb-doc
   "Coerce the Object to an object of type Output-Type-Spec."
+  (declare (explicit-check))
   (flet ((coerce-error ()
-           (/show0 "entering COERCE-ERROR")
+           (declare (optimize allow-non-returning-tail-call))
            (error 'simple-type-error
-                  :format-control "~S can't be converted to type ~S."
+                  :format-control "~S can't be converted to type ~
+                                    ~/sb-impl:print-type-specifier/."
                   :format-arguments (list object output-type-spec)
                   :datum object
                   :expected-type output-type-spec)))
     (let ((type (specifier-type output-type-spec)))
       (cond
-        ((%typep object output-type-spec)
+        ((%%typep object type)
          object)
         ((eq type *empty-type*)
          (coerce-error))
@@ -161,7 +145,7 @@
               (unless (typep res output-type-spec)
                 (coerce-error))
               res))
-           #!+long-float
+           #+long-float
            ((csubtypep type (specifier-type 'long-float))
             (let ((res (%long-float object)))
               (unless (typep res output-type-spec)
@@ -181,7 +165,7 @@
                      ((csubtypep type (specifier-type '(complex double-float)))
                       (complex (%double-float (realpart object))
                                (%double-float (imagpart object))))
-                     #!+long-float
+                     #+long-float
                      ((csubtypep type (specifier-type '(complex long-float)))
                       (complex (%long-float (realpart object))
                                (%long-float (imagpart object))))
@@ -222,7 +206,7 @@
                                                          (length object))))
                ((cons-type-p type)
                 (multiple-value-bind (min exactp)
-                    (sb!kernel::cons-type-length-info type)
+                    (sb-kernel::cons-type-length-info type)
                   (let ((length (length object)))
                     (if exactp
                         (unless (= length min)
@@ -234,7 +218,7 @@
              (if (sequencep object)
                  (cond
                    ((type= type (specifier-type 'list))
-                    (sb!sequence:make-sequence-like
+                    (sb-sequence:make-sequence-like
                      nil (length object) :initial-contents object))
                    ((type= type (specifier-type 'null))
                     (if (= (length object) 0)
@@ -243,14 +227,14 @@
                                                              (length object))))
                    ((cons-type-p type)
                     (multiple-value-bind (min exactp)
-                        (sb!kernel::cons-type-length-info type)
+                        (sb-kernel::cons-type-length-info type)
                       (let ((length (length object)))
                         (if exactp
                             (unless (= length min)
                               (sequence-type-length-mismatch-error type length))
                             (unless (>= length min)
                               (sequence-type-length-mismatch-error type length)))
-                        (sb!sequence:make-sequence-like
+                        (sb-sequence:make-sequence-like
                          nil length :initial-contents object))))
                    (t (sequence-type-too-hairy (type-specifier type))))
                  (coerce-error))))
@@ -265,80 +249,13 @@
             (coerce-error))))
         ((and (csubtypep type (specifier-type 'sequence))
               (find-class output-type-spec nil))
-         (let ((prototype (sb!mop:class-prototype
-                           (sb!pcl:ensure-class-finalized
+         (let ((prototype (sb-mop:class-prototype
+                           (sb-pcl:ensure-class-finalized
                             (find-class output-type-spec)))))
-           (sb!sequence:make-sequence-like
+           (sb-sequence:make-sequence-like
             prototype (length object) :initial-contents object)))
         ((csubtypep type (specifier-type 'function))
          (coerce-to-fun object))
         (t
          (coerce-error))))))
 
-;;; new version, which seems as though it should be better, but which
-;;; does not yet work
-#+nil
-(defun coerce (object output-type-spec)
-  #!+sb-doc
-  "Coerces the Object to an object of type Output-Type-Spec."
-  (flet ((coerce-error ()
-           (error 'simple-type-error
-                  :format-control "~S can't be converted to type ~S."
-                  :format-arguments (list object output-type-spec)))
-         (check-result (result)
-           #!+high-security (aver (typep result output-type-spec))
-           result))
-    (let ((type (specifier-type output-type-spec)))
-      (cond
-        ((%typep object output-type-spec)
-         object)
-        ((eq type *empty-type*)
-         (coerce-error))
-        ((csubtypep type (specifier-type 'character))
-         (character object))
-        ((csubtypep type (specifier-type 'function))
-         (coerce-to-fun object))
-        ((numberp object)
-         (let ((res
-                (cond
-                  ((csubtypep type (specifier-type 'single-float))
-                   (%single-float object))
-                  ((csubtypep type (specifier-type 'double-float))
-                   (%double-float object))
-                  #!+long-float
-                  ((csubtypep type (specifier-type 'long-float))
-                   (%long-float object))
-                  ((csubtypep type (specifier-type 'float))
-                   (%single-float object))
-                  ((csubtypep type (specifier-type '(complex single-float)))
-                   (complex (%single-float (realpart object))
-                            (%single-float (imagpart object))))
-                  ((csubtypep type (specifier-type '(complex double-float)))
-                   (complex (%double-float (realpart object))
-                            (%double-float (imagpart object))))
-                  #!+long-float
-                  ((csubtypep type (specifier-type '(complex long-float)))
-                   (complex (%long-float (realpart object))
-                            (%long-float (imagpart object))))
-                  ((csubtypep type (specifier-type 'complex))
-                   (complex object))
-                  (t
-                   (coerce-error)))))
-           ;; If RES has the wrong type, that means that rule of
-           ;; canonical representation for complex rationals was
-           ;; invoked. According to the ANSI spec, (COERCE 7/2
-           ;; 'COMPLEX) returns 7/2. Thus, if the object was a
-           ;; rational, there is no error here.
-           (unless (or (typep res output-type-spec) (rationalp object))
-             (coerce-error))
-           res))
-        ((csubtypep type (specifier-type 'list))
-         (coerce-to-list object))
-        ((csubtypep type (specifier-type 'string))
-         (check-result (coerce-to-simple-string object)))
-        ((csubtypep type (specifier-type 'bit-vector))
-         (check-result (coerce-to-bit-vector object)))
-        ((csubtypep type (specifier-type 'vector))
-         (check-result (coerce-to-vector object output-type-spec)))
-        (t
-         (coerce-error))))))

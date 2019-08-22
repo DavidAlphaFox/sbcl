@@ -11,8 +11,8 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_FDEFN
-#define SBCL_GENESIS_FDEFN 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_FDEFN
+#ifndef __ASSEMBLER__
 
 struct fdefn {
     lispobj header;
@@ -20,8 +20,11 @@ struct fdefn {
     lispobj fun;
     char * raw_addr;
 };
+static inline struct fdefn* FDEFN(lispobj obj) {
+  return (struct fdefn*)(obj - 15);
+}
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
@@ -29,7 +32,8 @@ struct fdefn {
 #define FDEFN_NAME_OFFSET -7
 #define FDEFN_FUN_OFFSET 1
 #define FDEFN_RAW_ADDR_OFFSET 9
+#define FDEFN_SIZE 4
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_FDEFN */
+#endif

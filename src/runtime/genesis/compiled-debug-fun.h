@@ -11,28 +11,20 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_COMPILED_DEBUG_FUN
-#define SBCL_GENESIS_COMPILED_DEBUG_FUN 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_COMPILED_DEBUG_FUN
+#ifndef __ASSEMBLER__
 
 struct compiled_debug_fun {
-    lispobj header;
-    lispobj _layout;
+    lispobj header; // = word_0_
     lispobj name;
-    lispobj kind;
     lispobj vars;
     lispobj blocks;
-    lispobj tlf_number;
     lispobj arguments;
     lispobj returns;
-    lispobj return_pc;
-    lispobj old_fp;
-    lispobj nfp;
-    lispobj start_pc;
-    lispobj elsewhere_pc;
-    lispobj closure_save;
-    lispobj bsp_save;
+    lispobj encoded_locs;
+    lispobj next;
 };
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_COMPILED-DEBUG-FUN */
+#endif

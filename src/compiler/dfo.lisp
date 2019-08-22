@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; Find the DFO for a component, deleting any unreached blocks and
 ;;; merging any other components we reach. We repeatedly iterate over
@@ -22,7 +22,8 @@
   (let ((head (component-head component)))
     (do ()
         ((dolist (ep (block-succ head) t)
-           (unless (or (block-flag ep) (block-delete-p ep))
+           (unless (or (block-flag ep)
+                       (block-to-be-deleted-p ep))
              (find-dfo-aux ep head component)
              (return nil))))))
   (let ((num 0))
@@ -189,11 +190,8 @@
       (let* ((home (node-home-lambda ref))
              (home-kind (functional-kind home))
              (home-externally-visible-p
-              (or (eq home-kind :toplevel)
-                  (functional-has-external-references-p home)
-                  (let ((entry (functional-entry-fun home)))
-                    (and entry
-                         (functional-has-external-references-p entry))))))
+               (or (eq home-kind :toplevel)
+                   (functional-has-external-references-p home))))
         (unless (or (and home-externally-visible-p
                          (eq (functional-kind fun) :external))
                     (eq home-kind :deleted))
@@ -238,7 +236,7 @@
 ;;; already be one.
 (defun dfo-scavenge-dependency-graph (clambda component)
   (declare (type clambda clambda) (type component component))
-  (assert (not (eql (lambda-kind clambda) :deleted)))
+  (aver (not (eql (lambda-kind clambda) :deleted)))
   (let* ((bind-block (node-block (lambda-bind clambda)))
          (old-lambda-component (block-component bind-block))
          (return (lambda-return clambda)))
@@ -321,16 +319,15 @@
 ;;; are deleted.
 (defun separate-toplevelish-components (components)
   (declare (list components))
-  (collect ((real)
-            (top)
-            (real-top))
+  (collect ((non-top)
+            (top))
     (dolist (component components)
       (unless (eq (block-next (component-head component))
                   (component-tail component))
         (let* ((funs (component-lambdas component))
                (has-top (find :toplevel funs :key #'functional-kind))
                (has-external-references
-                (some #'functional-has-external-references-p funs)))
+                 (some #'functional-has-external-references-p funs)))
           (cond (;; The FUNCTIONAL-HAS-EXTERNAL-REFERENCES-P concept
                  ;; is newer than the rest of this function, and
                  ;; doesn't really seem to fit into its mindset. Here
@@ -341,32 +338,27 @@
                  ;; references from pure :TOPLEVEL components. -- WHN
                  has-external-references
                  (setf (component-kind component) :complex-toplevel)
-                 (real component)
-                 (real-top component))
+                 (non-top component))
                 ((or (some #'has-xep-or-nlx funs)
                      (and has-top (rest funs)))
                  (setf (component-name component)
-                       (find-component-name component))
-                 (real component)
+                       (possibly-base-stringize
+                        (find-component-name component)))
+                 (non-top component)
                  (when has-top
-                   (setf (component-kind component) :complex-toplevel)
-                   (real-top component)))
+                   (setf (component-kind component) :complex-toplevel)))
                 (has-top
                  (setf (component-kind component) :toplevel)
                  (setf (component-name component) "top level form")
                  (top component))
                 (t
                  (delete-component component))))))
-
-    (values (real) (top) (real-top))))
+    (values (non-top) (top))))
 
 ;;; Given a list of top level lambdas, return
-;;;   (VALUES NONTOP-COMPONENTS TOP-COMPONENTS HAIRY-TOP-COMPONENTS).
-;;; Each of the three values returned is a list of COMPONENTs:
+;;;   (VALUES NONTOP-COMPONENTS TOP-COMPONENTS):
 ;;;   NONTOP-COMPONENTS = non-top-level-ish COMPONENTs;
 ;;;   TOP-COMPONENTS = top-level-ish COMPONENTs;
-;;;   HAIRY-TOP-COMPONENTS = a subset of NONTOP-COMPONENTS, those
-;;;    elements which include a top-level-ish lambda.
 ;;;
 ;;; We assign the DFO for each component, and delete any unreachable
 ;;; blocks. We assume that the FLAGS have already been cleared.
@@ -503,20 +495,27 @@
   (let* ((result-lambda (first lambdas))
          (result-return (lambda-return result-lambda)))
     (cond
-     (result-return
+      ((null (rest lambdas)))
+      ((and result-return
+            ;; KLUDGE: why is the node deleted but clambda still has a return?
+            ;; see a test-case for this in tests/merge-lambdas.lisp
+            ;; But now it can only be exercised with block
+            ;; compilation, which doesn't seem to work anyway.
+            (not (node-to-be-deleted-p
+                  (ctran-use (node-prev
+                              (lvar-uses (return-result result-return)))))))
+       ;; Make sure the result's return node starts a block so that we
+       ;; can splice code in before it.
+       (let ((prev (node-prev
+                    (lvar-uses (return-result result-return)))))
+         (when (ctran-use prev)
+           (node-ends-block (ctran-use prev))))
 
-      ;; Make sure the result's return node starts a block so that we
-      ;; can splice code in before it.
-      (let ((prev (node-prev
-                   (lvar-uses (return-result result-return)))))
-        (when (ctran-use prev)
-          (node-ends-block (ctran-use prev))))
-
-      (dolist (lambda (rest lambdas))
-        (merge-1-toplevel-lambda result-lambda lambda)))
-     (t
-      (dolist (lambda (rest lambdas))
-        (setf (functional-entry-fun lambda) nil)
-        (delete-component (lambda-component lambda)))))
+       (dolist (lambda (rest lambdas))
+         (merge-1-toplevel-lambda result-lambda lambda)))
+      (t
+       (dolist (lambda (rest lambdas))
+         (setf (functional-entry-fun lambda) nil)
+         (delete-component (lambda-component lambda)))))
 
     (values (lambda-component result-lambda) result-lambda)))

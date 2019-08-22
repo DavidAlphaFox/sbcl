@@ -11,8 +11,8 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_COMPLEX
-#define SBCL_GENESIS_COMPLEX 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_COMPLEX
+#ifndef __ASSEMBLER__
 
 struct complex {
     lispobj header;
@@ -20,14 +20,15 @@ struct complex {
     lispobj imag;
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
 #define COMPLEX_REAL_OFFSET -7
 #define COMPLEX_IMAG_OFFSET 1
+#define COMPLEX_SIZE 3
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_COMPLEX */
+#endif

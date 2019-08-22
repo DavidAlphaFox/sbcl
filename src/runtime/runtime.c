@@ -70,8 +70,11 @@
 #include "interr.h"
 #endif
 
-#ifndef SBCL_HOME
-#define SBCL_HOME SBCL_PREFIX"/lib/sbcl/"
+#ifdef SBCL_PREFIX
+char *sbcl_home = SBCL_PREFIX"/lib/sbcl/";
+#else
+static char libpath[] = "../lib/sbcl";
+char *sbcl_home;
 #endif
 
 #ifdef LISP_FEATURE_HPUX
@@ -83,7 +86,9 @@ extern void *return_from_lisp_stub;
 
 /* SIGINT handler that invokes the monitor (for when Lisp isn't up to it) */
 static void
-sigint_handler(int signal, siginfo_t *info, os_context_t *context)
+sigint_handler(int __attribute__((unused)) signal,
+               siginfo_t __attribute__((unused)) *info,
+               os_context_t *context)
 {
     lose("\nSIGINT hit at 0x%08lX\n",
          (unsigned long) *os_context_pc_addr(context));
@@ -95,7 +100,7 @@ void
 sigint_init(void)
 {
     SHOW("entering sigint_init()");
-    install_handler(SIGINT, sigint_handler, 1);
+    install_handler(SIGINT, sigint_handler, 0, 1);
     SHOW("leaving sigint_init()");
 }
 
@@ -121,7 +126,7 @@ copied_string(char *string)
     return strcpy(successful_malloc(1+strlen(string)), string);
 }
 
-char *
+static char *
 copied_existing_filename_or_null(char *filename)
 {
     struct stat filename_stat;
@@ -133,7 +138,7 @@ copied_existing_filename_or_null(char *filename)
 }
 
 #ifndef LISP_FEATURE_WIN32
-char *
+static char *
 copied_realpath(const char *pathname)
 {
     char *messy, *tidy;
@@ -165,7 +170,7 @@ copied_realpath(const char *pathname)
 
 /* miscellaneous chattiness */
 
-void
+static void
 print_help()
 {
     puts(
@@ -176,6 +181,7 @@ Common runtime options:\n\
   --core <filename>          Use the specified core file instead of the default.\n\
   --dynamic-space-size <MiB> Size of reserved dynamic space in megabytes.\n\
   --control-stack-size <MiB> Size of reserved control stack in megabytes.\n\
+  --tls-limit                Maximum number of thread-local symbols.\n\
 \n\
 Common toplevel options:\n\
   --sysinit <filename>       System-wide init-file to use instead of default.\n\
@@ -200,13 +206,13 @@ should be installed along with SBCL, and is also available from the\n\
 website <http://www.sbcl.org/>.\n");
 }
 
-void
+static void
 print_version()
 {
     printf("SBCL %s\n", SBCL_VERSION_STRING);
 }
 
-void
+static void
 print_banner()
 {
     printf(
@@ -231,20 +237,21 @@ and resources this platform demands.\n\
 /* Look for a core file to load, first in the directory named by the
  * SBCL_HOME environment variable, then in a hardcoded default
  * location.  Returns a malloced copy of the core filename. */
-char *
+static char *
 search_for_core ()
 {
-    char *sbcl_home = getenv("SBCL_HOME");
+    char *env_sbcl_home = getenv("SBCL_HOME");
     char *lookhere;
     char *stem = "/sbcl.core";
     char *core;
 
-    if (!(sbcl_home && *sbcl_home)) sbcl_home = SBCL_HOME;
-    lookhere = (char *) calloc(strlen(sbcl_home) +
+    if (!(env_sbcl_home && *env_sbcl_home))
+      env_sbcl_home = sbcl_home;
+    lookhere = (char *) calloc(strlen(env_sbcl_home) +
                                strlen(stem) +
                                1,
                                sizeof(char));
-    sprintf(lookhere, "%s%s", sbcl_home, stem);
+    sprintf(lookhere, "%s%s", env_sbcl_home, stem);
     core = copied_existing_filename_or_null(lookhere);
 
     if (!core) {
@@ -259,13 +266,13 @@ search_for_core ()
 /* Try to find the path to an executable from argv[0], this is only
  * used when os_get_runtime_executable_path() returns NULL */
 #ifdef LISP_FEATURE_WIN32
-char *
+static char *
 search_for_executable(const char *argv0)
 {
     return NULL;
 }
 #else /* LISP_FEATURE_WIN32 */
-char *
+static char *
 search_for_executable(const char *argv0)
 {
     char *search, *start, *end, *buf;
@@ -314,7 +321,7 @@ search_for_executable(const char *argv0)
 }
 #endif /* LISP_FEATURE_WIN32 */
 
-size_t
+static size_t
 parse_size_arg(char *arg, char *arg_name)
 {
   char *tail, *power_name;
@@ -360,14 +367,12 @@ parse_size_arg(char *arg, char *arg_name)
 char **posix_argv;
 char *core_string;
 
-struct runtime_options *runtime_options;
-
 char *saved_runtime_path = NULL;
 #if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
 void pthreads_win32_init();
 #endif
 
-void print_locale_variable(const char *name)
+static void print_locale_variable(const char *name)
 {
   char *value = getenv(name);
 
@@ -376,7 +381,7 @@ void print_locale_variable(const char *name)
   }
 }
 
-void setup_locale()
+static void setup_locale()
 {
   if(setlocale(LC_ALL, "") == NULL) {
 #ifndef LISP_FEATURE_WIN32
@@ -410,7 +415,7 @@ void setup_locale()
 #endif
   }
 }
-void print_environment(int argc, char *argv[])
+static void print_environment(int argc, char *argv[])
 {
     int n = 0;
     printf("; Commandline arguments:\n");
@@ -426,8 +431,10 @@ void print_environment(int argc, char *argv[])
     }
 }
 
+extern void write_protect_immobile_space();
+struct lisp_startup_options lisp_startup_options;
 int
-main(int argc, char *argv[], char *envp[])
+sbcl_main(int argc, char *argv[], char *envp[])
 {
 #ifdef LISP_FEATURE_WIN32
     /* Exception handling support structure. Evil Win32 hack. */
@@ -442,23 +449,28 @@ main(int argc, char *argv[], char *envp[])
     char *runtime_path = 0;
 
     /* other command line options */
-    boolean noinform = 0;
     boolean end_runtime_options = 0;
-    boolean disable_lossage_handler_p = 0;
+    boolean disable_lossage_handler_p
+#if defined(LISP_FEATURE_SB_LDB)
+        = 0;
+#else
+        = 1;
+#endif
+
     boolean debug_environment_p = 0;
 
     lispobj initial_function;
-    const char *sbcl_home = getenv("SBCL_HOME");
+    int merge_core_pages = -1;
+    struct memsize_options memsize_options;
+    memsize_options.present_in_core = 0;
 
+    boolean have_hardwired_spaces = os_preinit(argv, envp);
 #if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
-    os_preinit();
     pthreads_win32_init();
 #endif
 
     interrupt_init();
-    block_blockable_signals(0, 0);
-
-    runtime_options = NULL;
+    block_blockable_signals(0);
 
     /* Save the argv[0] derived runtime path in case
      * os_get_runtime_executable_path(1) isn't able to get an
@@ -471,7 +483,8 @@ main(int argc, char *argv[], char *envp[])
     runtime_path = os_get_runtime_executable_path(0);
     if (runtime_path || saved_runtime_path) {
         os_vm_offset_t offset = search_for_embedded_core(
-            runtime_path ? runtime_path : saved_runtime_path);
+            runtime_path ? runtime_path : saved_runtime_path,
+            &memsize_options);
         if (offset != -1) {
             embedded_core_offset = offset;
             core = (runtime_path ? runtime_path :
@@ -485,14 +498,13 @@ main(int argc, char *argv[], char *envp[])
 
     /* Parse our part of the command line (aka "runtime options"),
      * stripping out those options that we handle. */
-    if (runtime_options != NULL) {
-        dynamic_space_size = runtime_options->dynamic_space_size;
-        thread_control_stack_size = runtime_options->thread_control_stack_size;
+    if (memsize_options.present_in_core) {
+        dynamic_space_size = memsize_options.dynamic_space_size;
+        thread_control_stack_size = memsize_options.thread_control_stack_size;
+        dynamic_values_bytes = memsize_options.thread_tls_bytes;
         sbcl_argv = argv;
     } else {
         int argi = 1;
-
-        runtime_options = successful_malloc(sizeof(struct runtime_options));
 
         while (argi < argc) {
             char *arg = argv[argi];
@@ -501,13 +513,13 @@ main(int argc, char *argv[], char *envp[])
                  * runtime option, it is equivalent to --noinform.
                  * This exits, and does not increment argi, so that
                  * TOPLEVEL-INIT sees the option. */
-                noinform = 1;
+                lisp_startup_options.noinform = 1;
                 end_runtime_options = 1;
                 disable_lossage_handler_p = 1;
                 lose_on_corruption_p = 1;
                 break;
             } else if (0 == strcmp(arg, "--noinform")) {
-                noinform = 1;
+                lisp_startup_options.noinform = 1;
                 ++argi;
             } else if (0 == strcmp(arg, "--core")) {
                 if (core) {
@@ -557,6 +569,13 @@ main(int argc, char *argv[], char *envp[])
                     lose("missing argument for --control-stack-size");
                 errno = 0;
                 thread_control_stack_size = parse_size_arg(argv[argi++], "--control-stack-size");
+            } else if (0 == strcmp(arg, "--tls-limit")) {
+                // this is not named "tls-size" because "size" is not the
+                // best measurement for how many symbols to allow
+                ++argi;
+                if (argi >= argc)
+                    lose("missing argument for --tls-limit");
+                dynamic_values_bytes = N_WORD_BYTES * atoi(argv[argi++]);
             } else if (0 == strcmp(arg, "--debug-environment")) {
                 debug_environment_p = 1;
                 ++argi;
@@ -576,9 +595,6 @@ main(int argc, char *argv[], char *envp[])
             } else if (0 == strcmp(arg, "--no-merge-core-pages")) {
                 ++argi;
                 merge_core_pages = 0;
-            } else if (0 == strcmp(arg, "--default-merge-core-pages")) {
-                ++argi;
-                merge_core_pages = -1;
             } else {
                 /* This option was unrecognized as a runtime option,
                  * so it must be a toplevel option or a user option,
@@ -616,54 +632,65 @@ main(int argc, char *argv[], char *envp[])
 
     /* Align down to multiple of page_table page size, and to the appropriate
      * stack alignment. */
-    dynamic_space_size &= ~(sword_t)(PAGE_BYTES-1);
+    dynamic_space_size &= ~(sword_t)(BACKEND_PAGE_BYTES-1);
 #ifdef LISP_FEATURE_GENCGC
     dynamic_space_size &= ~(sword_t)(GENCGC_CARD_BYTES-1);
 #endif
     thread_control_stack_size &= ~(sword_t)(CONTROL_STACK_ALIGNMENT_BYTES-1);
 
-    /* Preserve the runtime options for possible future core saving */
-    runtime_options->dynamic_space_size = dynamic_space_size;
-    runtime_options->thread_control_stack_size = thread_control_stack_size;
-
-    /* KLUDGE: os_vm_page_size is set by os_init(), and on some
-     * systems (e.g. Alpha) arch_init() needs need os_vm_page_size, so
-     * it must follow os_init(). -- WHN 2000-01-26 */
     os_init(argv, envp);
-    /* os_init may re-execute the runtime, don't print anything before
-     * that, otherwise it will be duplicated. */
     if (debug_environment_p) {
         print_environment(argc, argv);
     }
     dyndebug_init();
+#ifdef LISP_FEATURE_ALPHA // When we remove Alpha, this #if can go away
+    /* KLUDGE: os_vm_page_size is set by os_init(), and on some
+     * systems (e.g. Alpha) arch_init() needs need os_vm_page_size, so
+     * it must follow os_init(). -- WHN 2000-01-26 */
     arch_init();
+#endif
+    allocate_spaces(have_hardwired_spaces);
     gc_init();
-    validate();
 
     setup_locale();
+
+    #ifndef SBCL_PREFIX
+    /* If built without SBCL_PREFIX defined, then set 'sbcl_home' to
+     * "<here>/../lib/sbcl/" based on how this executable was invoked. */
+    {
+        char *exename = argv[0]; // Use as-it, not truenameified
+        char *slash = strrchr(exename, '/');
+        if (!slash) {
+            sbcl_home = libpath;
+        } else {
+            int prefixlen = slash - exename + 1; // keep the slash in the prefix
+            char *tail = exename + prefixlen - 4;
+            char *suffix = libpath;
+            sbcl_home = successful_malloc(prefixlen + sizeof libpath); // sizeof incl. nul
+            // Translate "{path/}bin/sbcl" => "{path/}lib/sbcl", otherwise
+            // "{path}/sbcl" => "{path}/../lib/sbcl" so that running "./sbcl" works
+            // if sitting in "bin".
+            if (prefixlen >= 4 && !strncmp(tail, "bin/", 4)
+                // chop "bin" only if a complete word: '/' or nothing to its left.
+                && (tail-1 < exename || tail[-1] == '/')) {
+                prefixlen -= 4; // remove "bin/"
+                suffix += 3; // don't append "../"
+            }
+            memcpy(sbcl_home, exename, prefixlen);
+            strcpy(sbcl_home+prefixlen, suffix);
+        }
+    }
+    #endif
 
     /* If no core file was specified, look for one. */
     if (!core) {
         core = search_for_core();
     }
 
-    /* Make sure that SBCL_HOME is set and not the empty string,
-       unless loading an embedded core. */
-    if (!(sbcl_home && *sbcl_home) && embedded_core_offset == 0) {
-        char *envstring, *copied_core, *dir;
-        char *stem = "SBCL_HOME=";
-        copied_core = copied_string(core);
-        dir = dirname(copied_core);
-        envstring = (char *) calloc(strlen(stem) +
-                                    strlen(dir) +
-                                    1,
-                                    sizeof(char));
-        sprintf(envstring, "%s%s", stem, dir);
-        putenv(envstring);
-        free(copied_core);
-    }
+    if (embedded_core_offset)
+        lisp_startup_options.noinform = 1;
 
-    if (!noinform && embedded_core_offset == 0) {
+    if (!lisp_startup_options.noinform) {
         print_banner();
         fflush(stdout);
     }
@@ -676,9 +703,21 @@ main(int argc, char *argv[], char *envp[])
          * before we reach this block, so that there is no observable
          * difference between "embedded" and "bare" images given to
          * --core. */
-        os_vm_offset_t offset = search_for_embedded_core(core);
+        os_vm_offset_t offset = search_for_embedded_core(core, 0);
         if (offset != -1)
             embedded_core_offset = offset;
+    }
+
+    globals_init();
+
+    /* Doing this immediately after the core has been located
+     * and before any random malloc() calls occur improves the chance
+     * of mapping dynamic space at our preferred address (if movable).
+     * If not movable, it was already mapped in allocate_spaces(). */
+    initial_function = load_core_file(core, embedded_core_offset,
+                                      merge_core_pages);
+    if (initial_function == NIL) {
+        lose("couldn't find initial function\n");
     }
 
 #if defined(SVR4) || defined(__linux__) || defined(__NetBSD__)
@@ -691,23 +730,20 @@ main(int argc, char *argv[], char *envp[])
     if (!disable_lossage_handler_p)
         enable_lossage_handler();
 
-    globals_init();
-
-    initial_function = load_core_file(core, embedded_core_offset);
-    if (initial_function == NIL) {
-        lose("couldn't find initial function\n");
-    }
-#ifdef LISP_FEATURE_SB_DYNAMIC_CORE
     os_link_runtime();
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    /* Delayed until after dynamic space has been mapped, fixups made,
+     * and/or immobile-space linkage entries written,
+     * since it was too soon earlier to handle write faults. */
+    write_protect_immobile_space();
 #endif
 #ifdef LISP_FEATURE_HPUX
+    // FIXME: obvious bitrot here. 23 isn't the offset to anything.
     /* -1 = CLOSURE_FUN_OFFSET, 23 = SIMPLE_FUN_CODE_OFFSET, we are
-     * not in LANGUAGE_ASSEMBLY so we cant reach them. */
+     * not in __ASSEMBLER__ so we cant reach them. */
     return_from_lisp_stub = (void *) ((char *)*((unsigned long *)
                  ((char *)initial_function + -1)) + 23);
 #endif
-
-    gc_initialize_pointers();
 
     arch_install_interrupt_handlers();
 #ifndef LISP_FEATURE_WIN32

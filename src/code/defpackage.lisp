@@ -9,27 +9,16 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
-;;; the list of packages to use by default when no :USE argument is
-;;; supplied to MAKE-PACKAGE or other package creation forms
-;;;
-;;; ANSI specifies (1) that MAKE-PACKAGE and DEFPACKAGE use the same
-;;; value, and (2) that it (as an implementation-defined value) should
-;;; be documented, which we do in the doc string. So for OAOO reasons
-;;; we represent this value as a variable only at compile time, and
-;;; then use #. readmacro hacks to splice it into the target code as a
-;;; constant.
-(eval-when (:compile-toplevel)
-  (defparameter *default-package-use-list*
-    ;; ANSI says this is implementation-defined. So we make it NIL,
-    ;; the way God intended. Anyone who actually wants a random value
-    ;; is free to :USE (PACKAGE-USE-LIST :CL-USER) anyway.:-|
-    nil))
+;;; FIXME: figure out why a full call to FORMAT this early in warm load
+;;; says that CLASS is not a known type. (Obviously it needs to parse
+;;; a type spec, but then why it is only a style-warning and not an error?)
+;;; Weirder still, why does it depend on the target architecture?
 
 (defmacro defpackage (package &rest options)
-  #!+sb-doc
-  #.(format nil
+  #.(locally (declare (notinline format))
+     (format nil
   "Defines a new package called PACKAGE. Each of OPTIONS should be one of the
    following: ~{~&~4T~A~}
    All options except ~{~A, ~}and :DOCUMENTATION can be used multiple
@@ -39,14 +28,14 @@
     (:import-from "<package-name> {symbol-name}*")
     (:shadow "{symbol-name}*")
     (:shadowing-import-from "<package-name> {symbol-name}*")
-    (:local-nicknames "{local-nickname actual-package-name}*")
-    #!+sb-package-locks (:lock "boolean")
-    #!+sb-package-locks (:implement "{package-name}*")
+    (:local-nicknames "{(local-nickname actual-package-name)}*")
+    (:lock "boolean")
+    (:implement "{package-name}*")
     (:documentation "doc-string")
     (:intern "{symbol-name}*")
     (:size "<integer>")
     (:nicknames "{package-name}*"))
-  '(:size #!+sb-package-locks :lock))
+  '(:size :lock)))
   (let ((nicknames nil)
         (local-nicknames nil)
         (size nil)
@@ -57,20 +46,31 @@
         (imports nil)
         (interns nil)
         (exports nil)
-        (implement (stringify-package-designators (list package)))
+        (package (stringify-string-designator package))
+        (implement nil)
         (implement-p nil)
         (lock nil)
-        (doc nil))
-    #!-sb-package-locks
-    (declare (ignore implement-p))
+        (doc nil)
+        (optname nil)
+        (optval nil)
+        (seen nil))
     (dolist (option options)
       (unless (consp option)
-        (error 'simple-program-error
-               :format-control "bogus DEFPACKAGE option: ~S"
-               :format-arguments (list option)))
-      (case (car option)
+        (%program-error "bogus DEFPACKAGE option: ~S" option))
+      (setq optname (car option) optval (cdr option))
+      (case optname
+        ((:documentation :size :lock)
+         (when (memq optname seen)
+           (%program-error "can't specify ~S more than once." optname))
+         (unless (typep optval '(cons t null))
+           (%program-error "~S expects a single argument. Got ~S"
+                          (car option) (cdr option)))
+         (push optname seen)
+         (setq optval (car optval))))
+      (case optname
         (:nicknames
-         (setf nicknames (stringify-package-designators (cdr option))))
+         (setf nicknames
+               (append nicknames (stringify-string-designators optval))))
         (:local-nicknames
          (setf local-nicknames
                (append local-nicknames
@@ -78,70 +78,44 @@
                                  (destructuring-bind (nick name) spec
                                    (cons (stringify-package-designator nick)
                                          (stringify-package-designator name))))
-                               (cdr option)))))
+                               optval))))
         (:size
-         (cond (size
-                (error 'simple-program-error
-                       :format-control "can't specify :SIZE twice."))
-               ((and (consp (cdr option))
-                     (typep (second option) 'unsigned-byte))
-                (setf size (second option)))
-               (t
-                (error
-                 'simple-program-error
-                 :format-control ":SIZE is not a positive integer: ~S"
-                 :format-arguments (list (second option))))))
+         (if (typep optval 'unsigned-byte)
+             (setf size optval)
+             (%program-error ":SIZE is not a positive integer: ~S" option)))
         (:shadow
-         (let ((new (stringify-string-designators (cdr option))))
-           (setf shadows (append shadows new))))
+         (setf shadows (append shadows (stringify-string-designators optval))))
         (:shadowing-import-from
-         (let ((package-name (stringify-package-designator (second option)))
-               (names (stringify-string-designators (cddr option))))
-           (let ((assoc (assoc package-name shadowing-imports
-                               :test #'string=)))
+         (let ((package-name (stringify-package-designator (car optval)))
+               (names (stringify-string-designators (cdr optval))))
+           (let ((assoc (assoc package-name shadowing-imports :test #'string=)))
              (if assoc
                  (setf (cdr assoc) (append (cdr assoc) names))
                  (setf shadowing-imports
                        (acons package-name names shadowing-imports))))))
         (:use
-         (setf use (append use (stringify-package-designators (cdr option)) )
+         (setf use (append use (stringify-package-designators optval))
                use-p t))
         (:import-from
-         (let ((package-name (stringify-package-designator (second option)))
-               (names (stringify-string-designators (cddr option))))
-           (let ((assoc (assoc package-name imports
-                               :test #'string=)))
+         (let ((package-name (stringify-package-designator (car optval)))
+               (names (stringify-string-designators (cdr optval))))
+           (let ((assoc (assoc package-name imports :test #'string=)))
              (if assoc
                  (setf (cdr assoc) (append (cdr assoc) names))
                  (setf imports (acons package-name names imports))))))
         (:intern
-         (let ((new (stringify-string-designators (cdr option))))
-           (setf interns (append interns new))))
+         (setf interns (append interns (stringify-string-designators optval))))
         (:export
-         (let ((new (stringify-string-designators (cdr option))))
-           (setf exports (append exports new))))
-        #!+sb-package-locks
+         (setf exports (append exports (stringify-string-designators optval))))
         (:implement
-         (unless implement-p
-           (setf implement nil))
-         (let ((new (stringify-package-designators (cdr option))))
-           (setf implement (append implement new)
-                 implement-p t)))
-        #!+sb-package-locks
+         (setf implement (append implement (stringify-package-designators optval))
+               implement-p t))
         (:lock
-         (when lock
-           (error 'simple-program-error
-                  :format-control "multiple :LOCK options"))
-         (setf lock (coerce (second option) 'boolean)))
+         (setf lock (coerce optval 'boolean)))
         (:documentation
-         (when doc
-           (error 'simple-program-error
-                  :format-control "multiple :DOCUMENTATION options"))
-         (setf doc (coerce (second option) 'simple-string)))
+         (setf doc (possibly-base-stringize optval)))
         (t
-         (error 'simple-program-error
-                :format-control "bogus DEFPACKAGE option: ~S"
-                :format-arguments (list option)))))
+         (%program-error "bogus DEFPACKAGE option: ~S" option))))
     (check-disjoint `(:intern ,@interns) `(:export  ,@exports))
     (check-disjoint `(:intern ,@interns)
                     `(:import-from
@@ -150,11 +124,19 @@
                     `(:shadowing-import-from
                       ,@(apply #'append (mapcar #'rest shadowing-imports))))
     `(eval-when (:compile-toplevel :load-toplevel :execute)
-       (%defpackage ,(stringify-string-designator package) ',nicknames ',size
+       (%defpackage ,package ',nicknames ',size
                     ',shadows ',shadowing-imports ',(if use-p use :default)
-                    ',imports ',interns ',exports ',implement ',local-nicknames
-                    ',lock ',doc
-                    (sb!c:source-location)))))
+                    ',imports ',interns ',exports
+                    ;; FIXME: the default singleton list seems unnecessary.
+                    ;; PACKAGE-LOCK-VIOLATION-P considers every package to implement
+                    ;; itself. Additionally there's an obvious inconsistency:
+                    ;; * (package-implements-list (defpackage "A")) => (#<PACKAGE "A">)
+                    ;; * (package-implements-list (make-package "B")) => NIL
+                    ',(if implement-p implement (list package))
+                    ',local-nicknames
+                    ',lock (sb-c:source-location)
+                    ,@(and doc
+                           `(,doc))))))
 
 (defun check-disjoint (&rest args)
   ;; An arg is (:key . set)
@@ -164,32 +146,31 @@
       with x = (car list)
       for y in (rest list)
       for z = (remove-duplicates (intersection (cdr x)(cdr y) :test #'string=))
-      when z do (error 'simple-program-error
-                       :format-control "Parameters ~S and ~S must be disjoint ~
-                                        but have common elements ~%   ~S"
-                       :format-arguments (list (car x)(car y) z)))))
+      when z do (%program-error "Parameters ~S and ~S must be disjoint ~
+                                 but have common elements ~%   ~S"
+                                (car x) (car y) z))))
 
-(defun stringify-string-designator (string-designator)
-  (typecase string-designator
-    (simple-string string-designator)
-    (string (coerce string-designator 'simple-string))
-    (symbol (symbol-name string-designator))
-    (character (string string-designator))
-    (t
-     (error "~S does not designate a string" string-designator))))
+(flet ((designator-to-string (kind designator)
+         (cond ((and (eq kind 'package) (packagep designator))
+                (package-name designator)) ; already simple and basic if possible
+               (t
+                (possibly-base-stringize
+                 (cond ((stringp designator) designator)
+                       ((symbolp designator) (symbol-name designator))
+                       ((characterp designator) (string designator))
+                       (t (error 'simple-type-error
+                                 :datum designator
+                                 :expected-type
+                                 (if (eq kind 'package) 'package-designator 'string-designator)
+                                 :format-control "~S does not designate a ~(~A~)"
+                                 :format-arguments (list designator kind)))))))))
+  (defun stringify-string-designator (string-designator)
+    (designator-to-string 'string string-designator))
+  (defun stringify-package-designator (package-designator)
+    (designator-to-string 'package package-designator)))
 
 (defun stringify-string-designators (string-designators)
   (mapcar #'stringify-string-designator string-designators))
-
-(defun stringify-package-designator (package-designator)
-  (typecase package-designator
-    (simple-string package-designator)
-    (string (coerce package-designator 'simple-string))
-    (symbol (symbol-name package-designator))
-    (character (string package-designator))
-    (package (package-name package-designator))
-    (t
-     (error "~S does not designate a package" package-designator))))
 
 (defun stringify-package-designators (package-designators)
   (mapcar #'stringify-package-designator package-designators))
@@ -212,8 +193,8 @@
          ;; existing use list
          (package-use-list package))
         (t
-         ;; :default for a new package is the *default-package-use-list*
-         '#.*default-package-use-list*)))
+         ;; :default for a new package is the *!default-package-use-list*
+         '#.*!default-package-use-list*)))
 
 (defun update-package (package nicknames source-location
                        shadows shadowing-imports
@@ -221,8 +202,6 @@
                        imports interns
                        exports implement local-nicknames
                        lock doc-string)
-  (declare #!-sb-package-locks
-           (ignore implement lock))
   (%enter-new-nicknames package nicknames)
   ;; 1. :shadow and :shadowing-import-from
   ;;
@@ -245,26 +224,26 @@
   (export (mapcar (lambda (symbol-name) (intern symbol-name package))
                   exports)
           package)
+  ;; 5. :local-nicknames
+  ;; FIXME: See bug at PACKAGE-LOCALLY-NICKNAMED-BY-LIST
+  (setf (package-%local-nicknames package) nil) ; throw out the old ones.
+  (loop :for (nickname . nickname-package) :in local-nicknames :do
+     (%add-package-local-nickname nickname nickname-package package))
   ;; Everything was created: update metadata
-  (sb!c:with-source-location (source-location)
+  (when source-location
     (setf (package-source-location package) source-location))
   (setf (package-doc-string package) doc-string)
-  #!+sb-package-locks
-  (progn
-    ;; Handle packages this is an implementation package of
-    (dolist (p implement)
+  ;; Handle packages this is an implementation package of
+  (dolist (p implement)
       (add-implementation-package package p))
-    ;; Handle lock
-    (setf (package-lock package) lock))
-  ;; Local nicknames. Throw out the old ones.
-  (setf (package-%local-nicknames package) nil)
-  (dolist (spec local-nicknames)
-    (add-package-local-nickname (car spec) (cdr spec) package))
+  ;; Handle lock
+  (setf (package-lock package) lock)
+  ;; Flush cached FIND-PACKAGE values
+  (atomic-incf *package-names-cookie*)
   package)
 
 (declaim (type list *on-package-variance*))
 (defvar *on-package-variance* '(:warn t)
-  #!+sb-doc
   "Specifies behavior when redefining a package using DEFPACKAGE and the
 definition is in variance with the current state of the package.
 
@@ -359,7 +338,6 @@ specifies to signal a warning if SWANK package is in variance, and an error othe
            (unexport no-longer-exported package))
          (keep-them ()
            :report "Keep exporting them.")))))
-  #!+sb-package-locks
   (let ((old-implements
           (set-difference (package-implements-list package)
                           (mapcar #'find-undeleted-package-or-lose implement))))
@@ -383,13 +361,12 @@ specifies to signal a warning if SWANK package is in variance, and an error othe
 
 (defun %defpackage (name nicknames size shadows shadowing-imports
                     use imports interns exports implement local-nicknames
-                    lock doc-string
-                    source-location)
+                    lock source-location &optional doc)
   (declare (type simple-string name)
            (type list nicknames shadows shadowing-imports
                  imports interns exports)
            (type (or list (member :default)) use)
-           (type (or simple-string null) doc-string))
+           (type (or simple-string null) doc))
   (with-package-graph ()
     (let* ((existing-package (find-package name))
            (use (use-list-packages existing-package use))
@@ -401,7 +378,7 @@ specifies to signal a warning if SWANK package is in variance, and an error othe
                                         shadows shadowing-imports
                                         use imports interns exports
                                         implement local-nicknames
-                                        lock doc-string)
+                                        lock doc)
           (let ((package (make-package name
                                        :use nil
                                        :internal-symbols (or size 10)
@@ -412,7 +389,7 @@ specifies to signal a warning if SWANK package is in variance, and an error othe
                             shadows shadowing-imports
                             use imports interns exports
                             implement local-nicknames
-                            lock doc-string))))))
+                            lock doc))))))
 
 (defun find-or-make-symbol (name package)
   (multiple-value-bind (symbol how) (find-symbol name package)
@@ -425,3 +402,30 @@ specifies to signal a warning if SWANK package is in variance, and an error othe
                     :format-control "no symbol named ~S in ~S"
                     :format-arguments (list name (package-name package))))
            (intern name package)))))
+
+;;;; One more package-related transform. I'm unsure why this can't be installed
+;;;; sooner, but it can't. It's a symptom of our build weirdness involving
+;;;; the lack of a class definition for the class CLASS, but I can't see what
+;;;; that's got to do with anything.
+(in-package "SB-C")
+
+;;; As for the INTERN transform, you could be screwed if you use any of the
+;;; standard package names as a local nickname of a random package.
+(deftransform find-package ((name) ((constant-arg string-designator)))
+  (multiple-value-bind (form constp) (find-package-xform name)
+    ;; standard packages are effectively constant objects, otherwise
+    ;; we have to invoke the find function.
+    (if constp form `(sb-impl::cached-find-package ,form))))
+
+;;;; package hacking
+
+;;; FIXME: This nickname is a deprecated hack for backwards
+;;; compatibility with code which assumed the CMU-CL-style
+;;; SB-ALIEN/SB-C-CALL split. That split went away and was deprecated
+;;; in 0.7.0, so we should get rid of this nickname after a while.
+(let ((package (find-package "SB-ALIEN")))
+  (rename-package package package
+                  (cons "SB-C-CALL" (package-nicknames package))))
+
+(let ((package (find-package "SB-SEQUENCE")))
+  (rename-package package package (list "SEQUENCE")))

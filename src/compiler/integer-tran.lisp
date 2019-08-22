@@ -10,18 +10,18 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; RANDOM in various integer cases
 
 (deftransform random ((limit &optional state)
-                      ((integer 1 #.(ash 1 sb!vm:n-word-bits)) &optional *))
+                      ((integer 1 #.(ash 1 sb-vm:n-word-bits)) &optional *))
   "transform to a sample no wider than CPU word"
   (let ((type (lvar-type limit)))
     (if (numeric-type-p type)
         (let ((limit-high (numeric-type-high (lvar-type limit))))
           (aver limit-high)
-          (if (<= limit-high (1+ most-positive-fixnum))
+          (if (<= limit-high (1+ sb-xc:most-positive-fixnum))
               '(%inclusive-random-fixnum (1- limit)
                                          (or state *random-state*))
               '(%inclusive-random-integer (1- limit)

@@ -6,27 +6,15 @@
 
 (cl:in-package :sb-aclrepl)
 
-;;; FIXME: These declaims violate package locks. Are they needed at
-;;; all? Seems not.
-#+ignore
-(declaim (special
-          sb-debug::*debug-command-level*
-          sb-debug::*real-stack-top* sb-debug::*stack-top*
-          sb-debug::*stack-top-hint* sb-debug::*current-frame*
-          sb-debug::*flush-debug-errors*))
-
 (defun debug-loop ()
   (let* ((sb-debug::*debug-command-level* (1+ sb-debug::*debug-command-level*))
-         (sb-debug::*real-stack-top* (sb-di:top-frame))
-         (sb-debug::*stack-top* (or sb-debug::*stack-top-hint*
-                                    sb-debug::*real-stack-top*))
+         (sb-debug::*current-frame* (or sb-debug::*stack-top-hint*
+                                    (sb-di:top-frame)))
          (sb-debug::*stack-top-hint* nil)
-         (sb-debug::*current-frame* sb-debug::*stack-top*)
          (continuable (continuable-break-p)))
     (handler-bind ((sb-di:debug-condition
                     (lambda (condition)
                       (princ condition sb-debug::*debug-io*)
-                      (sb-int:/show0 "handling d-c by THROWing DEBUG-LOOP-CATCHER")
                       (throw 'debug-loop-catcher nil))))
       (fresh-line)
       ;;(sb-debug::print-frame-call sb-debug::*current-frame* :verbosity 2)
@@ -42,7 +30,6 @@
                                            "~&error flushed (because ~
                                              ~S is set)"
                                           'sb-debug::*flush-debug-errors*)
-                                   (sb-int:/show0 "throwing DEBUG-LOOP-CATCHER")
                                    (throw 'debug-loop-catcher nil)))))
 
            (if (zerop *break-level*) ; restart added by SBCL

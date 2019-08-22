@@ -12,7 +12,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; We make a pass over the component's environments, assigning argument
 ;;; passing locations and return conventions and TNs for local variables.
@@ -21,7 +21,6 @@
   (let ((funs (component-lambdas component)))
     (dolist (fun funs)
       (assign-ir2-physenv fun)
-      (assign-return-locations fun)
       (assign-ir2-nlx-info fun)
       (assign-lambda-var-tns fun nil)
       (dolist (let (lambda-lets fun))
@@ -56,20 +55,21 @@
                                         (policy node (zerop debug))
                                         (policy node (= speed 3))))))
         (cond
-         ((and (lambda-var-indirect var)
-               (not (lambda-var-explicit-value-cell var)))
-          ;; Force closed-over indirect LAMBDA-VARs without explicit
-          ;; VALUE-CELLs to the stack, and make sure that they are
-          ;; live over the dynamic contour of the physenv.
-          (setf (tn-sc res) (if ptype-info
-                                (second ptype-info)
-                                (sc-or-lose 'sb!vm::control-stack)))
-          (physenv-live-tn res (lambda-physenv fun)))
+          ((and (lambda-var-indirect var)
+                (not (lambda-var-explicit-value-cell var)))
+           ;; Force closed-over indirect LAMBDA-VARs without explicit
+           ;; VALUE-CELLs to the stack, and make sure that they are
+           ;; live over the dynamic contour of the physenv.
+           (setf (tn-sc res) (if ptype-info
+                                 (second ptype-info)
+                                 (sc-or-lose 'sb-vm::control-stack)))
+           (physenv-live-tn res (lambda-physenv fun)))
 
-         (debug-variable-p
-          (physenv-debug-live-tn res (lambda-physenv fun))))
+          (debug-variable-p
+           (physenv-debug-live-tn res (lambda-physenv fun))))
 
         (setf (tn-leaf res) var)
+        (setf (tn-type res) (leaf-type var))
         (setf (leaf-info var) res))))
   (values))
 
@@ -78,22 +78,32 @@
 ;;; environment values and the old-FP/return-PC.)
 (defun assign-ir2-physenv (clambda)
   (declare (type clambda clambda))
-  (let ((lambda-physenv (lambda-physenv clambda))
-        (reversed-ir2-physenv-alist nil))
-    ;; FIXME: should be MAPCAR, not DOLIST
-    (dolist (thing (physenv-closure lambda-physenv))
-      (let ((ptype (etypecase thing
-                     (lambda-var
-                      (if (lambda-var-indirect thing)
-                          *backend-t-primitive-type*
-                          (primitive-type (leaf-type thing))))
-                     (nlx-info *backend-t-primitive-type*)
-                     (clambda *backend-t-primitive-type*))))
-        (push (cons thing (make-normal-tn ptype))
-              reversed-ir2-physenv-alist)))
-
+  (let* ((lambda-physenv (lambda-physenv clambda))
+         (indirect-fp-tns)
+         (ir2-physenv-alist
+           (loop for thing in (physenv-closure lambda-physenv)
+                 collect
+                 (cons thing
+                       (etypecase thing
+                         (lambda-var
+                          (cond ((not (lambda-var-indirect thing))
+                                 (make-normal-tn
+                                  (primitive-type (leaf-type thing))))
+                                ((not (lambda-var-explicit-value-cell thing))
+                                 (let ((physenv (lambda-physenv (lambda-var-home thing))))
+                                   (or (getf indirect-fp-tns physenv)
+                                       (let ((tn (make-normal-tn *backend-t-primitive-type*)))
+                                         (push tn indirect-fp-tns)
+                                         (push physenv indirect-fp-tns)
+                                         tn))))
+                                (t
+                                 (make-normal-tn *backend-t-primitive-type*))))
+                         (nlx-info
+                          (make-normal-tn *backend-t-primitive-type*))
+                         (clambda
+                          (make-normal-tn *backend-t-primitive-type*)))))))
     (let ((res (make-ir2-physenv
-                :closure (nreverse reversed-ir2-physenv-alist)
+                :closure ir2-physenv-alist
                 :return-pc-pass (make-return-pc-passing-location
                                  (xep-p clambda)))))
       (setf (physenv-info lambda-physenv) res)
@@ -104,47 +114,41 @@
 
   (values))
 
-;;; Return true if FUN's result is used in a tail-recursive full
-;;; call. We only consider explicit :FULL calls. It is assumed that
-;;; known calls are never part of a tail-recursive loop, so we don't
-;;; need to enforce tail-recursion. In any case, we don't know which
-;;; known calls will actually be full calls until after LTN.
-(defun has-full-call-use (fun)
-  (declare (type clambda fun))
-  (let ((return (lambda-return fun)))
-    (and return
-         (do-uses (use (return-result return) nil)
-           (when (and (node-tail-p use)
-                      (basic-combination-p use)
-                      (eq (basic-combination-kind use) :full))
-             (return t))))))
-
 ;;; Return true if we should use the standard (unknown) return
 ;;; convention for a TAIL-SET. We use the standard return convention
 ;;; when:
-;;; -- We must use the standard convention to preserve tail-recursion,
-;;;    since the TAIL-SET contains both an XEP and a TR full call.
+;;; -- If it has an XEP.
+;;;    it could break the tail call in this case, but it usually
+;;;    doesn't produce better code and makes for worse debugging.
 ;;; -- It appears to be more efficient to use the standard convention,
 ;;;    since there are no non-TR local calls that could benefit from
 ;;;    a non-standard convention.
 ;;; -- We're compiling with RETURN-FROM-FRAME instrumentation, which
-;;;    only works (on x86 and x86-64) for the standard convention.
+;;;    only works (on x86, x86-64, arm) for the standard convention.
 (defun use-standard-returns (tails)
   (declare (type tail-set tails))
   (let ((funs (tail-set-funs tails)))
-    (or (and (find-if #'xep-p funs)
-             (find-if #'has-full-call-use funs))
+    (or (find-if #'xep-p funs)
         (some (lambda (fun) (policy fun (>= insert-debug-catch 2))) funs)
         (block punt
           (dolist (fun funs t)
             (dolist (ref (leaf-refs fun))
               (let* ((lvar (node-lvar ref))
                      (dest (and lvar (lvar-dest lvar))))
-                (when (and (basic-combination-p dest)
-                           (not (node-tail-p dest))
-                           (eq (basic-combination-fun dest) lvar)
-                           (eq (basic-combination-kind dest) :local))
-                  (return-from punt nil)))))))))
+                (flet ((all-returns-tail-calls-p (call)
+                         (let* ((lambda (combination-lambda call))
+                                (return (lambda-return lambda)))
+                           (when return
+                             (do-uses (node (return-result return) t)
+                               (unless (and (basic-combination-p node)
+                                            (eq (basic-combination-info node) :full))
+                                 (return)))))))
+                 (when (and (basic-combination-p dest)
+                            (not (node-tail-p dest))
+                            (eq (basic-combination-fun dest) lvar)
+                            (eq (basic-combination-kind dest) :local)
+                            (not (all-returns-tail-calls-p dest)))
+                   (return-from punt nil))))))))))
 
 ;;; If policy indicates, give an efficiency note about our inability to
 ;;; use the known return convention. We try to find a function in the
@@ -194,17 +198,15 @@
       (if (or (eq count :unknown) use-standard)
           (make-return-info :kind :unknown
                             :count count
-                            :types ptypes)
+                            :primitive-types ptypes
+                            :types types)
           (make-return-info :kind :fixed
                             :count count
-                            :types ptypes
+                            :primitive-types ptypes
+                            :types types
                             :locations (mapcar #'make-normal-tn ptypes))))))
 
 ;;; If TAIL-SET doesn't have any INFO, then make a RETURN-INFO for it.
-;;; If we choose a return convention other than :UNKNOWN, and this
-;;; environment is for an XEP, then break tail recursion on the XEP
-;;; calls, since we must always use unknown values when returning from
-;;; an XEP.
 (defun assign-return-locations (fun)
   (declare (type clambda fun))
   (let* ((tails (lambda-tail-set fun))
@@ -213,10 +215,8 @@
                             (return-info-for-set tails))))
          (return (lambda-return fun)))
     (when (and return
-               (not (eq (return-info-kind returns) :unknown))
                (xep-p fun))
-      (do-uses (use (return-result return))
-        (setf (node-tail-p use) nil))))
+      (aver (eq (return-info-kind returns) :unknown))))
   (values))
 
 ;;; Make an IR2-NLX-INFO structure for each NLX entry point recorded.
@@ -235,5 +235,7 @@
                      (if (nlx-info-safe-p nlx)
                          (make-normal-tn *backend-t-primitive-type*)
                          (make-stack-pointer-tn)))
-             :save-sp (make-nlx-sp-tn physenv)))))
+             :save-sp (unless (eq (cleanup-kind (nlx-info-cleanup nlx))
+                                  :unwind-protect)
+                        (make-nlx-sp-tn physenv))))))
   (values))

@@ -9,25 +9,25 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; level and length abbreviations
 
 ;;; The current level we are printing at, to be compared against
 ;;; *PRINT-LEVEL*. See the macro DESCEND-INTO for a handy interface to
 ;;; depth abbreviation.
+(defparameter *current-level-in-print* 0) ; initialized by genesis
 (declaim (index *current-level-in-print*))
-(!defvar *current-level-in-print* 0)
 
 ;;; Automatically handle *PRINT-LEVEL* abbreviation. If we are too
 ;;; deep, then a #\# is printed to STREAM and BODY is ignored.
 (defmacro descend-into ((stream) &body body)
-  (let ((flet-name (sb!xc:gensym "DESCEND")))
+  (let ((flet-name (sb-xc:gensym "DESCEND")))
     `(flet ((,flet-name ()
               ,@body))
        (cond ((and (null *print-readably*)
-                   *print-level*
-                   (>= *current-level-in-print* *print-level*))
+                   (let ((level *print-level*))
+                     (and level (>= *current-level-in-print* level))))
               (write-char #\# ,stream))
              (t
               (let ((*current-level-in-print* (1+ *current-level-in-print*)))
@@ -38,8 +38,8 @@
 ;;; the block named NIL.
 (defmacro punt-print-if-too-long (index stream)
   `(when (and (not *print-readably*)
-              *print-length*
-              (>= ,index *print-length*))
+              (let ((len *print-length*))
+                (and len (>= ,index len))))
      (write-string "..." ,stream)
      (return)))
 
@@ -85,20 +85,22 @@
 ;;; output like #1=#1#. The MODE parameter is used for detecting and
 ;;; correcting this problem.
 (defun check-for-circularity (object &optional assign (mode t))
-  (cond ((null *print-circle*)
+  (when (null *print-circle*)
          ;; Don't bother, nobody cares.
-         nil)
-        ((null *circularity-hash-table*)
+    (return-from check-for-circularity nil))
+  (let ((circularity-hash-table *circularity-hash-table*))
+    (cond
+        ((null circularity-hash-table)
           (values nil :initiate))
         ((null *circularity-counter*)
-         (ecase (gethash object *circularity-hash-table*)
+         (ecase (gethash object circularity-hash-table)
            ((nil)
             ;; first encounter
-            (setf (gethash object *circularity-hash-table*) mode)
+            (setf (gethash object circularity-hash-table) mode)
             ;; We need to keep looking.
             nil)
            ((:logical-block)
-            (setf (gethash object *circularity-hash-table*)
+            (setf (gethash object circularity-hash-table)
                   :logical-block-circular)
             t)
            ((t)
@@ -106,19 +108,19 @@
                    ;; We've seen the object before in output-object, and now
                    ;; a second time in a PPRINT-LOGICAL-BLOCK (for example
                    ;; via pprint-dispatch). Don't mark it as circular yet.
-                   (setf (gethash object *circularity-hash-table*)
+                   (setf (gethash object circularity-hash-table)
                          :logical-block)
                    nil)
                   (t
                    ;; second encounter
-                   (setf (gethash object *circularity-hash-table*) 0)
+                   (setf (gethash object circularity-hash-table) 0)
                    ;; It's a circular reference.
                    t)))
            ((0 :logical-block-circular)
             ;; It's a circular reference.
             t)))
         (t
-         (let ((value (gethash object *circularity-hash-table*)))
+         (let ((value (gethash object circularity-hash-table)))
            (case value
              ((nil t :logical-block)
               ;; If NIL, we found an object that wasn't there the
@@ -148,7 +150,7 @@
                           (eq mode :logical-block))
                      (let ((value (incf *circularity-counter*)))
                        ;; first occurrence of this object: Set the counter.
-                       (setf (gethash object *circularity-hash-table*) value)
+                       (setf (gethash object circularity-hash-table) value)
                        value))
                     (t
                      nil)))
@@ -156,12 +158,12 @@
               (if (eq assign t)
                   (let ((value (incf *circularity-counter*)))
                     ;; first occurrence of this object: Set the counter.
-                    (setf (gethash object *circularity-hash-table*) value)
+                    (setf (gethash object circularity-hash-table) value)
                     value)
                   t))
              (t
               ;; second or later occurrence
-              (- value)))))))
+              (- value))))))))
 
 ;;; Handle the results of CHECK-FOR-CIRCULARITY. If this returns T then
 ;;; you should go ahead and print the object. If it returns NIL, then
@@ -179,22 +181,19 @@
      nil)
     (t
      (write-char #\# stream)
-     (let ((*print-base* 10) (*print-radix* nil))
-       (cond ((minusp marker)
-              (output-integer (- marker) stream)
-              (write-char #\# stream)
-              nil)
-             (t
-              (output-integer marker stream)
-              (write-char #\= stream)
-              t))))))
+     (output-integer (abs marker) stream 10 nil)
+     (cond ((minusp marker)
+            (write-char #\# stream)
+            nil)
+           (t
+            (write-char #\= stream)
+            t)))))
 
 (defmacro with-circularity-detection ((object stream) &body body)
   (with-unique-names (marker body-name)
     `(labels ((,body-name ()
                ,@body))
-      (cond ((not *print-circle*)
-            (,body-name))
+      (cond ((not *print-circle*) (,body-name))
             (*circularity-hash-table*
              (let ((,marker (check-for-circularity ,object t :logical-block)))
                (if ,marker
@@ -210,4 +209,3 @@
                    (when ,marker
                      (handle-circularity ,marker ,stream)))
                 (,body-name))))))))
-

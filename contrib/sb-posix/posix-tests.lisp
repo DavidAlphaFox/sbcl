@@ -226,6 +226,7 @@
         result)))
   #.sb-posix::eacces)
 
+#-(or (and darwin x86) win32)
 (deftest stat.1
   (let* ((stat (sb-posix:stat *test-directory*))
          (mode (sb-posix::stat-mode stat)))
@@ -233,7 +234,7 @@
     (logand mode (logior sb-posix::s-iread sb-posix::s-iwrite sb-posix::s-iexec)))
   #.(logior sb-posix::s-iread sb-posix::s-iwrite sb-posix::s-iexec))
 
-#-win32
+#-(or (and darwin x86) win32)
 (deftest stat.2
   (let* ((stat (sb-posix:stat "/"))
          (mode (sb-posix::stat-mode stat)))
@@ -254,7 +255,7 @@
     (< (- atime unix-now) 10))
   t)
 
-#-win32
+#-(or (and darwin x86) win32)
 (deftest stat.4
   (let* ((stat (sb-posix:stat (make-pathname :directory '(:absolute :up))))
          (mode (sb-posix::stat-mode stat)))
@@ -344,6 +345,7 @@
     (sb-posix:s-isreg mode))
   nil)
 
+#-(and darwin x86)
 (deftest stat-mode.2
   (with-stat-mode (mode *test-directory*)
     (sb-posix:s-isdir mode))
@@ -364,13 +366,13 @@
     (sb-posix:s-isfifo mode))
   nil)
 
-#-win32
+#-(or (and darwin x86) win32)
 (deftest stat-mode.6
   (with-stat-mode (mode *test-directory*)
     (sb-posix:s-issock mode))
   nil)
 
-#-win32
+#-(or (and darwin x86) win32)
 (deftest stat-mode.7
   (let ((link-pathname (make-pathname :name "stat-mode.7"
                                       :defaults *test-directory*)))
@@ -382,6 +384,7 @@
       (ignore-errors (sb-posix:unlink link-pathname))))
   t)
 
+#-(and darwin x86)
 (deftest stat-mode.8
   (let ((pathname (make-pathname :name "stat-mode.8"
                                  :defaults *test-directory*)))
@@ -429,14 +432,14 @@
   #+win32
   #.sb-posix:eacces)
 
-#-(or (and x86-64 (or linux sunos)) win32)
+#-(or (and (or x86-64 arm64 alpha) (or linux sunos)) win32)
 (deftest fcntl.1
   (let ((fd (sb-posix:open "/dev/null" sb-posix::o-nonblock)))
     (= (sb-posix:fcntl fd sb-posix::f-getfl) sb-posix::o-nonblock))
   t)
 ;; On AMD64/Linux O_LARGEFILE is always set, even though the whole
 ;; flag makes no sense.
-#+(and x86-64 (or linux sunos))
+#+(and (or x86-64 arm64 alpha) (or linux sunos))
 (deftest fcntl.1
   (let ((fd (sb-posix:open "/dev/null" sb-posix::o-nonblock)))
     (/= 0 (logand (sb-posix:fcntl fd sb-posix::f-getfl)
@@ -535,6 +538,7 @@
         (sb-posix:closedir dir))))
   nil)
 
+#-(and darwin x86)
 (deftest readdir.1
   (let ((dir (sb-posix:opendir "/")))
     (unwind-protect
@@ -614,9 +618,12 @@
 
 #-(or android win32)
 (deftest grent.2
-  ;; make sure that we found something
-  (not (sb-posix:getgrnam "sys"))
-  nil)
+    ;; make sure that we found something
+    (let* ((gid 0)
+           (group (sb-posix:getgrgid gid)))
+      (eql gid
+           (sb-posix:group-gid (sb-posix:getgrnam (sb-posix:group-name group)))))
+  t)
 
 #-(or android win32)
 (deftest grent.non-existing
@@ -662,7 +669,7 @@
     (plusp (sb-posix:time))
   t)
 
-#-(or win32)
+#-(or (and darwin x86) win32)
 (deftest utimes.1
     (let ((file (merge-pathnames #p"utimes.1" *test-directory*))
           (atime (random (1- (expt 2 31))))
@@ -804,6 +811,22 @@
     (equal (sb-unix::posix-getcwd) (sb-posix:getcwd))
   t)
 
+(defun parse-native-namestring (namestring &key as-directory)
+  ;; XXXXXX can contain a dot changing pathname-type
+  (let ((parsed (sb-ext:parse-native-namestring namestring nil
+                                                *default-pathname-defaults*
+                                                :as-directory as-directory)))
+    (if as-directory
+        parsed
+        (let* ((name (pathname-name parsed))
+               (type (pathname-type parsed))
+               (dot (position #\. name)))
+          (if dot
+              (make-pathname :name (subseq name 0 dot)
+                             :type (format nil "~a.~a" (subseq name (1+ dot)) type)
+                             :defaults parsed)
+              parsed)))))
+
 #-win32
 (deftest mkstemp.1
     (multiple-value-bind (fd temp)
@@ -811,7 +834,7 @@
                            :name "mkstemp-1"
                            :type "XXXXXX"
                            :defaults *test-directory*))
-      (let ((pathname (sb-ext:parse-native-namestring temp)))
+      (let ((pathname (parse-native-namestring temp)))
         (unwind-protect
              (values (integerp fd) (pathname-name pathname))
           (delete-file temp))))
@@ -823,13 +846,11 @@
 ;;; But it is implemented on OpenSolaris 2008.11
 (deftest mkdtemp.1
     (let ((pathname
-           (sb-ext:parse-native-namestring
+           (parse-native-namestring
             (sb-posix:mkdtemp (make-pathname
                                :name "mkdtemp-1"
                                :type "XXXXXX"
                                :defaults *test-directory*))
-            nil
-            *default-pathname-defaults*
             :as-directory t)))
       (unwind-protect
            (values (let* ((xxx (car (last (pathname-directory pathname))))
@@ -842,7 +863,7 @@
 
 #-win32
 (deftest mktemp.1
-    (let ((pathname (sb-ext:parse-native-namestring
+    (let ((pathname (parse-native-namestring
                      (sb-posix:mktemp #p"mktemp.XXXXXX"))))
       (values (equal "mktemp" (pathname-name pathname))
               (not (equal "XXXXXX" (pathname-type pathname)))))

@@ -41,3 +41,14 @@
 (defun slot-boundp-name (slot-name)
   (list 'slot-accessor :global slot-name 'boundp))
 
+;;; This is the object that we stick into a slot to tell us that it is
+;;; unbound. It is the same as the marker for unbound symbols.
+;;; There are two ways to check whether a slot is unbound:
+;;;   (EQ <val> +slot-unbound+) ; ordinary object equality test
+;;;   (UNBOUND-MARKER-P <val>)  ; (potentially) faster test
+;;;
+;;; It seems only reasonable to also export this for users, since
+;;; otherwise dealing with STANDARD-INSTANCE-ACCESS becomes harder
+;;; -- and slower -- than it needs to be.
+#-sb-xc-host (define-symbol-macro +slot-unbound+ (make-unbound-marker))
+

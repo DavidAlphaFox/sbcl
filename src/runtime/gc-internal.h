@@ -1,5 +1,12 @@
 /*
  * garbage collection - shared definitions for modules "inside" the GC system
+ *
+ * Despite the preceding claim, this header is a bit of a mashup of things
+ * that are "internal to strictly GC" vs "for all SBCL-internal C code"
+ * as opposed to gc.h which is some kind of external API,
+ * though it's unclear for what, since hardly anything includes it.
+ * GC-internal pieces that don't need to be revealed more widely
+ * should be declared in 'gc-private.h'
  */
 
 /*
@@ -16,9 +23,14 @@
 #ifndef _GC_INTERNAL_H_
 #define _GC_INTERNAL_H_
 
-#include <genesis/simple-fun.h>
+#include "genesis/code.h"
+#include "genesis/simple-fun.h"
 #include "thread.h"
-#include "interr.h"
+#include "interr.h" /* for lose() */
+#include "gc-assert.h"
+#include "code.h"
+extern const char *widetag_names[];
+extern struct weak_pointer *weak_pointer_chain; /* in gc-common.c */
 
 #ifdef LISP_FEATURE_GENCGC
 #include "gencgc-internal.h"
@@ -26,150 +38,79 @@
 #include "cheneygc-internal.h"
 #endif
 
-/* disabling gc assertions made no discernable difference to GC speed,
- * last I tried it - dan 2003.12.21
- *
- * And it's unsafe to do so while things like gc_assert(0 ==
- * thread_mutex_lock(&allocation_lock)) exist. - MG 2009-01-13
- */
-#if 1
-# define gc_assert(ex)                                                 \
-do {                                                                   \
-    if (!(ex)) gc_abort();                                             \
-} while (0)
-# define gc_assert_verbose(ex, fmt, ...)                               \
-do {                                                                   \
-    if (!(ex)) {                                                       \
-        fprintf(stderr, fmt, ## __VA_ARGS__);                          \
-        gc_abort();                                                    \
-    }                                                                  \
-} while (0)
-#else
-# define gc_assert(ex)
-# define gc_assert_verbose(ex, fmt, ...)
-#endif
+#include "align.h"
 
-#define gc_abort()                                                     \
-  lose("GC invariant lost, file \"%s\", line %d\n", __FILE__, __LINE__)
-
-#define CEILING(x,y) (((x) + ((y) - 1)) & (~((y) - 1)))
-
-static inline uword_t
-NWORDS(uword_t x, uword_t n_bits)
-{
-    /* A good compiler should be able to constant-fold this whole thing,
-       even with the conditional. */
-    if(n_bits <= N_WORD_BITS) {
-        uword_t elements_per_word = N_WORD_BITS/n_bits;
-
-        return CEILING(x, elements_per_word)/elements_per_word;
-    }
-    else {
-        /* FIXME: should have some sort of assertion that N_WORD_BITS
-           evenly divides n_bits */
-        return x * (n_bits/N_WORD_BITS);
-    }
-}
-
-/* FIXME: Shouldn't this be defined in sbcl.h? */
-
-#if defined(LISP_FEATURE_SPARC) || defined(LISP_FEATURE_ARM)
+// Offset from an fdefn raw address to the underlying simple-fun,
+// if and only if it points to a simple-fun.
+// For those of us who are too memory-impaired to know how to use the value:
+//  - it is the amount to ADD to a tagged simple-fun pointer to get its entry address
+//  - or the amount to SUBTRACT from an entry address to get a tagged fun pointer
+// I almost might prefer two accessors named tagged_fun_to_fun_entry() and
+// and fun_entry_to_tagged_fun() instead of the manifest constant.
+#if defined(LISP_FEATURE_SPARC) || defined(LISP_FEATURE_ARM) || defined(LISP_FEATURE_RISCV)
 #define FUN_RAW_ADDR_OFFSET 0
 #else
-#define FUN_RAW_ADDR_OFFSET (offsetof(struct simple_fun, code) - FUN_POINTER_LOWTAG)
+#define FUN_RAW_ADDR_OFFSET (offsetof(struct simple_fun, insts) - FUN_POINTER_LOWTAG)
 #endif
+
+// For x86[-64], a simple-fun or closure's "self" slot is a fixum
+// On other backends, it is a lisp ointer.
+#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
+#define FUN_SELF_FIXNUM_TAGGED 1
+#else
+#define FUN_SELF_FIXNUM_TAGGED 0
+#endif
+
+// Return only the lisp-visible vector header flag bits bits,
+// masking out subtype_VectorWeakVisited.
+#define vector_subtype(header) (HeaderValue(header) & 7)
+// Test for presence of a bit in vector's header.
+// As a special case, if 'val' is 0, then test for all bits clear.
+#define is_vector_subtype(header, val) \
+  (subtype_##val ? (HeaderValue(header) & subtype_##val) : \
+   !(HeaderValue(header) & 7))
+
+// Mask out the fullcgc mark bit when asserting header validity
+#define UNSET_WEAK_VECTOR_VISITED(v) \
+  gc_assert((v->header & 0xffff) == \
+    (((subtype_VectorWeakVisited|subtype_VectorWeak) << N_WIDETAG_BITS) \
+     | SIMPLE_VECTOR_WIDETAG)); \
+  v->header ^= subtype_VectorWeakVisited << N_WIDETAG_BITS
 
 /* values for the *_alloc_* parameters, also see the commentary for
- * struct page in gencgc-internal.h.  FIXME: Perhaps these constants
- * should be there, or at least defined on gencgc only? */
-#define FREE_PAGE_FLAG 0
-#define BOXED_PAGE_FLAG 1
-#define UNBOXED_PAGE_FLAG 2
-#define OPEN_REGION_PAGE_FLAG 4
-#define CODE_PAGE_FLAG        (BOXED_PAGE_FLAG|UNBOXED_PAGE_FLAG)
+ * struct page in gencgc-internal.h. These constants are used in gc-common,
+ * so they can't easily be made gencgc-only */
+#define FREE_PAGE_FLAG        0
+#define PAGE_TYPE_MASK        7 // mask out the 'single-object flag'
+/* Note: MAP-ALLOCATED-OBJECTS expects this value to be 1 */
+#define BOXED_PAGE_FLAG       1
+#define UNBOXED_PAGE_FLAG     2
+#define OPEN_REGION_PAGE_FLAG 8
+#define CODE_PAGE_TYPE        (BOXED_PAGE_FLAG|UNBOXED_PAGE_FLAG)
 
-#define ALLOC_BOXED 0
-#define ALLOC_UNBOXED 1
-#define ALLOC_QUICK 1
-
-#ifdef LISP_FEATURE_GENCGC
-#include "gencgc-alloc-region.h"
-void *
-gc_alloc_with_region(sword_t nbytes,int page_type_flag, struct alloc_region *my_region,
-                     int quick_p);
-static inline void *
-gc_general_alloc(sword_t nbytes, int page_type_flag, int quick_p)
-{
-    struct alloc_region *my_region;
-    if (UNBOXED_PAGE_FLAG == page_type_flag) {
-        my_region = &unboxed_region;
-    } else if (BOXED_PAGE_FLAG & page_type_flag) {
-        my_region = &boxed_region;
-    } else {
-        lose("bad page type flag: %d", page_type_flag);
-    }
-    return gc_alloc_with_region(nbytes, page_type_flag, my_region, quick_p);
-}
-#else
-extern void *gc_general_alloc(word_t nbytes,int page_type_flag,int quick_p);
-#endif
-
-static inline lispobj
-gc_general_copy_object(lispobj object, long nwords, int page_type_flag)
-{
-    lispobj *new;
-
-    gc_assert(is_lisp_pointer(object));
-    gc_assert(from_space_p(object));
-    gc_assert((nwords & 0x01) == 0);
-
-    /* Allocate space. */
-    new = gc_general_alloc(nwords*N_WORD_BYTES, page_type_flag, ALLOC_QUICK);
-
-    /* Copy the object. */
-    memcpy(new,native_pointer(object),nwords*N_WORD_BYTES);
-
-    return make_lispobj(new, lowtag_of(object));
-}
-
-extern sword_t (*scavtab[256])(lispobj *where, lispobj object);
-extern lispobj (*transother[256])(lispobj object);
 extern sword_t (*sizetab[256])(lispobj *where);
+#define OBJECT_SIZE(header,where) \
+  (is_cons_half(header)?2:sizetab[header_widetag(header)](where))
 
-extern struct weak_pointer *weak_pointers; /* in gc-common.c */
-extern struct hash_table *weak_hash_tables; /* in gc-common.c */
+lispobj *gc_search_space3(void *pointer, lispobj *start, void *limit);
+static inline lispobj *gc_search_space(lispobj *start, void *pointer) {
+    return gc_search_space3(pointer,
+                            start,
+                            (void*)(1+((lispobj)pointer | LOWTAG_MASK)));
+}
 
-extern void scavenge(lispobj *start, sword_t n_words);
-extern void scavenge_interrupt_contexts(struct thread *thread);
-extern void scav_weak_hash_tables(void);
-extern void scan_weak_hash_tables(void);
-extern void scan_weak_pointers(void);
+struct vector *symbol_name(lispobj*);
 
-lispobj  copy_large_unboxed_object(lispobj object, sword_t nwords);
-lispobj  copy_unboxed_object(lispobj object, sword_t nwords);
-lispobj  copy_large_object(lispobj object, sword_t nwords);
-lispobj  copy_object(lispobj object, sword_t nwords);
-lispobj  copy_code_object(lispobj object, sword_t nwords);
-
-lispobj *search_read_only_space(void *pointer);
-lispobj *search_static_space(void *pointer);
-lispobj *search_dynamic_space(void *pointer);
-
-lispobj *gc_search_space(lispobj *start, size_t words, lispobj *pointer);
-
-extern int looks_like_valid_lisp_pointer_p(lispobj pointer, lispobj *start_addr);
-
-extern void scavenge_control_stack(struct thread *th);
 extern void scrub_control_stack(void);
 extern void scrub_thread_control_stack(struct thread *);
 
-#include "fixnump.h"
-
-#ifdef LISP_FEATURE_GENCGC
-#include "gencgc-internal.h"
+#ifdef LISP_FEATURE_X86
+void gencgc_apply_code_fixups(struct code *old_code, struct code *new_code);
 #else
-#include "cheneygc-internal.h"
+#define gencgc_apply_code_fixups(ignore1,ignore2)
 #endif
+
+#include "fixnump.h"
 
 #if N_WORD_BITS == 32
 # define SIMPLE_ARRAY_WORD_WIDETAG SIMPLE_ARRAY_UNSIGNED_BYTE_32_WIDETAG
@@ -177,12 +118,45 @@ extern void scrub_thread_control_stack(struct thread *);
 # define SIMPLE_ARRAY_WORD_WIDETAG SIMPLE_ARRAY_UNSIGNED_BYTE_64_WIDETAG
 #endif
 
-#ifdef LISP_FEATURE_INTERLEAVED_RAW_SLOTS
 extern void
-instance_scan_interleaved(void (*proc)(),
-                          lispobj *instance_ptr,
-                          sword_t n_words,
-                          lispobj *layout_obj);
+instance_scan(void (*proc)(lispobj*, sword_t, uword_t),
+              lispobj *instance_ptr, sword_t n_words,
+              lispobj bitmap, uword_t arg);
+
+extern int simple_fun_index(struct code*, struct simple_fun*);
+extern lispobj simple_fun_name(struct simple_fun*);
+
+#ifdef LISP_FEATURE_COMPACT_INSTANCE_HEADER
+static inline lispobj funinstance_layout(lispobj* funinstance_ptr) { // native ptr
+    return instance_layout(funinstance_ptr);
+}
+static inline lispobj function_layout(lispobj* fun_ptr) { // native ptr
+    return instance_layout(fun_ptr);
+}
+static inline void set_function_layout(lispobj* fun_ptr, lispobj layout) {
+    instance_layout(fun_ptr) = layout;
+}
+#else
+static inline lispobj funinstance_layout(lispobj* instance_ptr) { // native ptr
+    // first 4 words are: header, trampoline, fin-fun, layout
+    return instance_ptr[3];
+}
+// No layout in simple-fun or closure, because there are no free bits
+static inline lispobj
+function_layout(lispobj __attribute__((unused)) *fun_ptr) { // native ptr
+    return 0;
+}
+static inline void set_function_layout(lispobj __attribute__((unused)) *fun_ptr,
+                                       lispobj __attribute__((unused)) layout) {
+    lose("Can't assign layout");
+}
 #endif
+
+#include "genesis/bignum.h"
+extern boolean positive_bignum_logbitp(int,struct bignum*);
+
+extern lispobj fdefn_callee_lispobj(struct fdefn *fdefn);
+
+boolean valid_widetag_p(unsigned char widetag);
 
 #endif /* _GC_INTERNAL_H_ */

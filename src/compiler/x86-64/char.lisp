@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Space optimization: As the upper 32 bits of (tagged or untagged)
 ;;; characters are always zero many operations can be done on 32-bit
@@ -19,7 +19,6 @@
 ;;;; moves and coercions
 
 ;;; Move a tagged char to an untagged representation.
-#!+sb-unicode
 (define-vop (move-to-character)
   (:args (x :scs (any-reg descriptor-reg) :target y
             :load-if (not (location= x y))))
@@ -28,57 +27,28 @@
   (:note "character untagging")
   (:generator 1
     (cond ((and (sc-is y character-reg) (sc-is x any-reg descriptor-reg))
-           (let ((y-dword (reg-in-size y :dword)))
-             (unless (location= x y)
-               (inst mov y-dword (reg-in-size x :dword)))
-             (inst shr y-dword n-widetag-bits)))
+           (unless (location= x y)
+             (inst mov :dword y x)))
           (t
-           (move y x)
-           (inst shr y n-widetag-bits)))))
-#!-sb-unicode
-(define-vop (move-to-character)
-  (:args (x :scs (any-reg control-stack)))
-  (:results (y :scs (character-reg #+nil character-stack)))
-  (:note "character untagging")
-  (:generator 1
-    (let ((y-wide-tn (make-random-tn
-                      :kind :normal
-                      :sc (sc-or-lose 'any-reg)
-                      :offset (tn-offset y))))
-      (move y-wide-tn x)
-      (inst shr y-wide-tn 8)
-      (inst and y-wide-tn #xff))))
+           (move y x)))
+    (inst shr :dword y n-widetag-bits)))
 (define-move-vop move-to-character :move
-  (any-reg #!-sb-unicode control-stack)
+  (any-reg)
   (character-reg))
 
 ;;; Move an untagged char to a tagged representation.
-#!+sb-unicode
 (define-vop (move-from-character)
   (:args (x :scs (character-reg) :target y))
   (:results (y :scs (any-reg descriptor-reg)))
   (:note "character tagging")
   (:generator 1
-    (let ((y-dword (reg-in-size y :dword)))
-      (unless (location= x y)
-        (inst mov y-dword (reg-in-size x :dword)))
-      (inst shl y-dword n-widetag-bits)
-      (inst or y-dword character-widetag))))
-#!-sb-unicode
-(define-vop (move-from-character)
-  (:args (x :scs (character-reg character-stack)))
-  (:results (y :scs (any-reg descriptor-reg #+nil control-stack)))
-  (:note "character tagging")
-  (:generator 1
-    (move (make-random-tn :kind :normal :sc (sc-or-lose 'character-reg)
-                          :offset (tn-offset y))
-          x)
-    (inst shl y n-widetag-bits)
-    (inst or y character-widetag)
-    (inst and y #xffff)))
+    (unless (location= x y)
+      (inst mov :dword y x))
+    (inst shl :dword y n-widetag-bits)
+    (inst or :dword y character-widetag)))
 (define-move-vop move-from-character :move
   (character-reg)
-  (any-reg descriptor-reg #!-sb-unicode control-stack))
+  (any-reg descriptor-reg))
 
 ;;; Move untagged character values.
 (define-vop (character-move)
@@ -88,8 +58,6 @@
   (:results (y :scs (character-reg character-stack)
                :load-if (not (location= x y))))
   (:note "character move")
-  (:effects)
-  (:affected)
   (:generator 0
     (move y x)))
 (define-move-vop character-move :move
@@ -108,13 +76,6 @@
       (character-reg
        (move y x))
       (character-stack
-       #!-sb-unicode
-       (inst mov
-             ;; XXX: If the sb-unicode case needs to handle c-call,
-             ;; why does the non-unicode case not need to?
-             (make-ea :byte :base fp :disp (frame-byte-offset (tn-offset y)))
-             x)
-       #!+sb-unicode
        (if (= (tn-offset fp) esp-offset)
            (storew x fp (tn-offset y))  ; c-call
            (storew x fp (frame-word-offset (tn-offset y))))))))
@@ -131,18 +92,13 @@
 (define-vop (char-code)
   (:translate char-code)
   (:policy :fast-safe)
-  (:args #!-sb-unicode (ch :scs (character-reg character-stack))
-         #!+sb-unicode (ch :scs (character-reg character-stack) :target res))
+  (:args (ch :scs (character-reg character-stack) :target res))
   (:arg-types character)
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 1
-    #!-sb-unicode
-    (inst movzx res ch)
-    #!+sb-unicode
-    (move res ch)))
+    (move res ch))) ; FIXME: shouldn't this be :dword ?
 
-#!+sb-unicode
 (define-vop (code-char)
   (:translate code-char)
   (:policy :fast-safe)
@@ -151,21 +107,17 @@
   (:results (res :scs (character-reg)))
   (:result-types character)
   (:generator 1
-    (move res code)))
-#!-sb-unicode
-(define-vop (code-char)
-  (:translate code-char)
-  (:policy :fast-safe)
-  (:args (code :scs (unsigned-reg unsigned-stack) :target eax))
-  (:arg-types positive-fixnum)
-  (:temporary (:sc unsigned-reg :offset rax-offset :target res
-                   :from (:argument 0) :to (:result 0))
-              eax)
-  (:results (res :scs (character-reg)))
-  (:result-types character)
-  (:generator 1
-    (move eax code)
-    (move res al-tn)))
+    ;; While we could use a byte-sized move here for non-unicode builds,
+    ;; I think it's better to move 32 bits from source to destination either way.
+    ;; The non-unicode case used to perform two moves - first CODE into EAX and then
+    ;; AL to result. I think it was blindly copied from the 32-bit vm definition.
+    ;; The 32-bit vm could use both the low and high byte subregisters of a word-sized
+    ;; register, thus you had to carefully avoid affecting other bits of the physical
+    ;; destination register. And since not all source registers had an accessible 8-bit
+    ;; subregister, it forced going through one of EAX,EBX,ECX,EDX.
+    ;; Those considerations do not pertain to the 64-bit vm.
+    (unless (location= code res)
+      (inst mov :dword res code))))
 
 ;;; comparison of CHARACTERs
 (define-vop (character-compare)
@@ -199,7 +151,7 @@
   (:policy :fast-safe)
   (:note "inline constant comparison")
   (:generator 2
-    (inst cmp x (sb!xc:char-code y))))
+    (inst cmp x (sb-xc:char-code y))))
 
 (define-vop (fast-char=/character/c character-compare/c)
   (:translate char=)
@@ -212,3 +164,38 @@
 (define-vop (fast-char>/character/c character-compare/c)
   (:translate char>)
   (:conditional :a))
+
+#+sb-unicode
+(define-vop (base-char-p)
+  (:args (value :scs (any-reg descriptor-reg)))
+  (:arg-types *)
+  (:translate base-char-p)
+  (:temporary (:sc unsigned-reg :from (:argument 0)) temp)
+  (:conditional :z)
+  (:save-p :compute-only)
+  (:policy :fast-safe)
+  (:generator 4
+    (inst lea :dword temp (ea (- character-widetag) value))
+    (inst test :dword temp (lognot #x7F00))))
+
+#+sb-unicode
+(define-vop (base-char-p-character)
+  (:args (value :scs (any-reg)))
+  (:arg-types character)
+  (:translate base-char-p)
+  (:conditional :z)
+  (:save-p :compute-only)
+  (:policy :fast-safe)
+  (:generator 3
+    (inst test :dword value (lognot #x7FFF))))
+
+#+sb-unicode
+(define-vop (base-char-p-character-reg)
+  (:args (value :scs (character-reg)))
+  (:arg-types character)
+  (:translate base-char-p)
+  (:conditional :l)
+  (:save-p :compute-only)
+  (:policy :fast-safe)
+  (:generator 2
+    (inst cmp :dword value base-char-code-limit)))

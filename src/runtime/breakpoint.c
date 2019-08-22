@@ -22,30 +22,14 @@
 #include "alloc.h"
 #include "breakpoint.h"
 #include "thread.h"
-#include "genesis/code.h"
+#include "code.h"
 #include "genesis/fdefn.h"
 
-#ifdef LISP_FEATURE_X86_64
 #define REAL_LRA_SLOT 0
-#define KNOWN_RETURN_P_SLOT 2
-#define BOGUS_LRA_CONSTANTS 3
-#elif defined(LISP_FEATURE_X86)
-#define REAL_LRA_SLOT 1
-#define KNOWN_RETURN_P_SLOT 3
-#define BOGUS_LRA_CONSTANTS 4
-#else
-#define REAL_LRA_SLOT 0
-#define KNOWN_RETURN_P_SLOT 1
-#define BOGUS_LRA_CONSTANTS 2
-#endif
 
 static void *compute_pc(lispobj code_obj, int pc_offset)
 {
-    struct code *code;
-
-    code = (struct code *)native_pointer(code_obj);
-    return (void *)((char *)code + HeaderValue(code->header)*sizeof(lispobj)
-                    + pc_offset);
+    return code_text_start((struct code*)native_pointer(code_obj)) + pc_offset;
 }
 
 unsigned int breakpoint_install(lispobj code_obj, int pc_offset)
@@ -76,7 +60,7 @@ void breakpoint_do_displaced_inst(os_context_t* context,
     arch_do_displaced_inst(context, orig_inst);
 }
 
-static lispobj find_code(os_context_t *context)
+lispobj find_code(os_context_t *context)
 {
 #ifdef reg_CODE
     lispobj code = *os_context_register_addr(context, reg_CODE);
@@ -87,13 +71,13 @@ static lispobj find_code(os_context_t *context)
 
     header = *(lispobj *)(code-OTHER_POINTER_LOWTAG);
 
-    if (widetag_of(header) == CODE_HEADER_WIDETAG)
+    if (header_widetag(header) == CODE_HEADER_WIDETAG)
         return code;
     else
         return code - HeaderValue(header)*sizeof(lispobj);
 #else
     lispobj codeptr =
-        (lispobj)component_ptr_from_pc((lispobj *)(*os_context_pc_addr(context)));
+        (lispobj)component_ptr_from_pc((char *)(*os_context_pc_addr(context)));
 
     if (codeptr == 0)
         return NIL;
@@ -104,29 +88,20 @@ static lispobj find_code(os_context_t *context)
 
 static long compute_offset(os_context_t *context, lispobj code)
 {
-    if (code == NIL)
-        return 0;
-    else {
-        uword_t code_start;
-        struct code *codeptr = (struct code *)native_pointer(code);
+  if (code != NIL) {
 #ifdef LISP_FEATURE_HPPA
         uword_t pc = *os_context_pc_addr(context) & ~3;
 #else
         uword_t pc = *os_context_pc_addr(context);
 #endif
-
-        code_start = (uword_t)codeptr
-            + HeaderValue(codeptr->header)*sizeof(lispobj);
-        if (pc < code_start)
-            return 0;
-        else {
-            uword_t offset = pc - code_start;
-            if (offset >= (uword_t)fixnum_value(codeptr->code_size))
-                return 0;
-            else
-                return make_fixnum(offset);
-        }
+        struct code *codeptr = (struct code *)native_pointer(code);
+        uword_t code_start = (uword_t)code_text_start(codeptr);
+        int offset;
+        if (pc >= code_start &&
+            ((offset = pc - code_start) < code_text_size(codeptr)))
+            return make_fixnum(offset);
     }
+    return 0;
 }
 
 void handle_breakpoint(os_context_t *context)
@@ -183,7 +158,7 @@ void *handle_fun_end_breakpoint(os_context_t *context)
 
     lra = codeptr->constants[REAL_LRA_SLOT];
 
-#ifdef LISP_FEATURE_PPC
+#if defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64
     /* PPC now passes LRA objects in reg_LRA during return.  Other
      * platforms should as well, but haven't been fixed yet. */
     *os_context_register_addr(context, reg_LRA) = lra;

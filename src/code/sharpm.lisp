@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (declaim (special *read-suppress*))
 
@@ -34,6 +34,9 @@
             "Vector longer than the specified length: #~S~S."
             length list))
           (length
+           (when (and (plusp length) (null list))
+             (simple-reader-error
+              stream "Vector of length ~D can't be initialized from ()" length))
            ;; the syntax `#n(foo ,@bar) is not well-defined. [See lp#1096043.]
            ;; We take it to mean that the vector as read should be padded to
            ;; length 'n'. It could be argued that 'n' is the length after
@@ -45,7 +48,7 @@
 
 (defun sharp-star (stream ignore numarg)
   (declare (ignore ignore))
-  (declare (type (or null fixnum) numarg))
+  (declare (type (or null integer) numarg))
   (binding* (((buffer escape-appearedp) (read-extended-token stream))
              (input-len (token-buf-fill-ptr buffer))
              (bstring (token-buf-string buffer)))
@@ -67,7 +70,7 @@
                                  1 0)))
                 (i 0 (1+ i)))
                ((= i input-len) bvec)
-             (declare (index i) (optimize (sb!c::insert-array-bounds-checks 0)))
+             (declare (index i) (optimize (sb-c::insert-array-bounds-checks 0)))
              (let ((char (char bstring i)))
                (setf (elt bvec i)
                      (case char
@@ -83,37 +86,50 @@
             numarg
             (copy-token-buf-string buffer))))))
 
-(defun sharp-A (stream ignore dimensions)
+(defun sharp-A (stream ignore rank)
   (declare (ignore ignore))
   (when *read-suppress*
     (read stream t nil t)
     (return-from sharp-A nil))
-  (unless dimensions
-    (simple-reader-error stream "No dimensions argument to #A."))
-  (collect ((dims))
-    (let* ((*bq-error*
-            (if (zerop *backquote-depth*)
-                *bq-error*
-                "Comma inside a backquoted array (not a list or general vector.)"))
-           (*backquote-depth* 0)
-           (contents (read stream t nil t))
-           (seq contents))
-      (dotimes (axis dimensions
-                     (make-array (dims) :initial-contents contents))
-        (unless (typep seq 'sequence)
-          (simple-reader-error stream
-                               "#~WA axis ~W is not a sequence:~%  ~S"
-                               dimensions axis seq))
-        (let ((len (length seq)))
-          (dims len)
-          (unless (or (= axis (1- dimensions))
-                      ;; ANSI: "If some dimension of the array whose
-                      ;; representation is being parsed is found to be
-                      ;; 0, all dimensions to the right (i.e., the
-                      ;; higher numbered dimensions) are also
-                      ;; considered to be 0."
-                      (= len 0))
-            (setq seq (elt seq 0))))))))
+  (let* ((*bq-error*
+           (if (zerop *backquote-depth*)
+               *bq-error*
+               "Comma inside a backquoted array (not a list or general vector.)"))
+         (*backquote-depth* 0)
+         (contents (read stream t nil t)))
+    (cond
+      (rank
+       (collect ((dims))
+         (let ((seq contents))
+           (dotimes (axis rank
+                          (make-array (dims) :initial-contents contents))
+             (unless (typep seq 'sequence)
+               (simple-reader-error stream
+                                    "#~WA axis ~W is not a sequence:~%  ~S"
+                                    rank axis seq))
+             (let ((len (length seq)))
+               (dims len)
+               (unless (or (= axis (1- rank))
+                           ;; ANSI: "If some dimension of the array whose
+                           ;; representation is being parsed is found to be
+                           ;; 0, all dimensions to the right (i.e., the
+                           ;; higher numbered dimensions) are also
+                           ;; considered to be 0."
+                           (= len 0))
+                 (setq seq (elt seq 0))))))))
+      ;; It's not legal to have #A without the rank, use that for
+      ;; #A(dimensions element-type contents) to avoid using #. when
+      ;; printing specialized arrays readably.
+      ((list-of-length-at-least-p contents 2)
+       (destructuring-bind (dimensions type &rest contents) contents
+         (make-array dimensions :initial-contents contents
+                                :element-type type)))
+      (t
+       (simple-reader-error stream
+                            "~@<Array literal is neither of the ~
+                             standard form #<rank>A<contents> nor the ~
+                             SBCL-specific form #A(dimensions ~
+                             element-type . contents).~@:>")))))
 
 ;;;; reading structure instances: the #S readmacro
 
@@ -236,22 +252,27 @@
 
 ;;;; reading circular data: the #= and ## readmacros
 
-;;; objects already seen by CIRCLE-SUBST
-(defvar *sharp-equal-circle-table*)
-(declaim (type hash-table *sharp-equal-circle-table*))
+(defconstant +sharp-equal-marker+ '+sharp-equal-marker+)
+
+(defstruct (sharp-equal-wrapper
+            (:constructor make-sharp-equal-wrapper (label))
+            (:copier nil))
+  (label nil :read-only t)
+  (value +sharp-equal-marker+))
+(declaim (freeze-type sharp-equal-wrapper))
 
 ;; This function is kind of like NSUBLIS, but checks for circularities and
 ;; substitutes in arrays and structures as well as lists. The first arg is an
 ;; alist of the things to be replaced assoc'd with the things to replace them.
-(defun circle-subst (old-new-alist tree)
-  (cond ((not (typep tree '(or cons (array t) instance funcallable-instance)))
-         (let ((entry (find tree old-new-alist :key #'second)))
-           (if entry (third entry) tree)))
-        ((null (gethash tree *sharp-equal-circle-table*))
-         (setf (gethash tree *sharp-equal-circle-table*) t)
+(defun circle-subst (circle-table tree)
+  (cond ((and (sharp-equal-wrapper-p tree)
+              (not (eq (sharp-equal-wrapper-value tree) +sharp-equal-marker+)))
+         (sharp-equal-wrapper-value tree))
+        ((null (gethash tree circle-table))
+         (setf (gethash tree circle-table) t)
          (cond ((consp tree)
-                (let ((a (circle-subst old-new-alist (car tree)))
-                      (d (circle-subst old-new-alist (cdr tree))))
+                (let ((a (circle-subst circle-table (car tree)))
+                      (d (circle-subst circle-table (cdr tree))))
                   (unless (eq a (car tree))
                     (rplaca tree a))
                   (unless (eq d (cdr tree))
@@ -262,104 +283,108 @@
                   (do ((i start (1+ i)))
                       ((>= i end))
                     (let* ((old (aref data i))
-                           (new (circle-subst old-new-alist old)))
+                           (new (circle-subst circle-table old)))
                       (unless (eq old new)
                         (setf (aref data i) new))))))
                ((typep tree 'instance)
-                ;; We don't grovel slot index 0, the layout.
-                (do-instance-tagged-slot (i tree :start 1)
+                ;; We don't grovel the layout.
+                (do-instance-tagged-slot (i tree)
                   (let* ((old (%instance-ref tree i))
-                         (new (circle-subst old-new-alist old)))
+                         (new (circle-subst circle-table old)))
                     (unless (eq old new)
                       (setf (%instance-ref tree i) new)))))
                ((typep tree 'funcallable-instance)
-                (do ((i 1 (1+ i))
-                     (end (- (1+ (get-closure-length tree)) sb!vm:funcallable-instance-info-offset)))
+                (do ((i sb-vm:instance-data-start (1+ i))
+                     (end (- (1+ (get-closure-length tree)) sb-vm:funcallable-instance-info-offset)))
                     ((= i end))
                   (let* ((old (%funcallable-instance-info tree i))
-                         (new (circle-subst old-new-alist old)))
+                         (new (circle-subst circle-table old)))
                     (unless (eq old new)
                       (setf (%funcallable-instance-info tree i) new))))))
          tree)
         (t tree)))
 
-;;; Sharp-equal works as follows. When a label is assigned (i.e. when
-;;; #= is called) we GENSYM a symbol is which is used as an
-;;; unforgeable tag. *SHARP-SHARP-ALIST* maps the integer tag to this
-;;; gensym.
-;;;
-;;; When SHARP-SHARP encounters a reference to a label, it returns the
-;;; symbol assoc'd with the label. Resolution of the reference is
-;;; deferred until the read done by #= finishes. Any already resolved
-;;; tags (in *SHARP-EQUAL-ALIST*) are simply returned.
-;;;
-;;; After reading of the #= form is completed, we add an entry to
-;;; *SHARP-EQUAL-ALIST* that maps the gensym tag to the resolved
-;;; object. Then for each entry in the *SHARP-SHARP-ALIST, the current
-;;; object is searched and any uses of the gensysm token are replaced
-;;; with the actual value.
-(defvar *sharp-sharp-alist* ())
-
+;;; Sharp-equal works as follows.
+;;; When creating a new label a SHARP-EQUAL-WRAPPER is pushed onto
+;;; *SHARP-EQUAL* with the value slot being +SHARP-EQUAL-MARKER+.
+;;; When #x# looks up the label and SHARP-EQUAL-WRAPPER-VALUE is
+;;; +SHARP-EQUAL-MARKER+ it leaves the wrapper, otherwise it uses the
+;;; value.
+;;; After reading the object the sharp-equal-wrapper-value is set to
+;;; the object and CIRCLE-SUBST replaces all the sharp-equal-wrappers
+;;; with the already read values.
 (defun sharp-equal (stream ignore label)
   (declare (ignore ignore))
   (when *read-suppress* (return-from sharp-equal (values)))
   (unless label
-    (simple-reader-error stream "missing label for #=" label))
-  (when (or (assoc label *sharp-sharp-alist*)
-            (assoc label *sharp-equal-alist*))
-    (simple-reader-error stream "multiply defined label: #~D=" label))
-  (let* ((tag (gensym))
-         (*sharp-sharp-alist* (acons label tag *sharp-sharp-alist*))
-         (obj (read stream t nil t)))
-    (when (eq obj tag)
+    (simple-reader-error stream "Missing label for #="))
+  (when (find label *sharp-equal* :key #'sharp-equal-wrapper-label)
+    (simple-reader-error stream "Multiply defined label: #~D=" label))
+  (let* ((wrapper (make-sharp-equal-wrapper label))
+         (obj (progn
+                (push wrapper *sharp-equal*)
+                (read stream t nil t))))
+    (when (eq obj wrapper)
       (simple-reader-error stream
-                     "must tag something more than just #~D#"
-                     label))
-    (push (list label tag obj) *sharp-equal-alist*)
-    (let ((*sharp-equal-circle-table* (make-hash-table :test 'eq :size 20)))
-      (circle-subst *sharp-equal-alist* obj))))
+                           "Must label something more than just #~D#"
+                           label))
+    (setf (sharp-equal-wrapper-value wrapper) obj)
+    (circle-subst (make-hash-table :test 'eq) obj)))
 
 (defun sharp-sharp (stream ignore label)
   (declare (ignore ignore))
   (when *read-suppress* (return-from sharp-sharp nil))
   (unless label
-    (simple-reader-error stream "missing label for ##" label))
-
-  (let ((entry (assoc label *sharp-equal-alist*)))
-    (if entry
-        (third entry)
-        (let (;; Has this label been defined previously? (Don't read
-              ;; ANSI "2.4.8.15 Sharpsign Equal-Sign" and worry that
-              ;; it requires you to implement forward references,
-              ;; because forward references are disallowed in
-              ;; "2.4.8.16 Sharpsign Sharpsign".)
-              (pair (assoc label *sharp-sharp-alist*)))
-          (unless pair
-            (simple-reader-error stream
-                                 "reference to undefined label #~D#"
-                                 label))
-          (cdr pair)))))
+    (simple-reader-error stream "Missing label for ##"))
+  ;; Has this label been defined previously? (Don't read
+  ;; ANSI "2.4.8.15 Sharpsign Equal-Sign" and worry that
+  ;; it requires you to implement forward references,
+  ;; because forward references are disallowed in
+  ;; "2.4.8.16 Sharpsign Sharpsign".)
+  (let ((entry (find label *sharp-equal* :key #'sharp-equal-wrapper-label)))
+    (cond ((not entry)
+           (simple-reader-error stream
+                                "Reference to undefined label #~D#"
+                                label))
+          ((eq (sharp-equal-wrapper-value entry) +sharp-equal-marker+)
+           entry)
+          (t
+           (sharp-equal-wrapper-value entry)))))
 
 ;;;; conditional compilation: the #+ and #- readmacros
 
-(flet ((guts (stream not-p)
-         (unless (if (let ((*package* *keyword-package*)
-                           (*reader-package* nil)
-                           (*read-suppress* nil))
-                       (featurep (read stream t nil t)))
-                     (not not-p)
-                     not-p)
-           (let ((*read-suppress* t))
-             (read stream t nil t)))
-         (values)))
+;;; If X is a symbol, see whether it is present in *FEATURES*. Also
+;;; handle arbitrary combinations of atoms using NOT, AND, OR.
+(defun featurep (x)
+  (typecase x
+    (cons
+     (case (car x)
+       ((:not not)
+        (cond
+          ((cddr x)
+           (error "too many subexpressions in feature expression: ~S" x))
+          ((null (cdr x))
+           (error "too few subexpressions in feature expression: ~S" x))
+          (t (not (featurep (cadr x))))))
+       ((:and and) (every #'featurep (cdr x)))
+       ((:or or) (some #'featurep (cdr x)))
+       (t
+        (error "unknown operator in feature expression: ~S." x))))
+    (symbol (not (null (memq x *features*))))
+    (t
+      (error "invalid feature expression: ~S" x))))
 
-  (defun sharp-plus (stream sub-char numarg)
+(defun sharp-plus-minus (stream sub-char numarg)
     (ignore-numarg sub-char numarg)
-    (guts stream nil))
-
-  (defun sharp-minus (stream sub-char numarg)
-    (ignore-numarg sub-char numarg)
-    (guts stream t)))
+    (if (char= (if (featurep (let ((*package* *keyword-package*)
+                                   (*reader-package* nil)
+                                   (*read-suppress* nil))
+                               (read stream t nil t)))
+                   #\+ #\-) sub-char)
+        (read stream t nil t)
+        (let ((*read-suppress* t))
+          (read stream t nil t)
+          (values))))
 
 ;;;; reading miscellaneous objects: the #P, #\, and #| readmacros
 
@@ -389,38 +414,29 @@
         #'(lambda (decoding-error)
             (declare (ignorable decoding-error))
             (style-warn
-             'sb!kernel::character-decoding-error-in-dispatch-macro-char-comment
+             'sb-kernel::character-decoding-error-in-dispatch-macro-char-comment
              :sub-char sub-char :position (file-position stream) :stream stream)
             (invoke-restart 'attempt-resync))))
-    (let ((stream (in-synonym-of stream)))
-      (if (ansi-stream-p stream)
-          (prepare-for-fast-read-char stream
-            (do ((level 1)
-                 (prev (fast-read-char) char)
-                 (char (fast-read-char) (fast-read-char)))
-                (())
-              (cond ((and (char= prev #\|) (char= char #\#))
-                     (setq level (1- level))
-                     (when (zerop level)
-                       (done-with-fast-read-char)
-                       (return (values)))
-                     (setq char (fast-read-char)))
-                    ((and (char= prev #\#) (char= char #\|))
-                     (setq char (fast-read-char))
-                     (setq level (1+ level))))))
-          ;; fundamental-stream
-          (do ((level 1)
-               (prev (read-char stream t) char)
-               (char (read-char stream t) (read-char stream t)))
-              (())
-            (cond ((and (char= prev #\|) (char= char #\#))
-                   (setq level (1- level))
-                   (when (zerop level)
-                     (return (values)))
-                   (setq char (read-char stream t)))
-                  ((and (char= prev #\#) (char= char #\|))
-                   (setq char (read-char stream t))
-                   (setq level (1+ level)))))))))
+    (let ((stream (in-stream-from-designator stream)))
+      (macrolet ((munch (get-char &optional finish)
+                   `(do ((level 1)
+                         (prev ,get-char char)
+                         (char ,get-char ,get-char))
+                        (())
+                      (cond ((and (char= prev #\|) (char= char #\#))
+                             (setq level (1- level))
+                             (when (zerop level)
+                               ,finish
+                               (return (values)))
+                             (setq char ,get-char))
+                            ((and (char= prev #\#) (char= char #\|))
+                             (setq char ,get-char)
+                             (setq level (1+ level)))))))
+        (if (ansi-stream-p stream)
+            (prepare-for-fast-read-char stream
+              (munch (fast-read-char) (done-with-fast-read-char)))
+            ;; fundamental-stream
+            (munch (read-char stream t)))))))
 
 ;;;; a grab bag of other sharp readmacros: #', #:, and #.
 
@@ -469,7 +485,6 @@
                (make-symbol token)))))))
 
 (defvar *read-eval* t
-  #!+sb-doc
   "If false, then the #. read macro is disabled.")
 
 (defun sharp-dot (stream sub-char numarg)
@@ -505,8 +520,8 @@
   (set-dispatch-macro-character #\# #\s #'sharp-S)
   (set-dispatch-macro-character #\# #\= #'sharp-equal)
   (set-dispatch-macro-character #\# #\# #'sharp-sharp)
-  (set-dispatch-macro-character #\# #\+ #'sharp-plus)
-  (set-dispatch-macro-character #\# #\- #'sharp-minus)
+  (set-dispatch-macro-character #\# #\+ #'sharp-plus-minus)
+  (set-dispatch-macro-character #\# #\- #'sharp-plus-minus)
   (set-dispatch-macro-character #\# #\c #'sharp-C)
   (set-dispatch-macro-character #\# #\| #'sharp-vertical-bar)
   (set-dispatch-macro-character #\# #\p #'sharp-P)

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; the branch VOP
 
@@ -35,11 +35,11 @@
 ;;; false. Otherwise, the code must branch to dest if the test was true.
 
 (define-vop (branch-if)
-  (:info dest flags not-p)
+  (:info dest not-p flags)
   (:generator 0
      (flet ((negate-condition (name)
               (let ((code (logxor 1 (conditional-opcode name))))
-                (aref *condition-name-vec* code))))
+                (aref +condition-name-vec+ code))))
        (aver (null (rest flags)))
        (inst jmp
              (if not-p
@@ -47,17 +47,15 @@
                  (first flags))
              dest))))
 
-(defvar *cmov-ptype-representation-vop*
+(define-load-time-global *cmov-ptype-representation-vop*
   (mapcan (lambda (entry)
             (destructuring-bind (ptypes &optional sc vop)
                 entry
-              (unless (listp ptypes)
-                (setf ptypes (list ptypes)))
               (mapcar (if (and vop sc)
                           (lambda (ptype)
                             (list ptype sc vop))
                           #'list)
-                      ptypes)))
+                      (ensure-list ptypes))))
           '((t descriptor-reg move-if/t)
 
             ((fixnum positive-fixnum)
@@ -68,7 +66,7 @@
             ;; FIXME: Can't use CMOV with byte registers, and characters live
             ;; in such outside of unicode builds. A better solution then just
             ;; disabling MOVE-IF/CHAR should be possible, though.
-            #!+sb-unicode
+            #+sb-unicode
             (character character-reg move-if/char)
 
             ((single-float complex-single-float
@@ -84,8 +82,8 @@
 
 (defun convert-conditional-move-p (node dst-tn x-tn y-tn)
   (declare (ignore node))
-  (let* ((ptype (sb!c::tn-primitive-type dst-tn))
-         (name  (sb!c::primitive-type-name ptype))
+  (let* ((ptype (sb-c::tn-primitive-type dst-tn))
+         (name  (sb-c::primitive-type-name ptype))
          (param (and (memq :cmov *backend-subfeatures*)
                      (cdr (or (assoc name *cmov-ptype-representation-vop*)
                               '(t descriptor-reg move-if/t))))))
@@ -95,7 +93,7 @@
           (labels ((make-tn ()
                      (make-representation-tn ptype scn))
                    (frob-tn (tn)
-                     (if (immediate-tn-p tn)
+                     (if (constant-tn-p tn)
                          tn
                          (make-tn))))
             (values vop
@@ -155,7 +153,7 @@
   (def-move-if move-if/unsigned unsigned-num unsigned-reg unsigned-stack)
   (def-move-if move-if/signed signed-num signed-reg signed-stack)
   ;; FIXME: See *CMOV-PTYPE-REPRESENTATION-VOP* above.
-  #!+sb-unicode
+  #+sb-unicode
   (def-move-if move-if/char character character-reg character-stack)
   (def-move-if move-if/sap system-area-pointer sap-reg sap-stack))
 

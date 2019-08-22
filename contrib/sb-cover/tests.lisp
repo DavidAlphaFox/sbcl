@@ -18,14 +18,14 @@
 (defun report ()
   (handler-case
       (sb-cover:report *output-directory*)
-    (warning ()
-      (error "Unexpected warning"))))
+    (warning (condition)
+      (error "Unexpected warning: ~A" condition))))
 
 (defun report-expect-failure ()
   (handler-case
       (progn
         (sb-cover:report *output-directory*)
-        (error "Should've raised a warning"))
+        (error "Should've signaled a warning"))
     (warning ())))
 
 
@@ -106,7 +106,32 @@
 
 ;; Check for presence of constant coalescing bugs
 (compile-load "test-data-3")
-(test-2)
+(let ((*standard-output* (make-broadcast-stream)))
+  (test-2))
+
+;;; Another file, with some branches
+(compile-load "test-data-branching-forms")
+
+(test-branching-forms)
+(report)
+
+;; Complete expression coverage
+(assert (= 13
+           (sb-cover::ok-of (getf sb-cover::*counts* :expression))
+           (sb-cover::all-of (getf sb-cover::*counts* :expression))))
+
+;; Make sure we simulate (in-package) correctly.
+(sb-cover:clear-coverage)
+(compile-load "test-data-4")
+(test4)
+(report)
+
+;;; And now we should have complete expression coverage
+(assert (zerop (sb-cover::ok-of (getf sb-cover::*counts* :branch))))
+(assert (zerop (sb-cover::all-of (getf sb-cover::*counts* :branch))))
+(assert (plusp (sb-cover::ok-of (getf sb-cover::*counts* :expression))))
+(assert (= (sb-cover::ok-of (getf sb-cover::*counts* :expression))
+           (sb-cover::all-of (getf sb-cover::*counts* :expression))))
 
 ;; Clean up after the tests
 (map nil #'delete-file

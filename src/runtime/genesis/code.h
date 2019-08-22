@@ -11,27 +11,28 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_CODE
-#define SBCL_GENESIS_CODE 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_CODE
+#ifndef __ASSEMBLER__
 
 struct code {
     lispobj header;
-    lispobj code_size;
-    lispobj entry_points;
+    lispobj boxed_size;
     lispobj debug_info;
+    lispobj fixups;
     lispobj constants[1];
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
-#define CODE_CODE_SIZE_OFFSET -7
-#define CODE_ENTRY_POINTS_OFFSET 1
-#define CODE_DEBUG_INFO_OFFSET 9
+#define CODE_BOXED_SIZE_OFFSET -7
+#define CODE_DEBUG_INFO_OFFSET 1
+#define CODE_FIXUPS_OFFSET 9
 #define CODE_CONSTANTS_OFFSET 17
+#define CODE_SIZE 4
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_CODE */
+#endif

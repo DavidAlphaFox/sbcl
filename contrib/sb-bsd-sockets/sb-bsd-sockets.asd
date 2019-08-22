@@ -1,34 +1,38 @@
 ;;; -*-  Lisp -*-
 
-(defsystem :sb-bsd-sockets
+(defsystem "sb-bsd-sockets"
   :version "0.59"
-  :defsystem-depends-on (sb-grovel)
+  :defsystem-depends-on ("sb-grovel")
   #+sb-building-contrib :pathname
   #+sb-building-contrib #p"SYS:CONTRIB;SB-BSD-SOCKETS;"
   :components
   ((:file "defpackage")
-   (:file "win32-lib" :if-feature :win32)
-   (:sb-grovel-constants-file "constants"
-    :package :sockint
-    :depends-on ("defpackage")
-    :if-feature (:not :win32))
-   (:sb-grovel-constants-file "win32-constants"
-    :package :sockint
-    :depends-on ("defpackage" "win32-lib")
-    :if-feature :win32)
-   (:file "util" :depends-on ("defpackage" "constants"))
-   (:file "protocol" :depends-on ("defpackage"))
+
+   (:sb-grovel-constants-file "constants" :depends-on ("defpackage")
+                          :if-feature (:not :win32)
+                          :package :sockint)
+   (:file "win32-lib"     :if-feature :win32)
+   (:sb-grovel-constants-file "win32-constants" :depends-on ("defpackage" "win32-lib")
+                          :if-feature :win32
+                          :package :sockint)
+
+   (:file "util"          :depends-on ("defpackage" "constants"))
+   (:file "protocol"      :depends-on ("defpackage"))
+
    (:file "win32-sockets" :depends-on ("protocol" "win32-constants")
-    :if-feature :win32)
-   (:file "sockets" :depends-on ("util" "constants" "protocol" "win32-sockets"))
-   (:file "sockopt" :depends-on ("util" "sockets"))
-   (:file "inet" :depends-on ("protocol" "sockets"))
-   (:file "inet4" :depends-on ("protocol" "sockets"))
-   (:file "inet6" :depends-on ("protocol" "sockets")
-    :if-feature (:not :win32))
-   (:file "local" :depends-on ("protocol" "sockets"))
-   (:file "name-service" :depends-on ("protocol" "sockets"))
-   (:file "misc" :depends-on ("sockets"))
+                          :if-feature :win32)
+   (:file "sockets"       :depends-on ("util" "constants" "protocol" "win32-sockets"))
+   (:file "sockopt"       :depends-on ("util" "sockets"))
+
+   (:file "inet"          :depends-on ("protocol" "sockets"))
+   (:file "inet4"         :depends-on ("protocol" "sockets"))
+   (:file "inet6"         :depends-on ("protocol" "sockets")
+                          :if-feature (:not :win32))
+   (:file "local"         :depends-on ("protocol" "sockets")
+                          :if-feature (:not :win32))
+
+   (:file "name-service"  :depends-on ("protocol" "sockets"))
+   (:file "misc"          :depends-on ("sockets"))
 
    ;; FIXME at least NEWS and TODO actually exist in the
    ;; filesystem. However, their all-uppercase names are translated to
@@ -40,10 +44,12 @@
    ;; (:static-file "TODO")
    )
   :perform (load-op :after (o c) (provide 'sb-bsd-sockets))
-  :perform (test-op (o c) (test-system 'sb-bsd-sockets/tests)))
+  :in-order-to ((test-op (test-op "sb-bsd-sockets/tests"))))
 
-(defsystem :sb-bsd-sockets/tests
-  :depends-on (sb-rt sb-bsd-sockets #-win32 sb-posix)
+(defsystem "sb-bsd-sockets/tests"
+  :depends-on ("sb-rt"
+               "sb-bsd-sockets"
+               (:feature (:not :win32) "sb-posix"))
   :components ((:file "tests"))
   :perform (test-op (o c)
              (multiple-value-bind (soft strict pending)

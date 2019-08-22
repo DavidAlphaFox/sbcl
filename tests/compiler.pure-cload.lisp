@@ -11,8 +11,6 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package :cl-user)
-
 ;;; Exercise a compiler bug (by causing a call to ERROR).
 ;;;
 ;;; This bug was in sbcl-0.6.11.6.
@@ -131,7 +129,7 @@
            (declare (type (simple-array (unsigned-byte 32) (*)) a))
            (declare (type (function (fixnum)) f))
            (funcall f (aref a 0))))
-    #-x86-64
+    #-64-bit
     (assert
      (eval `(let ((n (1+ most-positive-fixnum)))
               (if (not (typep n '(unsigned-byte 32)))
@@ -181,3 +179,11 @@
     (make-tests)))
 
 (lambda () (the string (+ 1 x)))
+
+(lambda ()
+  (macrolet ((x (&rest args)
+               (declare (ignore args))
+               'a))
+    (let (a)
+      (declare (type vector a))
+      (x #.#'list))))

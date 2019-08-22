@@ -315,6 +315,24 @@
       (test ((a -1)) (my-plusp (signum a))
             "The assertion (MY-PLUSP (SIGNUM A)) failed with (SIGNUM A) = -1."))))
 
+;; If ASSERT thinks it's checking a function call form, it binds the arguments
+;; to local vars so that it can show them on failure. But it would accidentally
+;; treat a local macro as a function if its name coincided with a global.
+(defun compute (a b) (declare (ignore a b)))
+(defun compute-something-else (a b) (list a b))
+(defun assert-arg-eval-order (a b)
+  (let ((evals))
+    (flet ((eval-arg (arg) (setq evals (nconc evals (list arg))) arg))
+      (macrolet ((compute (x y z)
+                   (declare (ignore y)) ; does not appear in expansion
+                   `(compute-something-else ,z ,x)))
+        (assert (compute (eval-arg a)
+                         (eval-arg (error "bork"))
+                         (eval-arg b)))))
+    evals))
+(with-test (:name :assert-arg-eval-order)
+  (assert (equal (assert-arg-eval-order 1 2) '(2 1))))
+
 (with-test (:name (find-restart :recheck-conditions-and-tests :bug-774410))
   (let ((activep t))
     (restart-bind ((switchable-restart
@@ -427,3 +445,168 @@
   (assert (= (length (sb-kernel::condition-classoid-class-slots
                       *a-classy-classoid*))
              2)))
+
+(defun some-silly-handler (x) (declare (ignore x)))
+
+;; Note, you should exercise extreme caution when printing *HANDLER-CLUSTERS*
+;; from the REPL or you will likely confuse yourself.
+;; At any point, the clusters are composed of a chain of dx conses.
+;; One way to print them is like this:
+;;  (funcall (lambda () (print sb-kernel::*handler-clusters*) nil))
+
+(with-test (:name :handler-bind-expansion-variations)
+
+  ;; exercise all 3 possibilities for the TEST of a clause
+  (handler-bind ((error #'print))
+    ;; first cluster, first binding, first part
+    (let ((test (caaar sb-kernel:*handler-clusters*)))
+      (assert (eq test (sb-kernel:find-classoid-cell 'error)))))
+  (locally (declare (muffle-conditions style-warning))
+    (handler-bind (((satisfies some-silly-fun) #'print))
+      (let ((test (caaar sb-kernel:*handler-clusters*)))
+        (assert (eq test (sb-int:find-fdefn 'some-silly-fun))))))
+  (handler-bind (((or warning error) #'print))
+    (let ((test (caaar sb-kernel:*handler-clusters*)))
+      (assert (functionp test))))
+
+  ;; exercise all 3 possibilities for the HANDLER of a clause
+
+  (flet ((frob (x) (print x)))
+    (handler-bind ((warning
+                    (lambda (c) (frob (frob c)))))
+      ;; first cluster, first binding, second part
+      (let ((fn (cdaar sb-kernel:*handler-clusters*)))
+        (assert (functionp fn)))))
+
+  (handler-bind ((warning 'some-silly-handler))
+    (let ((fn (cdaar sb-kernel:*handler-clusters*)))
+      ;; the function is stored as an fdefn
+      (assert (typep fn 'sb-kernel::fdefn))))
+
+  (handler-bind ((warning 'muffle-warning))
+    (let ((fn (cdaar sb-kernel:*handler-clusters*)))
+      ;; the function is stored directly because it's a builtin.
+      (assert (eq fn (symbol-function 'muffle-warning))))))
+
+;; Oddly enough, at least one other Lisp considers this example
+;; *not* to fail, quite explicitly - the handler function in the
+;; handler-cluster is a lambda that returns a function that is
+;; the real handler function.
+(defun this-should-fail ()
+  (declare (muffle-conditions style-warning))
+  (handler-bind ((condition #'some-nonexistent-handler))
+    (random 100)))
+
+(with-test (:name :handler-bind-evals-handlers-immediately)
+  (assert-error (this-should-fail))
+  (defun some-nonexistent-handler (x) x)
+  (assert (integerp (this-should-fail)))) ; but not now it shouldn't
+
+(defun (setf thing) (a b) (declare (ignore b)) a)
+
+(with-test (:name :undefined-restart
+            :skipped-on (not :undefined-fun-restarts))
+  (let* ((name (gensym))
+         (tail-call (checked-compile `(lambda () (,name)) :allow-style-warnings t))
+         (call (checked-compile `(lambda () (1+ (,name))) :allow-style-warnings t))
+         (return (checked-compile `(lambda () #',name) :allow-style-warnings t))
+         (value-lambda (lambda () 10)))
+    (flet ((test-continue (fun)
+             (fmakunbound name)
+             (handler-bind ((undefined-function
+                              (lambda (c)
+                                (declare (ignore c))
+                                (setf (fdefinition name)
+                                      (lambda () 123))
+                                (invoke-restart 'continue))))
+               (funcall fun)))
+           (test-use-value (fun value)
+             (fmakunbound name)
+             (handler-bind ((undefined-function
+                              (lambda (c)
+                                (declare (ignore c))
+                                (invoke-restart 'use-value value))))
+               (funcall fun))))
+      (assert (eq (test-continue tail-call) 123))
+      (assert (eq (test-continue call) 124))
+      (assert (eq (test-continue return) (fdefinition name)))
+      (assert (eq (test-use-value tail-call value-lambda) 10))
+      (assert (eq (test-use-value call value-lambda) 11))
+      (assert (eq (test-use-value return value-lambda) value-lambda))
+      (assert (eq (test-use-value return '(setf thing)) #'(setf thing)))
+      (assert (eq (test-use-value return #'(setf thing)) #'(setf thing))))))
+
+;;; Assert that the USE-VALUE restart for SYMBOL-FUNCTION
+;;; lets you specify any function.
+(with-test (:name :undefined-restart-symbol-function)
+  (flet ((test-use-value (value-to-use)
+           (let ((f (handler-bind
+                        ((undefined-function
+                          (lambda (c)
+                            (declare (ignore c))
+                            (use-value value-to-use))))
+                      (symbol-function 'nonexistent-fun))))
+             (assert (eq :win (funcall f :win 'whatever))))))
+    (test-use-value #'(setf thing))
+    (test-use-value '(setf thing))))
+
+(with-test (:name :unknown-key-restart)
+  (handler-bind ((sb-ext:unknown-keyword-argument
+                   (lambda (c)
+                     (assert (eq (sb-ext:unknown-keyword-argument-name c)
+                                 :bogus))
+                     (continue c))))
+    (assert (= (funcall (checked-compile '(lambda (&key abc) (1+ abc)))
+                        :bogus 30 :abc 20)
+               21))))
+
+(define-condition allocation-class-default-initargs ()
+  ((a :initarg :a :initform :initform :allocation :class))
+  (:default-initargs :a :default-initarg))
+
+(with-test (:name :allocation-class-default-initargs)
+  (assert (eql (slot-value (make-condition 'allocation-class-default-initargs) 'a)
+               :default-initarg))
+  (assert (eql (slot-value (make-condition 'allocation-class-default-initargs :a 10) 'a)
+               10)))
+
+(define-condition allocation-class-unbound ()
+  ((a :initarg :a :allocation :class)))
+
+(with-test (:name :allocation-class-unbound)
+  (assert-error (slot-value (make-condition 'allocation-class-unbound) 'a)))
+
+(define-condition allocation-class-initarg-order ()
+  ((a :initarg :a :initarg :b :allocation :class)))
+
+(with-test (:name :allocation-class-initarg-order)
+  (assert (eql (slot-value (make-condition 'allocation-class-initarg-order :a 10 :b 20) 'a)
+               10))
+  (assert (eql (slot-value (make-condition 'allocation-class-initarg-order :b 10 :a 20) 'a)
+               10)))
+
+(defvar *ggg*)
+(declaim (integer *ggg*))
+(defun ggg+1 () (1+ *ggg*))
+
+(with-test (:name :restart-unbound-variable
+                  :skipped-on (not (and :x86-64 :sb-thread)))
+  (let ((success nil))
+    (handler-bind
+        ((unbound-variable
+          (lambda (e)
+            ;; This is kinda whacky, I'd have preferred to
+            ;; see a TYPE-ERROR here, but instead we signal
+            ;; RETRY-UNBOUND-VARIABLE which is a system-internal
+            ;; type name, and a format control describing the problem
+            ;; Apparently I don't understand anything anyway,
+            ;; because why is this *same* handler still accessible?
+            (cond ((typep e 'sb-kernel::retry-unbound-variable)
+                   (when (search ":NOPE is not of type INTEGER"
+                                 (write-to-string e :escape nil))
+                     (setq success t))
+                   (invoke-restart 'use-value 1))
+                  (t
+                   (invoke-restart 'store-value :nope))))))
+      (ggg+1)
+      (assert success))))

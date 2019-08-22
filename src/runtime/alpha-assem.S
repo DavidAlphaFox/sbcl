@@ -8,7 +8,12 @@
  * provided with absolutely no warranty. See the COPYING and CREDITS
  * files for more information.
  */
-	
+
+#ifdef __ELF__
+// Mark the object as not requiring an executable stack.
+.section .note.GNU-stack,"",%progbits
+#endif
+
 #include "validate.h"		
 #include <alpha/regdef.h>
 #ifdef linux
@@ -20,6 +25,7 @@
 #include "lispregs.h"
 #include "genesis/fdefn.h"
 #include "genesis/closure.h"
+#include "genesis/code.h"
 #include "genesis/funcallable-instance.h"
 #include "genesis/simple-fun.h"
 #include "genesis/static-symbols.h"
@@ -95,7 +101,7 @@ call_into_lisp:
 
 	/* Indirect the closure */
 	ldl	reg_CODE, CLOSURE_FUN_OFFSET(reg_LEXENV)
-	addl	reg_CODE, SIMPLE_FUN_CODE_OFFSET, reg_LIP
+	addl	reg_CODE, SIMPLE_FUN_INSTS_OFFSET, reg_LIP
 
 	/* And into lisp we go. */
 	jsr	reg_ZERO,(reg_LIP)
@@ -109,7 +115,7 @@ call_into_lisp:
 	.globl	call_into_lisp_LRA
 call_into_lisp_LRA:	
 
-	.long	RETURN_PC_HEADER_WIDETAG
+	.long	RETURN_PC_WIDETAG
 
 	/* execution resumes here*/
 	mov	reg_OCFP,reg_CSP
@@ -251,70 +257,10 @@ call_into_c:
 	.globl	start_of_tramps
 start_of_tramps:
 
-/*
- * The undefined-function trampoline.  Causes a trap_Error trap which
- * sigtrap_handler catches and eventaully calls the Lisp
- * INTERNAL-ERROR function
- */
-        .text
-	.globl	start_of_tramps
-	.globl	undefined_tramp
-	.globl	undefined_tramp_offset
-        .ent    undefined_tramp_offset
-undefined_tramp_offset:
-	/* an explanation is called for here.  0x140 is the difference
-	 * between undefined_tramp_offset and call_into_lisp_LRA, but
-	 * the assembler is too dumb to allow that as an expression.
-	 * So, change this number whenever you add or remove any code
-	 * in this file */
-
-undefined_tramp= call_into_lisp_LRA_page+0x140
-	call_pal PAL_bugchk
-	.long    trap_Error
-        .byte    4                         /* what are these numbers? */
-        .byte    UNDEFINED_FUN_ERROR
-        .byte    254
-        .byte    (0xe0 + sc_DescriptorReg)
-        .byte    2
-        .align 2
-        .end     undefined_tramp_offset
-
-
-/* The closure trampoline. */
-        .text
-        .globl  closure_tramp
-        .globl  closure_tramp_offset
-        .ent    closure_tramp_offset
-closure_tramp_offset:
-closure_tramp= call_into_lisp_LRA_page+0x150
-        ldl     reg_LEXENV, FDEFN_FUN_OFFSET(reg_FDEFN)
-        ldl     reg_L0, CLOSURE_FUN_OFFSET(reg_LEXENV)
-        addl    reg_L0, SIMPLE_FUN_CODE_OFFSET, reg_LIP
-        jmp     reg_ZERO,(reg_LIP)
-        .end    closure_tramp_offset
-
 	.text
 	.globl	end_of_tramps
 end_of_tramps:
 
-	.text
-	.globl funcallable_instance_tramp
-	.align 2
-	.long SIMPLE_FUN_HEADER_WIDETAG
-funcallable_instance_tramp = . + 1
-	.long funcallable_instance_tramp
-	.long NIL
-	.long NIL
-	.long NIL
-	.long NIL
-	.long NIL
-
-	ldl reg_LEXENV, FUNCALLABLE_INSTANCE_FUNCTION_OFFSET(reg_LEXENV)
-	/* I think we don't actually need to use reg_CODE here, because
-	   $CODE is computed from $LIP in the function itself */
-	ldl reg_CODE, CLOSURE_FUN_OFFSET(reg_LEXENV) 
-	addl reg_CODE, SIMPLE_FUN_CODE_OFFSET, reg_LIP
-	jmp reg_ZERO, (reg_LIP)
 
 /*
  * fun-end breakpoint magic.
@@ -330,7 +276,7 @@ funcallable_instance_tramp = . + 1
 	.set	noreorder
 	.globl	fun_end_breakpoint_guts
 fun_end_breakpoint_guts:
-	.long	RETURN_PC_HEADER_WIDETAG + 0x600
+	.long	(((CODE_SIZE+1)&~1)<<N_WIDETAG_BITS)|RETURN_PC_WIDETAG
 	br	zero, fun_end_breakpoint_trap
 	nop
 	mov	reg_CSP, reg_OCFP

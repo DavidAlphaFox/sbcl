@@ -1,22 +1,24 @@
 ;;; -*-  Lisp -*-
-(defsystem sb-posix
-  :defsystem-depends-on (sb-grovel)
+(defsystem "sb-posix"
+  :defsystem-depends-on ("sb-grovel")
   #+sb-building-contrib :pathname
   #+sb-building-contrib #p"SYS:CONTRIB;SB-POSIX;"
   :components ((:file "defpackage")
+               (:file "strtod" :depends-on ("defpackage"))
                (:file "designator" :depends-on ("defpackage"))
                (:file "macros" :depends-on ("designator"))
                (:sb-grovel-constants-file "constants"
                 :package :sb-posix :depends-on  ("defpackage"))
                (:file "interface" :depends-on ("constants" "macros" "designator")))
   :perform (load-op :after (o c) (provide 'sb-posix))
-  :perform (test-op (o c) (test-system 'sb-posix/tests)))
+  :in-order-to ((test-op (test-op "sb-posix/tests"))))
 
-(defsystem sb-posix/tests
-  :depends-on (sb-rt)
+(defsystem "sb-posix/tests"
+  :depends-on ("sb-rt")
   #+sb-building-contrib :pathname
   #+sb-building-contrib #p"SYS:CONTRIB;SB-POSIX;"
-  :components ((:file "posix-tests"))
+  :components ((:file "libc-tests")
+               (:file "posix-tests"))
   :perform
   (test-op (o c)
     (funcall (intern "DO-TESTS" (find-package "SB-RT")))

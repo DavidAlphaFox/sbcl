@@ -77,7 +77,8 @@
       (list (constant-form-value form))
       nil))
 
-(defstruct (fgen (:constructor make-fgen (gensyms generator generator-lambda system)))
+(defstruct (fgen (:constructor make-fgen (gensyms generator generator-lambda system))
+                 (:copier nil))
   gensyms
   generator
   generator-lambda
@@ -86,7 +87,7 @@
 ;;; *FGENS* stores all the function generators we have so far. Each
 ;;; element is a FGEN structure as implemented below. Don't ever touch this
 ;;; list by hand, use LOOKUP-FGEN, and ENSURE-FGEN.
-(defvar *fgens* (make-hash-table :test #'equal :synchronized t))
+(define-load-time-global *fgens* (make-hash-table :test #'equal :synchronized t))
 
 (defun ensure-fgen (test gensyms generator generator-lambda system)
   (with-locked-system-table (*fgens*)
@@ -112,7 +113,8 @@
 (defun get-new-fun-generator (lambda test code-converter)
   (multiple-value-bind (code gensyms) (compute-code lambda code-converter)
     (let ((generator-lambda `(lambda ,gensyms
-                               (declare (muffle-conditions compiler-note))
+                               (declare (muffle-conditions compiler-note)
+                                        (optimize (sb-c:store-source-form 0)))
                                (function ,code))))
       (let ((generator (compile nil generator-lambda)))
         (ensure-fgen test gensyms generator generator-lambda nil)

@@ -242,7 +242,7 @@ again:
         timeout = &tv;
     }
 
-    block_deferrable_signals(0, &oldset);
+    block_deferrable_signals(&oldset);
 
     futex = futex_get(lock_word);
 
@@ -288,7 +288,7 @@ again:
 done:
     ; /* Null statement is required between label and pthread_cleanup_pop. */
     pthread_cleanup_pop(1);
-    pthread_sigmask(SIG_SETMASK, &oldset, NULL);
+    thread_sigmask(SIG_SETMASK, &oldset, NULL);
 
     /* futex_wake() in linux-os.c loops when futex system call returns
      * EINTR.  */
@@ -310,7 +310,7 @@ futex_wake(int *lock_word, int n)
     struct futex *futex;
     sigset_t oldset;
 
-    block_deferrable_signals(0, &oldset);
+    block_deferrable_signals(&oldset);
 
     futex = futex_get(lock_word);
 
@@ -332,7 +332,7 @@ futex_wake(int *lock_word, int n)
         pthread_cleanup_pop(1);
     }
 
-    pthread_sigmask(SIG_SETMASK, &oldset, NULL);
+    thread_sigmask(SIG_SETMASK, &oldset, NULL);
 
     return 0;
 }

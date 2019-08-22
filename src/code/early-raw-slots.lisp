@@ -7,149 +7,118 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
-;;; This file has to be loaded during cold-init as early as you'd like to
-;;; have any defstructs that use raw slots.  %COMPILER-DEFSTRUCT needs the
-;;; raw-slot-data-list both at compile-time and load-time.
+;;; STRUCTURE-OBJECT supports placement of raw bits within the object
+;;; to allow representation of native word and float-point types directly.
 
-;;; STRUCTURE-OBJECT supports two different strategies to place raw slots
-;;; (containing "just bits", not Lisp descriptors) within it in a way
-;;; that GC has knowledge of. No backend supports both strategies though.
-
-;;; The older strategy is "non-interleaved".
-;;; Consider a structure of 3 tagged slots (A,B,C) and 2 raw slots,
-;;; where (for simplicity) each raw slot takes space equal to one Lisp word.
-;;; (In general raw slots can take >1 word)
-;;; Lisp code arranges so that raw slots are last.
-;;; Word offsets are listed on the left
-;;;    0 : header = (instance-length << 8) | instance-header-widetag
-;;;    1 : dsd-index 0 = ptr to LAYOUT
-;;;    2 : dsd-index 1 = tagged slot A
-;;;    3 : dsd-index 2 = ... B
-;;;    4 : dsd-index 3 = ... C
-;;;    5 : filler
-;;;    6 : dsd-index 1 = second raw slot
-;;;    7 : dsd-index 0 = first raw slot
-;;;
-;;; Note that numbering of raw slots with respect to their DSD-INDEX
-;;; restarts at 0, so there are two "spaces" of dsd-indices, the non-raw
-;;; and the raw space. Also note that filler was added in the middle, so
-;;; that adding INSTANCE-LENGTH to the object's address always gets you
-;;; to exactly the 0th raw slot. The filler can't be squeezed out, because
-;;; all Lisp objects must consume an even number of words, and the length
-;;; of an instance reflects the number of physical - not logical - words
-;;; that follow the instance header.
-;;;
-;;; This strategy for placement of raw slots is easy for GC because GC's
-;;; view of an instance is simply some number of boxed words followed by
-;;; some number of ignored words.
-;;; However, this strategy presents a difficulty for Lisp in that a raw
-;;; slot at a given index is not at a fixed offset relative to the base of
-;;; the object - it is fixed relative to the _last_ word of the object.
-;;; This has to do with the requirement that structure accessors defined by
-;;; a parent type work correctly on a descendant type, while preserving the
-;;; simple-for-GC aspect. If another DEFSTRUCT says to :INCLUDE the above,
-;;; adding two more tagged slots D and E, the slot named D occupies word 5
-;;; ('filler' above), E occupies word 6, and the two raw slots shift down.
-;;; To read raw slot at index N requires adding to the object pointer
-;;; the number of words represented by instance-length and subtracting the
-;;; raw slot index.
-;;; Aside from instance-length, the only additional piece of information
-;;; that GC needs to know to scavenge a structure is the number of raw slots,
-;;; which is obtained from the object's layout in the N-UNTAGGED-SLOTS slot.
-
-;;; Assuming that it is more important to simplify runtime access than
-;;; to simplify GC, we can use the newer strategy, "interleaved" raw slots.
-;;; Interleaving freely intermingles tagged data with untagged data
-;;; following the layout.  This permits descendant structures to add
-;;; slots of any kind to the end without changing any physical placement
-;;; that was already determined, and eliminates the runtime computation
-;;; of the offset to raw slots. It is also generally easier to understand.
+;;; Historically the implementation was optimized for GC by placing all
+;;; such slots at the end of the instance, and scavenging only up to last
+;;; non-raw slot. This imposed significant overhead for access from Lisp,
+;;; because "is-a" inheritance was obliged to rearrange raw slots
+;;; to comply with the GC requirement, thus forcing ancestor structure
+;;; accessors to compensate for physical structure length in all cases.
+;;; Assuming that it is more important to simplify Lisp access than
+;;; to simplify GC, we use a more flexible strategy that permits
+;;; descendant structures to place new slots anywhere without changing
+;;; slot placement established in ancestor structures.
 ;;; The trade-off is that GC (and a few other things - structure dumping,
 ;;; EQUALP checking, to name a few) have to be able to determine for each
 ;;; slot whether it is a Lisp descriptor or just bits. This is done
-;;; with the LAYOUT-UNTAGGED-BITMAP of an object's layout.
-;;; The bitmap stores a '1' for each bit representing a raw word,
-;;; and could be a BIGNUM given a spectacularly huge structure.
-
-;;; Also note that in both strategies there are possibly some alignment
-;;; concerns which must be accounted for when DEFSTRUCT lays out slots,
+;;; with the LAYOUT-BITMAP of an object's layout.
+;;;
+;;; The bitmap stores a 1 in each bit index corresponding to a tagged slot
+;;; index. If tagged slots follow raw slots and the the number of slots is
+;;; large, the bitmap could be a bignum.  As a special case, -1 represents
+;;; that all slots are tagged regardless of instance length.
+;;;
+;;; Also note that there are possibly some alignment concerns which must
+;;; be accounted for when DEFSTRUCT lays out slots,
 ;;; by injecting padding words appropriately.
 ;;; For example COMPLEX-DOUBLE-FLOAT *should* be aligned to twice the
 ;;; alignment of a DOUBLE-FLOAT. It is not, as things stand,
 ;;; but this is considered a minor bug.
-;;; Interleaving is supported only on x86-64, but porting should be
-;;; straightforward, because if anything the VOPs become simpler.
 
 ;; To utilize a word-sized slot in a defstruct without having to resort to
-;; writing (myslot :type (unsigned-byte #.sb!vm:n-word-bits)), or even
+;; writing (myslot :type (unsigned-byte #.sb-vm:n-word-bits)), or even
 ;; worse (:type #+sb-xc-host <sometype> #-sb-xc-host <othertype>),
 ;; these abstractions are provided as soon as the raw slots defs are.
-;; 'signed-word' is here for companionship - slots of that type are not raw.
-(def!type sb!vm:word () `(unsigned-byte ,sb!vm:n-word-bits))
-(def!type sb!vm:signed-word () `(signed-byte ,sb!vm:n-word-bits))
-
-;; These definitions pertain to how a LAYOUT stores the raw-slot metadata,
-;; and we need them before 'class.lisp' is compiled (why, I'm can't remember).
-;; LAYOUT-RAW-SLOT-METADATA is an abstraction over whichever kind of
-;; metadata we have - it will be one or the other.
-#!-interleaved-raw-slots
-(progn (deftype layout-raw-slot-metadata-type () 'index)
-       (defmacro layout-raw-slot-metadata (x) `(layout-n-untagged-slots ,x)))
-;; It would be possible to represent an unlimited number of trailing untagged
-;; slots (maybe) without consing a bignum if we wished to allow signed integers
-;; for the raw slot bitmap, but that's probably confusing and pointless, so...
-#!+interleaved-raw-slots
-(progn (deftype layout-raw-slot-metadata-type () 'unsigned-byte)
-       (defmacro layout-raw-slot-metadata (x) `(layout-untagged-bitmap ,x)))
+(def!type sb-vm:word () `(unsigned-byte ,sb-vm:n-word-bits))
+(def!type sb-vm:signed-word () `(signed-byte ,sb-vm:n-word-bits))
+(defconstant +layout-all-tagged+ -1)
 
 ;; information about how a slot of a given DSD-RAW-TYPE is to be accessed
-(eval-when (:compile-toplevel :load-toplevel :execute)
 (defstruct (raw-slot-data
+            (:constructor !make-raw-slot-data)
             (:copier nil)
             (:predicate nil))
-  ;; the raw slot type, or T for a non-raw slot
-  ;;
-  ;; (Non-raw slots are in the ordinary place you'd expect, directly
-  ;; indexed off the instance pointer.  Raw slots are indexed from the end
-  ;; of the instance and skipped by GC.)
-  (raw-type (missing-arg) :type (or symbol cons) :read-only t)
   ;; What operator is used to access a slot of this type?
-  (accessor-name (missing-arg) :type symbol :read-only t)
+  ;; On the host this is a symbol, on the target it is a function
+  ;; from which we can extract a name if needed.
+  #+sb-xc-host (accessor-name (missing-arg) :type symbol :read-only t)
+  #-sb-xc-host (accessor-fun (missing-arg) :type function :read-only t)
+  ;; Function to compare slots of this type. Not used on host.
+  #-sb-xc-host (comparator (missing-arg) :type function :read-only t)
+  ;; the type specifier, which must specify a numeric type.
+  (raw-type (missing-arg) :type symbol :read-only t)
   (init-vop (missing-arg) :type symbol :read-only t)
   ;; How many words are each value of this type?
   (n-words (missing-arg) :type (and index (integer 1)) :read-only t)
   ;; Necessary alignment in units of words.  Note that instances
   ;; themselves are aligned by exactly two words, so specifying more
   ;; than two words here would not work.
-  (alignment 1 :type (integer 1 2) :read-only t)
-  (comparer (missing-arg) :type function :read-only t)))
+  (alignment 1 :type (integer 1 2) :read-only t))
 
-#!-sb-fluid (declaim (freeze-type raw-slot-data))
+#-sb-xc-host
+(progn (declaim (inline raw-slot-data-accessor-name))
+       (defun raw-slot-data-accessor-name (rsd)
+         (%simple-fun-name (raw-slot-data-accessor-fun rsd))))
 
-(defglobal *raw-slot-data-list*
-  (macrolet ((make-comparer (accessor-name)
-               ;; Not a symbol, because there aren't any so-named functions.
-               `(named-lambda ,(string (symbolicate accessor-name "="))
-                    (index x y)
-                  (declare (optimize speed (safety 0)))
-                  (= (,accessor-name x index)
-                     (,accessor-name y index)))))
+#-sb-fluid (declaim (freeze-type raw-slot-data))
+
+;; Simulate DEFINE-LOAD-TIME-GLOBAL - always bound in the image
+;; but not eval'd in the compiler.
+(defglobal *raw-slot-data* nil)
+;; By making this a cold-init function, it is possible to use raw slots
+;; in cold toplevel forms.
+(defun !raw-slot-data-init ()
+  (macrolet ((make-raw-slot-data (&rest args &key accessor-name &allow-other-keys)
+               (declare (ignorable accessor-name))
+               #+sb-xc-host
+               `(!make-raw-slot-data ,@args)
+               #-sb-xc-host
+               (let ((access (cadr accessor-name)))
+                 `(!make-raw-slot-data
+                   :accessor-fun #',access
+                   :comparator
+                   ;; Not a symbol, because there aren't any so-named functions.
+                   (named-lambda ,(string (symbolicate access "="))
+                       (index x y)
+                     (declare (optimize speed (safety 0)))
+                     (= (,access x index) (,access y index)))
+                   ;; Ignore the :ACCESSOR-NAME initarg
+                   ,@args :allow-other-keys t))))
     (let ((double-float-alignment
             ;; white list of architectures that can load unaligned doubles:
-            #!+(or x86 x86-64 ppc) 1
+            #+(or x86 x86-64 ppc arm64 riscv) 1
             ;; at least sparc, mips and alpha can't:
-            #!-(or x86 x86-64 ppc) 2))
-      (list
-       (make-raw-slot-data :raw-type 'sb!vm:word
+            #-(or x86 x86-64 ppc arm64 riscv) 2))
+     (setq *raw-slot-data*
+      (vector
+       (make-raw-slot-data :raw-type 'sb-vm:word
                            :accessor-name '%raw-instance-ref/word
-                           :init-vop 'sb!vm::raw-instance-init/word
-                           :n-words 1
-                           :comparer (make-comparer %raw-instance-ref/word))
+                           :init-vop 'sb-vm::raw-instance-init/word
+                           :n-words 1)
+       ;; If this list of architectures is changed, then also change the test
+       ;; for :DEFINE-STRUCTURE-SLOT-ADDRESSOR in raw-slots-interleaved.impure
+       #-(or alpha hppa sparc)
+       (make-raw-slot-data :raw-type 'sb-vm:signed-word
+                           :accessor-name '%raw-instance-ref/signed-word
+                           :init-vop 'sb-vm::raw-instance-init/signed-word
+                           :n-words 1)
        (make-raw-slot-data :raw-type 'single-float
                            :accessor-name '%raw-instance-ref/single
-                           :init-vop 'sb!vm::raw-instance-init/single
+                           :init-vop 'sb-vm::raw-instance-init/single
                            ;; KLUDGE: On 64 bit architectures, we
                            ;; could pack two SINGLE-FLOATs into the
                            ;; same word if raw slots were indexed
@@ -160,91 +129,62 @@
                            ;; would really benefit is (UNSIGNED-BYTE
                            ;; 32), but that is a subtype of FIXNUM, so
                            ;; we store it unraw anyway.  :-( -- DFL
-                           :n-words 1
-                           :comparer (make-comparer %raw-instance-ref/single))
+                           :n-words 1)
        (make-raw-slot-data :raw-type 'double-float
                            :accessor-name '%raw-instance-ref/double
-                           :init-vop 'sb!vm::raw-instance-init/double
+                           :init-vop 'sb-vm::raw-instance-init/double
                            :alignment double-float-alignment
-                           :n-words (/ 8 sb!vm:n-word-bytes)
-                           :comparer (make-comparer %raw-instance-ref/double))
+                           :n-words (/ 8 sb-vm:n-word-bytes))
        (make-raw-slot-data :raw-type 'complex-single-float
                            :accessor-name '%raw-instance-ref/complex-single
-                           :init-vop 'sb!vm::raw-instance-init/complex-single
-                           :n-words (/ 8 sb!vm:n-word-bytes)
-                           :comparer (make-comparer %raw-instance-ref/complex-single))
+                           :init-vop 'sb-vm::raw-instance-init/complex-single
+                           :n-words (/ 8 sb-vm:n-word-bytes))
        (make-raw-slot-data :raw-type 'complex-double-float
                            :accessor-name '%raw-instance-ref/complex-double
-                           :init-vop 'sb!vm::raw-instance-init/complex-double
+                           :init-vop 'sb-vm::raw-instance-init/complex-double
                            :alignment double-float-alignment
-                           :n-words (/ 16 sb!vm:n-word-bytes)
-                           :comparer (make-comparer %raw-instance-ref/complex-double))
-       #!+long-float
+                           :n-words (/ 16 sb-vm:n-word-bytes))
+       #+long-float
        (make-raw-slot-data :raw-type long-float
                            :accessor-name '%raw-instance-ref/long
-                           :init-vop 'sb!vm::raw-instance-init/long
-                           :n-words #!+x86 3 #!+sparc 4
-                           :comparer (make-comparer %raw-instance-ref/long))
-       #!+long-float
+                           :init-vop 'sb-vm::raw-instance-init/long
+                           :n-words #+x86 3 #+sparc 4)
+       #+long-float
        (make-raw-slot-data :raw-type complex-long-float
                            :accessor-name '%raw-instance-ref/complex-long
-                           :init-vop 'sb!vm::raw-instance-init/complex-long
-                           :n-words #!+x86 6 #!+sparc 8
-                           :comparer (make-comparer %raw-instance-ref/complex-long))))))
+                           :init-vop 'sb-vm::raw-instance-init/complex-long
+                           :n-words #+x86 6 #+sparc 8))))))
 
-(declaim (ftype (sfunction (symbol) raw-slot-data) raw-slot-data-or-lose))
-(defun raw-slot-data-or-lose (type)
-  (or (car (member type *raw-slot-data-list* :key #'raw-slot-data-raw-type))
-      (error "Invalid raw slot type: ~S" type)))
+#+sb-xc-host (!raw-slot-data-init)
+#+sb-xc
+(declaim (type (simple-vector #.(length *raw-slot-data*)) *raw-slot-data*))
 
-(defun raw-slot-words (type)
-  (raw-slot-data-n-words (raw-slot-data-or-lose type)))
-
-;; DO-INSTANCE-TAGGED-SLOT will iterate over the slots of THING that
-;; contain tagged objects. INDEX-VAR is bound to successive slot-indices,
+;; DO-INSTANCE-TAGGED-SLOT iterates over the manifest slots of THING
+;; that contain tagged objects. (The LAYOUT does not count as a manifest slot).
+;; INDEX-VAR is bound to successive slot-indices,
 ;; and is usually used as the second argument to %INSTANCE-REF.
-;; START, if supplied, should be either 0 or 1 to include,
-;; or respectively exclude, the object's layout slot.
-;; END, if supplied, represents the upper bound of the scan and should be
-;; the LAYOUT-LENGTH of the object; it defaults to %INSTANCE-LENGTH if
-;; unsupplied, will therefore possibly include one word that can, in theory,
-;; covertly hold one tagged object more than indicated by LAYOUT-LENGTH
-;; depending on ODDP of LAYOUT-LENGTH.
-;; END works correctly whether or not the backend supports slot interleaving,
-;; but it is probably a bug if anyone uses the padding slot for storage.
+;; :PAD, if T, includes a final word that may be present at the end of the
+;; structure due to alignment requirements.
 ;; LAYOUT is optional and somewhat unnecessary, but since some uses of
 ;; this macro already have a layout in hand, it can be supplied.
 ;; [If the compiler were smarter about doing fewer memory accesses,
 ;; there would be no need at all for the LAYOUT - if it had already been
 ;; accessed, it shouldn't be another memory read]
-;; Note also that THING is usually a STRUCTURE-OBJECT, not a condition or
-;; standard-object. Iterating over a CONDITION means iterating over the
-;; slots comprising the primitive representation, not the manifest slots.
-;; Similarly for STANDARD-OBJECT. Additionally, in the latter case
-;; it would be a bug to specify LAYOUT-LENGTH as the :END parameter.
-(defmacro do-instance-tagged-slot ((index-var thing
-                                    &key (start 0) end layout) &body body)
-  (with-unique-names (instance limit bitmap)
-    (declare (ignorable bitmap))
-    (unless layout
-      (setq layout `(%instance-layout ,instance)))
-    (unless end
-      (setq end `(%instance-length ,instance)))
-    `(let ((,instance ,thing))
-       ;; If the macro is given both :LAYOUT and :END, it never uses
-       ;; the local rebinding of INSTANCE, which is ok.
-       (declare (ignorable ,instance))
-       #!+interleaved-raw-slots
-       (let ((,bitmap (layout-untagged-bitmap ,layout)))
-         (do ((,index-var ,start (1+ ,index-var))
-              (,limit ,end))
-             ((>= ,index-var ,limit))
-           (declare (type index ,index-var))
-           (unless (logbitp ,index-var ,bitmap)
-             ,@body)))
-       #!-interleaved-raw-slots
-       (do ((,index-var ,start (1+ ,index-var))
-            (,limit (- ,end (layout-n-untagged-slots ,layout))))
+;;
+(defmacro do-instance-tagged-slot ((index-var thing &key layout
+                                                    ((:bitmap bitmap-expr)) (pad t))
+                                   &body body)
+  (with-unique-names (instance bitmap limit)
+    `(let* ((,instance ,thing)
+            (,bitmap ,(or bitmap-expr
+                          `(layout-bitmap
+                            ,(or layout `(%instance-layout ,instance)))))
+            (,limit ,(if pad
+                         ;; target instances have an odd number of payload words.
+                         `(logior (%instance-length ,instance) #-sb-xc-host 1)
+                         `(%instance-length ,instance))))
+       (do ((,index-var sb-vm:instance-data-start (1+ ,index-var)))
            ((>= ,index-var ,limit))
          (declare (type index ,index-var))
-         ,@body))))
+         (when (logbitp ,index-var ,bitmap)
+           ,@body)))))

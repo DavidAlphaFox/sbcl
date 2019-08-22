@@ -49,12 +49,7 @@
 
 #include "validate.h"
 #include "thread.h"
-#include "gc.h"
-#if defined LISP_FEATURE_GENCGC
-#include "gencgc-internal.h"
-#else
-#include "cheneygc-internal.h"
-#endif
+#include "gc-internal.h"
 #include <fcntl.h>
 #ifdef LISP_FEATURE_SB_WTIMER
 # include <sys/timerfd.h>
@@ -64,6 +59,7 @@
 /* Prototype for personality(2). Done inline here since the header file
  * for this isn't available on old versions of glibc. */
 int personality (unsigned long);
+#define ADDR_NO_RANDOMIZE 0x0040000
 #else
 #include <sys/personality.h>
 #endif
@@ -126,6 +122,25 @@ futex_init()
     }
 }
 
+/* Try to guess the name of the mutex for this futex, based on knowing
+ * the two pertinent Lisp object types (WAITQUEUE and MUTEX) that use a futex.
+ * Callable from a C debugger */
+#include "genesis/vector.h"
+char* futex_name(int *lock_word)
+{
+    // If there is a Lisp string at lock_word-1 or -2, return that.
+    // Otherwise return NULL.
+    lispobj name = *(lock_word - 1);
+    struct vector* v = (struct vector*)native_pointer(name);
+    if (lowtag_of(name) == OTHER_POINTER_LOWTAG && widetag_of(&v->header) == SIMPLE_BASE_STRING_WIDETAG)
+        return (char*)(v->data);
+    name = *(lock_word - 2);
+    v = (struct vector*)native_pointer(name);
+    if (lowtag_of(name) == OTHER_POINTER_LOWTAG && widetag_of(&v->header) == SIMPLE_BASE_STRING_WIDETAG)
+        return (char*)(v->data);
+    return 0;
+}
+
 int
 futex_wait(int *lock_word, int oldval, long sec, unsigned long usec)
 {
@@ -161,21 +176,6 @@ futex_wake(int *lock_word, int n)
 
 int linux_sparc_siginfo_bug = 0;
 
-/* This variable was in real use for a few months, basically for
- * storing autodetected information about whether the Linux
- * installation was recent enough to support SBCL threads, and make
- * some run-time decisions based on that. But this turned out to be
- * unstable, so now we just flat-out refuse to start on the old installations
- * when thread support has been compiled in.
- *
- * Unfortunately, in the meanwhile Slime started depending on this
- * variable for deciding which communication style to use. So even
- * though this variable looks unused, it shouldn't be deleted until
- * it's no longer used in the versions of Slime that people are
- * likely to download first. -- JES, 2006-06-07
- */
-int linux_no_threads_p = 0;
-
 #ifdef LISP_FEATURE_SB_THREAD
 int
 isnptl (void)
@@ -192,29 +192,31 @@ isnptl (void)
 }
 #endif
 
-void
-os_init(char *argv[], char *envp[])
+static void getuname(int *major_version, int* minor_version, int *patch_version)
 {
     /* Conduct various version checks: do we have enough mmap(), is
      * this a sparc running 2.2, can we do threads? */
     struct utsname name;
-    int major_version;
-    int minor_version;
-    int patch_version;
     char *p;
     uname(&name);
 
     p=name.release;
-    major_version = atoi(p);
-    minor_version = patch_version = 0;
+    *major_version = atoi(p);
+    *minor_version = *patch_version = 0;
     p=strchr(p,'.');
     if (p != NULL) {
-            minor_version = atoi(++p);
+            *minor_version = atoi(++p);
             p=strchr(p,'.');
             if (p != NULL)
-                    patch_version = atoi(++p);
+                    *patch_version = atoi(++p);
     }
+}
 
+void os_init(char __attribute__((unused)) *argv[],
+             char __attribute__((unused)) *envp[])
+{
+    int major_version, minor_version, patch_version;
+    getuname(&major_version, &minor_version, &patch_version);
     if (major_version<2) {
         lose("linux kernel version too old: major version=%d (can't run in version < 2.0.0)\n",
              major_version);
@@ -242,15 +244,48 @@ os_init(char *argv[], char *envp[])
      */
     os_vm_page_size = BACKEND_PAGE_BYTES;
 
+#ifdef LISP_FEATURE_X86
+    /* Use SSE detector.  Recent versions of Linux enable SSE support
+     * on SSE capable CPUs.  */
+    /* FIXME: Are there any old versions that does not support SSE?  */
+    fast_bzero_pointer = fast_bzero_detect;
+#endif
+}
+
+#if (defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)) \
+     && (!defined(DISABLE_ASLR) || DISABLE_ASLR)
+# define ALLOW_PERSONALITY_CHANGE 1
+#else
+# define ALLOW_PERSONALITY_CHANGE 0
+#endif
+
+int os_preinit(char *argv[], char *envp[])
+{
+#if ALLOW_PERSONALITY_CHANGE
+    if (getenv("SBCL_IS_RESTARTING")) {
+        /* We restarted due to previously enabled ASLR.  Now,
+         * reenable it for fork()'ed children. */
+        int pers = personality(0xffffffffUL);
+        personality(pers & ~ADDR_NO_RANDOMIZE);
+        unsetenv("SBCL_IS_RESTARTING");
+        return 0; // ensure_spaces() will win or not. Not much to do here.
+    }
+#endif
+    /* See if we can allocate read-only, static, and linkage table spaces
+     * at their required addresses. If we can, then there's no need to try
+     * the re-exec trick since dynamic space is relocatable. */
+    if (allocate_hardwired_spaces(0)) // soft failure mode
+        return 1; // indicate that we already allocated hardwired spaces
+
     /* KLUDGE: Disable memory randomization on new Linux kernels
      * by setting a personality flag and re-executing. (We need
      * to re-execute, since the memory maps that can conflict with
      * the SBCL spaces have already been done at this point).
-     *
-     * Since randomization is currently implemented only on x86 kernels,
-     * don't do this trick on other platforms.
      */
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
+    int major_version, minor_version, patch_version;
+    getuname(&major_version, &minor_version, &patch_version);
+
+#if ALLOW_PERSONALITY_CHANGE
     if ((major_version == 2
          /* Some old kernels will apparently lose unsupported personality flags
           * on exec() */
@@ -261,9 +296,8 @@ os_init(char *argv[], char *envp[])
         || major_version >= 3)
     {
         int pers = personality(0xffffffffUL);
-        /* 0x40000 aka. ADDR_NO_RANDOMIZE */
-        if (!(pers & 0x40000)) {
-            int retval = personality(pers | 0x40000);
+        if (!(pers & ADDR_NO_RANDOMIZE)) {
+            int retval = personality(pers | ADDR_NO_RANDOMIZE);
             /* Allegedly some Linux kernels (the reported case was
              * "hardened Linux 2.6.7") won't set the new personality,
              * but nor will they return -1 for an error. So as a
@@ -291,24 +325,12 @@ os_init(char *argv[], char *envp[])
                     execv(runtime, argv);
                 }
             }
-            /* Either changing the personality or execve() failed. Either
-             * way we might as well continue, and hope that the random
-             * memory maps are ok this time around.
-             */
-            fprintf(stderr, "WARNING:\
-\nCouldn't re-execute SBCL with proper personality flags (/proc isn't mounted? setuid?)\
-\nTrying to continue anyway.\n");
-        } else {
-            unsetenv("SBCL_IS_RESTARTING");
+            /* Either changing the personality or execve() failed.
+             * Just get on with life and hope for the best. */
         }
     }
-#ifdef LISP_FEATURE_X86
-    /* Use SSE detector.  Recent versions of Linux enable SSE support
-     * on SSE capable CPUs.  */
-    /* FIXME: Are there any old versions that does not support SSE?  */
-    fast_bzero_pointer = fast_bzero_detect;
 #endif
-#endif
+    return 0;
 }
 
 
@@ -318,71 +340,20 @@ os_init(char *argv[], char *envp[])
  * information loss, we have to make sure it allocates all its ram in the
  * 0-2Gb region.  */
 
-static void * under_2gb_free_pointer=DYNAMIC_1_SPACE_END;
-#endif
-
-os_vm_address_t
-os_validate(os_vm_address_t addr, os_vm_size_t len)
+static void * under_2gb_free_pointer;
+os_set_cheneygc_spaces(uword_t space0_start, uword_t space1_start)
 {
-    int flags =  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
-    os_vm_address_t actual;
-
-#ifdef LISP_FEATURE_ALPHA
-    if (!addr) {
-        addr=under_2gb_free_pointer;
-    }
-#endif
-    actual = mmap(addr, len, OS_VM_PROT_ALL, flags, -1, 0);
-    if (actual == MAP_FAILED) {
-        perror("mmap");
-        return 0;               /* caller should check this */
-    }
-
-    if (addr && (addr!=actual)) {
-        fprintf(stderr, "mmap: wanted %lu bytes at %p, actually mapped at %p\n",
-                (unsigned long) len, addr, actual);
-        return 0;
-    }
-
-#ifdef LISP_FEATURE_ALPHA
-
-    len=(len+(os_vm_page_size-1))&(~(os_vm_page_size-1));
-    under_2gb_free_pointer+=len;
-#endif
-
-    return actual;
+    uword_t max;
+    max = (space1_start > space0_start) ? space1_start : space0_start;
+    under_2gb_free_pointer = max + dynamic_space_size;
 }
 
-void
-os_invalidate(os_vm_address_t addr, os_vm_size_t len)
-{
-    if (munmap(addr,len) == -1) {
-        perror("munmap");
-    }
-}
-
-os_vm_address_t
-os_map(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
-{
-    os_vm_address_t actual;
-
-    actual = mmap(addr, len, OS_VM_PROT_ALL, MAP_PRIVATE | MAP_FIXED,
-                  fd, (off_t) offset);
-    if (actual == MAP_FAILED || (addr && (addr != actual))) {
-        perror("mmap");
-        lose("unexpected mmap(..) failure\n");
-    }
-
-    return actual;
-}
+#endif
 
 void
 os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
 {
-  // 使用mprotect来分配页面
-  // 可以通过PROT_EXEC来指定页面可执行
-  // JIT都是将代码放在可执行页面中来完成代码注入
-    if (mprotect(address, length, prot) == -1) {
+    if (mprotect(address, length, prot)) {
         if (errno == ENOMEM) {
             lose("An mprotect call failed with ENOMEM. This probably means that the maximum amount\n"
                  "of separate memory mappings was exceeded. To fix the problem, either increase\n"
@@ -395,33 +366,6 @@ os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
     }
 }
 
-boolean
-is_valid_lisp_addr(os_vm_address_t addr)
-{
-    struct thread *th;
-    size_t ad = (size_t) addr;
-
-    if ((READ_ONLY_SPACE_START <= ad && ad < READ_ONLY_SPACE_END)
-        || (STATIC_SPACE_START <= ad && ad < STATIC_SPACE_END)
-#if defined LISP_FEATURE_GENCGC
-        || (DYNAMIC_SPACE_START <= ad && ad < DYNAMIC_SPACE_END)
-#else
-        || (DYNAMIC_0_SPACE_START <= ad && ad < DYNAMIC_0_SPACE_END)
-        || (DYNAMIC_1_SPACE_START <= ad && ad < DYNAMIC_1_SPACE_END)
-#endif
-        )
-        return 1;
-    for_each_thread(th) {
-        if((size_t)(th->control_stack_start) <= ad
-           && ad < (size_t)(th->control_stack_end))
-            return 1;
-        if((size_t)(th->binding_stack_start) <= ad
-           && ad < (size_t)(th->binding_stack_start + BINDING_STACK_SIZE))
-            return 1;
-    }
-    return 0;
-}
-
 /*
  * any OS-dependent special low-level handling for signals
  */
@@ -430,6 +374,16 @@ is_valid_lisp_addr(os_vm_address_t addr)
  * The GC needs to be hooked into whatever signal is raised for
  * page fault on this OS.
  */
+static void
+fallback_sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
+{
+    // This calls corruption_warning_and_maybe_lose.
+    lisp_memory_fault_error(context, arch_get_bad_addr(signal, info, context));
+}
+
+void (*sbcl_fallback_sigsegv_handler)  // Settable by user.
+       (int, siginfo_t*, os_context_t*) = fallback_sigsegv_handler;
+
 static void
 sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
 {
@@ -461,14 +415,16 @@ sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
     if (!cheneygc_handle_wp_violation(context, addr))
 #endif
         if (!handle_guard_page_triggered(context, addr))
-            lisp_memory_fault_error(context, addr);
+            sbcl_fallback_sigsegv_handler(signal, info, context);
 }
 
 void
 os_install_interrupt_handlers(void)
 {
+    if (INSTALL_SIG_MEMORY_FAULT_HANDLER) {
     undoably_install_low_level_interrupt_handler(SIG_MEMORY_FAULT,
                                                  sigsegv_handler);
+    }
 
     /* OAOOM c.f. sunos-os.c.
      * Should we have a reusable function gc_install_interrupt_handlers? */
@@ -485,7 +441,7 @@ os_install_interrupt_handlers(void)
 }
 
 char *
-os_get_runtime_executable_path(int external)
+os_get_runtime_executable_path(int __attribute__((unused)) external)
 {
     char path[PATH_MAX + 1];
     int size;

@@ -1,23 +1,25 @@
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(define-alien-type os-context-t (struct os-context-t-struct))
-
-;;;; MACHINE-TYPE
-
+#-sb-xc-host
 (defun machine-type ()
   "Returns a string describing the type of the local machine."
   "HPPA")
 
 ;;;; FIXUP-CODE-OBJECT
-;FIX-lav: unify code with genesis.lisp fixup
-(defun fixup-code-object (code offset value kind)
-  (unless (zerop (rem offset n-word-bytes))
+(defconstant-eqx +fixup-kinds+
+    #(:absolute :load :load11u :load-short :hi :branch)
+  #'equalp)
+(!with-bigvec-or-sap
+(defun fixup-code-object (code offset value kind flavor)
+  (declare (ignore flavor))
+  (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
     (error "Unaligned instruction?  offset=#x~X." offset))
-  (without-gcing
-   (let* ((sap (%primitive code-instructions code))
-          (inst (sap-ref-32 sap offset)))
-     (setf (sap-ref-32 sap offset)
-           (ecase kind
+  (let* ((sap (code-instructions code))
+         (inst (sap-ref-32 sap offset)))
+    (setf (sap-ref-32 sap offset)
+          (ecase kind
+             (:absolute
+              value)
              (:load
               (logior (mask-field (byte 18 14) value)
                       (if (< value 0)
@@ -48,34 +50,14 @@
                 (logior (ash bits 3)
                         (mask-field (byte 1 1) inst)
                         (mask-field (byte 3 13) inst)
-                        (mask-field (byte 11 21) inst)))))))))
+                        (mask-field (byte 11 21) inst)))))))
+  nil))
 
-(define-alien-routine ("os_context_pc_addr" context-pc-addr) (* unsigned-int)
-  (context (* os-context-t)))
+#-sb-xc-host (progn
 
-(defun context-pc (context)
-  (declare (type (alien (* os-context-t)) context))
-  (int-sap (logandc2 (deref (context-pc-addr context)) 3)))
-
-(define-alien-routine ("os_context_register_addr" context-register-addr)
-  (* unsigned-int)
-  (context (* os-context-t))
-  (index int))
-
-;;; FIXME: Should this and CONTEXT-PC be INLINE to reduce consing?
-;;; (Are they used in anything time-critical, or just the debugger?)
-(defun context-register (context index)
-  (declare (type (alien (* os-context-t)) context))
-  (deref (context-register-addr context index)))
-
-(defun %set-context-register (context index new)
-(declare (type (alien (* os-context-t)) context))
-(setf (deref (context-register-addr context index))
-      new))
-
-#!+linux
 ;;; For now.
 (defun context-floating-point-modes (context)
+  (declare (ignore context))
   (warn "stub CONTEXT-FLOATING-POINT-MODES")
   0)
 
@@ -88,18 +70,9 @@
 ;;;
 (defun internal-error-args (context)
   (declare (type (alien (* os-context-t)) context))
-  (let ((pc (context-pc context)))
+  (let* ((pc (context-pc context))
+         (trap-number (logand (sap-ref-8 pc 3) #x1f)))
     (declare (type system-area-pointer pc))
-    (let* ((length (sap-ref-8 pc 4))
-           (vector (make-array length :element-type '(unsigned-byte 8))))
-      (declare (type (unsigned-byte 8) length)
-               (type (simple-array (unsigned-byte 8) (*)) vector))
-      (copy-ub8-from-system-area pc 5 vector 0 length)
-      (let* ((index 0)
-             (error-number (sb!c:read-var-integer vector index)))
-        (collect ((sc-offsets))
-         (loop
-          (when (>= index length)
-            (return))
-          (sc-offsets (sb!c:read-var-integer vector index)))
-         (values error-number (sc-offsets)))))))
+    (sb-kernel::decode-internal-error-args (sap+ pc 5) trap-number
+                                           (sap-ref-8 pc 4))))
+) ; end PROGN

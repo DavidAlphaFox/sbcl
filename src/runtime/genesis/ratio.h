@@ -11,8 +11,8 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_RATIO
-#define SBCL_GENESIS_RATIO 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_RATIO
+#ifndef __ASSEMBLER__
 
 struct ratio {
     lispobj header;
@@ -20,14 +20,15 @@ struct ratio {
     lispobj denominator;
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
 #define RATIO_NUMERATOR_OFFSET -7
 #define RATIO_DENOMINATOR_OFFSET 1
+#define RATIO_SIZE 3
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_RATIO */
+#endif

@@ -14,7 +14,7 @@
 
 (test-util:with-test (:name :unparse-alien-niladic-function)
   (let* ((type (parse-alien-type '(function long) nil))
-         (val (make-alien-value :sap (int-sap #x4000) :type type)))
+         (val (%sap-alien (int-sap #x4000) type)))
     (assert (not (search "#'" (write-to-string type :pretty t))))
     (assert (not (search "#'" (write-to-string val :pretty t))))))
 
@@ -30,19 +30,21 @@
 
 (defun try-call-into-lisp (c-prog) ; er, assembly program, but whatever
   (flet ((assemble-it (n)
-           (let ((segment (sb-assem:make-segment :type :regular)))
-             (dolist (instruction (subst n :ARGC c-prog)
-                      (sb-assem::segment-buffer segment))
-               (apply (symbolicate (car instruction) "-INST-EMITTER")
-                      segment nil (cdr instruction))))))
+           (let ((segment (sb-assem:make-segment)))
+             (sb-assem:assemble (segment)
+               (dolist (instruction (subst n :ARGC c-prog)
+                                    (sb-assem::segment-buffer segment))
+                 (apply #'sb-assem::%inst
+                        (sb-assem::op-encoder-name (car instruction))
+                        (cdr instruction)))))))
     (dotimes (n-args 4)
       (let ((the-code (assemble-it n-args)))
         ;; in case we change the way the assembler output works ...
         (assert (typep the-code '(simple-array (unsigned-byte 8) 1)))
         (with-pinned-objects (the-code)
           (let ((my-little-alien
-                 (make-alien-value :type (parse-alien-type '(function long) nil)
-                                   :sap (vector-sap the-code)))
+                 (%sap-alien (vector-sap the-code)
+                             (parse-alien-type '(function long) nil)))
                 (expect  (concatenate 'list (subseq '(#\A 311 T) 0 n-args)
                                       (subseq '(0 0 0) n-args 3)))
                 (monkeybiz-result))

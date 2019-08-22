@@ -43,7 +43,7 @@
                          (type-of (unbound-slot-instance condition))))))))
 
 (defmethod wrapper-fetcher ((class standard-class))
-  'std-instance-wrapper)
+  '%instance-layout)
 
 (defmethod slots-fetcher ((class standard-class))
   'std-instance-slots)
@@ -58,20 +58,32 @@
 ;;; structure protocol are promoted to the implementation-specific class
 ;;; std-class. Many of these methods call these four functions.
 
-(defun %swap-wrappers-and-slots (i1 i2)
+(defun %swap-wrappers-and-slots (i1 i2) ; old -> new
   (cond ((std-instance-p i1)
-         (let ((w1 (std-instance-wrapper i1))
+         #+(and compact-instance-header x86-64)
+         (let ((oslots (std-instance-slots i1))
+               (nslots (std-instance-slots i2)))
+           ;; The hash val is in the header of the slots. Copying is race-free
+           ;; because it is immutable once memoized by STD-INSTANCE-HASH.
+           (sb-vm::cas-header-data-high
+            nslots 0 (sb-impl::%std-instance-hash oslots)))
+         ;; FIXME: If a backend supports two-word primitive instances
+         ;; and double-wide CAS, it's probably best to use that.
+         ;; Maybe we're inside a mutex here anyway though?
+         (let ((w1 (%instance-layout i1))
                (s1 (std-instance-slots i1)))
-           (setf (std-instance-wrapper i1) (std-instance-wrapper i2))
+           (setf (%instance-layout i1) (%instance-layout i2))
            (setf (std-instance-slots i1) (std-instance-slots i2))
-           (setf (std-instance-wrapper i2) w1)
+           (setf (%instance-layout i2) w1)
            (setf (std-instance-slots i2) s1)))
         ((fsc-instance-p i1)
-         (let ((w1 (fsc-instance-wrapper i1))
+         (let ((w1 (%funcallable-instance-layout i1))
+               (w2 (%funcallable-instance-layout i2))
                (s1 (fsc-instance-slots i1)))
-           (setf (fsc-instance-wrapper i1) (fsc-instance-wrapper i2))
+           (aver (= (layout-bitmap w1) (layout-bitmap w2)))
+           (setf (%funcallable-instance-layout i1) w2)
            (setf (fsc-instance-slots i1) (fsc-instance-slots i2))
-           (setf (fsc-instance-wrapper i2) w1)
+           (setf (%funcallable-instance-layout i2) w1)
            (setf (fsc-instance-slots i2) s1)))
         (t
          (error "unrecognized instance type"))))
@@ -129,25 +141,17 @@
                  (cdr location))
                 (t
                  (bug "Bogus slot cell in SLOT-VALUE: ~S" cell)))))
-    (if (eq +slot-unbound+ value)
+    (if (unbound-marker-p value)
         (slot-unbound (wrapper-class* wrapper) object slot-name)
         value)))
-
-;;; This is used during the PCL build, but gets replaced by a deftransform
-;;; in fixup.lisp.
-(define-compiler-macro slot-value (&whole form object slot-name
-                                   &environment env)
-  (if (and (constantp slot-name env)
-           (interned-symbol-p (constant-form-value slot-name env)))
-      `(accessor-slot-value ,object ,slot-name)
-      form))
 
 (defun set-slot-value (object slot-name new-value)
   (let* ((wrapper (valid-wrapper-of object))
          (cell (or (find-slot-cell wrapper slot-name)
                    (return-from set-slot-value
-                     (values (slot-missing (wrapper-class* wrapper) object slot-name
-                                           'setf new-value)))))
+                     (progn (slot-missing (wrapper-class* wrapper)
+                                          object slot-name 'setf new-value)
+                            new-value))))
          (location (car cell))
          (info (cdr cell))
          (typecheck (slot-info-typecheck info)))
@@ -173,21 +177,6 @@
 (defun safe-set-slot-value (object slot-name new-value)
   (set-slot-value object slot-name new-value))
 
-;;; This is used during the PCL build, but gets replaced by a deftransform
-;;; in fixup.lisp.
-(define-compiler-macro set-slot-value (&whole form object slot-name new-value
-                                      &environment env)
-  (if (and (constantp slot-name env)
-           (interned-symbol-p (constant-form-value slot-name env))
-           ;; We can't use the ACCESSOR-SET-SLOT-VALUE path in safe
-           ;; code, since it'll use the global automatically generated
-           ;; accessor, which won't do typechecking. (SLOT-OBJECT
-           ;; won't have been compiled with SAFETY 3, so SAFE-P will
-           ;; be NIL in MAKE-STD-WRITER-METHOD-FUNCTION).
-           (not (safe-code-p env)))
-      `(accessor-set-slot-value ,object ,slot-name ,new-value)
-      form))
-
 (defun (cas slot-value) (old-value new-value object slot-name)
   (let* ((wrapper (valid-wrapper-of object))
          (cell (or (find-slot-cell wrapper slot-name)
@@ -211,8 +200,7 @@
                       (cas (cdr location) old-value new-value))
                      (t
                       (bug "Bogus slot-cell in (CAS SLOT-VALUE): ~S" cell)))))
-      (if (and (eq +slot-unbound+ old)
-               (neq old old-value))
+      (if (and (unbound-marker-p old) (neq old old-value))
           (slot-unbound (wrapper-class* wrapper) object slot-name)
           old))))
 
@@ -236,14 +224,7 @@
                  (cdr location))
                 (t
                  (bug "Bogus slot cell in SLOT-VALUE: ~S" cell)))))
-    (not (eq +slot-unbound+ value))))
-
-(define-compiler-macro slot-boundp (&whole form object slot-name
-                                    &environment env)
-  (if (and (constantp slot-name env)
-           (interned-symbol-p (constant-form-value slot-name env)))
-      `(accessor-slot-boundp ,object ,slot-name)
-      form))
+    (not (unbound-marker-p value))))
 
 (defun slot-makunbound (object slot-name)
   (let* ((wrapper (valid-wrapper-of object))
@@ -273,15 +254,10 @@
 (defun slot-exists-p (object slot-name)
   (not (null (find-slot-cell (valid-wrapper-of object) slot-name))))
 
-(defvar *unbound-slot-value-marker* (make-unprintable-object "unbound slot"))
-
-;;; This isn't documented, but is used within PCL in a number of print
-;;; object methods. (See NAMED-OBJECT-PRINT-FUNCTION.)
-(defun slot-value-or-default (object slot-name &optional
-                              (default *unbound-slot-value-marker*))
+(defun slot-value-for-printing (object slot-name)
   (if (slot-boundp object slot-name)
       (slot-value object slot-name)
-      default))
+      (load-time-value (make-unprintable-object "unbound slot") t)))
 
 (defmethod slot-value-using-class ((class std-class)
                                    (object standard-object)
@@ -306,7 +282,7 @@
             (t
              (instance-structure-protocol-error slotd
                                                 'slot-value-using-class)))))
-    (if (eq value +slot-unbound+)
+    (if (unbound-marker-p value)
         (values (slot-unbound class object (slot-definition-name slotd)))
         value)))
 
@@ -363,7 +339,7 @@
             (t
              (instance-structure-protocol-error slotd
                                                 'slot-boundp-using-class)))))
-    (not (eq value +slot-unbound+))))
+    (not (unbound-marker-p value))))
 
 (defmethod slot-makunbound-using-class
            ((class std-class)
@@ -423,7 +399,7 @@
     (declare (type function function))
     ;; FIXME: Is this really necessary? Structure slots should surely
     ;; never be unbound!
-    (if (eq value +slot-unbound+)
+    (if (unbound-marker-p value)
         (values (slot-unbound class object (slot-definition-name slotd)))
         value)))
 
@@ -483,20 +459,18 @@
        ;; In the vast majority of cases location corresponds to the position
        ;; in list. The only exceptions are when there are non-local slots
        ;; before the one we want.
-       (let* ((slots (layout-slot-list (layout-of instance)))
-              (guess (nth position slots)))
-         (if (eql position (slot-definition-location guess))
-             (slot-definition-name guess)
-             (slot-definition-name
-              (car (member position (class-slots instance) :key #'slot-definition-location))))))
+       (slot-definition-name
+        (find position (layout-slot-list (layout-of instance))
+              :key #'slot-definition-location)))
       (cons
        (car position))))))
 
-;;; FIXME: AMOP says that allocate-instance imples finalize-inheritance
+;;; FIXME: AMOP says that allocate-instance implies finalize-inheritance
 ;;; if the class is not yet finalized, but we don't seem to be taking
 ;;; care of this for non-standard-classes.
 (defmethod allocate-instance ((class standard-class) &rest initargs)
-  (declare (ignore initargs))
+  (declare (ignore initargs)
+           (inline ensure-class-finalized))
   (allocate-standard-instance
    (class-wrapper (ensure-class-finalized class))))
 
@@ -509,13 +483,11 @@
 
 (defmethod allocate-instance ((class condition-class) &rest initargs)
   (declare (ignore initargs))
-  (allocate-condition (class-name class)))
+  (values (allocate-condition (class-name class))))
 
-(macrolet ((def (name class)
-             `(defmethod ,name ((class ,class) &rest initargs)
-                (declare (ignore initargs))
-                (error "Cannot allocate an instance of ~S." class))))
-  (def allocate-instance system-class))
+(defmethod allocate-instance ((class system-class) &rest initargs)
+  (declare (ignore initargs))
+  (error "Cannot allocate an instance of ~S." class))
 
 ;;; AMOP says that CLASS-SLOTS signals an error for unfinalized classes.
 (defmethod class-slots :before ((class slot-class))
@@ -523,4 +495,12 @@
     (error 'simple-reference-error
            :format-control "~S called on ~S, which is not yet finalized."
            :format-arguments (list 'class-slots class)
-           :references (list '(:amop :generic-function class-slots)))))
+           :references '((:amop :generic-function class-slots)))))
+
+(defun %set-slots (object names &rest values)
+  (mapc (lambda (name value)
+          (if (unbound-marker-p value)
+              ;; SLOT-MAKUNBOUND-USING-CLASS might do something nonstandard.
+              (slot-makunbound object name)
+              (setf (slot-value object name) value)))
+        names values))

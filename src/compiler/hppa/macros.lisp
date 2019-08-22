@@ -8,7 +8,7 @@
 ;;;; public domain. The software is in the public domain and is
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 
@@ -22,7 +22,6 @@
 ;;; Instruction-like macros.
 ;;; FIXME-lav: add if always-emit-code-p is :e= then error if location=
 (defmacro move (src dst &optional always-emit-code-p)
-  #!+sb-doc
   "Move SRC into DST (unless they are location= and ALWAYS-EMIT-CODE-P is nil)."
   (once-only ((n-src src)
               (n-dst dst))
@@ -63,7 +62,6 @@
          null-tn))
 
 (defmacro load-type (target source &optional (offset 0))
-  #!+sb-doc
   "Loads the type bits of a pointer into target independent of
 byte-ordering issues."
   (once-only ((n-target target)
@@ -84,16 +82,14 @@ byte-ordering issues."
 ;;; return instructions.
 
 (defmacro lisp-jump (function)
-  #!+sb-doc
   "Jump to the lisp function FUNCTION."
   `(progn
-     (inst addi (- (ash simple-fun-code-offset word-shift)
+     (inst addi (- (ash simple-fun-insts-offset word-shift)
                    fun-pointer-lowtag) ,function lip-tn)
      (inst bv lip-tn)
      (move ,function code-tn t)))
 
 (defmacro lisp-return (return-pc &key (offset 0) (frob-code t))
-  #!+sb-doc
   "Return to RETURN-PC."
   `(progn
      (inst addi (- (* (1+ ,offset) n-word-bytes) other-pointer-lowtag)
@@ -103,7 +99,6 @@ byte-ordering issues."
          `((move ,return-pc code-tn t)))))
 
 (defmacro emit-return-pc (label)
-  #!+sb-doc
   "Emit a return-pc header word.  LABEL is the label to use for this
    return-pc."
   `(progn
@@ -134,7 +129,6 @@ byte-ordering issues."
           (storew reg cfp-tn offset))))))
 
 (defmacro maybe-load-stack-tn (reg reg-or-stack)
-  #!+sb-doc
   "Move the TN Reg-Or-Stack into Reg if it isn't already there."
   (once-only ((n-reg reg)
               (n-stack reg-or-stack))
@@ -154,7 +148,6 @@ byte-ordering issues."
                                   &key (lowtag other-pointer-lowtag)
                                        maybe-write)
                                  &body body)
-  #!+sb-doc
   "Do stuff to allocate an other-pointer object of fixed Size with a single
 word header having the specified Type-Code.  The result is placed in
 Result-TN, and Temp-TN is a non-descriptor temp (which may be randomly used
@@ -164,7 +157,7 @@ initializes the object."
   (once-only ((result-tn result-tn) (temp-tn temp-tn)
               (type-code type-code) (size size)
               (lowtag lowtag))
-    (let ((write-body `((inst li (logior (ash (1- ,size) n-widetag-bits) ,type-code) ,temp-tn)
+    (let ((write-body `((inst li (compute-object-header ,size ,type-code) ,temp-tn)
                         (storew ,temp-tn ,result-tn 0 ,lowtag))))
       `(if ,dynamic-extent-p
          (pseudo-atomic ()
@@ -195,67 +188,24 @@ initializes the object."
 
 
 ;;;; Error Code
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (defun emit-error-break (vop kind code values)
-    (let ((vector (gensym)))
-      `((let ((vop ,vop))
-          (when vop
-            (note-this-location vop :internal-error)))
-        (inst break ,kind)
-        (with-adjustable-vector (,vector)
-          (write-var-integer (error-number-or-lose ',code) ,vector)
-          ,@(mapcar #'(lambda (tn)
-                        `(let ((tn ,tn))
-                           (write-var-integer (make-sc-offset (sc-number
-                                                               (tn-sc tn))
-                                                              (tn-offset tn))
-                                              ,vector)))
-                    values)
-          (inst byte (length ,vector))
-          (dotimes (i (length ,vector))
-            (inst byte (aref ,vector i))))
-        (emit-alignment word-shift)))))
+(defun emit-error-break (vop kind code values)
+  (assemble ()
+    (when vop
+      (note-this-location vop :internal-error))
+    (emit-internal-error kind code values
+                         :trap-emitter (lambda (trap-number)
+                                         (inst break trap-number))
+                         :compact-error-trap nil)
+    (emit-alignment word-shift)))
 
-(defmacro error-call (vop error-code &rest values)
-  #!+sb-doc
-  "Cause an error.  ERROR-CODE is the error to cause."
-  (cons 'progn
-        (emit-error-break vop error-trap error-code values)))
-
-
-(defmacro cerror-call (vop label error-code &rest values)
-  #!+sb-doc
-  "Cause a continuable error.  If the error is continued, execution resumes at
-  LABEL."
-  `(progn
-     (without-scheduling ()
-       (inst b ,label)
-       ,@(emit-error-break vop cerror-trap error-code values))))
-
-(defmacro generate-error-code (vop error-code &rest values)
-  #!+sb-doc
+(defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
-  `(assemble (*elsewhere*)
-     (let ((start-lab (gen-label)))
-       (emit-label start-lab)
-       (error-call ,vop ,error-code ,@values)
-       start-lab)))
-
-(defmacro generate-cerror-code (vop error-code &rest values)
-  #!+sb-doc
-  "Generate-CError-Code Error-code Value*
-  Emit code for a continuable error with the specified Error-Code and
-  context Values.  If the error is continued, execution resumes after
-  the GENERATE-CERROR-CODE form."
-  (with-unique-names (continue error)
-    `(let ((,continue (gen-label)))
-       (emit-label ,continue)
-       (assemble (*elsewhere*)
-         (let ((,error (gen-label)))
-           (emit-label ,error)
-           (cerror-call ,vop ,continue ,error-code ,@values)
-           ,error)))))
+  (assemble (:elsewhere)
+    (let ((start-lab (gen-label)))
+      (emit-label start-lab)
+      (apply #'error-call vop error-code values)
+      start-lab)))
 
 ;;;; PSEUDO-ATOMIC
 
@@ -265,12 +215,20 @@ initializes the object."
     `(let ((,n-extra ,extra))
        (inst addi 4 alloc-tn alloc-tn)
        ,@forms
-       (inst addit (- ,n-extra 4) alloc-tn alloc-tn :od))))
+       (cond
+         ((typep ,n-extra '(signed-byte 11))
+          (inst addit (- ,n-extra 4) alloc-tn alloc-tn :od))
+         ((typep ,n-extra '(signed-byte 14))
+          (inst ldo ,n-extra alloc-tn alloc-tn)
+          (inst addit -4 alloc-tn alloc-tn :od))
+         (t
+          ;; FIXME: Make this case work, somehow
+          (error "EXTRA out-of-range in PSEUDO-ATOMIC"))))))
 
 ;;;; indexed references
 
-(deftype load/store-index (scale lowtag min-offset
-                                 &optional (max-offset min-offset))
+(sb-xc:deftype load/store-index (scale lowtag min-offset
+                                  &optional (max-offset min-offset))
   `(integer ,(- (truncate (+ (ash 1 14)
                              (* min-offset n-word-bytes)
                              (- lowtag))
@@ -426,14 +384,3 @@ initializes the object."
                  (- (+ (* ,offset n-word-bytes) (* index ,scale)) ,lowtag)
                  object)
            (move value result))))))
-
-
-(def!macro with-pinned-objects ((&rest objects) &body body)
-  "Arrange with the garbage collector that the pages occupied by
-OBJECTS will not be moved in memory for the duration of BODY.
-Useful for e.g. foreign calls where another thread may trigger
-garbage collection.  This is currently implemented by disabling GC"
-  (declare (ignore objects))            ;should we eval these for side-effect?
-  `(without-gcing
-    ,@body))
-

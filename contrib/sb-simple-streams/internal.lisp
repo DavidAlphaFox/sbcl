@@ -44,8 +44,7 @@
 (defun buffer-copy (src soff dst doff length)
   (declare (type simple-stream-buffer src dst)
            (type fixnum soff doff length))
-  ;; FIXME: Should probably be with-pinned-objects
-  (sb-sys:without-gcing
+  (sb-sys:with-pinned-objects (src dst)
    (sb-kernel:system-area-ub8-copy (buffer-sap src) soff
                                    (buffer-sap dst) doff
                                    length)))
@@ -364,8 +363,9 @@
                                       (t (return (- -10 errno)))))
                                ((zerop count) (return -1))
                                (t (return count)))))))))))
-        (t (%read-vector buffer fd start end :byte-8
-                         (if blocking :bnb nil)))))))
+        (t ;; (%read-vector buffer fd start end :byte-8
+           ;;               (if blocking :bnb nil))
+         )))))
 
 (defun write-octets (stream buffer start end blocking)
   (declare (type simple-stream stream)
@@ -568,42 +568,42 @@
         (loop
           (multiple-value-bind (fd errno)
               (if name
-                  #+win32
-                  (sb-win32:unixlike-open name mask mode)
-                  #-win32
                   (sb-unix:unix-open name mask mode)
-                  (values nil sb-unix:enoent))
+                  (values nil #-win32 sb-unix:enoent
+                              #+win32 sb-win32::error_file_not_found))
             (cond ((integerp fd)
                    (when (eql if-exists :append)
                      (sb-unix:unix-lseek fd 0 sb-unix:l_xtnd))
                    (return (values fd name original delete-original)))
-                  ((eql errno sb-unix:enoent)
+                  ((eql errno #-win32 sb-unix:enoent
+                              #+win32 sb-win32::error_file_not_found)
                    (case if-does-not-exist
                      (:error
-                       (cerror "Return NIL."
-                               'sb-int:simple-file-error
-                               :pathname pathname
-                               :format-control "Error opening ~S, ~A."
-                               :format-arguments
-                                   (list pathname
-                                         (sb-int:strerror errno))))
+                      (cerror "Return NIL."
+                              'sb-int:simple-file-error
+                              :pathname pathname
+                              :format-control "Error opening ~S, ~A."
+                              :format-arguments
+                              (list pathname
+                                    (sb-int:strerror errno))))
                      (:create
                       (cerror "Return NIL."
-                               'sb-int:simple-file-error
-                               :pathname pathname
-                               :format-control
-                                   "Error creating ~S, path does not exist."
-                               :format-arguments (list pathname))))
+                              'sb-int:simple-file-error
+                              :pathname pathname
+                              :format-control
+                              "Error creating ~S, path does not exist."
+                              :format-arguments (list pathname))))
                    (return nil))
-                  ((eql errno sb-unix:eexist)
+                  ((eql errno #-win32 sb-unix:eexist
+                              #+win32 sb-win32::error_file_not_found)
                    (unless (eq nil if-exists)
                      (cerror "Return NIL."
                              'sb-int:simple-file-error
                              :pathname pathname
                              :format-control "Error opening ~S, ~A."
                              :format-arguments
-                                 (list pathname
-                                       (sb-int:strerror errno))))
+                             (list pathname
+                                   (sb-int:strerror errno))))
                    (return nil))
                   #+nil ; FIXME: reinstate this; error reporting is nice.
                   ((eql errno sb-unix:eacces)
@@ -612,19 +612,20 @@
                            :pathname pathname
                            :format-control "Error opening ~S, ~A."
                            :format-arguments
-                               (list pathname
-                                     (sb-int:strerror errno))))
+                           (list pathname
+                                 (sb-int:strerror errno))))
                   (t
                    (cerror "Return NIL."
                            'sb-int:simple-file-error
                            :pathname pathname
                            :format-control "Error opening ~S, ~A."
                            :format-arguments
-                               (list pathname
-                                     (sb-int:strerror errno)))
+                           (list pathname
+                                 (sb-int:strerror errno)))
                    (return nil)))))))))
 
-(defun open-fd-stream (pathname &key (direction :input)
+(defun open-fd-stream (pathname &key (class 'sb-sys:fd-stream)
+                                (direction :input)
                                 (element-type 'base-char)
                                 (if-exists nil if-exists-given)
                                 (if-does-not-exist nil if-does-not-exist-given)
@@ -642,6 +643,7 @@
         (case direction
           ((:input :output :io)
            (sb-sys:make-fd-stream fd
+                                  :class class
                                   :input (member direction '(:input :io))
                                   :output (member direction '(:output :io))
                                   :element-type element-type
@@ -698,3 +700,4 @@
 
 (define-filespec pathname (string)
   (pathname string))
+

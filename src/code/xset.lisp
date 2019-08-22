@@ -9,7 +9,7 @@
 
 ;;;; XSET
 ;;;;
-;;;; A somewhat effcient set implementation that can store arbitrary
+;;;; A somewhat efficient set implementation that can store arbitrary
 ;;;; objects. For small sets the data is stored in a list, but when
 ;;;; the amount of elements grows beyond +XSET-LIST-SIZE-LIMIT+, we
 ;;;; switch to a hash-table instead.
@@ -25,10 +25,8 @@
 ;;;; XSET-LIST-SIZE is true only for XSETs whose data is stored into a
 ;;;; list -- XSET-COUNT returns the real value.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
-#!-sb-fluid
-(declaim (inline alloc-xset xset-data (setf xset-data) xset-list-size (setf xset-list-size)))
 (defstruct (xset (:constructor alloc-xset) (:copier nil) (:predicate nil))
   (list-size 0 :type index)
   (data nil :type (or list hash-table)))
@@ -41,6 +39,7 @@
 
 (defun map-xset (function xset)
   (declare (function function))
+  #-sb-xc-host (declare (dynamic-extent function)) ; Avoid "unable" in host
   (let ((data (xset-data xset)))
     (if (listp data)
         (dolist (elt data)
@@ -68,6 +67,14 @@
                 (setf (gethash x table) t))
               (setf (xset-data xset) table)))
         (setf (gethash elt data) t))))
+
+;; items must be canonical - no duplicates - and few in number.
+(defun xset-from-list (items)
+  (let ((n (length items)))
+    (aver (<= n +xset-list-size-limit+))
+    (let ((xset (alloc-xset)))
+      (setf (xset-list-size xset) n (xset-data xset) items)
+      xset)))
 
 (defun xset-union (a b)
   (let ((xset (alloc-xset)))
@@ -127,6 +134,6 @@
        xset1))
     t))
 
-#!-sb-fluid (declaim (inline xset-empty-p))
+#-sb-fluid (declaim (inline xset-empty-p))
 (defun xset-empty-p (xset)
   (not (xset-data xset)))

@@ -16,11 +16,6 @@
 ;;;; why this idiom (a sequence of top-level forms) works as a test of
 ;;;; EVAL.
 
-(cl:in-package :cl-user)
-
-(load "assertoid.lisp")
-(use-package "ASSERTOID")
-
 ;;; Until sbcl-0.7.9.x, EVAL was not correctly treating LOCALLY,
 ;;; MACROLET and SYMBOL-MACROLET, which should preserve top-levelness
 ;;; of their body forms:
@@ -249,7 +244,7 @@
               (simple-type-error () 'error)))
       t)))
 
-(with-test (:name :bug-524707 :skipped-on '(not :sb-eval))
+(with-test (:name :bug-524707 :skipped-on (not :sb-eval))
   (let ((*evaluator-mode* :interpret)
         (lambda-form '(lambda (x) (declare (fixnum x)) (1+ x))))
     (let ((fun (eval lambda-form)))
@@ -283,16 +278,21 @@
     (assert (eq :fun (empty-let-is-not-toplevel-fun)))))
 
 (with-test (:name (eval function-lambda-expression))
-  (assert (equal `(sb-int:named-lambda eval-fle-1 (x)
-                    (block eval-fle-1
-                      (+ x 1)))
-                 (function-lambda-expression
+  (assert (equal (function-lambda-expression
                   (eval `(progn
                            (defun eval-fle-1 (x) (+ x 1))
-                           #'eval-fle-1)))))
-  (assert (equal `(lambda (x y z) (+ x 1 y z))
-                 (function-lambda-expression
-                  (eval `(lambda (x y z) (+ x 1 y z)))))))
+                           #'eval-fle-1)))
+                 #+interpreter
+                 `(sb-int:named-lambda eval-fle-1 (x)
+                    (block eval-fle-1
+                      (+ x 1)))
+                 #-interpreter
+                 `(lambda (x)
+                    (block eval-fle-1
+                      (+ x 1)))))
+  (assert (equal (function-lambda-expression
+                  (eval `(lambda (x y z) (+ x 1 y z))))
+                 `(lambda (x y z) (+ x 1 y z)))))
 
 (with-test (:name (:bug-573747 eval :compile))
   (let ((*out* (make-string-output-stream))
@@ -303,8 +303,24 @@
 
 (with-test (:name (:bug-573747 eval :interpret))
   (let ((*out* (make-string-output-stream))
-        (sb-ext:*evaluator-mode* :interpret))
+        #+(or sb-eval sb-fasteval) (sb-ext:*evaluator-mode* :interpret))
     (declare (special *out*))
     (assert-error (eval '(declare (print "foo" *out*))))
     (assert (string= (get-output-stream-string *out*) ""))))
+
+(with-test (:name :the-keyword-not-borked)
+  (assert (the (or integer keyword) :foo)))
+
+;; If the DEFUN macro produces a style-warning, it needs to perform the
+;; effect of defun no matter what. The style-warning comes from an EVAL-WHEN,
+;; not as part of the execution-time behavior of %DEFUN because it is neither
+;; polite nor useful to issue a warning about the co-existence of a DEFSETF
+;; and DEFUN SETF after compile-time. The other viable alternative would have
+;; been to remove the :EXECUTE situation from the expansion of DEFUN
+;; where it signal to warning.
+(with-test (:name :handler-case-does-not-bork-defun)
+  (defsetf bar set-bar)
+  (handler-case (defun (setf bar) (newval x) (declare (ignore newval x)))
+    (style-warning () 'drat))
+  (assert (fboundp '(setf bar))))
 ;;; success

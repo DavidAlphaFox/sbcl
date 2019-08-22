@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; allocator for the array header
 
@@ -26,7 +26,7 @@
   (:generator 13
     (inst lea bytes
           (make-ea :dword :base rank
-                   :disp (+ (* (1+ array-dimensions-offset) n-word-bytes)
+                   :disp (+ (* array-dimensions-offset n-word-bytes)
                             lowtag-mask)))
     (inst and bytes (lognot lowtag-mask))
     (inst lea header (make-ea :dword :base rank
@@ -34,10 +34,29 @@
     (inst shl header n-widetag-bits)
     (inst or  header type)
     (inst shr header 2)
-    (pseudo-atomic
-     (allocation result bytes node)
-     (inst lea result (make-ea :dword :base result :disp other-pointer-lowtag))
+    (pseudo-atomic ()
+     (allocation result bytes node nil other-pointer-lowtag)
      (storew header result 0 other-pointer-lowtag))))
+
+(define-vop (make-array-header/c)
+  (:translate make-array-header)
+  (:policy :fast-safe)
+  (:arg-types (:constant t) (:constant t))
+  (:info type rank)
+   (:results (result :scs (descriptor-reg)))
+  (:node-var node)
+  (:generator 12
+    (let* ((header-size (+ rank
+                           (1- array-dimensions-offset)))
+           (bytes (logandc2 (+ (* (1+ header-size) n-word-bytes)
+                               lowtag-mask)
+                            lowtag-mask))
+           (header (logior (ash header-size
+                                n-widetag-bits)
+                           type)))
+     (pseudo-atomic ()
+      (allocation result bytes node nil other-pointer-lowtag)
+      (storew header result 0 other-pointer-lowtag)))))
 
 ;;;; additional accessors and setters for the array header
 (define-full-reffer %array-dimension *
@@ -60,70 +79,82 @@
     (inst sub res (1- array-dimensions-offset))))
 
 ;;;; bounds checking routine
-
-;;; Note that the immediate SC for the index argument is disabled
-;;; because it is not possible to generate a valid error code SC for
-;;; an immediate value.
-;;;
-;;; FIXME: As per the KLUDGE note explaining the :IGNORE-FAILURE-P
-;;; flag in build-order.lisp-expr, compiling this file causes warnings
-;;;    Argument FOO to VOP CHECK-BOUND has SC restriction
-;;;    DESCRIPTOR-REG which is not allowed by the operand type:
-;;;      (:OR POSITIVE-FIXNUM)
-;;; CSR's message "format ~/ /" on sbcl-devel 2002-03-12 contained
-;;; a possible patch, described as
-;;;   Another patch is included more for information than anything --
-;;;   removing the descriptor-reg SCs from the CHECK-BOUND vop in
-;;;   x86/array.lisp seems to allow that file to compile without error[*],
-;;;   and build; I haven't tested rebuilding capability, but I'd be
-;;;   surprised if there were a problem.  I'm not certain that this is the
-;;;   correct fix, though, as the restrictions on the arguments to the VOP
-;;;   aren't the same as in the sparc and alpha ports, where, incidentally,
-;;;   the corresponding file builds without error currently.
-;;; Since neither of us (CSR or WHN) was quite sure that this is the
-;;; right thing, I've just recorded the patch here in hopes it might
-;;; help when someone attacks this problem again:
-;;;   diff -u -r1.7 array.lisp
-;;;   --- src/compiler/x86/array.lisp 11 Oct 2001 14:05:26 -0000      1.7
-;;;   +++ src/compiler/x86/array.lisp 12 Mar 2002 12:23:37 -0000
-;;;   @@ -76,10 +76,10 @@
-;;;      (:translate %check-bound)
-;;;      (:policy :fast-safe)
-;;;      (:args (array :scs (descriptor-reg))
-;;;   -        (bound :scs (any-reg descriptor-reg))
-;;;   -        (index :scs (any-reg descriptor-reg #+nil immediate) :target result))
-;;;   +        (bound :scs (any-reg))
-;;;   +        (index :scs (any-reg #+nil immediate) :target result))
-;;;      (:arg-types * positive-fixnum tagged-num)
-;;;   -  (:results (result :scs (any-reg descriptor-reg)))
-;;;   +  (:results (result :scs (any-reg)))
-;;;      (:result-types positive-fixnum)
-;;;      (:vop-var vop)
-;;;      (:save-p :compute-only)
 (define-vop (check-bound)
   (:translate %check-bound)
   (:policy :fast-safe)
-  (:args (array :scs (descriptor-reg))
-         (bound :scs (any-reg))
-         (index :scs (any-reg #+nil immediate) :target result))
-  (:arg-types * positive-fixnum tagged-num)
-  (:results (result :scs (any-reg)))
-  (:result-types positive-fixnum)
+  (:args (array :scs (descriptor-reg constant))
+         (bound :scs (any-reg descriptor-reg)
+                :load-if (not (and (sc-is bound immediate)
+                                   (typep (tn-value bound)
+                                          'sc-offset)
+                                   (not (sc-is index immediate)))))
+         (index :scs (any-reg descriptor-reg)
+                :load-if (not (and (sc-is index immediate)
+                                   (typep (tn-value index)
+                                          'sc-offset)))))
+  (:variant-vars %test-fixnum)
+  (:variant t)
   (:vop-var vop)
   (:save-p :compute-only)
-  (:generator 5
+  (:generator 6
     (let ((error (generate-error-code vop 'invalid-array-index-error
                                       array bound index))
+          (bound (if (sc-is bound immediate)
+                     (let ((value (tn-value bound)))
+                       (cond ((and %test-fixnum
+                                   (power-of-two-limit-p (1- value)))
+                              (lognot (fixnumize (1- value))))
+                             ((sc-is index any-reg descriptor-reg)
+                              (fixnumize value))
+                             (t
+                              value)))
+                     bound))
           (index (if (sc-is index immediate)
-                   (fixnumize (tn-value index))
-                   index)))
-      (inst cmp bound index)
-      ;; We use below-or-equal even though it's an unsigned test,
-      ;; because negative indexes appear as large unsigned numbers.
-      ;; Therefore, we get the <0 and >=bound test all rolled into one.
-      (inst jmp :be error)
-      (unless (and (tn-p index) (location= result index))
-        (inst mov result index)))))
+                     (let ((value (tn-value index)))
+                       (if (sc-is bound any-reg descriptor-reg)
+                           (fixnumize value)
+                           value))
+                     index)))
+      (cond ((typep bound '(integer * -1))
+             ;; Power of two bound, can be checked for fixnumness at
+             ;; the same time as it always occupies a consecutive bit
+             ;; range, everything else, including the tag, has to be
+             ;; zero.
+             (inst test index (if (eql bound -1)
+                                  index ;; zero?
+                                  bound))
+             (inst jmp :ne error))
+            (t
+             (when (and %test-fixnum (not (integerp index)))
+               (%test-fixnum index nil error t))
+             (cond ((integerp bound)
+                    (inst cmp index bound)
+                    (inst jmp :nb error))
+                   (t
+                    (inst cmp bound index)
+                    (inst jmp :be error))))))))
+
+(define-vop (check-bound/fast check-bound)
+  (:policy :fast)
+  (:variant nil)
+  (:variant-cost 4))
+
+(define-vop (check-bound/fixnum check-bound)
+  (:args (array)
+         (bound)
+         (index :scs (any-reg)))
+  (:arg-types * * tagged-num)
+  (:variant nil)
+  (:variant-cost 4))
+
+(define-vop (check-bound/untagged check-bound)
+  (:args (array)
+         (bound :scs (unsigned-reg signed-reg))
+         (index :scs (unsigned-reg signed-reg)))
+  (:arg-types * (:or unsigned-num signed-num)
+                (:or unsigned-num signed-num))
+  (:variant nil)
+  (:variant-cost 5))
 
 ;;;; accessors/setters
 
@@ -147,7 +178,7 @@
     signed-reg)
   (def-full-data-vector-frobs simple-array-unsigned-byte-31 unsigned-num
     unsigned-reg)
-  #!+sb-unicode
+  #+sb-unicode
   (def-full-data-vector-frobs simple-character-string character character-reg))
 
 (define-full-compare-and-swap %compare-and-swap-svref simple-vector
@@ -158,11 +189,54 @@
 ;;;; integer vectors whose elements are smaller than a byte, i.e.,
 ;;;; bit, 2-bit, and 4-bit vectors
 
+(define-vop (data-vector-ref-with-offset/simple-bit-vector-c)
+  (:translate data-vector-ref-with-offset)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg)))
+  (:arg-types simple-bit-vector
+              (:constant (integer 0 #x7fffffff)) (:constant (integer 0 0)))
+  (:info index offset)
+  (:ignore offset)
+  (:results (result :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:generator 3
+    (multiple-value-bind (dword-index bit) (floor index 32)
+      (inst mov result
+                (make-ea :dword :base object
+                         :disp (+ (* dword-index 4)
+                                  (- (* vector-data-offset n-word-bytes)
+                                     other-pointer-lowtag))))
+      (let ((right-shift (- bit n-fixnum-tag-bits)))
+        (cond ((plusp right-shift)
+               (inst shr result right-shift))
+              ((minusp right-shift) ; = left shift
+               (inst shl result (- right-shift))))))
+    (inst and result (fixnumize 1))))
+
+(define-vop (data-vector-ref-with-offset/simple-bit-vector)
+  (:translate data-vector-ref-with-offset)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg))
+         (index :scs (unsigned-reg)))
+  (:info offset)
+  (:ignore offset)
+  (:arg-types simple-bit-vector positive-fixnum (:constant (integer 0 0)))
+  (:results (result :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:generator 4
+    (inst bt (make-ea :dword :base object
+                      :disp (- (* vector-data-offset n-word-bytes)
+                               other-pointer-lowtag))
+             index)
+    (inst sbb result result)
+    (inst and result (fixnumize 1))))
+
 (macrolet ((def-small-data-vector-frobs (type bits)
              (let* ((elements-per-word (floor n-word-bits bits))
                     (bit-shift (1- (integer-length elements-per-word))))
     `(progn
-       (define-vop (,(symbolicate 'data-vector-ref-with-offset/ type))
+      ,@(unless (= bits 1)
+       `((define-vop (,(symbolicate 'data-vector-ref-with-offset/ type))
          (:note "inline array access")
          (:translate data-vector-ref-with-offset)
          (:policy :fast-safe)
@@ -189,7 +263,7 @@
                  (inst shl ecx ,(1- (integer-length bits)))))
            (inst shr result :cl)
            (inst and result ,(1- (ash 1 bits)))))
-       (define-vop (,(symbolicate 'data-vector-ref-c-with-offset/ type))
+       (define-vop (,(symbolicate 'data-vector-ref-with-offset/ type "-C"))
          (:translate data-vector-ref-with-offset)
          (:policy :fast-safe)
          (:args (object :scs (descriptor-reg)))
@@ -205,7 +279,7 @@
              (unless (zerop extra)
                (inst shr result (* extra ,bits)))
              (unless (= extra ,(1- elements-per-word))
-               (inst and result ,(1- (ash 1 bits)))))))
+               (inst and result ,(1- (ash 1 bits)))))))))
        (define-vop (,(symbolicate 'data-vector-set-with-offset/ type))
          (:note "inline array store")
          (:translate data-vector-set-with-offset)
@@ -253,7 +327,7 @@
               (inst mov result (tn-value value)))
              (unsigned-reg
               (move result value)))))
-       (define-vop (,(symbolicate 'data-vector-set-c-with-offset/ type))
+       (define-vop (,(symbolicate 'data-vector-set-with-offset/ type "-C"))
          (:translate data-vector-set-with-offset)
          (:policy :fast-safe)
          (:args (object :scs (descriptor-reg))
@@ -621,8 +695,8 @@
   (define-data-vector-frobs simple-array-signed-byte-8 tagged-num
     movsx nil signed-reg)
   (define-data-vector-frobs simple-base-string character
-                            #!+sb-unicode movzx #!-sb-unicode mov
-                            #!+sb-unicode nil #!-sb-unicode t character-reg))
+                            #+sb-unicode movzx #-sb-unicode mov
+                            #+sb-unicode nil #-sb-unicode t character-reg))
 
 ;;; {un,}signed-byte-16
 (macrolet ((define-data-vector-frobs (ptype element-type ref-inst &rest scs)
@@ -704,8 +778,7 @@
   (:results (result :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:generator 4
-    (inst xadd (make-ea :dword :base array
-                        :scale 1 :index index
+    (inst xadd (make-ea :dword :base array :index index
                         :disp (- (* vector-data-offset n-word-bytes)
                                  other-pointer-lowtag))
           diff :lock)

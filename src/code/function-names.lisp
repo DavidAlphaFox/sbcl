@@ -1,7 +1,7 @@
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; generalized function names
-(defvar *valid-fun-names-alist* nil)
+(!define-load-time-global *valid-fun-names-alist* nil)
 
 (defun %define-fun-name-syntax (symbol checker)
   (let ((found (assoc symbol *valid-fun-names-alist* :test #'eq)))
@@ -10,8 +10,13 @@
         (setq *valid-fun-names-alist*
               (acons symbol checker *valid-fun-names-alist*)))))
 
+#+sb-xc-host
+(setf (get '%define-fun-name-syntax :sb-cold-funcall-handler/for-effect)
+      (lambda (symbol checker)
+        (cold-target-push (cold-cons (cold-intern symbol) checker)
+                          '*valid-fun-names-alist*)))
+
 (defmacro define-function-name-syntax (symbol (var) &body body)
-  #!+sb-doc
   "Define function names of the form of a list headed by SYMBOL to be
 a legal function name, subject to restrictions imposed by BODY.  BODY
 is evaluated with VAR bound to the form required to check, and should
@@ -30,7 +35,6 @@ situations."
 ;;; I would think that after 11 years of we're entitled to rename it.
 ;;; VALIDATE-FUNCTION-NAME would be apt.
 (defun valid-function-name-p (name)
-  #!+sb-doc
   "The primary return value indicates whether NAME is a valid function
 name; if it is, the second return value will be a symbol suitable for
 use as a BLOCK name in the function in question."
@@ -61,21 +65,3 @@ use as a BLOCK name in the function in question."
 ;; 'cas.lisp' doesn't need to know this technique for sharing the parser,
 ;; so the name syntax is defined here instead of there.
 (%define-fun-name-syntax 'cas #'%check-setf-fun-name)
-
-(defun macro-function-name (name)
-  (when (and (cdr name)
-             (consp (cdr name)))
-    (destructuring-bind (fun &rest rest) (cdr name)
-      (when (null rest)
-        (typecase fun
-          ;; (DEFMACRO FOO)
-          (symbol (values t fun))
-          ;; (DEFMACRO (SETF FOO))
-          (cons (when (eq (car fun) 'setf)
-                  (valid-function-name-p fun))))))))
-
-(define-function-name-syntax defmacro (name)
-  (macro-function-name name))
-
-(define-function-name-syntax macrolet (name)
-  (macro-function-name name))

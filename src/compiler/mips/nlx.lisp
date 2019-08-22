@@ -1,10 +1,4 @@
-(in-package "SB!VM")
-
-;;; Make an environment-live stack TN for saving the SP for NLX entry.
-(defun make-nlx-sp-tn (env)
-  (physenv-live-tn
-   (make-representation-tn *fixnum-primitive-type* immediate-arg-scn)
-   env))
+(in-package "SB-VM")
 
 ;;; Make a TN for the argument count passing location for a
 ;;; non-local entry.
@@ -55,7 +49,15 @@
   (:generator 1
     (move res bsp-tn)))
 
+(define-vop (current-nsp)
+  (:results (res :scs (any-reg descriptor-reg)))
+  (:generator 1
+    (move res nsp-tn)))
 
+(define-vop (set-nsp)
+  (:args (nsp :scs (any-reg descriptor-reg)))
+  (:generator 1
+    (move nsp-tn nsp)))
 
 ;;;; Unwind block hackery:
 
@@ -69,11 +71,11 @@
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:generator 22
-    (inst addu block cfp-tn (* (tn-offset tn) n-word-bytes))
+    (inst addu block cfp-tn (tn-byte-offset tn))
     (load-symbol-value temp *current-unwind-protect-block*)
-    (storew temp block unwind-block-current-uwp-slot)
-    (storew cfp-tn block unwind-block-current-cont-slot)
-    (storew code-tn block unwind-block-current-code-slot)
+    (storew temp block unwind-block-uwp-slot)
+    (storew cfp-tn block unwind-block-cfp-slot)
+    (storew code-tn block unwind-block-code-slot)
     (inst compute-lra-from-code temp code-tn entry-label ndescr)
     (storew temp block catch-block-entry-pc-slot)))
 
@@ -90,11 +92,11 @@
   (:temporary (:scs (descriptor-reg) :target block :to (:result 0)) result)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:generator 44
-    (inst addu result cfp-tn (* (tn-offset tn) n-word-bytes))
+    (inst addu result cfp-tn (tn-byte-offset tn))
     (load-symbol-value temp *current-unwind-protect-block*)
-    (storew temp result catch-block-current-uwp-slot)
-    (storew cfp-tn result catch-block-current-cont-slot)
-    (storew code-tn result catch-block-current-code-slot)
+    (storew temp result catch-block-uwp-slot)
+    (storew cfp-tn result catch-block-cfp-slot)
+    (storew code-tn result catch-block-code-slot)
     (inst compute-lra-from-code temp code-tn entry-label ndescr)
     (storew temp result catch-block-entry-pc-slot)
 
@@ -106,15 +108,13 @@
     (move block result)))
 
 
-;;; Just set the current unwind-protect to TN's address.  This instantiates an
+;;; Just set the current unwind-protect to UWP.  This instantiates an
 ;;; unwind block as an unwind-protect.
 ;;;
 (define-vop (set-unwind-protect)
-  (:args (tn))
-  (:temporary (:scs (descriptor-reg)) new-uwp)
+  (:args (uwp :scs (any-reg)))
   (:generator 7
-    (inst addu new-uwp cfp-tn (* (tn-offset tn) n-word-bytes))
-    (store-symbol-value new-uwp *current-unwind-protect-block*)))
+    (store-symbol-value uwp *current-unwind-protect-block*)))
 
 
 (define-vop (unlink-catch-block)
@@ -132,7 +132,7 @@
   (:translate %unwind-protect-breakup)
   (:generator 17
     (load-symbol-value block *current-unwind-protect-block*)
-    (loadw block block unwind-block-current-uwp-slot)
+    (loadw block block unwind-block-uwp-slot)
     (store-symbol-value block *current-unwind-protect-block*)))
 
 
@@ -181,7 +181,7 @@
 
                (emit-label defaulting-done)
 
-               (assemble (*elsewhere*)
+               (assemble (:elsewhere)
                  (dolist (def (defaults))
                    (emit-label (car def))
                    (let ((tn (cdr def)))

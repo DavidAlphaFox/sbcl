@@ -11,33 +11,24 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_SIMPLE_FUN
-#define SBCL_GENESIS_SIMPLE_FUN 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_SIMPLE_FUN
+#ifndef __ASSEMBLER__
 
 struct simple_fun {
     lispobj header;
     lispobj self;
-    lispobj next;
-    lispobj name;
-    lispobj arglist;
-    lispobj type;
-    lispobj info;
-    unsigned char code[1];
+    unsigned char insts[1];
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
 #define SIMPLE_FUN_SELF_OFFSET -3
-#define SIMPLE_FUN_NEXT_OFFSET 5
-#define SIMPLE_FUN_NAME_OFFSET 13
-#define SIMPLE_FUN_ARGLIST_OFFSET 21
-#define SIMPLE_FUN_TYPE_OFFSET 29
-#define SIMPLE_FUN_INFO_OFFSET 37
-#define SIMPLE_FUN_CODE_OFFSET 45
+#define SIMPLE_FUN_INSTS_OFFSET 5
+#define SIMPLE_FUN_SIZE 2
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_SIMPLE-FUN */
+#endif

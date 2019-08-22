@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (defun query-read-char ()
   (clear-input *query-io*)
@@ -33,11 +33,11 @@
           yes no))
 
 (defun y-or-n-p (&optional format-string &rest arguments)
-  #!+sb-doc
   "Y-OR-N-P prints the message, if any, and reads characters from
    *QUERY-IO* until the user enters y or Y as an affirmative, or either
    n or N as a negative answer. It asks again if you enter any other
    characters."
+  (declare (explicit-check))
   (flet ((print-query ()
            (apply #'maybe-print-query "(y or n)" format-string arguments)))
     (loop (print-query)
@@ -47,10 +47,10 @@
             (t (clarify-legal-query-input "y" "n"))))))
 
 (defun yes-or-no-p (&optional format-string &rest arguments)
-  #!+sb-doc
   "YES-OR-NO-P is similar to Y-OR-N-P, except that it clears the
    input buffer, beeps, and uses READ-LINE to get the strings
    YES or NO."
+  (declare (explicit-check))
   (flet ((print-query ()
            (apply #'maybe-print-query "(yes or no)" format-string arguments)))
     (beep *query-io*)

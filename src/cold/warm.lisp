@@ -13,55 +13,67 @@
 
 ;;;; general warm init compilation policy
 
-(proclaim '(optimize (compilation-speed 1)
-                     (debug #+sb-show 2 #-sb-show 1)
-                     (inhibit-warnings 2)
-                     (safety 2)
-                     (space 1)
-                     (speed 2)))
+;;;; Use the same settings as PROCLAIM-TARGET-OPTIMIZATION
+;;;; I could not think of a trivial way to ensure that this stays functionally
+;;;; identical to the corresponding code in 'compile-cold-sbcl'.
+;;;; (One possibility would be to read this form from a lisp-expr file)
+;;;; The intent is that we should generate identical code if a file is moved
+;;;; from the cross-compiled sources to warm-compiled or vice-versa.
+(proclaim '(optimize
+            #+sb-show (debug 2)
+            (safety 2) (speed 2)
+            ;; never insert stepper conditions
+            (sb-c:insert-step-conditions 0)
+            (sb-c:alien-funcall-saves-fp-and-pc #+x86 3 #-x86 0)))
 
-
-;;;; package hacking
+(locally
+    (declare (notinline find-symbol)) ; don't ask
+  (let ((s (find-symbol "*/SHOW*" "SB-INT")))
+  ;; If you made it this far, chances are that you no longer wish to see
+  ;; whatever it is that show would have shown. Comment this out if you need.
+    (when s (set s nil))))
 
-;;; Our cross-compilation host is out of the picture now, so we no
-;;; longer need to worry about collisions between our package names
-;;; and cross-compilation host package names, so now is a good time to
-;;; rename any package with a bootstrap-only name SB!FOO to its
-;;; permanent name SB-FOO.
-;;;
-;;; (In principle it might be tidier to do this when dumping the cold
-;;; image in genesis, but in practice the logic might be a little
-;;; messier because genesis dumps both symbols and packages, and we'd
-;;; need to make sure that dumped symbols were renamed in the same way
-;;; as dumped packages. Or we could do it in cold init, but it's
-;;; easier to experiment with and debug things here in warm init than
-;;; in cold init, so we do it here instead.)
-(let ((boot-prefix "SB!")
-      (perm-prefix "SB-"))
-  (dolist (package (list-all-packages))
-    (let ((old-package-name (package-name package)))
-      (when (and (>= (length old-package-name) (length boot-prefix))
-                 (string= boot-prefix old-package-name
-                          :end2 (length boot-prefix)))
-        (let ((new-package-name (concatenate 'string
-                                             perm-prefix
-                                             (subseq old-package-name
-                                                     (length boot-prefix)))))
-          (rename-package package
-                          new-package-name
-                          (package-nicknames package)))))))
+(assert (zerop (deref (extern-alien "lowtag_for_widetag" (array char 64))
+                      (ash sb-vm:character-widetag -2))))
 
-;;; FIXME: This nickname is a deprecated hack for backwards
-;;; compatibility with code which assumed the CMU-CL-style
-;;; SB-ALIEN/SB-C-CALL split. That split went away and was deprecated
-;;; in 0.7.0, so we should get rid of this nickname after a while.
-(let ((package (find-package "SB-ALIEN")))
-  (rename-package package
-                  (package-name package)
-                  (cons "SB-C-CALL" (package-nicknames package))))
+;;; Verify that all defstructs except for one were compiled in a null lexical
+;;; environment. Compiling any call to a structure constructor would like to
+;;; know whether some slots get their default value especially if the default
+;;; is incompatible with the slot type (consider MISSING-ARG, e.g).
+;;; If some initform was compiled in a non-null environment, it might not refer
+;;; to a global function. We'd rather ignore it than incorrectly style-warn.
+(let (result)
+  (do-all-symbols (s)
+    (let ((dd (sb-kernel:find-defstruct-description s nil)))
+      (when (and dd (not (sb-kernel::dd-null-lexenv-p dd)))
+        (push (sb-kernel:dd-name dd) result))))
+  (assert (equal result '(sb-c::conset))))
 
-(let ((package (find-package "SB-SEQUENCE")))
-  (rename-package package (package-name package) (list "SEQUENCE")))
+;;; Assert that genesis preserved shadowing symbols.
+(let ((p sb-assem::*backend-instruction-set-package*))
+  (unless (eq p (find-package "SB-VM"))
+    (dolist (expect '("SEGMENT" "MAKE-SEGMENT"))
+      (assert (find expect (package-shadowing-symbols p) :test 'string=)))))
+
+;;; Verify that compile-time floating-point math matches load-time.
+(defvar *compile-files-p*)
+(when (or (not (boundp '*compile-files-p*)) *compile-files-p*)
+  (with-open-file (stream "float-math.lisp-expr" :if-does-not-exist nil)
+    (when stream
+      (format t "; Checking ~S~%" (pathname stream))
+      ;; Ensure that we're reading the correct variant of the file
+      ;; in case there is more than one set of floating-point formats.
+      (assert (eq (read stream) :default))
+      (let ((*package* (find-package "SB-KERNEL")))
+        (dolist (expr (read stream))
+          (destructuring-bind (fun args result) expr
+            (let ((actual (apply fun (sb-int:ensure-list args))))
+              (unless (eql actual result)
+                (#+sb-devel error
+                 #-sb-devel format #-sb-devel t
+                 "FLOAT CACHE LINE ~S vs COMPUTED ~S~%"
+                 expr actual)))))))))
+
 
 ;;;; compiling and loading more of the system
 
@@ -87,104 +99,43 @@
 ;;;     ((:or :macro (:match "$EARLY-") (:match "$BOOT-"))
 ;;;     (declare (optimize (speed 0))))))
 ;;;
-;;; FIXME: This has mutated into a hack which crudely duplicates
-;;; functionality from the existing mechanism to load files from
-;;; build-order.lisp-expr, without being quite parallel. (E.g. object
-;;; files end up alongside the source files instead of ending up in
-;;; parallel directory trees.) Maybe we could merge the filenames here
-;;; into build-order.lisp-expr with some new flag (perhaps :WARM) to
-;;; indicate that the files should be handled not in cold load but
-;;; afterwards.
-(let ((pcl-srcs
-              '(;; CLOS, derived from the PCL reference implementation
-                ;;
-                ;; This PCL build order is based on a particular
-                ;; (arbitrary) linearization of the declared build
-                ;; order dependencies from the old PCL defsys.lisp
-                ;; dependency database.
-                #+nil "src/pcl/walk" ; #+NIL = moved to build-order.lisp-expr
-                "SRC;PCL;EARLY-LOW"
-                "SRC;PCL;MACROS"
-                "SRC;PCL;COMPILER-SUPPORT"
-                "SRC;PCL;LOW"
-                "SRC;PCL;SLOT-NAME"
-                "SRC;PCL;DEFCLASS"
-                "SRC;PCL;DEFS"
-                "SRC;PCL;FNGEN"
-                "SRC;PCL;WRAPPER"
-                "SRC;PCL;CACHE"
-                "SRC;PCL;DLISP"
-                "SRC;PCL;BOOT"
-                "SRC;PCL;VECTOR"
-                "SRC;PCL;SLOTS-BOOT"
-                "SRC;PCL;COMBIN"
-                "SRC;PCL;DFUN"
-                "SRC;PCL;CTOR"
-                "SRC;PCL;BRAID"
-                "SRC;PCL;DLISP3"
-                "SRC;PCL;GENERIC-FUNCTIONS"
-                "SRC;PCL;SLOTS"
-                "SRC;PCL;INIT"
-                "SRC;PCL;STD-CLASS"
-                "SRC;PCL;CPL"
-                "SRC;PCL;FSC"
-                "SRC;PCL;METHODS"
-                "SRC;PCL;FIXUP"
-                "SRC;PCL;DEFCOMBIN"
-                "SRC;PCL;CTYPES"
-                "SRC;PCL;ENV"
-                "SRC;PCL;DOCUMENTATION"
-                "SRC;PCL;PRINT-OBJECT"
-                "SRC;PCL;PRECOM1"
-                "SRC;PCL;PRECOM2"))
-      (other-srcs
-              '(;; miscellaneous functionality which depends on CLOS
-                "SRC;CODE;FORCE-DELAYED-DEFBANGMETHODS"
-                "SRC;CODE;LATE-CONDITION"
-
-                ;; CLOS-level support for the Gray OO streams
-                ;; extension (which is also supported by various
-                ;; lower-level hooks elsewhere in the code)
-                "SRC;PCL;GRAY-STREAMS-CLASS"
-                "SRC;PCL;GRAY-STREAMS"
-
-                ;; CLOS-level support for User-extensible sequences.
-                "SRC;PCL;SEQUENCE"
-
-                ;; other functionality not needed for cold init, moved
-                ;; to warm init to reduce peak memory requirement in
-                ;; cold init
-                "SRC;CODE;DESCRIBE"
-                "SRC;CODE;DESCRIBE-POLICY"
-                "SRC;CODE;INSPECT"
-                "SRC;CODE;PROFILE"
-                "SRC;CODE;NTRACE"
-                "SRC;CODE;STEP"
-                "SRC;CODE;WARM-LIB"
-                #+win32 "SRC;CODE;WARM-MSWIN"
-                "SRC;CODE;RUN-PROGRAM")))
- (declare (special *compile-files-p*))
- (flet
-    ((do-srcs (list)
-       (dolist (stem list)
-         (let ((fullname (concatenate 'string "SYS:" stem ".LISP")))
-           (sb-int:/show "about to compile" fullname)
+(let ((sources (with-open-file (f (merge-pathnames "../../build-order.lisp-expr"
+                                                   *load-pathname*))
+                 (read f) ; skip over the make-host-{1,2} input files
+                 (read f)))
+      (sb-c::*handled-conditions* sb-c::*handled-conditions*))
+ (proclaim '(sb-ext:muffle-conditions compiler-note))
+ (flet ((do-srcs (list)
+         (dolist (stem list)
+          ;; Do like SB-COLD::LPNIFY-STEM for consistency, though parse/xlate/unparse
+          ;; would probably also work. I don't think that's better.
+          (let ((fullname (sb-int:logically-readonlyize
+                           (format nil "SYS:~:@(~A~).LISP" (substitute #\; #\/ stem))
+                           ;; indicate shareable string even if not dumped as
+                           ;; a literal (when compiling in the LOAD step)
+                           t))
+                (output
+                  (compile-file-pathname stem
+                   :output-file
+                   (merge-pathnames
+                    (concatenate
+                     'string sb-fasl::*!target-obj-prefix*
+                     (subseq stem 0 (1+ (position #\/ stem :from-end t))))))))
            (flet ((report-recompile-restart (stream)
-                    (format stream "Recompile file ~S" fullname))
+                    (format stream "Recompile file ~S" stem))
                   (report-continue-restart (stream)
-                    (format stream
-                            "Continue, using possibly bogus file ~S"
-                            (compile-file-pathname fullname))))
+                    (format stream "Continue, using possibly bogus file ~S" output)))
              (tagbody
               retry-compile-file
                 (multiple-value-bind (output-truename warnings-p failure-p)
-                    (if *compile-files-p*
-                        (compile-file fullname)
-                        (compile-file-pathname fullname))
+                    (ecase (if (boundp '*compile-files-p*) *compile-files-p* t)
+                     ((t)   (let ((sb-c::*source-namestring* fullname))
+                              (ensure-directories-exist output)
+                              (compile-file stem :output-file output)))
+                     ((nil) output))
                   (declare (ignore warnings-p))
-                  (sb-int:/show "done compiling" fullname)
                   (cond ((not output-truename)
-                         (error "COMPILE-FILE of ~S failed." fullname))
+                         (error "COMPILE-FILE of ~S failed." stem))
                         (failure-p
                          (unwind-protect
                               (restart-case
@@ -205,41 +156,18 @@
                   (unless (handler-bind
                               ((sb-kernel:redefinition-with-defgeneric
                                 #'muffle-warning))
-                            (load output-truename))
+                            (let ((sb-c::*source-namestring* fullname))
+                              (load output-truename)))
                     (error "LOAD of ~S failed." output-truename))
                   (sb-int:/show "done loading" output-truename))))))))
 
-   (let* ((ppd (copy-pprint-dispatch))
-          (sb-debug:*debug-print-variable-alist*
-           (list (cons '*print-pprint-dispatch* ppd)))
-          (*print-pprint-dispatch* ppd))
-     (set-pprint-dispatch
-      'sb-thread:thread (lambda (stream obj)
-                          (declare (ignore obj))
-                          (write-string "#<main-thread>" stream)))
-     (set-pprint-dispatch
-      'restart (lambda (stream obj)
-                 (print-unreadable-object (obj stream :type t :identity t)
-                   (write (restart-name obj) :stream stream))))
-     (with-compilation-unit ()
-       (let ((*compile-print* nil))
-         (do-srcs pcl-srcs)))
-     (when *compile-files-p*
-       (format t "~&; Done with PCL compilation~2%"))
-     (do-srcs other-srcs))))
-
-;;;; setting package documentation
-
-;;; While we were running on the cross-compilation host, we tried to
-;;; be portable and not overwrite the doc strings for the standard
-;;; packages. But now the cross-compilation host is only a receding
-;;; memory, and we can have our way with the doc strings.
-(sb-int:/show "setting package documentation")
-#+sb-doc (setf (documentation (find-package "COMMON-LISP") t)
-"public: home of symbols defined by the ANSI language specification")
-#+sb-doc (setf (documentation (find-package "COMMON-LISP-USER") t)
-               "public: the default package for user code and data")
-#+sb-doc (setf (documentation (find-package "KEYWORD") t)
-               "public: home of keywords")
-
-
+  (let ((*compile-print* nil))
+    (dolist (group sources)
+      (handler-bind ((simple-warning
+                      (lambda (c)
+                        ;; escalate "undefined variable" warnings to errors.
+                        ;; There's no reason to allow them in our code.
+                        (when (search "undefined variable"
+                                      (write-to-string c :escape nil))
+                          (cerror "Finish warm compile ignoring the problem" c)))))
+        (with-compilation-unit () (do-srcs group)))))))

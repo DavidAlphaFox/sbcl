@@ -9,18 +9,25 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-MIPS-ASM")
 
-(setf *assem-scheduler-p* t)
-(setf *assem-max-locations* 68)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  ;; Imports from this package into SB-VM
+  (import '(reg-tn-encoding) "SB-VM")
+  ;; Imports from SB-VM into this package
+  (import '(;; SBs, SCs, and TNs
+            sb-vm::immediate-constant
+            sb-vm::registers sb-vm::float-registers
+            sb-vm::zero
+            sb-vm::lip-tn sb-vm::zero-tn)))
 
 ;;;; Constants, types, conversion functions, some disassembler stuff.
 
 (defun reg-tn-encoding (tn)
   (declare (type tn tn))
   (sc-case tn
-    (zero zero-offset)
-    (null null-offset)
+    (zero sb-vm::zero-offset)
+    (null sb-vm::null-offset)
     (t
      (if (eq (sb-name (sc-sb (tn-sc tn))) 'registers)
          (tn-offset tn)
@@ -31,8 +38,6 @@
   (unless (eq (sb-name (sc-sb (tn-sc tn))) 'float-registers)
     (error "~S isn't a floating-point register." tn))
   (tn-offset tn))
-
-;;;(sb!disassem:set-disassem-params :instruction-alignment 32)
 
 (defvar *disassem-use-lisp-reg-names* t)
 
@@ -60,49 +65,49 @@
        (:float-status 66)
        (:ctrl-stat-reg 67)))))
 
-(defparameter reg-symbols
+(defparameter *reg-symbols*
   (map 'vector
-       #'(lambda (name)
-           (cond ((null name) nil)
-                 (t (make-symbol (concatenate 'string "$" name)))))
-       *register-names*))
+       (lambda (name)
+         (and name
+              (make-symbol (concatenate 'string "$" name))))
+       sb-vm::*register-names*))
 
-(sb!disassem:define-arg-type reg
+(define-arg-type reg
   :printer #'(lambda (value stream dstate)
                (declare (stream stream) (fixnum value))
-               (let ((regname (aref reg-symbols value)))
+               (let ((regname (aref *reg-symbols* value)))
                  (princ regname stream)
-                 (sb!disassem:maybe-note-associated-storage-ref
-                  value
-                  'registers
-                  regname
-                  dstate))))
+                 (maybe-note-associated-storage-ref
+                  value 'registers regname dstate))))
 
-(defparameter float-reg-symbols
-  #.(coerce
-     (loop for n from 0 to 31 collect (make-symbol (format nil "$F~d" n)))
-     'vector))
+(define-arg-type load-store-annotation
+  :printer (lambda (value stream dstate)
+             (declare (ignore stream))
+             (destructuring-bind (reg offset) value
+               (when (= reg sb-vm::code-offset)
+                 (note-code-constant offset dstate)))))
 
-(sb!disassem:define-arg-type fp-reg
+(defparameter *float-reg-symbols*
+  (coerce
+   (loop for n from 0 to 31 collect (make-symbol (format nil "$F~d" n)))
+   'vector))
+
+(define-arg-type fp-reg
   :printer #'(lambda (value stream dstate)
                (declare (stream stream) (fixnum value))
-               (let ((regname (aref float-reg-symbols value)))
+               (let ((regname (aref *float-reg-symbols* value)))
                  (princ regname stream)
-                 (sb!disassem:maybe-note-associated-storage-ref
-                  value
-                  'float-registers
-                  regname
-                  dstate))))
+                 (maybe-note-associated-storage-ref
+                  value 'float-registers regname dstate))))
 
-(sb!disassem:define-arg-type control-reg
-  :printer "(CR:#x~X)")
+(define-arg-type control-reg :printer "(CR:#x~X)")
 
-(sb!disassem:define-arg-type relative-label
+(define-arg-type relative-label
   :sign-extend t
   :use-label #'(lambda (value dstate)
                  (declare (type (signed-byte 16) value)
-                          (type sb!disassem:disassem-state dstate))
-                 (+ (ash (1+ value) 2) (sb!disassem:dstate-cur-addr dstate))))
+                          (type disassem-state dstate))
+                 (+ (ash (1+ value) 2) (dstate-cur-addr dstate))))
 
 (deftype float-format ()
   '(member :s :single :d :double :w :word))
@@ -113,7 +118,7 @@
     ((:d :double) 1)
     ((:w :word) 4)))
 
-(sb!disassem:define-arg-type float-format
+(define-arg-type float-format
   :printer #'(lambda (value stream dstate)
                (declare (ignore dstate)
                         (stream stream)
@@ -129,8 +134,7 @@
   '(:f :un :eq :ueq :olt :ult :ole :ule :sf :ngle :seq :ngl :lt :nge :le :ngt)
   #'equalp)
 
-(defconstant-eqx compare-kinds-vec
-  (apply #'vector compare-kinds)
+(defconstant-eqx compare-kinds-vec #.(apply #'vector compare-kinds)
   #'equalp)
 
 (deftype compare-kind ()
@@ -142,8 +146,7 @@
              kind
              compare-kinds)))
 
-(sb!disassem:define-arg-type compare-kind
-  :printer compare-kinds-vec)
+(define-arg-type compare-kind :printer compare-kinds-vec)
 
 (defconstant-eqx float-operations '(+ - * /) #'equalp)
 
@@ -161,19 +164,18 @@
              op
              float-operations)))
 
-(sb!disassem:define-arg-type float-operation
-  :printer float-operation-names)
+(define-arg-type float-operation :printer float-operation-names)
 
 
 
 ;;;; Constants used by instruction emitters.
 
-(def!constant special-op #b000000)
-(def!constant bcond-op #b000001)
-(def!constant cop0-op #b010000)
-(def!constant cop1-op #b010001)
-(def!constant cop2-op #b010010)
-(def!constant cop3-op #b010011)
+(defconstant special-op #b000000)
+(defconstant bcond-op #b000001)
+(defconstant cop0-op #b010000)
+(defconstant cop1-op #b010001)
+(defconstant cop2-op #b010010)
+(defconstant cop3-op #b010011)
 
 
 
@@ -188,22 +190,37 @@
   '(:name :tab rt (:unless (:constant 0) ", " rs) ", " immediate)
   #'equalp)
 
-(sb!disassem:define-instruction-format
-    (immediate 32 :default-printer immed-printer)
+(define-instruction-format (immediate 32 :default-printer immed-printer)
   (op :field (byte 6 26))
   (rs :field (byte 5 21) :type 'reg)
   (rt :field (byte 5 16) :type 'reg)
   (immediate :field (byte 16 0) :sign-extend t))
 
+(defconstant-eqx load-store-printer
+    '(:name :tab
+      rt ", "
+      rs
+      (:unless (:constant 0) "[" immediate "]"))
+  #'equalp)
+
+(define-instruction-format
+    (load-store 32 :default-printer '(:name :tab
+                                      rt ", "
+                                      rs
+                                      (:unless (:constant 0) "[" immediate "]")
+                                      load-store-annotation)
+                   :include immediate)
+    (load-store-annotation :fields (list (byte 5 21) (byte 16 0))
+                           :type 'load-store-annotation))
+
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defparameter jump-printer
     #'(lambda (value stream dstate)
         (let ((addr (ash value 2)))
-          (sb!disassem:maybe-note-assembler-routine addr t dstate)
+          (maybe-note-assembler-routine addr t dstate)
           (write addr :base 16 :radix t :stream stream)))))
 
-(sb!disassem:define-instruction-format
-    (jump 32 :default-printer '(:name :tab target))
+(define-instruction-format (jump 32 :default-printer '(:name :tab target))
   (op :field (byte 6 26))
   (target :field (byte 26 0) :printer jump-printer))
 
@@ -211,8 +228,7 @@
   '(:name :tab rd (:unless (:same-as rd) ", " rs) ", " rt)
   #'equalp)
 
-(sb!disassem:define-instruction-format
-    (register 32 :default-printer reg-printer)
+(define-instruction-format (register 32 :default-printer reg-printer)
   (op :field (byte 6 26))
   (rs :field (byte 5 21) :type 'reg)
   (rt :field (byte 5 16) :type 'reg)
@@ -220,7 +236,7 @@
   (shamt :field (byte 5 6) :value 0)
   (funct :field (byte 6 0)))
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (break 32 :default-printer
            '(:name :tab code (:unless (:constant 0) ", " subcode)))
   (op :field (byte 6 26) :value special-op)
@@ -228,8 +244,8 @@
   (subcode :field (byte 10 6) :reader break-subcode)
   (funct :field (byte 6 0) :value #b001101))
 
-(sb!disassem:define-instruction-format
-    (coproc-branch 32 :default-printer '(:name :tab offset))
+(define-instruction-format (coproc-branch 32
+                            :default-printer '(:name :tab offset))
   (op :field (byte 6 26))
   (funct :field (byte 10 16))
   (offset :field (byte 16 0)))
@@ -248,8 +264,7 @@
           ", " ft)
   #'equalp)
 
-(sb!disassem:define-instruction-format
-    (float 32 :default-printer float-printer)
+(define-instruction-format (float 32 :default-printer float-printer)
   (op :field (byte 6 26) :value cop1-op)
   (filler :field (byte 1 25) :value 1)
   (format :field (byte 4 21) :type 'float-format)
@@ -258,8 +273,7 @@
   (fd :field (byte 5 6) :type 'fp-reg)
   (funct :field (byte 6 0)))
 
-(sb!disassem:define-instruction-format
-    (float-aux 32 :default-printer float-printer)
+(define-instruction-format (float-aux 32 :default-printer float-printer)
   (op :field (byte 6 26) :value cop1-op)
   (filler-1 :field (byte 1 25) :value 1)
   (format :field (byte 4 21) :type 'float-format)
@@ -269,7 +283,7 @@
   (funct :field (byte 2 4))
   (sub-funct :field (byte 4 0)))
 
-(sb!disassem:define-instruction-format
+(define-instruction-format
     (float-op 32
               :include float
               :default-printer
@@ -287,9 +301,6 @@
 
 (define-bitfield-emitter emit-word 32
   (byte 32 0))
-
-(define-bitfield-emitter emit-short 16
-  (byte 16 0))
 
 (define-bitfield-emitter emit-immediate-inst 32
   (byte 6 26) (byte 5 21) (byte 5 16) (byte 16 0))
@@ -602,8 +613,8 @@
 (defun emit-relative-branch (segment opcode r1 r2 target)
   (emit-chooser
    segment 20 2
-      #'(lambda (segment posn magic-value)
-          (declare (ignore magic-value))
+      #'(lambda (segment chooser posn magic-value)
+          (declare (ignore chooser magic-value))
           (let ((delta (ash (- (label-position target) (+ posn 4)) -2)))
             (when (typep delta '(signed-byte 16))
               (emit-back-patch segment 4
@@ -1024,33 +1035,6 @@
 (define-instruction-macro entry-point ()
   nil)
 
-(defun snarf-error-junk (sap offset &optional length-only)
-  (let* ((length (sap-ref-8 sap offset))
-         (vector (make-array length :element-type '(unsigned-byte 8))))
-    (declare (type system-area-pointer sap)
-             (type (unsigned-byte 8) length)
-             (type (simple-array (unsigned-byte 8) (*)) vector))
-    (cond (length-only
-           (values 0 (1+ length) nil nil))
-          (t
-           (copy-ub8-from-system-area sap (1+ offset) vector 0 length)
-           (collect ((sc-offsets)
-                     (lengths))
-             (lengths 1)                ; the length byte
-             (let* ((index 0)
-                    (error-number (read-var-integer vector index)))
-               (lengths index)
-               (loop
-                 (when (>= index length)
-                   (return))
-                 (let ((old-index index))
-                   (sc-offsets (read-var-integer vector index))
-                   (lengths (- index old-index))))
-               (values error-number
-                       (1+ length)
-                       (sc-offsets)
-                       (lengths))))))))
-
 (defmacro break-cases (breaknum &body cases)
   (let ((bn-temp (gensym)))
     (collect ((clauses))
@@ -1061,35 +1045,28 @@
 
 (defun break-control (chunk inst stream dstate)
   (declare (ignore inst))
-  (flet ((nt (x) (if stream (sb!disassem:note x dstate))))
-    (when (= (break-code chunk dstate) 0)
-      (case (break-subcode chunk dstate)
+  (flet ((nt (x) (if stream (note x dstate))))
+    (let ((trap (break-subcode chunk dstate)))
+      (case trap
         (#.halt-trap
          (nt "Halt trap"))
         (#.pending-interrupt-trap
          (nt "Pending interrupt trap"))
-        (#.error-trap
-         (nt "Error trap")
-         (sb!disassem:handle-break-args #'snarf-error-junk stream dstate))
-        (#.cerror-trap
-         (nt "Cerror trap")
-         (sb!disassem:handle-break-args #'snarf-error-junk stream dstate))
         (#.breakpoint-trap
          (nt "Breakpoint trap"))
         (#.fun-end-breakpoint-trap
          (nt "Function end breakpoint trap"))
         (#.after-breakpoint-trap
          (nt "After breakpoint trap"))
-        (#.pseudo-atomic-trap
-         (nt "Pseudo atomic trap"))
-        (#.object-not-list-trap
-         (nt "Object not list trap"))
-        (#.object-not-instance-trap
-         (nt "Object not instance trap"))
         (#.single-step-around-trap
          (nt "Single step around trap"))
         (#.single-step-before-trap
-         (nt "Single step before trap"))))))
+         (nt "Single step before trap"))
+        (#.cerror-trap
+         (nt "Cerror trap")
+         (handle-break-args #'snarf-error-junk trap stream dstate))
+        (t
+         (handle-break-args #'snarf-error-junk trap stream dstate))))))
 
 (define-instruction break (segment code &optional (subcode 0))
   (:declare (type (unsigned-byte 10) code subcode))
@@ -1111,7 +1088,7 @@
    (emit-register-inst segment special-op 0 0 0 0 #b001110)))
 
 (define-instruction nop (segment)
-  (:printer register ((op 0) (rd 0) (rd 0) (rs 0) (funct 0)) '(:name))
+  (:printer register ((op 0) (rd 0) (rs 0) (funct 0)) '(:name))
   (:attributes flushable)
   (:delay 0)
   (:emitter
@@ -1121,20 +1098,16 @@
   (emit-word segment 0))
 
 (define-instruction word (segment word)
-  (:declare (type (or (unsigned-byte 32) (signed-byte 32)) word))
   :pinned
   (:cost 0)
   (:delay 0)
   (:emitter
-   (emit-word segment word)))
-
-(define-instruction short (segment short)
-  (:declare (type (or (unsigned-byte 16) (signed-byte 16)) short))
-  :pinned
-  (:cost 0)
-  (:delay 0)
-  (:emitter
-   (emit-short segment short)))
+   (etypecase word
+     (fixup
+      (note-fixup segment :absolute word)
+      (emit-word segment 0))
+     (integer
+      (emit-word segment word)))))
 
 (define-instruction byte (segment byte)
   (:declare (type (or (unsigned-byte 8) (signed-byte 8)) byte))
@@ -1159,21 +1132,22 @@
   (:cost 0)
   (:delay 0)
   (:emitter
-   (emit-header-data segment simple-fun-header-widetag)))
+   (emit-header-data segment simple-fun-widetag)))
 
 (define-instruction lra-header-word (segment)
   :pinned
   (:cost 0)
   (:delay 0)
   (:emitter
-   (emit-header-data segment return-pc-header-widetag)))
+   (emit-header-data segment return-pc-widetag)))
 
 
 (defun emit-compute-inst (segment vop dst src label temp calc)
   (emit-chooser
    ;; We emit either 12 or 4 bytes, so we maintain 8 byte alignments.
    segment 12 3
-   #'(lambda (segment posn delta-if-after)
+   #'(lambda (segment chooser posn delta-if-after)
+       (declare (ignore chooser))
        (let ((delta (funcall calc label posn delta-if-after)))
           (when (typep delta '(signed-byte 16))
             (emit-back-patch segment 4
@@ -1242,13 +1216,6 @@
   (emit-immediate-inst segment opcode (reg-tn-encoding reg)
                        (+ (reg-tn-encoding base) oddhack) index))
 
-(defconstant-eqx load-store-printer
-  '(:name :tab
-          rt ", "
-          rs
-          (:unless (:constant 0) "[" immediate "]"))
-  #'equalp)
-
 (define-instruction lb (segment reg base &optional (index 0))
   (:declare (type tn reg base)
             (type (or (signed-byte 16) fixup) index))
@@ -1279,7 +1246,7 @@
 (define-instruction lw (segment reg base &optional (index 0))
   (:declare (type tn reg base)
             (type (or (signed-byte 16) fixup) index))
-  (:printer immediate ((op #b100011)) load-store-printer)
+  (:printer load-store ((op #b100011)))
   (:dependencies (reads base) (reads :memory) (writes reg))
   (:delay 1)
   (:emitter

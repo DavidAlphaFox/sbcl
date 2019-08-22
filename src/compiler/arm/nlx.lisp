@@ -10,13 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
-
-;;; Make an environment-live stack TN for saving the SP for NLX entry.
-(defun make-nlx-sp-tn (env)
-  (physenv-live-tn
-   (make-representation-tn *fixnum-primitive-type* immediate-arg-scn)
-   env))
+(in-package "SB-VM")
 
 ;;; Make a TN for the argument count passing location for a
 ;;; non-local entry.
@@ -65,6 +59,16 @@
   (:results (res :scs (any-reg descriptor-reg)))
   (:generator 1
     (load-symbol-value res *binding-stack-pointer*)))
+
+(define-vop (current-nsp)
+  (:results (res :scs (any-reg descriptor-reg)))
+  (:generator 1
+    (move res nsp-tn)))
+
+(define-vop (set-nsp)
+  (:args (nsp :scs (any-reg descriptor-reg)))
+  (:generator 1
+    (move nsp-tn nsp)))
 
 ;;;; Unwind block hackery:
 
@@ -79,11 +83,11 @@
   (:temporary (:scs (interior-reg)) lip)
   (:generator 22
     (composite-immediate-instruction add block cfp-tn
-                                     (* (tn-offset tn) n-word-bytes))
+                                     (tn-byte-offset tn))
     (load-symbol-value temp *current-unwind-protect-block*)
-    (storew temp block unwind-block-current-uwp-slot)
-    (storew cfp-tn block unwind-block-current-cont-slot)
-    (storew code-tn block unwind-block-current-code-slot)
+    (storew temp block unwind-block-uwp-slot)
+    (storew cfp-tn block unwind-block-cfp-slot)
+    (storew code-tn block unwind-block-code-slot)
     (inst compute-lra temp lip entry-label)
     (storew temp block catch-block-entry-pc-slot)))
 
@@ -99,11 +103,11 @@
   (:temporary (:scs (interior-reg)) lip)
   (:generator 44
     (composite-immediate-instruction
-     add result cfp-tn (* (tn-offset tn) n-word-bytes))
+     add result cfp-tn (tn-byte-offset tn))
     (load-symbol-value temp *current-unwind-protect-block*)
-    (storew temp result catch-block-current-uwp-slot)
-    (storew cfp-tn result catch-block-current-cont-slot)
-    (storew code-tn result catch-block-current-code-slot)
+    (storew temp result catch-block-uwp-slot)
+    (storew cfp-tn result catch-block-cfp-slot)
+    (storew code-tn result catch-block-code-slot)
     (inst compute-lra temp lip entry-label)
     (storew temp result catch-block-entry-pc-slot)
 
@@ -114,15 +118,12 @@
 
     (move block result)))
 
-;;; Just set the current unwind-protect to TN's address.  This
+;;; Just set the current unwind-protect to UWP.  This
 ;;; instantiates an unwind block as an unwind-protect.
 (define-vop (set-unwind-protect)
-  (:args (tn))
-  (:temporary (:scs (descriptor-reg)) new-uwp)
+  (:args (uwp :scs (any-reg)))
   (:generator 7
-    (composite-immediate-instruction
-     add new-uwp cfp-tn (* (tn-offset tn) n-word-bytes))
-    (store-symbol-value new-uwp *current-unwind-protect-block*)))
+    (store-symbol-value uwp *current-unwind-protect-block*)))
 
 (define-vop (unlink-catch-block)
   (:temporary (:scs (any-reg)) block)
@@ -139,7 +140,7 @@
   (:translate %unwind-protect-breakup)
   (:generator 17
     (load-symbol-value block *current-unwind-protect-block*)
-    (loadw block block unwind-block-current-uwp-slot)
+    (loadw block block unwind-block-uwp-slot)
     (store-symbol-value block *current-unwind-protect-block*)))
 
 ;;;; NLX entry VOPs:
@@ -228,3 +229,56 @@
   (:generator 0
     (emit-return-pc label)
     (note-this-location vop :non-local-entry)))
+
+(define-vop (unwind-to-frame-and-call)
+  (:args (ofp :scs (descriptor-reg))
+         (uwp :scs (descriptor-reg))
+         (function :scs (descriptor-reg) :to :load :target saved-function))
+  (:arg-types system-area-pointer system-area-pointer t)
+  (:temporary (:sc unsigned-reg) temp)
+  (:temporary (:sc descriptor-reg :offset r8-offset) saved-function)
+  (:temporary (:sc unsigned-reg :offset r0-offset) block)
+  (:temporary (:sc descriptor-reg :offset lexenv-offset) lexenv)
+  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc descriptor-reg :offset nargs-offset) nargs)
+  (:vop-var vop)
+  (:generator 22
+    (let ((uwp-label (gen-label))
+          (entry-label (gen-label)))
+      ;; Store the function into a non-stack location, since we'll be
+      ;; unwinding the stack and destroying register contents before we
+      ;; use it.  It turns out that R8 is preserved as part of the
+      ;; normal multiple-value handling of an unwind, so use that.
+      (move saved-function function)
+
+      ;; Allocate space for magic UWP block.
+      (load-csp block)
+      (inst add temp block (* unwind-block-size n-word-bytes))
+      (store-csp temp)
+
+      ;; Set up magic catch / UWP block.
+
+      (loadw temp uwp sap-pointer-slot other-pointer-lowtag)
+      (storew temp block unwind-block-uwp-slot)
+      (loadw temp ofp sap-pointer-slot other-pointer-lowtag)
+      (storew temp block unwind-block-cfp-slot)
+      ;; Don't need to save code at unwind-block-code-slot since
+      ;; it's not going to be used and will be overwritten after the
+      ;; function call
+
+      (inst compute-lra temp lip entry-label)
+      (storew temp block catch-block-entry-pc-slot)
+
+      ;; Run any required UWPs.
+      (assemble (:elsewhere vop)
+        (emit-label uwp-label)
+        (inst word (make-fixup 'unwind :assembly-routine)))
+      (inst load-from-label pc-tn lr-tn uwp-label)
+
+      (emit-return-pc ENTRY-LABEL)
+      (inst mov nargs 0)
+
+      (move lexenv saved-function)
+
+      (loadw saved-function lexenv closure-fun-slot fun-pointer-lowtag)
+      (lisp-jump saved-function))))

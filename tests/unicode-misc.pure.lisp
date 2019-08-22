@@ -11,7 +11,7 @@
 
 #+sb-unicode
 (with-test (:name (:unicode-casing)
-                  :skipped-on '(not :sb-unicode))
+                  :skipped-on (not :sb-unicode))
   (labels ((str (&rest chars)
              (coerce chars 'string))
            (test-fn (fn locale pairs)
@@ -57,7 +57,16 @@
   (assert (sb-unicode:confusable-p "l0" "1O"))
   (assert (sb-unicode:confusable-p "\"" "''"))
   (assert (not (sb-unicode:confusable-p "a" "A")))
+  (assert (not (sb-unicode:confusable-p "" "<")))
   #+sb-unicode
   (assert (sb-unicode:confusable-p
            (coerce '(#\a #\COMBINING_RING_ABOVE) 'string)
            (string #\LATIN_SMALL_LETTER_A_WITH_RING_ABOVE))))
+
+(with-test (:name :normalize-dispalced)
+  (assert (equal (sb-unicode:normalize-string
+                  (make-array 3 :element-type 'character
+                                :displaced-to "abcd"
+                                :displaced-index-offset 1
+                                :fill-pointer 2) :nfc)
+                 "bc")))

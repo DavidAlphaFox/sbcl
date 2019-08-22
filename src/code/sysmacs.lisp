@@ -9,31 +9,30 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
-;;;; these are initialized in cold init
+;;;; these are initialized by create_thread_struct()
 
-(!defvar *in-without-gcing* nil)
-(!defvar *gc-inhibit* t)
+(defvar *in-without-gcing*)
+(defvar *gc-inhibit*)
 
 ;;; When the dynamic usage increases beyond this amount, the system
 ;;; notes that a garbage collection needs to occur by setting
 ;;; *GC-PENDING* to T. It starts out as NIL meaning nobody has figured
 ;;; out what it should be yet.
-(!defvar *gc-pending* nil)
+(defvar *gc-pending*)
 
-#!+sb-thread
-(!defvar *stop-for-gc-pending* nil)
+#+sb-thread
+(defvar *stop-for-gc-pending*)
 
 ;;; This one is initialized by the runtime, at thread creation.  On
 ;;; non-x86oid gencgc targets, this is a per-thread list of objects
 ;;; which must not be moved during GC.  It is frobbed by the code for
 ;;; with-pinned-objects in src/compiler/target/macros.lisp.
-#!+(and gencgc (not (or x86 x86-64)))
-(defvar sb!vm::*pinned-objects*)
+#+(and gencgc (not (or x86 x86-64)))
+(defvar sb-vm::*pinned-objects*)
 
 (defmacro without-gcing (&body body)
-  #!+sb-doc
   "Executes the forms in the body without doing a garbage collection. It
 inhibits both automatically and explicitly triggered collections. Finally,
 upon leaving the BODY if gc is not inhibited it runs the pending gc.
@@ -69,8 +68,8 @@ maintained."
                ;; is a pending gc or stop-for-gc.
                (when (or *interrupt-pending*
                          *gc-pending*
-                         #!+sb-thread *stop-for-gc-pending*)
-                 (sb!unix::receive-pending-interrupt))))))))
+                         #+sb-thread *stop-for-gc-pending*)
+                 (sb-unix::receive-pending-interrupt))))))))
 
 ;;; EOF-OR-LOSE is a useful macro that handles EOF.
 (defmacro eof-or-lose (stream eof-error-p eof-value)
@@ -80,20 +79,18 @@ maintained."
 
 ;;; These macros handle the special cases of T and NIL for input and
 ;;; output streams.
-;;; It is unfortunate that the names connote synonym-streams being involved.
-;;; Perhaps {IN,OUT}-STREAM-FROM-DESIGNATOR would have been better.
-;;; And shouldn't the high-security feature check that if either NIL or T
-;;; is given, the designated stream has the right directionality?
-;;; Nothing prevents *TERMINAL-IO* from being bound to an output-only stream.
+;;; FIXME: should we kill the high-security feature? Or, if enabled,
+;;; ensure that the designated stream has the right directionality?
+;;; (Nothing prevents *TERMINAL-IO* from being bound to an output-only stream, e.g.)
 ;;;
 ;;; FIXME: Shouldn't these be functions instead of macros?
-(defmacro in-synonym-of (stream)
+(defmacro in-stream-from-designator (stream)
   (let ((svar (gensym)))
     `(let ((,svar ,stream))
        (cond ((null ,svar) *standard-input*)
              ((eq ,svar t) *terminal-io*)
              (t
-                #!+high-security
+                #+high-security
                 (unless (input-stream-p ,svar)
                   (error 'simple-type-error
                          :datum ,svar
@@ -112,13 +109,13 @@ maintained."
               ((t) '*terminal-io*)
               (t (return x))))))
 |#
-(defmacro out-synonym-of (stream)
+(defmacro out-stream-from-designator (stream)
   (let ((svar (gensym)))
     `(let ((,svar ,stream))
        (cond ((null ,svar) *standard-output*)
              ((eq ,svar t) *terminal-io*)
              (t
-                #!+high-security
+                #+high-security
                 (unless (output-stream-p ,svar)
                   (error 'simple-type-error
                          :datum ,svar
@@ -131,7 +128,7 @@ maintained."
 ;;; STREAM with the ARGS for ANSI-STREAMs, or the FUNCTION with the
 ;;; ARGS for FUNDAMENTAL-STREAMs.
 (defmacro with-in-stream (stream (slot &rest args) &optional stream-dispatch)
-  `(let ((stream (in-synonym-of ,stream)))
+  `(let ((stream (in-stream-from-designator ,stream)))
     ,(if stream-dispatch
          `(if (ansi-stream-p stream)
               (funcall (,slot stream) stream ,@args)
@@ -140,7 +137,7 @@ maintained."
                        `(,function stream ,@args)))))
          `(funcall (,slot stream) stream ,@args))))
 
-(defmacro with-out-stream/no-synonym (stream (slot &rest args) &optional stream-dispatch)
+(defmacro %with-out-stream (stream (slot &rest args) &optional stream-dispatch)
   `(let ((stream ,stream))
     ,(if stream-dispatch
          `(if (ansi-stream-p stream)
@@ -151,8 +148,9 @@ maintained."
          `(funcall (,slot stream) stream ,@args))))
 
 (defmacro with-out-stream (stream (slot &rest args) &optional stream-dispatch)
-  `(with-out-stream/no-synonym (out-synonym-of ,stream)
-    (,slot ,@args) ,stream-dispatch))
+  `(%with-out-stream (out-stream-from-designator ,stream)
+                     (,slot ,@args)
+                     ,stream-dispatch))
 
 
 ;;;; These are hacks to make the reader win.
@@ -163,19 +161,29 @@ maintained."
 ;;;
 ;;; KLUDGE: Some functions (e.g. ANSI-STREAM-READ-LINE) use these variables
 ;;; directly, instead of indirecting through FAST-READ-CHAR.
+;;; When ANSI-STREAM-INPUT-CHAR-POS is non-null, we take care to update it,
+;;; but not for each character of input.
 (defmacro prepare-for-fast-read-char (stream &body forms)
   `(let* ((%frc-stream% ,stream)
           (%frc-method% (ansi-stream-in %frc-stream%))
           (%frc-buffer% (ansi-stream-cin-buffer %frc-stream%))
           (%frc-index% (ansi-stream-in-index %frc-stream%)))
-     (declare (type index %frc-index%)
+     (declare (type (mod ,(1+ +ansi-stream-in-buffer-length+)) %frc-index%)
               (type ansi-stream %frc-stream%))
      ,@forms))
 
 ;;; This macro must be called after one is done with FAST-READ-CHAR
 ;;; inside its scope to decache the ANSI-STREAM-IN-INDEX.
+;;; To keep the amount of code injected by FAST-READ-CHAR as small as possible,
+;;; we avoid bumping the absolute stream position counter at each character.
+;;; When finished looping, one extra function call takes care of that.
+;;; If buffer refills occurred within FAST-READ-CHAR, the refill logic
+;;; similarly scans the cin-buffer before placing anything new into it.
 (defmacro done-with-fast-read-char ()
-  `(setf (ansi-stream-in-index %frc-stream%) %frc-index%))
+  `(progn
+     (when (ansi-stream-input-char-pos %frc-stream%)
+       (update-input-char-pos %frc-stream% %frc-index%))
+     (setf (ansi-stream-in-index %frc-stream%) %frc-index%)))
 
 ;;; a macro with the same calling convention as READ-CHAR, to be used
 ;;; within the scope of a PREPARE-FOR-FAST-READ-CHAR.
@@ -184,20 +192,22 @@ maintained."
 ;;; because it's either going to yield a character or signal EOF.
 (defmacro fast-read-char (&optional (eof-error-p t) (eof-value ()))
   (let ((result
-         `(cond
-            ((not %frc-buffer%)
-             (funcall %frc-method% %frc-stream% ,eof-error-p ,eof-value))
-            ((= %frc-index% +ansi-stream-in-buffer-length+)
-             (multiple-value-bind (eof-p index-or-value)
-                 (fast-read-char-refill %frc-stream% ,eof-error-p ,eof-value)
-               (if eof-p
-                   index-or-value
-                   (progn
-                     (setq %frc-index% (1+ (truly-the index index-or-value)))
-                     (aref %frc-buffer% index-or-value)))))
-            (t
-             (prog1 (aref %frc-buffer% %frc-index%)
-               (incf %frc-index%))))))
+         `(if (not %frc-buffer%)
+              (funcall %frc-method% %frc-stream% ,eof-error-p ,eof-value)
+              (block nil
+                (when (= %frc-index% +ansi-stream-in-buffer-length+)
+                  (let ((index-or-nil
+                         (fast-read-char-refill %frc-stream% ,eof-error-p)))
+                    ,@(unless (eq eof-error-p 't)
+                        `((when (null index-or-nil)
+                            (return ,eof-value))))
+                    (setq %frc-index%
+                          (truly-the (mod ,+ansi-stream-in-buffer-length+)
+                                     index-or-nil))))
+                (prog1 (aref %frc-buffer%
+                             (truly-the (mod ,+ansi-stream-in-buffer-length+)
+                                        %frc-index%))
+                  (incf %frc-index%))))))
     (cond ((eq eof-error-p 't)
            `(truly-the character ,result))
           ((and (symbolp eof-value) (constantp eof-value)
@@ -227,27 +237,25 @@ maintained."
                 (type index ,f-index))
        (declare (disable-package-locks fast-read-byte))
        (flet ((fast-read-byte ()
-                  (,@(cond ((equal '(unsigned-byte 8) type)
-                            ;; KLUDGE: For some reason I haven't tracked down
-                            ;; this makes a difference even in given the TRULY-THE.
-                            `(logand #xff))
-                           (t
-                            `(identity)))
-                   (truly-the ,type
-                              (cond
-                                ((not ,f-buffer)
-                                 (funcall ,f-method ,f-stream ,eof-p ,eof-val))
-                                ((= ,f-index +ansi-stream-in-buffer-length+)
-                                 (prog1 (fast-read-byte-refill ,f-stream ,eof-p ,eof-val)
-                                   (setq ,f-index (ansi-stream-in-index ,f-stream))))
-                                (t
-                                 (prog1 (aref ,f-buffer ,f-index)
-                                   (incf ,f-index))))))))
+                (,@(cond ((equal '(unsigned-byte 8) type)
+                          ;; KLUDGE: For some reason I haven't tracked down
+                          ;; this makes a difference even in given the TRULY-THE.
+                          `(logand #xff))
+                         (t
+                          `(identity)))
+                 (truly-the ,type
+                            (cond
+                              ((not ,f-buffer)
+                               (funcall ,f-method ,f-stream ,eof-p ,eof-val))
+                              ((< ,f-index (length ,f-buffer))
+                               (prog1 (aref ,f-buffer ,f-index)
+                                 (setf (ansi-stream-in-index ,f-stream) (incf ,f-index))))
+                              (t
+                               (prog1 (fast-read-byte-refill ,f-stream ,eof-p ,eof-val)
+                                 (setq ,f-index (ansi-stream-in-index ,f-stream)))))))))
          (declare (inline fast-read-byte))
-         (declare (enable-package-locks read-byte))
-         (unwind-protect
-              (locally ,@body)
-           (setf (ansi-stream-in-index ,f-stream) ,f-index))))))
+         (declare (enable-package-locks fast-read-byte))
+         (locally ,@body)))))
 
 ;; This is an internal-use-only macro.
 (defmacro do-rest-arg (((var &optional index-var) rest-var
@@ -255,11 +263,11 @@ maintained."
                        &body body)
   ;; If the &REST arg never needs to be reified, this is slightly quicker
   ;; than using a DX list.
-  (let ((index (sb!xc:gensym "INDEX")))
+  (let ((index (sb-xc:gensym "INDEX")))
     `(let ((,index ,start))
        (loop
         (cond ((< (truly-the index ,index) (length ,rest-var))
-               (let ((,var (sb!c::fast-&rest-nth ,index ,rest-var))
+               (let ((,var (fast-&rest-nth ,index ,rest-var))
                      ,@(if index-var `((,index-var ,index))))
                  ,@body)
                (incf ,index))

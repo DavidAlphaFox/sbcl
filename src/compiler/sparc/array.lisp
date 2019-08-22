@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; allocator for the array header.
 (define-vop (make-array-header)
@@ -24,7 +24,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 0
     (pseudo-atomic ()
-      (inst add ndescr rank (+ (* (1+ array-dimensions-offset) n-word-bytes)
+      (inst add ndescr rank (+ (* array-dimensions-offset n-word-bytes)
                                lowtag-mask))
       (inst andn ndescr lowtag-mask)
       (allocation header ndescr other-pointer-lowtag :temp-tn gencgc-temp)
@@ -66,17 +66,16 @@
   (:policy :fast-safe)
   (:args (array :scs (descriptor-reg))
          (bound :scs (any-reg descriptor-reg))
-         (index :scs (any-reg descriptor-reg) :target result))
-  (:results (result :scs (any-reg descriptor-reg)))
+         (index :scs (any-reg descriptor-reg)))
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 5
     (let ((error (generate-error-code vop 'invalid-array-index-error
                                       array bound index)))
+      (%test-fixnum index nil error t)
       (inst cmp index bound)
       (inst b :geu error)
-      (inst nop)
-      (move result index))))
+      (inst nop))))
 
 ;;;; Accessors/Setters
 
@@ -107,7 +106,7 @@
 
   (def-data-vector-frobs simple-base-string byte-index
     character character-reg)
-  #!+sb-unicode
+  #+sb-unicode
   (def-data-vector-frobs simple-character-string word-index
     character character-reg)
   (def-data-vector-frobs simple-vector word-index
@@ -362,7 +361,7 @@
     (unless (location= result value)
       (move-double-reg result value))))
 
-#!+long-float
+#+long-float
 (define-vop (data-vector-ref/simple-array-long-float)
   (:note "inline array access")
   (:translate data-vector-ref)
@@ -379,7 +378,7 @@
                         other-pointer-lowtag))
     (load-long-reg value object offset nil)))
 
-#!+long-float
+#+long-float
 (define-vop (data-vector-set/simple-array-long-float)
   (:note "inline array store")
   (:translate data-vector-set)
@@ -540,7 +539,7 @@
       (unless (location= result-imag value-imag)
         (move-double-reg result-imag value-imag)))))
 
-#!+long-float
+#+long-float
 (define-vop (data-vector-ref/simple-array-complex-long-float)
   (:note "inline array access")
   (:translate data-vector-ref)
@@ -561,7 +560,7 @@
       (inst add offset (* 4 n-word-bytes))
       (load-long-reg imag-tn object offset nil))))
 
-#!+long-float
+#+long-float
 (define-vop (data-vector-set/simple-array-complex-long-float)
   (:note "inline array store")
   (:translate data-vector-set)

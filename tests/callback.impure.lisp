@@ -25,9 +25,18 @@
 (defvar *thunk*
   (sb-alien::alien-callback (function c-string) #'thunk))
 
-(assert (equal (with-output-to-string (*standard-output*)
-                 (alien-funcall *thunk*))
-               "hi"))
+(with-test (:name (:callback :c-string)
+            ;; The whole file is broken, report one test
+            ;; and skip the rest.
+            :broken-on :interpreter)
+  (assert (equal (with-output-to-string (*standard-output*)
+                   (alien-funcall *thunk*))
+                 "hi")))
+
+;; WITH-ALIEN is broken when interpreted, e.g.
+;; (with-alien ((x int 10)) x), see lp#992362, lp#1731556
+(when (eq sb-ext:*evaluator-mode* :interpret)
+  (invoke-restart 'run-tests::skip-file))
 
 ;;; simple callback for a symbol
 
@@ -202,6 +211,8 @@
     (sb-alien:unsigned-int . "ui")
     ((sb-alien:integer 64) . "l")
     ((sb-alien:unsigned 64) . "ul")
+    (sb-alien:long-long . "ll")
+    (sb-alien:unsigned-long-long . "ull")
     (sb-alien:float . "f")
     (sb-alien:double . "d")))
 
@@ -415,10 +426,30 @@
 
 (with-test (:name :define-float-double-callback)
   (define-callback-adder double float double))
-(with-test (:name :call-double-float-callback)
+(with-test (:name :call-float-double-callback)
   (assert (= (alien-funcall *add-f-d* 1.0s0 2.0d0) 3.0d0)))
 
 (with-test (:name :define-double-float-int-callback)
   (define-callback-adder double double float int))
 (with-test (:name :call-double-float-int-callback)
   (assert (= (alien-funcall *add-d-f-i* 2.0d0 1.0s0 1) 4.0d0)))
+
+(with-test (:name :define-float-float-double-callback)
+  (define-callback-adder double float float double))
+(with-test (:name :call-float-float-double-callback)
+  (assert (= (alien-funcall *add-f-f-d* 2.0s0 1.0s0 3.0d0) 6.0d0)))
+
+(with-test (:name :define-int-float-double-callback)
+  (define-callback-adder double int float double))
+(with-test (:name :call-int-float-double-callback)
+  (assert (= (alien-funcall *add-i-f-d* 1 1.0s0 2.0d0) 4.0d0)))
+
+(with-test (:name :define-int-ulonglong-callback)
+  (define-callback-adder unsigned-long-long int unsigned-long-long))
+(with-test (:name :call-int-ulonglong-callback)
+  (assert (= (alien-funcall *add-i-ull* 1 #x200000003) #x200000004)))
+
+(with-test (:name :define-int-int-int-int-int-ulonglong-callback)
+  (define-callback-adder unsigned-long-long int int int int int unsigned-long-long))
+(with-test (:name :call-int-int-int-int-int-ulonglong-callback)
+  (assert (= (alien-funcall *add-i-i-i-i-i-ull* 0 0 0 0 1 #x200000003) #x200000004)))

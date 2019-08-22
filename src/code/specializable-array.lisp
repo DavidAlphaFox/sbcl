@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 ;;; ANSI doesn't guarantee the existence of specialized vectors
 ;;; other than T, BIT, CHARACTER.
@@ -36,7 +36,7 @@
 ;;; Therefore a host-reflection-based mechanism would be almost certain to fail.
 
 ;;; In case anyone wants to rewrite this yet again, here's an alternate way
-;;; that was deemed unworkable: in cross-compilation, all specialized arrays
+;;; that was deemed elegant but difficult: in cross-compilation, all arrays
 ;;; were wrapped in an XC-ARRAY-WRAPPER struct consisting of one slot for
 ;;; the desired element-type and one slot with the real array.  All affected
 ;;; uses of AREF and (SETF AREF) had to be macroized so that the cross-compiler
@@ -48,35 +48,44 @@
 ;;; as could bounds-checks (ARRAY-DIMENSION). This technique led to confusing
 ;;; code within the compiler and was abandoned in favor of the hashtable.
 
-#-sb-xc-host
-;; The target code is trivial
-(defmacro !make-specialized-array (length element-type &optional contents)
-  `(make-array ,length :element-type ,element-type
-               ,@(if contents `(:initial-contents ,contents))))
+;; Use this only for array specializations that are not required by ANSI.
+;; Because this is not performance-critical, we can just punt to a function.
+;; If no contents given, explicitly 0-fill in case element-type upgrades to T
+;; and would get a default of NIL where we would use 0 in our specialization.
+(defun sb-xc:make-array (dims &key (element-type (missing-arg))
+                                   (initial-contents nil contentsp)
+                                   (initial-element 0))
+  ;; ECL fails to compile MAKE-ARRAY when keyword args are not literal keywords. e.g.:
+  ;; (DEFUN TRY (DIMS SELECT VAL)
+  ;;   (MAKE-ARRAY DIMS (IF SELECT :INITIAL-CONTENTS :INITIAL-ELEMENT) VAL)) ->
+  ;; "The macro form (MAKE-ARRAY DIMS (IF SELECT :INITIAL-CONTENTS :INITIAL-ELEMENT) VAL)
+  ;;  was not expanded successfully.
+  ;;  Error detected:
+  ;;  The key (IF SELECT :INITIAL-CONTENTS :INITIAL-ELEMENT) is not allowed"
+  #+host-quirks-ecl (declare (notinline cl:make-array))
 
-#+sb-xc-host
-(progn
-  ;; Use this only for array specializations that are not required by ANSI.
-  (defmacro !make-specialized-array (length element-type &optional contents)
-    (once-only ((et element-type))
-      `(register-specialized-array
-        (make-array ,length :element-type ,et
-                    ,@(if contents
-                          `(:initial-contents ,contents)
-                          ;; Initialize in case it upgrades to (ARRAY T)
-                          ;; and gets filled with NIL where SBCL would 0-fill.
-                          `(:initial-element 0)))
-        ,et)))
-  (defun !coerce-to-specialized (data element-type)
-    (register-specialized-array (coerce data `(simple-array ,element-type 1))
-                                element-type))
-  ;; The specialized array registry has file-wide scope. Hacking that aspect
-  ;; into the xc build scaffold seemed preferable to hacking the compiler.
-  (defun register-specialized-array (array element-type)
+  ;; Expressed type must be _exactly_ one of the supported ones.
+  (assert (and element-type
+               (find (case element-type
+                       #-sb-unicode
+                       (base-char 'character)
+                       (t element-type))
+                     sb-vm:*specialized-array-element-type-properties*
+                     :key #'sb-vm::saetp-specifier :test 'equal)
+               (neq element-type 't)))
+  (let ((array (cl:make-array dims
+                              :element-type element-type
+                              (if contentsp :initial-contents :initial-element)
+                              (if contentsp initial-contents initial-element))))
     (setf (gethash array sb-cold::*array-to-specialization*) element-type)
-    array)
-  (defun !specialized-array-element-type (array)
-    (cond ((gethash array sb-cold::*array-to-specialization*))
-          ((bit-vector-p array) 'bit)
-          ((stringp array) 'base-char)
-          (t t))))
+    array))
+(defun sb-xc:array-element-type (array)
+  (cond ((gethash array sb-cold::*array-to-specialization*))
+        ((bit-vector-p array) 'bit)
+        ((stringp array) 'base-char)
+        (t t)))
+
+(defun target-specialized-array-p (array)
+  (gethash array sb-cold::*array-to-specialization*))
+(deftype sb-xc:simple-vector ()
+  '(and cl:simple-vector (not (satisfies target-specialized-array-p))))

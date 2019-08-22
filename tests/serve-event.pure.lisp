@@ -11,7 +11,11 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package sb-impl)
+#+os-provides-poll
+(import '(sb-impl::make-handler
+          sb-impl::handler-descriptor
+          sb-impl::handler-bogus
+          sb-impl::compute-pollfds))
 
 ;; Tests for SERVE-EVENT are somewhat lacking,
 ;; although RUN-PROGRAM exercises some multiplexed I/O.
@@ -38,15 +42,15 @@
            (run-test (&rest list)
              (sb-int:binding* (((fds1 map1) (try list nil))
                                ((fds2 map2) (try list t)))
-               (format t "~&~D handlers, ~D descriptors, ~D non-bogus
-~:{(~D #b~b)~:^ ~}~%~S~%"
-                       (length list)
-                       (length (remove-duplicates
-                                list :key #'handler-descriptor))
-                       (length (remove-duplicates
-                                (remove-if #'handler-bogus list)
-                                :key #'handler-descriptor))
-                       fds1 map1)
+               #+(or) (format t "~&~D handlers, ~D descriptors, ~D non-bogus~@
+                                 ~:{(~D #b~b)~:^ ~}~%~S~%"
+                              (length list)
+                              (length (remove-duplicates
+                                       list :key #'handler-descriptor))
+                              (length (remove-duplicates
+                                       (remove-if #'handler-bogus list)
+                                       :key #'handler-descriptor))
+                              fds1 map1)
                (loop for handler in list
                      for handler-index from 0
                      for fd-index = (svref map1 handler-index)

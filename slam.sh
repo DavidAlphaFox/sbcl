@@ -64,6 +64,12 @@ set -e
 # recommended way to make that happen.
 #######################################################################
 
+warm_option=""
+if [ "$1" == --load ]; then
+    warm_option="--load"
+    shift
+fi
+
 HOST_TYPE="${1:-sbcl}"
 
 echo //HOST_TYPE=\"$HOST_TYPE\"
@@ -106,7 +112,7 @@ export SBCL_XC_HOST
 . ./find-gnumake.sh
 find_gnumake
 
-sh make-target-1.sh
+$GNUMAKE -C src/runtime all
 
 # Instead of doing the full make-host-2.sh, we (1) use after-xc.core
 # to rebuild only obviously-out-of-date Lisp files, then (2) run
@@ -123,7 +129,7 @@ EOF
 #
 sh make-genesis-2.sh
 
-sh make-target-2.sh
+sh make-target-2.sh "$warm_option"
 
 echo //ordinary termination of slam.sh
 date

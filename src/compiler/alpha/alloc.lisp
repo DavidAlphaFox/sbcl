@@ -9,14 +9,14 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; LIST and LIST*
 (define-vop (list-or-list*)
   (:args (things :more t))
-  (:temporary (:scs (descriptor-reg) :type list) ptr)
+  (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (descriptor-reg)) temp)
-  (:temporary (:scs (descriptor-reg) :type list :to (:result 0) :target result)
+  (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
   (:info num)
   (:results (result :scs (descriptor-reg)))
@@ -76,33 +76,6 @@
 
 ;;;; special purpose inline allocators
 
-(define-vop (allocate-code-object)
-  (:args (boxed-arg :scs (any-reg))
-         (unboxed-arg :scs (any-reg)))
-  (:results (result :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) ndescr)
-  (:temporary (:scs (any-reg) :from (:argument 0)) boxed)
-  (:temporary (:scs (non-descriptor-reg)) unboxed)
-  (:generator 100
-    (inst li (lognot lowtag-mask) ndescr)
-    (inst lda boxed (fixnumize (1+ code-constants-offset)) boxed-arg)
-    (inst and boxed ndescr boxed)
-    (inst srl unboxed-arg word-shift unboxed)
-    (inst lda unboxed lowtag-mask unboxed)
-    (inst and unboxed ndescr unboxed)
-    (inst sll boxed (- n-widetag-bits word-shift) ndescr)
-    (inst bis ndescr code-header-widetag ndescr)
-
-    (pseudo-atomic ()
-      (inst bis alloc-tn other-pointer-lowtag result)
-      (storew ndescr result 0 other-pointer-lowtag)
-      (storew unboxed-arg result code-code-size-slot other-pointer-lowtag)
-      (storew null-tn result code-entry-points-slot other-pointer-lowtag)
-      (inst addq alloc-tn boxed alloc-tn)
-      (inst addq alloc-tn unboxed alloc-tn))
-
-    (storew null-tn result code-debug-info-slot other-pointer-lowtag)))
-
 (define-vop (make-fdefn)
   (:policy :fast-safe)
   (:translate make-fdefn)
@@ -113,19 +86,20 @@
     (with-fixed-allocation (result temp fdefn-widetag fdefn-size)
       (storew name result fdefn-name-slot other-pointer-lowtag)
       (storew null-tn result fdefn-fun-slot other-pointer-lowtag)
-      (inst li (make-fixup "undefined_tramp" :foreign) temp)
+      (inst li (make-fixup 'undefined-tramp :assembly-routine) temp)
       (storew temp result fdefn-raw-addr-slot other-pointer-lowtag))))
 
 (define-vop (make-closure)
   (:args (function :to :save :scs (descriptor-reg)))
-  (:info length stack-allocate-p)
+  (:info label length stack-allocate-p)
+  (:ignore label)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:results (result :scs (descriptor-reg)))
   (:generator 10
     (let* ((size (+ length closure-info-offset))
            (alloc-size (pad-data-block size)))
       (inst li
-            (logior (ash (1- size) n-widetag-bits) closure-header-widetag)
+            (logior (ash (1- size) n-widetag-bits) closure-widetag)
             temp)
       (pseudo-atomic (:extra (if stack-allocate-p 0 alloc-size))
         (cond (stack-allocate-p
@@ -146,7 +120,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 10
     (with-fixed-allocation
-        (result temp value-cell-header-widetag value-cell-size)
+        (result temp value-cell-widetag value-cell-size)
       (storew value result value-cell-value-slot other-pointer-lowtag))))
 
 ;;;; automatic allocators for primitive objects
@@ -161,17 +135,24 @@
   (:args)
   (:results (result :scs (any-reg)))
   (:generator 1
-    (inst li (make-fixup "funcallable_instance_tramp" :foreign) result)))
+    (inst li (make-fixup 'funcallable-instance-tramp :assembly-routine) result)))
 
 (define-vop (fixed-alloc)
   (:args)
   (:info name words type lowtag stack-allocate-p)
-  (:ignore name stack-allocate-p)
+  (:ignore name)
   (:results (result :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:generator 4
-    (pseudo-atomic (:extra (pad-data-block words))
-      (inst bis alloc-tn lowtag result)
+     (pseudo-atomic (:extra (if stack-allocate-p
+                                0
+                                (pad-data-block words)))
+      (cond (stack-allocate-p
+             (align-csp result)
+             (inst bis csp-tn lowtag result)
+             (inst addq csp-tn (pad-data-block words) csp-tn))
+            (t
+             (inst bis alloc-tn lowtag result)))
       (when type
         (inst li (logior (ash (1- words) n-widetag-bits) type) temp)
         (storew temp result 0 lowtag)))))
@@ -187,9 +168,14 @@
   (:generator 6
     (inst lda bytes (* (1+ words) n-word-bytes) extra)
     (inst sll bytes (- n-widetag-bits 2) header)
-    (inst lda header (+ (ash -2 n-widetag-bits) type) header)
-    (inst srl bytes n-lowtag-bits bytes)
-    (inst sll bytes n-lowtag-bits bytes)
+    ;; The specified EXTRA value is the exact value placed in the header
+    ;; as the word count when allocating code.
+    (cond ((= type code-header-widetag)
+           (inst lda header type header))
+          (t
+           (inst lda header (+ (ash -2 n-widetag-bits) type) header)
+           (inst srl bytes n-lowtag-bits bytes)
+           (inst sll bytes n-lowtag-bits bytes)))
     (pseudo-atomic ()
       (inst bis alloc-tn lowtag result)
       (storew header result 0 lowtag)

@@ -9,16 +9,14 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package "CL-USER")
-
 (with-test (:name (coerce complex :numeric-types))
   (labels ((function/optimized (type rationalp)
-             (compile nil `(lambda (input)
-                             (ignore-errors
-                               (the ,(if rationalp
-                                         `(or ,type rational)
-                                         type)
-                                    (coerce input ',type))))))
+             (checked-compile `(lambda (input)
+                                 (ignore-errors
+                                  (the ,(if rationalp
+                                            `(or ,type rational)
+                                            type)
+                                       (coerce input ',type))))))
            (function/unoptimized (type)
              (lambda (input)
                (ignore-errors (coerce input type))))
@@ -115,3 +113,27 @@
       (eval `(defun ,foo () 5))
       (setf (sb-int:info :function :kind foo) :macro)
       (assert (functionp (coerce-it foo))))))
+
+(with-test (:name :no-coerce-macro-to-function)
+  ;; When compiled, we actually just pass the FDEFN-FUN
+  ;; of the FDEFN of AND even though AND is a standard macro
+  ;; (making this particularly stupid).
+  ;; But at least it's generally an improvement
+  ;; to fail earlier than later in many cases.
+  (multiple-value-bind (fun failure-p warnings)
+      (checked-compile '(lambda ()
+                         (locally (declare (notinline sort))
+                           (sort () #'< :key 'and)))
+                       :allow-warnings t)
+    (declare (ignore failure-p))
+    (assert (= 1 (length warnings)))
+    (assert-error (funcall fun))))
+
+(with-test (:name :coerce-float-to-float)
+  (checked-compile-and-assert
+      ()
+      '(lambda (f)
+        (coerce f 'float))
+    ((10) 10.0)
+    ((1/2) 0.5)
+    ((30d0) 30d0)))

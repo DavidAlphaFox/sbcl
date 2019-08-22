@@ -14,8 +14,6 @@ Examples:
  (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp)
 ")))
 
-(defparameter *inet-address-any* (vector 0 0 0 0))
-
 (defun address-numbers/v4 (address)
   (coerce address 'list))
 
@@ -99,11 +97,12 @@ Examples:
 (defmethod size-of-sockaddr ((socket inet-socket))
   sockint::size-of-sockaddr-in)
 
-(defmethod bits-of-sockaddr ((socket inet-socket) sockaddr)
+(defmethod bits-of-sockaddr ((socket inet-socket) sockaddr &optional size)
   "Returns address and port of SOCKADDR as multiple values"
   (declare (type (sb-alien:alien
                   (* (sb-alien:struct sb-bsd-sockets-internal::sockaddr-in)))
-                 sockaddr))
+                 sockaddr)
+           (ignore size))
   (let ((vector (make-array 4 :element-type '(unsigned-byte 8))))
     (loop for i below 4
           do (setf (aref vector i)
@@ -114,5 +113,9 @@ Examples:
         (sb-alien:deref (sockint::sockaddr-in-port sockaddr) 1)))))
 
 (defun make-inet-socket (type protocol)
-  "Make an INET socket.  Deprecated in favour of make-instance"
+  "Make an INET socket."
   (make-instance 'inet-socket :type type :protocol protocol))
+
+(declaim (sb-ext:deprecated
+          :late ("SBCL" "1.2.15")
+          (function make-inet-socket :replacement make-instance)))

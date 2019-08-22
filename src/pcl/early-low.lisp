@@ -26,23 +26,18 @@
 
 (in-package "SB-PCL")
 
-(/show "starting early-low.lisp")
+(declaim (type (member nil early braid complete) **boot-state**))
+(define-load-time-global **boot-state** nil)
+
 
-;;; FIXME: The PCL package is internal and is used by code in potential
-;;; bottlenecks. Access to it might be faster through #.(find-package "SB-PCL")
-;;; than through *PCL-PACKAGE*. And since it's internal, no one should be
+;;; The PCL package is internal and is used by code in potential
+;;; bottlenecks. And since it's internal, no one should be
 ;;; doing things like deleting and recreating it in a running target Lisp.
-;;; So perhaps we should replace it uses of *PCL-PACKAGE* with uses of
-;;; (PCL-PACKAGE), and make PCL-PACKAGE a macro which expands into
-;;; the SB-PCL package itself. Maybe we should even use this trick for
-;;; COMMON-LISP and KEYWORD, too. (And the definition of PCL-PACKAGE etc.
-;;; could be made less viciously brittle when SB-FLUID.)
-;;; (Or perhaps just define a macro
-;;;   (DEFMACRO PKG (NAME)
-;;;     #-SB-FLUID (FIND-PACKAGE NAME)
-;;;     #+SB-FLUID `(FIND-PACKAGE ,NAME))
-;;; and use that to replace all three variables.)
-(defvar *pcl-package*                (find-package "SB-PCL"))
+(define-symbol-macro *pcl-package* #.(find-package "SB-PCL"))
+
+(declaim (inline class-classoid))
+(defun class-classoid (class)
+  (layout-classoid (class-wrapper class)))
 
 (declaim (inline defstruct-classoid-p))
 (defun defstruct-classoid-p (classoid)
@@ -67,68 +62,33 @@
 ;;; Symbol contruction utilities
 (defun format-symbol (package format-string &rest format-arguments)
   (without-package-locks
-   (intern (apply #'format nil format-string format-arguments) package)))
-
-(defun make-class-symbol (class-name)
-  (format-symbol *pcl-package* "*THE-CLASS-~A*" (symbol-name class-name)))
-
-(defun make-wrapper-symbol (class-name)
-  (format-symbol *pcl-package* "*THE-WRAPPER-~A*" (symbol-name class-name)))
+   (intern (possibly-base-stringize
+            (apply #'format nil format-string format-arguments))
+           package)))
 
 (defun condition-type-p (type)
   (and (symbolp type)
        (condition-classoid-p (find-classoid type nil))))
 
-(declaim (special *the-class-t*
-                  *the-class-vector* *the-class-symbol*
-                  *the-class-string* *the-class-sequence*
-                  *the-class-rational* *the-class-ratio*
-                  *the-class-number* *the-class-null* *the-class-list*
-                  *the-class-integer* *the-class-float* *the-class-cons*
-                  *the-class-complex* *the-class-character*
-                  *the-class-bit-vector* *the-class-array*
-                  *the-class-stream* *the-class-file-stream*
-                  *the-class-string-stream*
+;;;; PCL instances
 
-                  *the-class-slot-object*
-                  *the-class-structure-object*
-                  *the-class-standard-object*
-                  *the-class-funcallable-standard-object*
-                  *the-class-class*
-                  *the-class-generic-function*
-                  *the-class-system-class*
-                  *the-class-built-in-class*
-                  *the-class-slot-class*
-                  *the-class-condition-class*
-                  *the-class-structure-class*
-                  *the-class-std-class*
-                  *the-class-standard-class*
-                  *the-class-funcallable-standard-class*
-                  *the-class-forward-referenced-class*
-                  *the-class-method*
-                  *the-class-standard-method*
-                  *the-class-standard-reader-method*
-                  *the-class-standard-writer-method*
-                  *the-class-standard-boundp-method*
-                  *the-class-global-reader-method*
-                  *the-class-global-writer-method*
-                  *the-class-global-boundp-method*
-                  *the-class-standard-generic-function*
-                  *the-class-standard-direct-slot-definition*
-                  *the-class-standard-effective-slot-definition*
-                  *the-class-standard-specializer*
+(sb-kernel::!defstruct-with-alternate-metaclass standard-instance
+  ;; KLUDGE: arm64 needs to have CAS-HEADER-DATA-HIGH implemented
+  :slot-names (slots #-(and compact-instance-header x86-64) hash-code)
+  :constructor %make-standard-instance
+  :superclass-name t
+  :metaclass-name static-classoid
+  :metaclass-constructor make-static-classoid
+  :dd-type structure)
 
-                  *the-eslotd-standard-class-slots*
-                  *the-eslotd-funcallable-standard-class-slots*))
-
-(declaim (special *the-wrapper-of-t*
-                  *the-wrapper-of-vector* *the-wrapper-of-symbol*
-                  *the-wrapper-of-string* *the-wrapper-of-sequence*
-                  *the-wrapper-of-rational* *the-wrapper-of-ratio*
-                  *the-wrapper-of-number* *the-wrapper-of-null*
-                  *the-wrapper-of-list* *the-wrapper-of-integer*
-                  *the-wrapper-of-float* *the-wrapper-of-cons*
-                  *the-wrapper-of-complex* *the-wrapper-of-character*
-                  *the-wrapper-of-bit-vector* *the-wrapper-of-array*))
-
-(/show "finished with early-low.lisp")
+;;; Note: for x8-64 with #+immobile-code there are 2 additional raw slots which
+;;; hold machine instructions to load the funcallable-instance-fun and jump to
+;;; it, so that funcallable-instances can act like simple-funs, in as much as
+;;; there's an address you can jump to without loading a register.
+(sb-kernel::!defstruct-with-alternate-metaclass standard-funcallable-instance
+  :slot-names (clos-slots #-compact-instance-header hash-code)
+  :constructor %make-standard-funcallable-instance
+  :superclass-name function
+  :metaclass-name static-classoid
+  :metaclass-constructor make-static-classoid
+  :dd-type funcallable-structure)

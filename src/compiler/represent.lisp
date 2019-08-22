@@ -13,7 +13,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; error routines
 ;;;;
@@ -43,7 +43,7 @@
                   (values arg-p
                           (+ n
                              (or (position-in #'tn-ref-across ref refs)
-                                 (error "couldn't find REF?"))
+                                 (error "Couldn't find REF?"))
                              1)
                           t
                           more-cost
@@ -80,7 +80,7 @@
 (defun listify-restrictions (restr)
   (declare (type sc-vector restr))
   (collect ((res))
-    (dotimes (i sc-number-limit)
+    (dotimes (i sb-vm:sc-number-limit)
       (when (eq (svref restr i) t)
         (res (svref *backend-sc-numbers* i))))
     (res)))
@@ -132,7 +132,7 @@
       (collect ((load-lose)
                 (no-move-scs)
                 (move-lose))
-        (dotimes (i sc-number-limit)
+        (dotimes (i sb-vm:sc-number-limit)
           (let ((i-sc (svref *backend-sc-numbers* i)))
             (when (eq (svref load-scs i) t)
               (cond ((not (sc-allowed-by-primitive-type i-sc ptype))
@@ -185,9 +185,9 @@
 ;;;; We do some checking of the consistency of the VM definition at
 ;;;; load time.
 
-;;; FIXME: should probably be conditional on #!+SB-SHOW
+;;; FIXME: should probably be conditional on #+SB-SHOW
 (defun check-move-fun-consistency ()
-  (dotimes (i sc-number-limit)
+  (dotimes (i sb-vm:sc-number-limit)
     (let ((sc (svref *backend-sc-numbers* i)))
       (when sc
         (let ((moves (sc-move-funs sc)))
@@ -214,8 +214,8 @@
 ;;; ignore TYPE-CHECK-ERROR because we don't want the possibility of
 ;;; error to bias the result. Notes are suppressed for T-C-E as well,
 ;;; since we don't need to worry about the efficiency of that case.
-(defparameter *ignore-cost-vops* '(set type-check-error))
-(defparameter *suppress-note-vops* '(type-check-error))
+(define-load-time-global *ignore-cost-vops* '(set type-check-error))
+(define-load-time-global *suppress-note-vops* '(type-check-error))
 
 ;;; We special-case the move VOP, since using this costs for the
 ;;; normal MOVE would spuriously encourage descriptor representations.
@@ -224,9 +224,9 @@
 ;;; look at the other operand. If its representation has already been
 ;;; chosen (e.g. if it is wired), then we use the appropriate move
 ;;; costs, otherwise we just ignore the references.
-(defun add-representation-costs (refs scs costs
-                                      ops-slot costs-slot more-costs-slot
-                                      write-p)
+(defun add-representation-costs (tn refs scs costs
+                                 ops-slot costs-slot more-costs-slot
+                                 write-p)
   (declare (type function ops-slot costs-slot more-costs-slot))
   (do ((ref refs (tn-ref-next ref)))
       ((null ref))
@@ -238,7 +238,8 @@
                  (incf (svref costs scn) res)))))
       (let* ((vop (tn-ref-vop ref))
              (info (vop-info vop)))
-        (unless (find (vop-info-name info) *ignore-cost-vops*)
+        (unless (and (neq (tn-kind tn) :constant)
+                     (find (vop-info-name info) *ignore-cost-vops*))
           (case (vop-info-name info)
             (move
              (let ((rep (tn-sc
@@ -277,21 +278,21 @@
 ;;; value is returned which is true when the selection is unique which
 ;;; is often not the case for the MOVE VOP.
 (defun select-tn-representation (tn scs costs)
-  (declare (type tn tn) (type sc-vector costs)
-           (inline add-representation-costs))
+  (declare (type tn tn) (type sc-vector costs))
   (dolist (scn scs)
     (setf (svref costs scn) 0))
 
-  (add-representation-costs (tn-reads tn) scs costs
+  (add-representation-costs tn (tn-reads tn) scs costs
                             #'vop-args #'vop-info-arg-costs
                             #'vop-info-more-arg-costs
                             nil)
-  (add-representation-costs (tn-writes tn) scs costs
+  (add-representation-costs tn (tn-writes tn) scs costs
                             #'vop-results #'vop-info-result-costs
                             #'vop-info-more-result-costs
                             t)
 
-  (let ((min most-positive-fixnum)
+
+  (let ((min sb-xc:most-positive-fixnum)
         (min-scn nil)
         (unique nil))
     (dolist (scn scs)
@@ -302,7 +303,7 @@
                (setq min cost)
                (setq min-scn scn)
                (setq unique t)))))
-    (values (svref *backend-sc-numbers* min-scn) unique)))
+    (values min-scn unique)))
 
 ;;; Prepare for the possibility of a TN being allocated on the number
 ;;; stack by setting NUMBER-STACK-P in all functions that TN is
@@ -393,7 +394,7 @@
 ;;; whichever operand makes more sense, without worrying about which
 ;;; operand has the type info.
 (defun find-move-vop (op-tn write-p other-sc other-ptype slot)
-  (declare (type tn op-tn) (type sc other-sc)
+  (declare (type tn op-tn) (type storage-class other-sc)
            (type primitive-type other-ptype)
            (type function slot))
   (let* ((op-sc (tn-sc op-tn))
@@ -447,34 +448,40 @@
          (vop (tn-ref-vop op))
          (node (vop-node vop))
          (block (vop-block vop)))
-    (flet ((check-sc (scn sc)
-             (when (sc-allowed-by-primitive-type sc ptype)
-               (let ((res (find-move-vop op-tn write-p sc ptype
-                                         #'sc-move-vops)))
-                 (when res
-                   (when (>= (vop-info-cost res)
-                             *efficiency-note-cost-threshold*)
-                     (maybe-emit-coerce-efficiency-note res op dest-tn))
-                   (let ((temp (make-representation-tn ptype scn)))
-                     (change-tn-ref-tn op temp)
-                     (cond
-                       ((not write-p)
-                        (emit-move-template node block res op-tn temp before))
-                       ((and (null (tn-reads op-tn))
-                             (eq (tn-kind op-tn) :normal)))
-                       (t
-                        (emit-move-template node block res temp op-tn
-                                            before))))
-                   t)))))
+    (labels ((emit-move (vop x y)
+               (when (>= (vop-info-cost vop)
+                         *efficiency-note-cost-threshold*)
+                 (maybe-emit-coerce-efficiency-note vop op dest-tn))
+               (emit-move-template node block vop x y before))
+             (check-sc (scn sc)
+               (when (sc-allowed-by-primitive-type sc ptype)
+                 (let ((res (find-move-vop op-tn write-p sc ptype
+                                           #'sc-move-vops)))
+                   (when res
+                     (let ((temp (make-representation-tn ptype scn)))
+                       (change-tn-ref-tn op temp)
+                       (cond
+                         ((not write-p)
+                          (emit-move (or (maybe-move-from-fixnum+-1 op-tn temp
+                                                                    op)
+                                         res)
+                                     op-tn temp))
+                         ((and (null (tn-reads op-tn))
+                               (eq (tn-kind op-tn) :normal)))
+                         (t
+                          (emit-move (or (maybe-move-from-fixnum+-1 temp op-tn op)
+                                         res)
+                                     temp op-tn))))
+                     t)))))
       ;; Search the non-stack load SCs first.
-      (dotimes (scn sc-number-limit)
+      (dotimes (scn sb-vm:sc-number-limit)
         (let ((sc (svref *backend-sc-numbers* scn)))
           (when (and (eq (svref scs scn) t)
                      (not (eq (sb-kind (sc-sb sc)) :unbounded))
                      (check-sc scn sc))
             (return-from emit-coerce-vop))))
       ;; Search the stack SCs if the above failed.
-      (dotimes (scn sc-number-limit (bad-coerce-error op))
+      (dotimes (scn sb-vm:sc-number-limit (bad-coerce-error op))
         (let ((sc (svref *backend-sc-numbers* scn)))
           (when (and (eq (svref scs scn) t)
                      (eq (sb-kind (sc-sb sc)) :unbounded)
@@ -486,16 +493,17 @@
 ;;; specified VOP. Dest-TN is the destination TN if we are doing a
 ;;; move or move-arg, and is NIL otherwise. This is only used for
 ;;; efficiency notes.
-#!-sb-fluid (declaim (inline coerce-some-operands))
 (defun coerce-some-operands (ops dest-tn load-scs before)
   (declare (type (or tn-ref null) ops) (list load-scs)
            (type (or tn null) dest-tn) (type (or vop null) before))
   (do ((op ops (tn-ref-across op))
        (scs load-scs (cdr scs)))
       ((null scs))
-    (unless (svref (car scs)
-                   (sc-number (tn-sc (tn-ref-tn op))))
-      (emit-coerce-vop op dest-tn (car scs) before)))
+    (let ((tn (tn-ref-tn op)))
+      (unless (or (eq (tn-kind tn) :unused)
+                  (svref (car scs)
+                         (sc-number (tn-sc tn))))
+        (emit-coerce-vop op dest-tn (car scs) before))))
   (values))
 
 ;;; Emit coerce VOPs for the args and results, as needed.
@@ -573,6 +581,21 @@
                                 after)))))
   (values))
 
+(defun maybe-move-from-fixnum+-1 (x y &optional x-tn-ref)
+  (when (and (sc-is y sb-vm::descriptor-reg)
+             (sc-is x sb-vm::signed-reg sb-vm::unsigned-reg))
+    (let ((type (tn-ref-type x-tn-ref)))
+      (cond ((not type)
+             nil)
+            ((csubtypep type
+                        (specifier-type `(integer ,sb-xc:most-negative-fixnum
+                                                  ,(1+ sb-xc:most-positive-fixnum))))
+             (template-or-lose 'sb-vm::move-from-fixnum+1))
+            ((csubtypep type
+                        (specifier-type `(integer ,(1- sb-xc:most-negative-fixnum)
+                                                  ,sb-xc:most-positive-fixnum)))
+             (template-or-lose 'sb-vm::move-from-fixnum-1))))))
+
 ;;; Scan the IR2 looking for move operations that need to be replaced
 ;;; with special-case VOPs and emitting coercion VOPs for operands of
 ;;; normal VOPs. We delete moves to TNs that are never read at this
@@ -587,33 +610,38 @@
           (node (vop-node vop))
           (block (vop-block vop)))
       (cond
-       ((eq (vop-info-name info) 'move)
-        (let* ((args (vop-args vop))
-               (x (tn-ref-tn args))
-               (y (tn-ref-tn (vop-results vop)))
-               (res (find-move-vop x nil (tn-sc y) (tn-primitive-type y)
-                                   #'sc-move-vops)))
-          (cond ((and (null (tn-reads y))
-                      (eq (tn-kind y) :normal))
-                 (delete-vop vop))
-                ((eq res info))
-                (res
-                 (when (>= (vop-info-cost res)
-                           *efficiency-note-cost-threshold*)
-                   (maybe-emit-coerce-efficiency-note res args y))
-                 (emit-move-template node block res x y vop)
-                 (delete-vop vop))
-                (t
-                 (coerce-vop-operands vop)))))
-       ((vop-info-move-args info)
-        (emit-arg-moves vop))
-       (t
-        (coerce-vop-operands vop))))))
+        ((eq (vop-info-name info) 'move)
+         (let* ((args (vop-args vop))
+                (x (tn-ref-tn args))
+                (y (tn-ref-tn (vop-results vop)))
+                (res (find-move-vop x nil (tn-sc y) (tn-primitive-type y)
+                                    #'sc-move-vops)))
+
+           (cond ((and (null (tn-reads y))
+                       (eq (tn-kind y) :normal))
+                  (delete-vop vop))
+                 ((eq res info))
+                 (res
+
+                  (let ((res (or (maybe-move-from-fixnum+-1 x y
+                                                            args)
+                                 res)))
+                    (when (>= (vop-info-cost res)
+                              *efficiency-note-cost-threshold*)
+                      (maybe-emit-coerce-efficiency-note res args y))
+                    (emit-move-template node block res x y vop)
+                    (delete-vop vop)))
+                 (t
+                  (coerce-vop-operands vop)))))
+        ((vop-info-move-args info)
+         (emit-arg-moves vop))
+        (t
+         (coerce-vop-operands vop))))))
 
 ;;; If TN is in a number stack SC, make all the right annotations.
 ;;; Note that this should be called after TN has been referenced,
 ;;; since it must iterate over the referencing environments.
-#!-sb-fluid (declaim (inline note-if-number-stack))
+#-sb-fluid (declaim (inline note-if-number-stack))
 (defun note-if-number-stack (tn 2comp restricted)
   (declare (type tn tn) (type ir2-component 2comp))
   (when (if restricted
@@ -635,36 +663,46 @@
 ;;; allocated. This must be done last, since references in new
 ;;; environments may be introduced by MOVE-ARG insertion.
 (defun select-representations (component)
-  (let ((costs (make-array sc-number-limit))
+  (let ((costs (make-array sb-vm:sc-number-limit))
         (2comp (component-info component)))
+    (labels ((set-sc (tn sc)
+               (cond ((not (eq (tn-kind tn) :constant))
+                      (setf (tn-sc tn)
+                            (svref *backend-sc-numbers* sc)))
+                     ;; Translate primitive type scs into constant scs
+                     ((= sc sb-vm::descriptor-reg-sc-number)
+                      (setf (tn-sc tn)
+                            (svref *backend-sc-numbers* sb-vm:constant-sc-number)
+                            (tn-offset tn)
+                            (or (position (tn-leaf tn)
+                                          (ir2-component-constants 2comp))
+                                (vector-push-extend (tn-leaf tn)
+                                                    (ir2-component-constants 2comp)))))
+                     (t
+                      (setf (tn-sc tn)
+                            (svref *backend-sc-numbers*
+                                   (immediate-constant-sc (constant-value (tn-leaf tn))))))))
+             (possible-scs (tn)
+               (primitive-type-scs (tn-primitive-type tn)))
+             (pass (tn &key unique)
+               (do ((tn tn (tn-next tn)))
+                   ((null tn))
+                 (aver (tn-primitive-type tn))
+                 (unless (tn-sc tn)
+                   (let ((scs (possible-scs tn)))
+                     (cond ((rest scs)
+                            (multiple-value-bind (sc uniquep)
+                                (select-tn-representation tn scs costs)
+                              (when (or (not unique)
+                                        uniquep)
+                                (set-sc tn sc))))
+                           (t
+                            (set-sc tn (first scs)))))))))
 
-    ;; First pass; only allocate SCs where there is a distinct choice.
-    (do ((tn (ir2-component-normal-tns 2comp)
-             (tn-next tn)))
-        ((null tn))
-      (aver (tn-primitive-type tn))
-      (unless (tn-sc tn)
-        (let* ((scs (primitive-type-scs (tn-primitive-type tn))))
-          (cond ((rest scs)
-                 (multiple-value-bind (sc unique)
-                     (select-tn-representation tn scs costs)
-                   (when unique
-                      (setf (tn-sc tn) sc))))
-                (t
-                 (setf (tn-sc tn)
-                       (svref *backend-sc-numbers* (first scs))))))))
-
-    (do ((tn (ir2-component-normal-tns 2comp)
-             (tn-next tn)))
-        ((null tn))
-      (aver (tn-primitive-type tn))
-      (unless (tn-sc tn)
-        (let* ((scs (primitive-type-scs (tn-primitive-type tn)))
-               (sc (if (rest scs)
-                       (select-tn-representation tn scs costs)
-                       (svref *backend-sc-numbers* (first scs)))))
-          (aver sc)
-          (setf (tn-sc tn) sc))))
+      ;; First pass; only allocate SCs where there is a distinct choice.
+      (pass (ir2-component-normal-tns 2comp) :unique t)
+      (pass (ir2-component-normal-tns 2comp))
+      (pass (ir2-component-constant-tns 2comp)))
 
     (do ((alias (ir2-component-alias-tns 2comp)
                 (tn-next alias)))
@@ -681,5 +719,4 @@
       (frob ir2-component-normal-tns nil)
       (frob ir2-component-wired-tns t)
       (frob ir2-component-restricted-tns t)))
-
   (values))

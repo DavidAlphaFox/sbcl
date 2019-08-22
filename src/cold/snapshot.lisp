@@ -115,6 +115,9 @@
                       *compile-file-pathname*
                       *load-truename*
                       *load-pathname*
+                      ;; READ might get altered
+                      read
+                      read-preserving-whitespace
                       ;; These change because CMU CL uses them as internal
                       ;; variables:
                       ,@'
@@ -134,10 +137,7 @@
                              cl::*load-symbol-buffer*
                              cl::*load-symbol-buffer-size*
                              cl::in-index
-                             cl::in-buffer
-                             ;; These two are changed by PURIFY.
-                             cl::*static-space-free-pointer*
-                             cl::*static-space-end-pointer*)
+                             cl::in-buffer)
                       ))
       (setf (gethash symbol result) t))
     result))
@@ -149,7 +149,6 @@
 ;;; Note: The warnings from this code were somewhat useful when first setting
 ;;; up the cross-compilation system, have a rather low signal/noise ratio in
 ;;; the mature system. They can generally be safely ignored.
-#!+sb-show
 (progn
   (defun cl-snapshot-diff (cl-snapshot)
     (remove-if (lambda (entry)

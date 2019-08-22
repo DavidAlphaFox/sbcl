@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Data object ref/set stuff.
 
@@ -31,7 +31,9 @@
   (:generator 1
     (storew value object offset lowtag)))
 
-(define-vop (init-slot set-slot))
+(define-vop (init-slot set-slot)
+  (:info name dx-p offset lowtag)
+  (:ignore name dx-p))
 
 ;;;; Symbol hacking VOPs:
 
@@ -54,7 +56,7 @@
 ;;; Symbol-Value of NIL is NIL.
 ;;;
 (define-vop (symbol-value checked-cell-ref)
-  (:translate symbol-value)
+  (:translate symeval)
   (:generator 9
     (move obj-temp object)
     (loadw value obj-temp symbol-value-slot other-pointer-lowtag)
@@ -80,7 +82,7 @@
 (define-vop (fast-symbol-value cell-ref)
   (:variant symbol-value-slot other-pointer-lowtag)
   (:policy :fast)
-  (:translate symbol-value))
+  (:translate symeval))
 
 (define-vop (symbol-hash)
   (:policy :fast-safe)
@@ -100,9 +102,9 @@
 ;;; On unithreaded builds these are just copies of the non-global versions.
 (define-vop (%set-symbol-global-value set))
 (define-vop (symbol-global-value symbol-value)
-  (:translate symbol-global-value))
+  (:translate sym-global-val))
 (define-vop (fast-symbol-global-value fast-symbol-value)
-  (:translate symbol-global-value))
+  (:translate sym-global-val))
 
 ;;;; Fdefinition (fdefn) objects.
 
@@ -110,6 +112,8 @@
   (:variant fdefn-fun-slot other-pointer-lowtag))
 
 (define-vop (safe-fdefn-fun)
+  (:translate safe-fdefn-fun)
+  (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :target obj-temp))
   (:results (value :scs (descriptor-reg any-reg)))
   (:vop-var vop)
@@ -132,11 +136,11 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 38
     (let ((closure-tramp-fixup (gen-label)))
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label closure-tramp-fixup)
-        (inst word (make-fixup "closure_tramp" :foreign)))
+        (inst word (make-fixup 'closure-tramp :assembly-routine)))
       (load-type type function (- fun-pointer-lowtag))
-      (inst cmp type simple-fun-header-widetag)
+      (inst cmp type simple-fun-widetag)
       (inst mov :eq lip function)
       (inst load-from-label :ne lip lip closure-tramp-fixup)
       (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)
@@ -152,9 +156,9 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 38
     (let ((undefined-tramp-fixup (gen-label)))
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label undefined-tramp-fixup)
-        (inst word (make-fixup "undefined_tramp" :foreign)))
+        (inst word (make-fixup 'undefined-tramp :assembly-routine)))
       (storew null-tn fdefn fdefn-fun-slot other-pointer-lowtag)
       (inst load-from-label temp lip undefined-tramp-fixup)
       (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)
@@ -168,7 +172,7 @@
 ;;; the symbol on the binding stack and stuff the new value into the
 ;;; symbol.
 
-(define-vop (bind)
+(define-vop (dynbind)
   (:args (val :scs (any-reg descriptor-reg))
          (symbol :scs (descriptor-reg)))
   (:temporary (:scs (descriptor-reg)) value-temp)
@@ -238,11 +242,19 @@
   funcallable-instance-info-offset fun-pointer-lowtag
   (descriptor-reg any-reg) * %funcallable-instance-info)
 
-(define-vop (closure-ref slot-ref)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-ref)
+  (:args (object :scs (descriptor-reg)))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (loadw value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
-(define-vop (closure-init slot-set)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-init)
+  (:args (object :scs (descriptor-reg))
+         (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (storew value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 (define-vop (closure-init-from-fp)
   (:args (object :scs (descriptor-reg)))
@@ -289,20 +301,15 @@
 
 (macrolet
     ((define-raw-slot-vops (name ref-inst set-inst value-primtype value-sc
-                                 &key (width 1) use-lip (move-macro 'move))
+                                 &key use-lip (move-macro 'move))
        (labels ((emit-generator (instruction move-result)
-                  `((loadw offset object 0 instance-pointer-lowtag)
-                    (inst mov offset (lsr offset n-widetag-bits))
-                    (inst rsb offset index (lsl offset n-fixnum-tag-bits))
-                    (inst sub offset offset (+ (* (- ,width
-                                                     instance-slots-offset)
-                                                  n-word-bytes)
-                                               instance-pointer-lowtag))
-                    ,@(when use-lip
-                        '((inst add lip object offset)))
-                    (inst ,instruction value ,(if use-lip
-                                                  '(@ lip)
-                                                  '(@ object offset)))
+                  `((inst add offset index
+                          (- (* instance-slots-offset n-word-bytes)
+                             instance-pointer-lowtag))
+                    ,@(if use-lip
+                          `((inst add lip object offset)
+                            (inst ,instruction value (@ lip)))
+                          `((inst ,instruction value (@ object offset))))
                     ,@(when move-result
                         `((,move-macro result value))))))
          (let ((ref-vop (symbolicate "RAW-INSTANCE-REF/" name))
@@ -332,11 +339,12 @@
                 ,@(when use-lip '((:temporary (:scs (interior-reg)) lip)))
                 (:generator 5 ,@(emit-generator set-inst t))))))))
   (define-raw-slot-vops word ldr str unsigned-num unsigned-reg)
+  (define-raw-slot-vops signed-word ldr str signed-num signed-reg)
   (define-raw-slot-vops single flds fsts single-float single-reg
                         :use-lip t :move-macro move-single)
   (define-raw-slot-vops double fldd fstd double-float double-reg
-                        :use-lip t :width 2 :move-macro move-double)
+                        :use-lip t :move-macro move-double)
   (define-raw-slot-vops complex-single load-complex-single store-complex-single complex-single-float complex-single-reg
-                        :use-lip t :width 2 :move-macro move-complex-single)
+                        :use-lip t :move-macro move-complex-single)
   (define-raw-slot-vops complex-double load-complex-double store-complex-double complex-double-float complex-double-reg
-                        :use-lip t :width 4 :move-macro move-complex-double))
+                        :use-lip t :move-macro move-complex-double))

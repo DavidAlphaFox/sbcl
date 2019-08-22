@@ -11,7 +11,7 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_TAGNAMES
-#define SBCL_GENESIS_TAGNAMES 1
+#define SBCL_GENESIS_TAGNAMES
 
 static const char *lowtag_names[] = {
     "even fixnum",
@@ -32,7 +32,7 @@ static const char *lowtag_names[] = {
     "other pointer"
 };
 
-static const char *widetag_names[] = {
+const char *widetag_names[] = {
     "unknown [0]",
     "unknown [1]",
     "unknown [2]",
@@ -45,22 +45,22 @@ static const char *widetag_names[] = {
     "complex single float",
     "complex double float",
     "code header",
-    "simple fun header",
-    "closure header",
-    "funcallable instance header",
-    "return pc header",
-    "value cell header",
-    "symbol header",
+    "simple fun",
+    "closure",
+    "funcallable instance",
+    "unknown [15]",
+    "value cell",
+    "symbol",
     "character",
     "sap",
     "unbound marker",
     "weak pointer",
-    "instance header",
+    "instance",
     "fdefn",
     "no tls value marker",
     "simd pack",
-    "unknown [26]",
-    "unknown [27]",
+    "simd pack 256",
+    "filler",
     "unknown [28]",
     "unknown [29]",
     "unknown [30]",
@@ -98,7 +98,34 @@ static const char *widetag_names[] = {
     "complex vector",
     "complex array"
 };
-
-static unsigned char unprintable_array_types[32] = 
- {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,32,32,32,32,32,32,32,32,2,32,2,32,0,0,32,0};
-#endif /* SBCL_GENESIS_TAGNAMES */
+static char *symbol_slots[] = {
+ "value: ", "hash: ", "info: ", "name: ", "package: ", NULL
+};
+static char *ratio_slots[] = {
+ "numerator: ", "denominator: ", NULL
+};
+static char *complex_slots[] = {
+ "real: ", "imag: ", NULL
+};
+static char *code_slots[] = {
+ "boxed_size: ", "debug_info: ", "fixups: ", NULL
+};
+static char *simple_fun_slots[] = {
+ "self: ", NULL
+};
+static char *closure_slots[] = {
+ "fun: ", NULL
+};
+static char *funcallable_instance_slots[] = {
+ "trampoline: ", "function: ", NULL
+};
+static char *weak_pointer_slots[] = {
+ "value: ", "next: ", NULL
+};
+static char *fdefn_slots[] = {
+ "name: ", "fun: ", "raw_addr: ", NULL
+};
+static char *value_cell_slots[] = {
+ "value: ", NULL
+};
+#endif

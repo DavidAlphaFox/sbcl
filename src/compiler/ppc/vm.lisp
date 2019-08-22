@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; NUMBER-STACK-DISPLACEMENT
 ;;;
@@ -17,9 +17,9 @@
 ;;; slots are required by architecture, mostly (?) to make C backtrace
 ;;; work. This must be a power of 2 - see BYTES-REQUIRED-FOR-NUMBER-STACK.
 ;;;
-(def!constant number-stack-displacement
-  (* #!-darwin 2
-     #!+darwin 8
+(defconstant number-stack-displacement
+  (* #-darwin 2
+     #+darwin 8
      n-word-bytes))
 
 ;;;; Define the registers
@@ -30,7 +30,7 @@
 (macrolet ((defreg (name offset)
                (let ((offset-sym (symbolicate name "-OFFSET")))
                  `(eval-when (:compile-toplevel :load-toplevel :execute)
-                   (def!constant ,offset-sym ,offset)
+                   (defconstant ,offset-sym ,offset)
                    (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
 
            (defregset (name &rest regs)
@@ -49,15 +49,15 @@
   (defreg nl4 7)
   (defreg nl5 8)
   (defreg nl6 9)
-  (defreg fdefn 10)                     ; was nl7
+  (defreg fdefn 10)
   (defreg nargs 11)
   ;; FIXME: some kind of comment here would be nice.
   ;;
   ;; FIXME II: this also reveals the need to autogenerate lispregs.h
-  #!+darwin  (defreg cfunc 12)
-  #!-darwin  (defreg nfp 12)
-  #!+darwin  (defreg nfp 13)
-  #!-darwin  (defreg cfunc 13)
+  #+darwin  (defreg cfunc 12)
+  #-darwin  (defreg nfp 12)
+  #+darwin  (defreg nfp 13)
+  #-darwin  (defreg cfunc 13)
   (defreg bsp 14)
   (defreg cfp 15)
   (defreg csp 16)
@@ -74,14 +74,20 @@
   (defreg a3 27)
   (defreg l0 28)
   (defreg l1 29)
-  (defreg #!-sb-thread l2 #!+sb-thread thread 30)
+  (defreg #-sb-thread l2 #+sb-thread thread 30)
   (defreg lip 31)
 
   (defregset non-descriptor-regs
-      nl0 nl1 nl2 nl3 nl4 nl5 nl6 #+nil nl7 cfunc nargs nfp)
+      nl0 nl1 nl2 nl3 nl4 nl5 nl6 cfunc nargs nfp)
 
   (defregset descriptor-regs
-      fdefn a0 a1 a2 a3  ocfp lra cname lexenv l0 l1 #!-sb-thread l2 )
+      fdefn a0 a1 a2 a3  ocfp lra cname lexenv l0 l1 #-sb-thread l2 )
+
+  ;; OAOOM: Same as runtime/ppc-lispregs.h
+  (defregset boxed-regs
+      fdefn code cname lexenv ocfp lra
+      a0 a1 a2 a3
+      l0 l1 #-sb-thread l2 #+sb-thread thread)
 
 
  (defregset *register-arg-offsets*  a0 a1 a2 a3)
@@ -91,34 +97,16 @@
 
 ;;;; SB and SC definition:
 
+(!define-storage-bases
 (define-storage-base registers :finite :size 32)
 (define-storage-base float-registers :finite :size 32)
 (define-storage-base control-stack :unbounded :size 8)
 (define-storage-base non-descriptor-stack :unbounded :size 0)
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
+)
 
-;;;
-;;; Handy macro so we don't have to keep changing all the numbers whenever
-;;; we insert a new storage class.
-;;;
-(defmacro define-storage-classes (&rest classes)
-  (do ((forms (list 'progn)
-              (let* ((class (car classes))
-                     (sc-name (car class))
-                     (constant-name (intern (concatenate 'simple-string
-                                                         (string sc-name)
-                                                         "-SC-NUMBER"))))
-                (list* `(define-storage-class ,sc-name ,index
-                          ,@(cdr class))
-                       `(def!constant ,constant-name ,index)
-                       forms)))
-       (index 0 (1+ index))
-       (classes classes (cdr classes)))
-      ((null classes)
-       (nreverse forms))))
-
-(define-storage-classes
+(!define-storage-classes
 
   ;; Non-immediate contstants in the constant pool
   (constant constant)
@@ -240,8 +228,8 @@
    :save-p t
    :alternate-scs (complex-double-stack))
 
-  ;; A catch or unwind block.
-  (catch-block control-stack :element-size catch-block-size))
+  (catch-block control-stack :element-size catch-block-size)
+  (unwind-block control-stack :element-size unwind-block-size))
 
 ;;;; Make some random tns for important registers.
 
@@ -273,46 +261,37 @@
 (defun immediate-constant-sc (value)
   (typecase value
     ((integer 0 0)
-     (sc-number-or-lose 'zero))
+     zero-sc-number)
     (null
-     (sc-number-or-lose 'null))
-    ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
+     null-sc-number)
+    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
          character)
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
     (symbol
      (if (static-symbol-p value)
-         (sc-number-or-lose 'immediate)
+         immediate-sc-number
          nil))))
 
 (defun boxed-immediate-sc-p (sc)
-  (or (eql sc (sc-number-or-lose 'zero))
-      (eql sc (sc-number-or-lose 'null))
-      (eql sc (sc-number-or-lose 'immediate))))
-
-;;; A predicate to see if a character can be used as an inline
-;;; constant (the immediate field in the instruction used is sixteen
-;;; bits wide, which is not the same as any defined subtype of
-;;; CHARACTER).
-(defun inlinable-character-constant-p (char)
-  (and (characterp char)
-       (< (char-code char) #x10000)))
+  (or (eql sc zero-sc-number)
+      (eql sc null-sc-number)
+      (eql sc immediate-sc-number)))
 
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values
-(def!constant register-arg-scn (sc-number-or-lose 'descriptor-reg))
-(def!constant immediate-arg-scn (sc-number-or-lose 'any-reg))
-(def!constant control-stack-arg-scn (sc-number-or-lose 'control-stack))
+(defconstant immediate-arg-scn any-reg-sc-number)
+(defconstant control-stack-arg-scn control-stack-sc-number)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
 ;;; offsets of special stack frame locations
-(def!constant ocfp-save-offset 0)
-(def!constant lra-save-offset 1)
-(def!constant nfp-save-offset 2)
+(defconstant ocfp-save-offset 0)
+(defconstant lra-save-offset 1)
+(defconstant nfp-save-offset 2)
 
 ;;; the number of arguments/return values passed in registers
-(def!constant register-arg-count 4)
+(defconstant register-arg-count 4)
 
 ;;; names to use for the argument registers
 
@@ -329,7 +308,7 @@
                               :offset n))
           *register-arg-offsets*))
 
-#!+sb-thread
+#+sb-thread
 (defparameter thread-base-tn
   (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg)
                   :offset thread-offset))
@@ -337,7 +316,7 @@
 (export 'single-value-return-byte-offset)
 
 ;;; This is used by the debugger.
-(def!constant single-value-return-byte-offset 8)
+(defconstant single-value-return-byte-offset 8)
 
 ;;; This function is called by debug output routines that want a pretty name
 ;;; for a TN's location.  It returns a thing that can be printed with PRINC.
@@ -355,12 +334,12 @@
       (immediate-constant "Immed"))))
 
 (defun combination-implementation-style (node)
-  (declare (type sb!c::combination node))
+  (declare (type sb-c::combination node))
   (flet ((valid-funtype (args result)
-           (sb!c::valid-fun-use node
-                                (sb!c::specifier-type
+           (sb-c::valid-fun-use node
+                                (sb-c::specifier-type
                                  `(function ,args ,result)))))
-    (case (sb!c::combination-fun-source-name node)
+    (case (sb-c::combination-fun-source-name node)
       (logtest
        (cond
          ((or (valid-funtype '(fixnum fixnum) '*)
@@ -384,10 +363,10 @@
                                       ,type)
                                     'fixnum)
                      (destructuring-bind (size posn integer)
-                         (sb!c::basic-combination-args node)
+                         (sb-c::basic-combination-args node)
                        (declare (ignore integer))
-                       (<= (+ (sb!c::lvar-value size)
-                              (sb!c::lvar-value posn))
+                       (<= (+ (sb-c::lvar-value size)
+                              (sb-c::lvar-value posn))
                            width)))))
          (if (or (validp 'fixnum 29)
                  (validp '(signed-byte 32) 32)

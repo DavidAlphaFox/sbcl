@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!ALIEN")
+(in-package "SB-ALIEN")
 
 (define-alien-type hinstance signed)
 
@@ -60,7 +60,7 @@
         (when (zerop handle)
           (setf (shared-object-handle obj) nil)
           (error "Error opening shared object ~S:~% ~A"
-                 namestring (sb!win32:format-system-message (sb!win32:get-last-error))))
+                 namestring (sb-win32:format-system-message (sb-win32:get-last-error))))
         (setf (shared-object-handle obj) handle)
         handle)
       (extern-alien "runtime_module_handle" hinstance)))
@@ -72,7 +72,7 @@
               "FreeLibrary() caused an error while trying to close ~
                shared object ~S:~% ~A"
               (shared-object-namestring obj)
-              (sb!win32:format-system-message (sb!win32:get-last-error))))
+              (sb-win32:format-system-message (sb-win32:get-last-error))))
     (setf (shared-object-handle obj) nil)))
 
 (defun find-dynamic-foreign-symbol-address (symbol)
@@ -100,14 +100,14 @@
   ;; TODO: reimplement for x86-64. Not so hard.
   (let* ((image-base (extern-alien "runtime_module_handle" system-area-pointer))
          (pe-base (sap+ image-base (sap-ref-32 image-base 60)))
-         (export-directory (sap+ pe-base (- #!+x86 248 #!+x86-64 264 (* 16 8))))
+         (export-directory (sap+ pe-base (- #+x86 248 #+x86-64 264 (* 16 8))))
          (export-data (sap+ image-base (sap-ref-32 export-directory 0)))
          (n-functions (sap-ref-32 export-data 20))
          (n-names (sap-ref-32 export-data 24))
          (functions-sap (sap+ image-base (sap-ref-32 export-data 28)))
          (names-sap (sap+ image-base (sap-ref-32 export-data 32))))
     (loop repeat (min n-functions n-names)
-          for offset from 0 by #.sb!vm::n-word-bytes
+          for offset from 0 by #.sb-vm::n-word-bytes
           collect
        (cons
          (sap-int (sap+ image-base (sap-ref-32 functions-sap offset)))

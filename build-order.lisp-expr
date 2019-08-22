@@ -32,26 +32,50 @@
 ;;; the dependency information manually, and the brittleness of the
 ;;; package system would help make most violations of the declared
 ;;; dependencies obvious at build time. -- WHN 20000803
+
+;;; make-host-n build steps
+;;; All uses of #+ and #- reader macros within this file refer to
+;;; the chosen target features, and not CL:*FEATURES*.
+;;; The "host escape" syntax #+(host-feature x) must not be used,
+;;; because during the warm build phase, the reader is completely
+;;; standard and lacks the custom character macro handler.
+;;; If you must test a host feature, use "#.(cl:if ..)" syntax.
 (
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;;; miscellaneous
  ;; This comes as early as possible, so that we catch the source locations
  ;; for everything.
- ("src/code/early-source-location")
- ("src/code/cross-early" :not-target)
+ ("src/code/early-source-location" :c-headers)
+ ("src/code/cross-early" :c-headers :not-target)
 
  ;; This comes early because it's useful for debugging everywhere.
- ("src/code/show")
+ ("src/code/show" :c-headers)
+ ("src/compiler/early-constantp" :c-headers)
+ ("src/code/defsetfs" :not-host)
 
- ("src/code/early-constants")
+ ;; Declare all target special variables defined by ANSI
+ ("src/code/cl-specials" :not-host)
 
- ;; This comes early because the cross-compilation host's backquote
- ;; logic can expand into something which can't be executed on the
- ;; target Lisp (e.g. in CMU CL where it expands into internal
- ;; functions like BACKQ-LIST), and by replacing the host backquote
- ;; logic with our own as early as possible, we minimize the chance of
- ;; any forms referring to cross-compilation host internal functions
- ;; leaking into target SBCL code.
+ ;; Things like DX-FLET and AWHEN are available for use in both the host
+ ;; and target very early, with no DEF! obfuscation necessary.
+ ("src/code/primordial-extensions" :c-headers)
+ ("src/code/cold-init-helper-macros" :c-headers)
+ ("src/code/early-defmethod" :not-host)
+
+ ;; ASAP we replace the host's backquote reader with our own, to avoid leaking
+ ;; details of the host into the target. This is not a concern in make-host-2
+ ;; becase IN-TARGET-CROSS-COMPILATION-MODE assigns the reader macros before
+ ;; compiling anything. It is, however, a minor concern for make-host-1, but
+ ;; usually a problem can be exposed only by contrived code / poor style.
+ ;; e.g. if the host's reader were used when compiling
+ ;;  (EVAL-WHEN (#-SB-XC :COMPILE-TOPLEVEL :LOAD-TOPLEVEL :EXECUTE)
+ ;;    (DEFUN A-MACRO-HELPER () '`(FOO ,A ,B))
+ ;; then A-MACRO-HELPER returns host code, and calling it might be wrong, either
+ ;; obviously or subtly. If the result is (LIST* 'FOO (LIST* A (LIST B)))
+ ;; then it's subtly wrong because it might not be the optimal strategy;
+ ;; whereas if it's (BACKQUOTE (FOO (UNQUOTE A) (UNQUOTE B))) then it's
+ ;; flat out wrong. At any rate, judicious avoidance of EVAL-WHEN and nested
+ ;; quasiquotation in 'primordial-extensions' prevents any such issues.
  ("src/code/backq")
 
  ;; It's difficult to be too early with a DECLAIM SPECIAL (or DEFVAR
@@ -59,81 +83,64 @@
  ;; of CL special binding when the variable is undeclared.
  ("src/code/globals" :not-host)
 
- ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
- ;; various DEFSETFs and/or other DEFMACROish things, defined as early as
- ;; possible so we don't need to fiddle with any subtleties of defining them
- ;; before any possible use
-
- ;; KLUDGE: It would be nice to reimplement most or all of these as
- ;; functions (possibly inlined functions) so that we wouldn't need to
- ;; worry so much about forcing them all to be defined before any possible
- ;; use. It might be pretty tedious, though, working through any
- ;; transforms and translators and optimizers and so forth to make sure
- ;; that they can handle the change. -- WHN 19990919
- ("src/code/defsetfs")
-
- ("src/code/cold-init-helper-macros")
+ ("src/code/cmacros" :not-host)
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;;; cross-compiler-only replacements for stuff which in target Lisp would be
  ;;; supplied by basic machinery
 
- ("src/code/cross-misc"  :not-target)
- ("src/code/cross-char"  :not-target)
- ("src/code/cross-byte"  :not-target)
- ("src/code/cross-boole" :not-target)
- ("src/code/cross-float" :not-target)
+ ("src/code/cross-byte"  :c-headers :not-target)
+ ("src/code/cross-misc"  :c-headers :not-target)
+ ("src/code/cross-char"  :c-headers :not-target)
+ ("src/code/cross-float" :c-headers :not-target)
  ("src/code/cross-io"    :not-target)
- ("src/code/cross-sap"   :not-target)
- ("src/code/cross-thread" :not-target)
- ("src/code/cross-make-load-form" :not-target)
  ("src/code/cross-condition" :not-target)
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;;; stuff needed early both in cross-compilation host and in target Lisp
 
- ("src/code/uncross")
- ("src/code/primordial-type")
- ("src/code/early-defbangmethod")
+ ("src/code/uncross" :c-headers)
 
- ("src/code/defbangtype")
- ("src/code/defbangmacro")
- ("src/code/defbangconstant")
+ ("src/code/defbangtype" :c-headers)
+ ("src/code/early-constants" :c-headers)
 
- ("src/code/primordial-extensions")
+ ("src/compiler/deftype" :c-headers)     ; on host for SB-XC:DEFTYPE
+ ("src/compiler/early-lexenv" :c-headers)
+ ("src/compiler/early-globaldb" :c-headers)
 
  ;; comes early so that stuff can reason about function names
- ("src/code/function-names")
+ ("src/code/function-names" :c-headers)
 
- ;; for various constants e.g. SB!XC:MOST-POSITIVE-FIXNUM and
- ;; SB!VM:N-LOWTAG-BITS, needed by "early-objdef" and others
- ("src/compiler/generic/parms")
- ("src/compiler/target/parms")
- ("src/compiler/generic/early-vm")
- ("src/compiler/generic/early-objdef")
- ("src/code/early-array") ; needs "early-vm" numbers
+ ;; for various constants e.g. SB-XC:MOST-POSITIVE-FIXNUM and
+ ;; SB-VM:N-LOWTAG-BITS, needed by "early-objdef" and others
+ ("src/compiler/generic/parms" :c-headers)
+ ("src/compiler/target/parms" :c-headers)
+ ("src/compiler/generic/early-vm" :c-headers)
+ ("src/compiler/generic/early-objdef" :c-headers)
+ ("src/code/early-array" :c-headers) ; needs "early-vm" numbers
 
- ("src/code/early-extensions") ; on host for COLLECT, SYMBOLICATE, etc.
- ("src/code/parse-body")       ; on host for PARSE-BODY
- ("src/code/parse-defmacro")   ; on host for PARSE-DEFMACRO
- ("src/compiler/deftype")      ; on host for SB!XC:DEFTYPE
- ("src/compiler/defconstant")
- ("src/code/early-alieneval")  ; for funs and vars needed at build and run time
-
- ("src/code/specializable-array")
+ ;; This has the BARRIER stuff that the threading support needs,
+ ;; required for some code in 'early-extensions'
+ ("src/code/barrier" :not-host)
+ ("src/code/parse-body" :c-headers)       ; on host for PARSE-BODY
+ ("src/compiler/policy" :c-headers)
+ #+sb-fasteval ("src/interpreter/basic-env")
+ ;; PARSE-{UNKNOWN,DEPRECATED}-TYPE and other things should be known
+ ;; condition subtypes as soon as possible
+ ("src/code/condition-boot" :not-host)
+ ("src/code/early-extensions" :c-headers) ; on host for COLLECT, SYMBOLICATE, etc.
+ ("src/compiler/parse-lambda-list" :c-headers)
+ ("src/code/restart" :not-host) ; %DEFCONSTANT can bind a restart
 
  ("src/code/early-cl")
- ("src/code/early-fasl")
+ ("src/code/ansi-stream" :not-host)
+ ("src/code/early-fasl" :c-headers)
 
- ;; mostly needed by stuff from comcom, but also used by "x86-vm"
- ("src/code/debug-var-io")
-
- ("src/code/early-thread")
+ ("src/code/defbangstruct" :c-headers)
+ ("src/code/early-thread" :c-headers)
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;;; basic machinery for the target Lisp. Note that although most of these
  ;;; files are flagged :NOT-HOST, a few might not be.
-
- ("src/code/target-defbangmethod" :not-host)
 
  ("src/code/early-print" :not-host)
  ("src/code/early-pprint" :not-host)
@@ -144,59 +151,49 @@
  ;; Needed before the first use of WITH-SINGLE-PACKAGE-LOCKED-ERROR.
  ("src/code/early-package" :not-host)
 
- ("src/code/early-defstructs" :not-host) ; gotta-be-first DEFSTRUCTs
- ("src/code/early-raw-slots")
+ ("src/compiler/defconstant")
 
- ("src/code/defbangstruct")
-
- ("src/code/unportable-float")
+ ("src/code/early-raw-slots" :c-headers)
 
  ("src/code/funutils" :not-host)
 
+ ("src/code/maphash" :not-host)
+ ("src/code/xset" :c-headers) ; for representation of MEMBER type
  ;; This needs DEF!STRUCT, and is itself needed early so that structure
  ;; accessors and inline functions defined here can be compiled inline
- ;; later. (Avoiding full calls not only increases efficiency, but also
- ;; avoids some cold init issues involving full calls to structure
- ;; accessors.)
- ("src/code/type-class")
+ ;; later. (Avoiding full calls increases efficiency)
+ ("src/code/type-class" :c-headers)
 
- ("src/code/ansi-stream" :not-host)
+ ("src/code/cas" :not-host)
+ ("src/compiler/early-c" :c-headers)
+ ("src/compiler/fun-info" :c-headers)
+ ("src/pcl/slot-name") ; for calls from 'info-vector'
+ ;; 'info-vector' is needed at least as early as 'fdefinition' so that the
+ ;; inlined INFO-VECTOR-FDEFINITION is available to %COERCE-CALLABLE-TO-FUN.
+ ("src/code/signal" :not-host)
+ ("src/code/target-lfhash" :not-host)
+ ("src/compiler/info-vector" :c-headers)
+ ("src/compiler/globaldb" :c-headers)
+ ("src/compiler/generic/vm-array" :c-headers)
+ ("src/code/primordial-type" :c-headers)
+ ("src/code/early-classoid" :c-headers)
+ ("src/code/early-alieneval" :c-headers)  ; for funs and vars needed at build and run time
 
  ("src/code/sysmacs" :not-host)
 
- ;; "assembly/assemfile" was here in the sequence inherited from
- ;; CMU CL worldcom.lisp, but also appears later in the sequence
- ;; inherited from CMU CL comcom.lisp. We shouldn't need two versions,
- ;; so I've deleted the one here. -- WHN 19990620
-
  ("src/code/target-error" :not-host)
 
- ("src/compiler/early-backend")
- ;; "src/code/toplevel.lisp" si the first to need this. It's generated
- ;; automatically by grovel_headers.c, i.e. it's not in CVS.
+ ;; "src/code/toplevel.lisp" is the first to need this. It's generated
+ ;; automatically by grovel_headers.c, i.e. it's not under source control.
  ("output/stuff-groveled-from-headers" :not-host)
 
- ;; a comment from classic CMU CL:
- ;;   "These guys can supposedly come in any order, but not really.
- ;;    Some are put at the end so that macros don't run interpreted
- ;;    and stuff."
- ;; Dunno exactly what this meant or whether it still holds. -- WHN 19990803
- ;; FIXME: more informative and up-to-date comment?
- ("src/code/kernel"      :not-host)
- ("src/code/toplevel"    :not-host)
  ("src/code/cold-error"  :not-host)
- ;; 'info-vector' is needed at least as early as 'fdefinition' so that the
- ;; inlined INFO-VECTOR-FDEFINITION is available to %COERCE-CALLABLE-TO-FUN.
- ("src/compiler/info-vector")
  ("src/code/fdefinition" :not-host)
 
- ;; In classic CMU CL, code/type was here. I've since split that into
- ;; lots of smaller pieces, some of which are here and some of which
- ;; are handled later in the sequence, when the cross-compiler is
- ;; built. -- WHN 19990620
- ("src/code/target-type" :not-host)
-
- ("src/code/pred" :not-host)
+ ("src/code/weak"          :not-host)
+ ;; 'target-alieneval' needs FILL-POINTER which is defined in 'array'
+ ("src/code/array"         :not-host) ; needs WEAK-POINTER-VALUE
+ ("src/code/debug-var-io")
 
  ("src/code/target-alieneval" :not-host)
  ("src/code/target-c-call"    :not-host)
@@ -205,102 +202,66 @@
  ;; This needs DEFINE-ALIEN-ROUTINE from target-alieneval.
  ("src/code/misc-aliens" :not-host)
 
- ("src/code/typedefs")
- ("src/compiler/generic/vm-array")
- ("src/code/array"         :not-host)
- ("src/code/early-float"   :not-host)
+ ("src/code/early-float")
+ ("src/pcl/early-low" :not-host)
+  ;; Define at most one INTERPRETED-FUNCTION type based on target features
+ #+sb-eval ("src/code/early-full-eval" :not-host)
+ #+sb-fasteval ("src/interpreter/function" :not-host)
+ ("src/code/pred" :not-host)
+ ("src/compiler/generic/pinned-objects" :not-host)
+
  ("src/code/target-sxhash" :not-host) ; needs most-fooative-foo-float constants
 
  ("src/code/list"   :not-host)
  ("src/code/seq"    :not-host) ; "code/seq" should come after "code/list".
  ("src/code/coerce" :not-host)
 
+ ("src/code/huffman")
+ ("src/code/target-char"    :not-host)
+ ("src/code/target-unicode" :not-host)
  ("src/code/string"     :not-host)
  ("src/code/mipsstrops" :not-host)
 
- ("src/code/early-time" :not-host)
+ ("src/code/early-time" :c-headers)
  ("src/code/unix" :not-host)
- #!+win32 ("src/code/win32" :not-host)
- #!+mach  ("src/code/mach"     :not-host)
+ #+win32 ("src/code/win32" :not-host)
+ #+mach  ("src/code/mach"     :not-host)
 
- ("src/code/common-os" :not-host)
- #!+android ("src/code/android-os" :not-host)
- #!+mach  ("src/code/mach-os"  :not-host)
- #!+sunos ("src/code/sunos-os" :not-host)
- #!+hpux  ("src/code/hpux-os"  :not-host)
- #!+osf1  ("src/code/osf1-os"  :not-host)
- #!+irix  ("src/code/irix-os"  :not-host)
- #!+bsd   ("src/code/bsd-os"   :not-host)
- #!+linux ("src/code/linux-os" :not-host)
- #!+win32 ("src/code/win32-os" :not-host)
+ #+android ("src/code/android-os" :not-host)
+ #+sunos ("src/code/sunos-os" :not-host)
+ #+hpux  ("src/code/hpux-os"  :not-host)
+ #+bsd   ("src/code/bsd-os"   :not-host)
+ #+linux ("src/code/linux-os" :not-host)
+ #+win32 ("src/code/win32-os" :not-host)
 
- ;; sparc-vm and ppc-vm need sc-offset defined to get at internal
- ;; error args. This file contains stuff previously in
- ;; debug-info.lisp.  Should it therefore be :not-host?  -- CSR,
- ;; 2002-02-05
- ("src/code/sc-offset")
+ ("src/code/share-vm" :not-host)
 
- ;; KLUDGE: I'd prefer to have this done with a "code/target" softlink
- ;; instead of a bunch of reader macros. -- WHN 19990308
- #!+sparc ("src/code/sparc-vm" :not-host)
- #!+hppa  ("src/code/hppa-vm"  :not-host)
- #!+x86   ("src/code/x86-vm"   :not-host)
- #!+x86-64("src/code/x86-64-vm"   :not-host)
- #!+ppc   ("src/code/ppc-vm"   :not-host)
- #!+alpha ("src/code/alpha-vm" :not-host)
- #!+mips  ("src/code/mips-vm"  :not-host)
- #!+arm   ("src/code/arm-vm" :not-host)
+ ("src/code/thread" :not-host) ; provides *CURRENT-THREAD* for target-signal
+ ("src/code/target-signal-common" :not-host)
 
- ;; FIXME: do we really want to keep this? -- CSR, 2002-08-31
- #!+rt    ("src/code/rt-vm"    :not-host)
-
- #!-win32 ("src/code/target-signal" :not-host) ; needs OS-CONTEXT-T from x86-vm
- #!+win32 ("src/code/target-exception" :not-host)
-
- ("src/code/symbol"     :not-host)
  ("src/code/bignum"     :not-host)
  ("src/code/numbers"    :not-host)
  ("src/code/float-trap" :not-host)
  ("src/code/float"      :not-host)
  ("src/code/irrat"      :not-host)
 
- ("src/code/char")
- ("src/code/huffman")
- ("src/code/target-char"    :not-host)
- ("src/code/target-unicode" :not-host)
- ("src/code/target-misc"    :not-host)
- ("src/code/misc")
+ ("src/code/misc" :c-headers)
 
- ("src/code/room"   :not-host)
-
+ ("src/code/symbol"        :not-host)
+ ("src/code/late-cas"      :not-host)
+ ("src/code/fd-stream"     :not-host)
  ("src/code/stream"        :not-host)
- ("src/code/print"         :not-host)
- ("src/code/pprint"        :not-host)
  ("src/code/early-format")
- ("src/code/target-format" :not-host)
- ("src/code/defpackage"    :not-host)
 
- ("src/code/error-error" :not-host) ; needs WITH-STANDARD-IO-SYNTAX macro
+ ("src/code/common-os" :not-host)
 
  ("src/code/deadline" :not-host)
  ("src/code/serve-event" :not-host)
- ("src/code/fd-stream"   :not-host)
-
- ("src/code/module" :not-host)
-
- ("src/code/interr" :not-host)
 
  ("src/code/query"  :not-host)
 
  ("src/code/sort"  :not-host)
  ("src/code/time"  :not-host)
- ("src/code/timer" :not-host)
- ("src/code/weak"  :not-host)
- ("src/code/final" :not-host)
-
- ("src/code/setf-funs" :not-host)
-
- ("src/code/stubs" :not-host)
 
  ("src/code/exhaust" :not-host)
 
@@ -308,68 +269,105 @@
  ;;; compiler (and a few miscellaneous files whose dependencies make it
  ;;; convenient to stick them here)
 
- ("src/compiler/early-c")
- ("src/compiler/policy")
  ("src/compiler/policies")
 
- ;; ("src/code/defbangmacro" was here until sbcl-0.6.7.3.)
+ ("src/compiler/macros" :c-headers)
 
- ("src/compiler/macros")
- ("src/compiler/generic/vm-macs")
- ("src/compiler/generic/objdef")
+ ("src/compiler/constantp" :c-headers)
+ ("src/compiler/info-functions" :c-headers)
+ ("src/code/specializable-array" :not-target)
+
+ ("src/compiler/generic/vm-macs" :c-headers)
+ ("src/compiler/generic/objdef" :c-headers)
 
  ;; needed by "compiler/vop"
- ("src/compiler/sset")
+ ("src/compiler/sset" :c-headers)
+ ("src/code/early-type" :c-headers)
+ ;; sparc-vm and ppc-vm need sc+offset defined to get at internal
+ ;; error args. This file contains stuff previously in
+ ;; debug-info.lisp.  Should it therefore be :not-host?  -- CSR,
+ ;; 2002-02-05
+ ("src/code/sc-offset" :c-headers)
 
  ;; for e.g. BLOCK-ANNOTATION, needed by "compiler/vop"
- ("src/compiler/node")
+ ("src/compiler/node" :c-headers)
+ ;; RECONSTRUCT-LEXENV needs types GLOBAL-VAR and DEFINED-FUN
+ ("src/compiler/lexenv")
+
+ ;; This has ASSEMBLY-UNIT-related stuff needed by core.lisp.
+ ;; and LABEL, needed by IR2-NLX-INFO
+ ("src/compiler/early-assem")
 
  ;; for e.g. PRIMITIVE-TYPE, needed by "vmdef"
- ("src/compiler/vop")
+ ("src/compiler/vop" :c-headers)
+ ("src/compiler/constant-leaf")
 
  ;; needed by "vm" and "primtype"
- ("src/compiler/backend")
+ ("src/compiler/backend" :c-headers)
 
  ;; for e.g. MAX-VOP-TN-REFS, needed by "meta-vmdef"
- ("src/compiler/vmdef")
+ ("src/compiler/vmdef" :c-headers)
 
- ;; needs "backend"
- ("src/compiler/target/backend-parms")
-
- ;; for INFO and SB!XC:MACRO-FUNCTION, needed by defmacro.lisp
- ("src/compiler/globaldb")
- ("src/compiler/info-functions")
-
- ("src/code/force-delayed-defbangconstants")
- ("src/code/defmacro")
- ("src/code/force-delayed-defbangmacros")
-
- ("src/compiler/late-macros")
+ ("src/code/defmacro" :c-headers)
+ ("src/code/destructuring-bind" :c-headers)
 
  ;; for e.g. !DEF-PRIMITIVE-TYPE, needed by primtype.lisp, and
  ;; DEFINE-STORAGE-CLASS, needed by target/vm.lisp
- ("src/compiler/meta-vmdef")
+ ("src/compiler/meta-vmdef" :c-headers)
+
+ ("src/compiler/fixup") ; for DEFSTRUCT FIXUP, needed by generic/core
+ ("src/compiler/generic/core") ; for CORE-OBJECT-P, needed by x86-64/vm
 
  ;; for e.g. DESCRIPTOR-REG, needed by primtype.lisp
- ("src/compiler/target/vm")
- ("src/code/xset")
- ;; for e.g. SPECIFIER-TYPE, needed by primtype.lisp
- ("src/code/early-type")
+ ("src/compiler/target/vm" :c-headers)
 
+ ;; KLUDGE: I'd prefer to have this done with a "code/target" softlink
+ ;; instead of a bunch of reader macros. -- WHN 19990308
+ #+sparc ("src/code/sparc-vm")
+ #+hppa  ("src/code/hppa-vm")
+ #+x86   ("src/code/x86-vm"   :not-host)
+ #+x86-64("src/code/x86-64-vm"   :not-host)
+ #+(or ppc ppc64)
+ ("src/code/ppc-vm")
+ #+alpha ("src/code/alpha-vm")
+ #+mips  ("src/code/mips-vm")
+ #+arm   ("src/code/arm-vm")
+ #+arm64 ("src/code/arm64-vm")
+ #+riscv ("src/code/riscv-vm")
+
+ ;; RANDOM-LAYOUT-CLOS-HASH (in 'class') uses RANDOM, the transform for which
+ ;; uses GENERATE-RANDOM-EXPR-FOR-POWER-OF-2 which becomes BIG-RANDOM-CHUNK,
+ ;; which wants to be inlined, and which when inlined becomes RANDOM-CHUNK,
+ ;; which also wants to be inlined.
+ ("src/code/target-random" :not-host)
+ ;; META-FIXME: I think I figured out why this was, and fixed that,
+ ;; and never removed the following comment, nor can I remember why.
  ;; FIXME: Classic CMU CL had (OPTIMIZE (SAFETY 2) (DEBUG 2) declared
  ;; around the compilation of "code/class". Why?
- ("src/code/class")
+ ("src/code/class" :c-headers)
+ ("src/pcl/pre-warm")
+ ("src/pcl/low" :not-host)
 
- ;; The definition of CONDITION-CLASS depends on SLOT-CLASS, defined
- ;; in class.lisp.
+ ("src/code/debug-info" :c-headers
+  #.(cl:if (and (cl:find :sb-xc-host cl:*features*)
+                (cl:find :cmucl cl:*features*)) ; gets fatal warnings in CMUCL 20c
+        :ignore-failure-p))
+
+ ("src/code/source-location")
+ ("src/code/early-class")
  ("src/code/condition" :not-host)
+ #-win32 ("src/code/target-signal" :not-host) ; needs OS-CONTEXT-T from share-vm
+ #+win32 ("src/code/target-exception" :not-host)
+ ("src/code/toplevel"  :not-host)
+ ("src/code/parse-defmacro-errors")
+ ("src/code/format-directive")
+ ;; Target-only stuff should usually be compiled late unless it has
+ ;; compile-time side-effects. This file could probably be later,
+ ;; but should certainly be no earlier than the definitions
+ ;; of FORMAT-ERROR and FORMAT-DIRECTIVE.
+ ("src/code/target-format" :not-host)
 
- ("src/compiler/generic/primtype")
-
- ;; the implementation of the compiler-affecting part of forms like
- ;; DEFMACRO and DEFTYPE; must be loaded before we can start
- ;; defining types
- ("src/compiler/parse-lambda-list")
+ ("src/compiler/generic/primtype" :c-headers)
 
  ;; for DEFSTRUCT ALIEN-TYPE, needed by host-type.lisp
  ("src/code/host-alieneval")
@@ -378,62 +376,56 @@
  ;; host-alieneval.lisp
  ("src/code/host-c-call")
 
- ;; SB!XC:DEFTYPE is needed in order to compile late-type
+ ;; SB-XC:DEFTYPE is needed in order to compile late-type
  ;; in the host Common Lisp, and in order to run, it needs
  ;; %COMPILER-DEFTYPE.
- ("src/compiler/compiler-deftype")
+ ("src/compiler/compiler-deftype" :c-headers)
 
  ;; These appear here in the build sequence because they require
  ;;   * the macro INFO, defined in globaldb.lisp, and
  ;;   * the function PARSE-DEFMACRO, defined in parse-defmacro.lisp,
  ;; and because they define
  ;;   * the function SPECIFIER-TYPE, which is used in fndb.lisp.
- ("src/code/late-type")
- ("src/code/deftypes-for-target")
+ ("src/code/late-type" :c-headers)
+ ;; Compile target-only stuff after all defglobals like *CONS-T-T-TYPE*
+ ;; and all type-classes are defined.
+ ("src/code/target-type" :not-host)
+ ("src/code/deftypes-for-target" :c-headers)
 
  ;; defines IR1-ATTRIBUTES macro, needed by proclaim.lisp
  ("src/compiler/knownfun")
- ("src/compiler/constantp")
-
- ;; needs FUN-INFO structure slot setters, defined in knownfun.lisp
- ("src/compiler/fun-info-funs")
 
  ;; stuff needed by "code/defstruct"
- ("src/code/cross-type" :not-target)
- ("src/compiler/generic/vm-type")
- ("src/compiler/proclaim")
+ ("src/code/cross-type" :c-headers :not-target)
+ ("src/compiler/generic/vm-type" :c-headers)
+ ("src/compiler/proclaim" :c-headers)
 
- ("src/code/class-init")
+ ("src/code/class-init" :c-headers)
 
- ;; The DEFSTRUCT machinery needs SB!XC:SUBTYPEP, defined in
- ;; "code/late-type", and SB!XC:TYPEP, defined in "code/cross-type",
+ ;; The DEFSTRUCT machinery needs SB-XC:SUBTYPEP, defined in
+ ;; "code/late-type", and SB-XC:TYPEP, defined in "code/cross-type",
  ;; and SPECIALIZE-ARRAY-TYPE, defined in "compiler/generic/vm-type",
- ;; and SB!XC:PROCLAIM, defined in "src/compiler/proclaim"
- ("src/code/defstruct")
+ ;; and SB-XC:PROCLAIM, defined in "src/compiler/proclaim"
+
+ ;; KLUDGE: do we still need the special hack for cmucl?
+ ("src/code/defstruct"  :c-headers
+  #.(cl:if (and (cl:find :sb-xc-host cl:*features*)
+                (cl:find :cmucl cl:*features*))
+        :ignore-failure-p))
  ("src/code/target-defstruct" :not-host)
 
  ;; ALIEN-VALUE has to be defined as a class (done by DEFSTRUCT
  ;; machinery) before we can set its superclasses here.
  ("src/code/alien-type")
 
- ;; This needs not just the SB!XC:DEFSTRUCT machinery, but also
+ ;; This needs not just the SB-XC:DEFSTRUCT machinery, but also
  ;; the TYPE= stuff defined in late-type.lisp, and the
  ;; CHECK-FUN-NAME defined in proclaim.lisp.
- ("src/code/force-delayed-defbangstructs")
-
- ;; early-full-eval uses !DEFSTRUCT-WITH-ALTERNATE-METACLASS and
- ;; DEF!METHOD.  It split out from the rest of full-eval because
- ;; defstruct/metaclass fun makes it unslammable, and to define
- ;; INTERPRETED-FUNCTION before it is used in compiler/main and in the
- ;; definition of the COMPILED-FUNCTION type.
- #!+sb-eval
- ("src/code/early-full-eval")
+ ("src/code/force-delayed-defbangstructs" :c-headers)
 
  ("src/code/typep" :not-host)
 
  ("src/compiler/compiler-error")
-
- ("src/code/late-deftypes-for-target")
 
  ("src/code/type-init")
  ;; Now that the type system is initialized, fix up UNKNOWN types that
@@ -441,52 +433,29 @@
  ("src/compiler/fixup-type")
 
  ;; These define target types needed by fndb.lisp.
- ("src/code/package")
+ ("src/code/package" :c-headers)
  ("src/code/random")
- ("src/code/hash-table")
+ ("src/code/hash-table" :c-headers)
  ("src/code/readtable")
  ("src/code/pathname")
- ("src/code/host-pprint")
- ("src/compiler/lexenv")
+ ("src/code/host-pprint") ; defines QUEUED-OP needed by 'pprint'
 
- ;; KLUDGE: Much stuff above here is the type system and/or the INFO
- ;; system, not really the compiler proper. It might be easier to
- ;; understand the system if those things were split off into packages
- ;; SB-TYPE and SB-INFO and built in their own sections. -- WHN 20000124
-
- ;; In classic CMU CL (re)build order, these were done later, but
- ;; in building from scratch, these must be loaded before
- ;; "compiler/generic/objdef" in order to allow forms like
- ;; (DEFINE-PRIMITIVE-OBJECT (..) (CAR ..) ..) to work.
  ("src/compiler/fndb")
  ("src/compiler/generic/vm-fndb")
 
- ("src/compiler/generic/late-objdef")
+ ("src/compiler/generic/late-objdef" :c-headers)
 
- ("src/compiler/generic/interr")
+ ("src/compiler/generic/interr" :c-headers)
 
  ("src/compiler/bit-util")
 
- ;; This has ASSEMBLY-UNIT-related stuff needed by core.lisp.
- ("src/compiler/early-assem")
-
- ;; This has the BARRIER stuff that the threading support needs.
- ("src/code/barrier")
-
- ;; core.lisp contains DEFSTRUCT CORE-OBJECT, and "compiler/main.lisp"
- ;; does lots of (TYPEP FOO 'CORE-OBJECT), so it's nice to compile this
- ;; before "compiler/main.lisp" so that those can be coded efficiently
- ;; (and so that they don't cause lots of annoying compiler warnings
- ;; about undefined types).
- ("src/compiler/generic/core")
- ("src/code/thread")
  ("src/code/load")
 
- #!+linkage-table ("src/code/linkage-table" :not-host)
- #!+os-provides-dlopen ("src/code/foreign-load" :not-host)
- #!+(and os-provides-dlopen (not win32)) ("src/code/unix-foreign-load" :not-host)
- #!+(and os-provides-dlopen win32) ("src/code/win32-foreign-load" :not-host)
- ("src/code/foreign")
+ #+linkage-table ("src/code/linkage-table" :not-host)
+ ("src/code/foreign" :not-host)
+ #+os-provides-dlopen ("src/code/foreign-load" :not-host)
+ #+(and os-provides-dlopen (not win32)) ("src/code/unix-foreign-load" :not-host)
+ #+(and os-provides-dlopen win32) ("src/code/win32-foreign-load" :not-host)
 
  ("src/code/fop") ; needs macros from code/load.lisp
 
@@ -494,56 +463,57 @@
  ("src/compiler/disassem")
  ("src/compiler/assem")
 
- ("src/code/debug-info")
  ;; Compiling this requires fop definitions from code/fop.lisp and
  ("src/compiler/dump")
 
+ ("src/compiler/ir1report") ; for COMPILER-ERROR-CONTEXT
+ ("src/code/target-pathname" :not-host) ; needs "code/pathname"
  ("src/compiler/main") ; needs DEFSTRUCT FASL-OUTPUT from dump.lisp
  ("src/compiler/xref")
- ("src/code/source-location")
  ("src/compiler/target-main" :not-host)
  ("src/compiler/ir1tran")
  ("src/compiler/ir1tran-lambda")
- ("src/compiler/ir1-translators")
- ("src/compiler/ir1util")
- ("src/compiler/ir1report")
+ ("src/compiler/ir1-translators"
+  ;; workaround for ABCL warnings that are not of type STYLE-WARNING:
+  ;;  "Unable to compile function IR1-CONVERT-TAGBODY.  Using interpreted form instead."
+  #.(cl:if (and (cl:find :sb-xc-host cl:*features*)
+                (cl:find :abcl cl:*features*))
+        :ignore-failure-p))
+ ;; KLUDGE: do we still need the special hack for cmucl?
+ ("src/compiler/ir1util"
+  #.(cl:if (and (cl:find :sb-xc-host cl:*features*)
+                (cl:find :cmucl cl:*features*))
+        :ignore-failure-p))
+ ("src/compiler/callable-args")
  ("src/compiler/ir1opt")
  ("src/compiler/loop")
 
  ("src/compiler/ir1final")
+ ("src/compiler/constraint")
  ("src/compiler/array-tran")
  ("src/compiler/seqtran")
- ("src/compiler/typetran")
- ("src/compiler/generic/vm-typetran")
- ("src/compiler/float-tran")
  ("src/compiler/saptran")
- ("src/compiler/srctran")
+ ("src/compiler/sxhash")
+ ("src/code/quantifiers")
  ("src/compiler/bitops-derive-type")
- ("src/compiler/generic/vm-tran")
  ("src/compiler/locall")
  ("src/compiler/dfo")
+ ("src/compiler/dce")
  ("src/compiler/checkgen")
- ("src/compiler/constraint")
- ("src/compiler/physenvanal")
 
  ("src/compiler/tn")
  ("src/compiler/life")
 
  ("src/compiler/debug-dump")
- ("src/compiler/generic/utils")
+ ("src/compiler/generic/utils" :c-headers)
  ("src/compiler/fopcompile")
 
- ("src/assembly/assemfile")
+ ("src/assembly/assemfile" :not-target)
 
- ;; Compiling this file requires the macros SB!ASSEM:EMIT-LABEL and
- ;; SB!ASSEM:EMIT-POST-IT, defined in assem.lisp, and also possibly
- ;; the definition of the LOCATION-INFO structure (if structures in
- ;; the host lisp have setf expanders rather than setf functions).
- ("src/compiler/late-vmdef")
-
- ("src/compiler/fixup") ; for DEFSTRUCT FIXUP, used by insts.lisp
-
- ("src/compiler/target/insts")
+ ("src/compiler/target-dstate" :not-host)
+ ("src/compiler/asm-target/insts")
+ #+avx2
+ ("src/compiler/target/avx2-insts")
  ("src/compiler/target/macros")
  ("src/compiler/generic/early-type-vops")
 
@@ -551,13 +521,14 @@
 
  ("src/compiler/target/move")
  ("src/compiler/target/float")
- #!+sb-simd-pack
+ #+sb-simd-pack
  ("src/compiler/target/simd-pack")
+  #+sb-simd-pack-256
+ ("src/compiler/target/simd-pack-256")
  ("src/compiler/target/sap")
  ("src/compiler/target/system")
  ("src/compiler/target/char")
  ("src/compiler/target/memory")
- ("src/compiler/target/static-fn")
  ("src/compiler/target/arith"
   ;; KLUDGE: for ppc and sparc this appears to be necessary, as it
   ;; used to be for array VOPs for X86 until ca. 0.8.5.24 when CSR's
@@ -576,16 +547,23 @@
   ;; x compilation, for now we blithely ignore them and press on to more
   ;; x pressing problems. Someday, though, it would be nice to figure out
   ;; x what the problem is and fix it.
-  #!+(or ppc) :ignore-failure-p)
- ("src/code/cross-modular"  :not-target)
+  #+(or ppc ppc64) :ignore-failure-p)
+ ("src/compiler/target/pred")
 
+ ;; this file defines the INTERVAL struct which is also used in 'srctran'
+ ("src/compiler/float-tran")
+ ;; This is a terrible name for a file that contains type derivers
+ ;; and IR1 transforms. Maybe split it up into more appropriately named pieces.
+ ("src/compiler/srctran")
+ ("src/compiler/generic/vm-tran")
+ ("src/compiler/generic/late-type-vops")
  ("src/compiler/target/type-vops")
+ ("src/compiler/typetran")
+ ("src/compiler/generic/vm-typetran")
+ ("src/code/cross-modular"  :not-target)
 
  ("src/compiler/target/subprim")
  ("src/compiler/target/debug")
- ;; src/compiler/sparc/c-call contains a deftransform for
- ;; %ALIEN-FUNCALL -- CSR
- ("src/compiler/early-aliencomp")
  ("src/compiler/target/c-call")
  ("src/compiler/target/cell")
  ("src/compiler/target/values")
@@ -596,9 +574,7 @@
  ("src/compiler/target/show")
  ("src/compiler/target/array")
  ("src/compiler/generic/type-error")
- ("src/compiler/target/pred")
-
- ("src/compiler/generic/late-type-vops")
+ ("src/compiler/physenvanal")
 
  ;; KLUDGE: The assembly files need to be compiled twice: once as
  ;; normal lisp files, and once by sb-c:assemble-file.  We use a
@@ -609,10 +585,8 @@
  ("src/assembly/target/array")
  ("src/assembly/target/arith")
  ("src/assembly/target/alloc")
- ("src/assembly/target/assem-rtns" :assem :not-host)
- ("src/assembly/target/array"      :assem :not-host)
- ("src/assembly/target/arith"      :assem :not-host)
- ("src/assembly/target/alloc"      :assem :not-host)
+ ;; assembly files are all loaded by genesis before any compiled files.
+ ("src/assembly/master" :assem :not-host)
 
  ("src/compiler/pseudo-vops")
 
@@ -636,11 +610,10 @@
  ("src/compiler/codegen")
  ("src/compiler/debug")
 
- #!+sb-dyncount ("src/compiler/dyncount")
- #!+sb-dyncount ("src/code/dyncount")
+ #+sb-dyncount ("src/compiler/dyncount")
+ #+sb-dyncount ("src/code/dyncount")
 
- ;; needed by OPEN-FASL-OUTPUT, which is called by COMPILE-FILE
- ("src/code/format-time")
+ ("src/code/format-time" :not-host)
 
  ;; needed by various unhappy-path cases in the cross-compiler
  ("src/code/error")
@@ -657,84 +630,61 @@
  ("src/compiler/generic/target-core" :not-host) ; uses stuff from
                                                 ;   "compiler/generic/core"
 
+ ("src/code/alloc"             :not-host) ; needs foo-SPACE-START
+ ("src/code/simple-fun"        :not-host) ; function slot accessors
  ("src/code/eval"              :not-host) ; uses INFO, wants compiler macro
- ("src/code/target-sap"        :not-host) ; uses SAP-INT type
  ("src/code/target-package"    :not-host) ; needs "code/package"
- ("src/code/target-random"     :not-host) ; needs "code/random"
  ("src/code/bignum-random"     :not-host) ; needs "code/random" and
                                           ;   "code/bignum"
  ("src/code/target-hash-table" :not-host) ; needs "code/hash-table"
+ ("src/code/final" :not-host)
+ ("src/code/pprint" :not-host) ; defines WITH-PRETTY-STREAM needed by 'print'
+ ("src/code/print" :not-host)
  ("src/code/reader"            :not-host) ; needs "code/readtable"
  ("src/code/target-stream"     :not-host) ; needs WHITESPACEP from "code/reader"
- ("src/code/target-pathname"   :not-host) ; needs "code/pathname"
- #!-win32
+ #-win32
  ("src/code/unix-pathname"     :not-host)
- #!+win32
+ #+win32
  ("src/code/win32-pathname"    :not-host)
  ("src/code/filesys"           :not-host) ; needs HOST from "code/pathname"
 
- ("src/code/save"              :not-host) ; uses the definition of PATHNAME
-                                          ;   from "code/pathname"
+ ("src/code/target-misc"       :not-host) ; dribble-stream, used by "save"
  ("src/code/sharpm"            :not-host) ; uses stuff from "code/reader"
- ("src/code/alloc"             :not-host)
 
  ("src/code/early-step")                  ; target-thread needs *STEP-OUT*
 
+ ("src/code/gc"                :not-host)
+ ("src/code/avltree"           :not-host)
  ("src/code/target-thread"     :not-host)
+ ("src/code/timer" :not-host)
 
- ;; defines SB!DI:DO-DEBUG-FUN-BLOCKS, needed by target-disassem.lisp
- ("src/code/gc"     :not-host)
- ("src/code/purify" :not-host)
+ ("src/code/error-error" :not-host) ; needs WITH-STANDARD-IO-SYNTAX macro
+ ;; defines SB-DI:DO-DEBUG-FUN-BLOCKS, needed by target-disassem.lisp
  ("src/code/debug-int" :not-host)
+ ("src/code/interr" :not-host)
+
+ ("src/code/target-load" :not-host) ; for *assembler-routines*, needed by target-disassem
 
  ;; target-only assemblerish stuff
  ("src/compiler/target-disassem"     :not-host)
- ("src/compiler/target/target-insts" :not-host)
+ ("src/compiler/asm-target/target-insts" :not-host)
+ #+avx2
+ ("src/compiler/target/target-avx2-insts" :not-host)
 
  ("src/code/debug" :not-host)
 
  ("src/code/octets" :not-host)
  ("src/code/external-formats/enc-basic" :not-host)
- ("src/code/external-formats/enc-ebcdic" :not-host)
- #!+sb-unicode
- ("src/code/external-formats/enc-cyr" :not-host)
- #!+sb-unicode
- ("src/code/external-formats/enc-dos" :not-host)
- #!+sb-unicode
- ("src/code/external-formats/enc-iso" :not-host)
- #!+sb-unicode
- ("src/code/external-formats/enc-win" :not-host)
- #!+sb-unicode
- ("src/code/external-formats/enc-mac" :not-host)
- #!+sb-unicode
- ("src/code/external-formats/mb-util" :not-host)
- #!+sb-unicode
- ("src/code/external-formats/enc-cn-tbl" :not-host)
- #!+sb-unicode
- ("src/code/external-formats/enc-cn" :not-host)
- #!+sb-unicode
- ("src/code/external-formats/enc-jpn-tbl" :not-host)
- #!+sb-unicode
- ("src/code/external-formats/enc-jpn" :not-host)
- #!+sb-unicode
- ("src/code/external-formats/enc-ucs" :not-host)
- #!+sb-unicode
- ("src/code/external-formats/enc-utf" :not-host)
+ #+sb-unicode
+ ("src/code/external-formats/enc-ucs" :not-host) ; win32 needs this
 
- ;; The code here can't be compiled until CONDITION and
- ;; DEFINE-CONDITION are defined and SB!DEBUG:*STACK-TOP-HINT* is
- ;; declared special.
- ("src/code/parse-defmacro-errors")
-
- #!+sb-eval
+ #+sb-eval
  ("src/code/full-eval"   :not-host) ; uses INFO, ARG-COUNT-ERROR
 
  ("src/code/bit-bash"    :not-host) ; needs %NEGATE from assembly/target/arith
 
- ("src/code/target-load" :not-host) ; needs special vars from code/load.lisp
-
- #!-(or x86 x86-64)
- ("src/compiler/target/sanctify" :not-host)
+ #-(or x86 x86-64)
+ ("src/compiler/generic/sanctify" :not-host)
 
  ;; FIXME: Does this really need stuff from compiler/dump.lisp?
  ("src/compiler/target-dump" :not-host) ; needs stuff from compiler/dump.lisp
@@ -744,12 +694,6 @@
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;; target macros and DECLAIMs installed at build-the-cross-compiler time
 
- ;; Declare all target special variables defined by ANSI now, so that
- ;; we don't have to worry about any of them being bound incorrectly
- ;; when the compiler processes code which appears before the appropriate
- ;; DEFVAR or DEFPARAMETER.
- ("src/code/cl-specials")
-
  ;; FIXME: here? earlier?  can probably be as late as possible.  Also
  ;; maybe call it FORCE-DELAYED-PROCLAIMS?
  ("src/compiler/late-proclaim")
@@ -757,26 +701,132 @@
  ;; fundamental target macros (e.g. CL:DO and CL:DEFUN) and support
  ;; for them
  ("src/code/defboot")
- ("src/code/destructuring-bind")
- ("src/code/early-setf")
+ ("src/code/setf")
  ("src/code/macros")
  ("src/code/loop")
- ("src/code/late-setf")
- ("src/code/cas")
- ("src/code/late-cas")
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;; other target-code-building stuff which can't be processed until
- ;; machinery like SB!XC:DEFMACRO exists
+ ;; machinery like SB-XC:DEFMACRO exists
 
- ("src/code/late-format") ; needs SB!XC:DEFMACRO
- ("src/code/sxhash") ; needs SB!XC:DEFINE-MODIFY-MACRO
- ("src/code/signal")
- ("src/code/late-defbangmethod")
+ ("src/code/late-format" ; needs SB-XC:DEFMACRO
+  #.(cl:if (and (cl:find :sb-xc-host cl:*features*)
+                (cl:find :cmucl cl:*features*)) ; gets fatal warnings in CMUCL 20c
+        :ignore-failure-p))
 
- ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
- ;; PCL-related stuff, which shouldn't need to be done earlier than
- ;; anything else in cold build because after all it used to be
- ;; postponed 'til warm init with no problems.
+ ("src/code/late-globaldb" :not-host)
+ ("src/code/redblack" :not-host)
+ )
 
- ("src/pcl/walk"))
+;;; make-target-2 build steps
+(("src/code/early-ntrace" ; lets PCL hook into tracing
+  "src/code/room" ; for MAP-ALLOCATED-OBJECTS
+  #+immobile-code "src/code/immobile-space" ; needs src/code/room
+  ;; Delay (re)defining WARN until after remove-static-links works.
+  ;; The definition in cold-error is good enough for self-build.
+  "src/code/warm-error"
+  "src/code/icf"
+  ;; We re-nickname SB-SEQUENCE as SEQUENCE now.
+  ;; It could be done in genesis, but not earlier,
+  ;; since the host has a package of that name.
+  "src/code/defpackage"
+  "src/code/target-lflist"
+  "src/pcl/walk") ; needs DEFPACKAGE
+
+ #+sb-fasteval
+ ("src/interpreter/macros"
+  "src/interpreter/checkfuns"
+  "src/interpreter/env"
+  "src/interpreter/sexpr"
+  "src/interpreter/special-forms"
+  "src/interpreter/eval"
+  "src/interpreter/debug")
+
+ ("src/code/external-formats/enc-ebcdic")
+ #+sb-unicode
+ ("src/code/external-formats/enc-cyr"
+  "src/code/external-formats/enc-dos"
+  "src/code/external-formats/enc-iso"
+  "src/code/external-formats/enc-win"
+  "src/code/external-formats/enc-mac"
+  "src/code/external-formats/mb-util"
+  "src/code/external-formats/enc-cn-tbl"
+  "src/code/external-formats/enc-cn"
+  "src/code/external-formats/enc-jpn-tbl"
+  "src/code/external-formats/enc-jpn"
+  "src/code/external-formats/enc-utf")
+
+ ("src/code/stubs")
+
+ ;; CLOS, derived from the PCL reference implementation
+ ;;
+ ;; This PCL build order is based on a particular
+ ;; (arbitrary) linearization of the declared build
+ ;; order dependencies from the old PCL defsys.lisp
+ ;; dependency database.
+ ("src/pcl/macros"
+  "src/pcl/compiler-support"
+  "src/pcl/defclass"
+  "src/pcl/defs"
+  "src/pcl/fngen"
+  "src/pcl/wrapper"
+  "src/pcl/cache"
+  "src/pcl/dlisp"
+  "src/pcl/boot"
+  "src/pcl/vector"
+  "src/pcl/slots-boot"
+  "src/pcl/combin"
+  "src/pcl/dfun"
+  "src/pcl/ctor"
+  "src/pcl/braid"
+  "src/pcl/dlisp3"
+  "src/pcl/generic-functions"
+  "src/pcl/slots"
+  "src/pcl/init"
+  "src/pcl/std-class"
+  "src/pcl/cpl"
+  "src/pcl/fsc"
+  "src/pcl/methods"
+  "src/pcl/fixup"
+  "src/pcl/defcombin"
+  "src/pcl/ctypes"
+  "src/pcl/env"
+  "src/pcl/documentation"
+  "src/pcl/print-object"
+  "src/pcl/precom1"
+  "src/pcl/precom2"
+  "src/code/ntrace")
+
+ ("src/code/setf-funs"
+  ;; miscellaneous functionality which depends on CLOS
+  "src/code/late-condition"
+
+  ;; CLOS-level support for the Gray OO streams
+  ;; extension (which is also supported by various
+  ;; lower-level hooks elsewhere in the code)
+  "src/pcl/gray-streams-class"
+  "src/pcl/gray-streams"
+
+  ;; CLOS-level support for User-extensible sequences.
+  "src/pcl/sequence"
+
+  ;; other functionality not needed for cold init, moved
+  ;; to warm init to reduce peak memory requirement in
+  ;; cold init
+  "src/code/describe"
+
+  "src/code/describe-policy"
+  "src/code/inspect"
+  "src/code/profile"
+  #+x86-64 "src/code/aprof" ; precise allocation profiler
+  "src/code/step"
+  "src/code/warm-lib"
+  "src/code/alien-callback"
+  #+win32 "src/code/warm-mswin"
+  "src/code/run-program"
+  #+gencgc "src/code/traceroot"
+
+  "src/code/repack-xref"
+  #+cheneygc "src/code/purify"
+  "src/code/module"
+  "src/code/save"))

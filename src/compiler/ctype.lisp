@@ -16,7 +16,7 @@
 ;;;; probably be good to rename this file to "call-type.lisp" or
 ;;;; "ir1-type.lisp" or something.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (declaim (type (or function null) *lossage-fun* *unwinnage-fun* *ctype-test-fun*))
 
@@ -56,7 +56,6 @@
 (defvar *unwinnage-detected*)
 
 ;;; Signal a warning if appropriate and set *FOO-DETECTED*.
-(declaim (ftype (function (string &rest t) (values)) note-lossage note-unwinnage))
 (defun note-lossage (format-string &rest format-args)
   (setq *lossage-detected* t)
   (when *lossage-fun*
@@ -68,7 +67,6 @@
     (apply *unwinnage-fun* format-string format-args))
   (values))
 
-(declaim (special *compiler-error-context*))
 
 ;;;; stuff for checking a call against a function type
 ;;;;
@@ -113,7 +111,8 @@
   (let* ((*lossage-detected* nil)
          (*unwinnage-detected* nil)
          (*compiler-error-context* call)
-         (args (combination-args call)))
+         (args (combination-args call))
+         unknown-keys)
     (if (fun-type-p type)
         (let* ((nargs (length args))
                (required (fun-type-required type))
@@ -121,35 +120,21 @@
                (optional (fun-type-optional type))
                (max-args (+ min-args (length optional)))
                (rest (fun-type-rest type))
-               (keyp (fun-type-keyp type)))
+               (keyp (fun-type-keyp type))
+               (fun (combination-fun call))
+               (caller (loop for annotation in (lvar-annotations fun)
+                             when (typep annotation 'lvar-function-designator-annotation)
+                             do (setf *compiler-error-context* annotation)
+                                (return (lvar-function-designator-annotation-caller annotation)))))
           (cond
-            ((fun-type-wild-args type)
-             (loop for arg in args
-                   and i from 1
-                   do (check-arg-type arg *universal-type* i)))
-            ((not (or optional keyp rest))
-             (if (/= nargs min-args)
-                 (note-lossage
-                  "The function was called with ~R argument~:P, but wants exactly ~R."
-                  nargs min-args)
-                 (check-fixed-and-rest args required nil)))
-            ((< nargs min-args)
-             (note-lossage
-              "The function was called with ~R argument~:P, but wants at least ~R."
-              nargs min-args))
-            ((<= nargs max-args)
-             (check-fixed-and-rest args (append required optional) rest))
-            ((not (or keyp rest))
-             (note-lossage
-              "The function was called with ~R argument~:P, but wants at most ~R."
-              nargs max-args))
-            ((and keyp (oddp (- nargs max-args)))
-             (note-lossage
-              "The function has an odd number of arguments in the keyword portion."))
+            ((report-arg-count-mismatch (nth-value 1 (lvar-fun-type fun))
+                                        caller type nargs nil
+                                        :lossage-fun #'note-lossage))
             (t
              (check-fixed-and-rest args (append required optional) rest)
-             (when keyp
-               (check-key-args args max-args type))))
+             (when (and keyp
+                        (check-key-args args max-args type))
+               (setf unknown-keys t))))
 
           (when result-test
             (let* ((dtype (node-derived-type call))
@@ -174,9 +159,78 @@
         (loop for arg in args
               and i from 1
               do (check-arg-type arg *wild-type* i)))
-    (cond (*lossage-detected* (values nil t))
-          (*unwinnage-detected* (values nil nil))
-          (t (values t t)))))
+    (awhen (lvar-fun-name (combination-fun call) t)
+      (validate-test-and-test-not call)
+      (let ((xform (info :function :source-transform it)))
+        ;; One more check for structure constructors, because satisfying the
+        ;; ftype is not sufficient to ensure that slots get valid defaults.
+        (when (typep xform '(cons defstruct-description (eql :constructor)))
+          (let ((dd (car xform)))
+            (awhen (assq it (dd-constructors dd))
+              (check-structure-constructor-call call dd (cdr it)))))))
+    (cond (*lossage-detected* (values nil t unknown-keys))
+          (*unwinnage-detected* (values nil nil unknown-keys))
+          (t (values t t unknown-keys)))))
+
+;;;
+
+(defun check-structure-constructor-call (call dd ctor-ll-parts)
+  (destructuring-bind (&optional req opt rest keys aux)
+      (and (listp ctor-ll-parts) (cdr ctor-ll-parts))
+    (declare (ignore rest))
+    (let* ((call-args (combination-args call))
+           (n-req (length req))
+           (keyword-lvars (nthcdr (+ n-req (length opt)) call-args))
+           (const-keysp (check-key-args-constant keyword-lvars))
+           (n-call-args (length call-args)))
+      (dolist (slot (dd-slots dd))
+        (let ((name (dsd-name slot))
+              (suppliedp :maybe)
+              (lambda-list-element nil))
+          ;; Ignore &AUX vars - it's not the caller's fault if wrong.
+          (unless (find name aux :key (lambda (x) (if (listp x) (car x) x))
+                        ;; is this right, or should it be EQ
+                        ;; like in DETERMINE-UNSAFE-SLOTS ?
+                        :test #'string=)
+            (multiple-value-bind (arg position)
+                (%find-position name opt nil 0 nil #'parse-optional-arg-spec
+                                #'string=)
+              (when arg
+                (setq suppliedp (< (+ n-req position) n-call-args)
+                      lambda-list-element arg)))
+            (when (and (eq suppliedp :maybe) const-keysp)
+              ;; Deduce the keyword (if any) that initializes this slot.
+              (multiple-value-bind (keyword arg)
+                  (if (listp ctor-ll-parts)
+                      (dolist (arg keys)
+                        (multiple-value-bind (key var) (parse-key-arg-spec arg)
+                          (when (string= name var) (return (values key arg)))))
+                      (values (keywordicate name) t))
+                (when arg
+                  (setq suppliedp (find-keyword-lvar keyword-lvars keyword)
+                        lambda-list-element arg))))
+            (when (eq suppliedp nil)
+              (let ((initform (if (typep lambda-list-element '(cons t cons))
+                                  (second lambda-list-element)
+                                  (dsd-default slot))))
+                ;; Return T if value-form definitely does not satisfy
+                ;; the type-check for DSD. Return NIL if we can't decide.
+                (when (if (sb-xc:constantp initform)
+                          (not (sb-xc:typep (constant-form-value initform)
+                                            (dsd-type slot)))
+                          ;; Find uses of nil-returning functions as defaults,
+                          ;; like ERROR and MISSING-ARG.
+                          (and (sb-kernel::dd-null-lexenv-p dd)
+                               (listp initform)
+                               (let ((f (car initform)))
+                                 ;; Don't examine :function :type of macros!
+                                 (and (eq (info :function :kind f) :function)
+                                      (let ((info (info :function :type f)))
+                                        (and (fun-type-p info)
+                                             (type= (fun-type-returns info)
+                                                    *empty-type*)))))))
+                  (note-lossage "The slot ~S does not have a suitable default, ~
+and no value was provided for it." name))))))))))
 
 ;;; Check that the derived type of the LVAR is compatible with TYPE. N
 ;;; is the arg number, for error message purposes. We return true if
@@ -242,9 +296,10 @@
 ;;; be known and the corresponding argument should be of the correct
 ;;; type. If the key isn't a constant, then we can't tell, so we can
 ;;; complain about absence of manifest winnage.
-(declaim (ftype (function (list fixnum fun-type) (values)) check-key-args))
+(declaim (ftype (function (list fixnum fun-type) boolean) check-key-args))
 (defun check-key-args (args pre-key type)
-  (let (lossages allow-other-keys)
+  (let (lossages allow-other-keys
+        unknown-keys)
     (do ((key (nthcdr pre-key args) (cddr key))
          (n (1+ pre-key) (+ n 2)))
         ((null key))
@@ -254,9 +309,7 @@
         (cond
           ((not (check-arg-type k (specifier-type 'symbol) n)))
           ((not (constant-lvar-p k))
-           (note-unwinnage "~@<The ~:R argument (in keyword position) is not ~
-                            a constant, weakening keyword argument ~
-                            checking.~:@>" n)
+           (setf unknown-keys t)
            ;; An unknown key may turn out to be :ALLOW-OTHER-KEYS at runtime,
            ;; so we cannot signal full warnings for keys that look bad.
            (unless allow-other-keys
@@ -285,8 +338,8 @@
                         (butlast lossages)
                         (car (last lossages)))
           (note-lossage "~S is not a known argument keyword."
-                        (car lossages)))))
-  (values))
+                        (car lossages))))
+    unknown-keys))
 
 ;;; Construct a function type from a definition.
 ;;;
@@ -297,7 +350,9 @@
   (if (lambda-p functional)
       (make-fun-type
        :required (mapcar #'leaf-type (lambda-vars functional))
-       :returns (tail-set-type (lambda-tail-set functional)))
+       :returns (if (eq (functional-kind functional) :deleted)
+                    *empty-type*
+                    (tail-set-type (lambda-tail-set functional))))
       (let ((rest nil))
         (collect ((req)
                   (opt)
@@ -343,10 +398,10 @@
 (defstruct (approximate-fun-type (:copier nil))
   ;; the smallest and largest numbers of arguments that this function
   ;; has been called with.
-  (min-args sb!xc:call-arguments-limit
-            :type (integer 0 #.sb!xc:call-arguments-limit))
+  (min-args sb-xc:call-arguments-limit
+            :type (integer 0 #.sb-xc:call-arguments-limit))
   (max-args 0
-            :type (integer 0 #.sb!xc:call-arguments-limit))
+            :type (integer 0 #.sb-xc:call-arguments-limit))
   ;; a list of lists of the all the types that have been used in each
   ;; argument position
   (types () :type list)
@@ -364,7 +419,7 @@
   ;; The position at which this keyword appeared. 0 if it appeared as the
   ;; first argument, etc.
   (position (missing-arg)
-            :type (integer 0 #.sb!xc:call-arguments-limit))
+            :type (integer 0 #.sb-xc:call-arguments-limit))
   ;; a list of all the argument types that have been used with this keyword
   (types nil :type list)
   ;; true if this keyword has appeared only in calls with an obvious
@@ -664,7 +719,7 @@
            ((lambda-var-arg-info arg)
             (let* ((info (lambda-var-arg-info arg))
                    (default (arg-info-default info))
-                   (def-type (when (sb!xc:constantp default)
+                   (def-type (when (sb-xc:constantp default)
                                (ctype-of (constant-form-value default)))))
               (ecase (arg-info-kind info)
                 (:keyword
@@ -751,10 +806,9 @@
 ;;; false). If there was a problem, we return NIL.
 (defun assert-definition-type
     (functional type &key (really-assert t)
-     ((:lossage-fun *lossage-fun*)
-      #'compiler-style-warn)
-     unwinnage-fun
-     (where "previous declaration"))
+                          ((:lossage-fun *lossage-fun*) #'compiler-style-warn)
+                          unwinnage-fun
+                          (where "previous declaration"))
   (declare (type functional functional)
            (type function *lossage-fun*)
            (string where))
@@ -774,53 +828,78 @@
              (dtype (when return
                       (lvar-derived-type (return-result return)))))
         (cond
-          ((and dtype (not (values-types-equal-or-intersect dtype
-                                                            type-returns)))
-           (note-lossage
-            "The result type from ~A:~%  ~S~@
-             conflicts with the definition's result type:~%  ~S"
-            where (type-specifier type-returns) (type-specifier dtype))
-           nil)
-          (*lossage-detected* nil)
-          ((not really-assert) t)
-          (t
+          (really-assert
+           ;; REALLY-ASSERT can be T or `(:NOT . ,vars) where the latter is
+           ;; a list of vars for which compiling will *not* generate
+           ;; an automatic check.
            (let ((policy (lexenv-policy (functional-lexenv functional))))
-             (when (policy policy (> type-check 0))
+             (when (and return
+                        (or (eq really-assert t)
+                            (not (member :result (cdr really-assert)))))
                (assert-lvar-type (return-result return) type-returns
-                                 policy)))
-           (loop for var in vars and type in types do
+                                 policy
+                                 :ftype)))
+           (loop for var in vars
+                 for type in types do
                  (cond ((basic-var-sets var)
                         (when (and unwinnage-fun
                                    (not (csubtypep (leaf-type var) type)))
                           (funcall unwinnage-fun
-                                   "Assignment to argument: ~S~%  ~
-                                    prevents use of assertion from function ~
-                                    type ~A:~%  ~S~%"
-                                   (leaf-debug-name var)
-                                   where
-                                   (type-specifier type))))
+                                   (sb-format:tokens
+                                      "Assignment to argument: ~S~%  ~
+                                       prevents use of assertion from function ~
+                                       type ~A:~% ~/sb-impl:print-type/~%")
+                                   (leaf-debug-name var) where type)))
+                       ((and (listp really-assert) ; (:NOT . ,vars)
+                             (member (lambda-var-%source-name var)
+                                     (cdr really-assert)))) ; do nothing
                        (t
                         (setf (leaf-type var) type)
                         (let ((s-type (make-single-value-type type)))
                           (dolist (ref (leaf-refs var))
                             (derive-node-type ref s-type))))))
+           t)
+          ((and dtype
+                (not (values-types-equal-or-intersect dtype
+                                                      type-returns)))
+           (note-lossage
+            "The result type from ~A:~%  ~
+             ~/sb-impl:print-type/~@
+             conflicts with the definition's result type:~%  ~
+             ~/sb-impl:print-type/"
+            where type-returns dtype)
+           nil)
+          (t
            t))))))
+
+;;; Manipulate the poorly-named :REALLY-ASSERT value.
+;;; It would make sense to pass the opposite sense of the arg
+;;; (as ":SKIP-CHECKS") corresponding to the declaration.
+(defun explicit-check->really-assert (explicit-check)
+  (case explicit-check
+    ((nil) t)
+    ((t) nil)
+    (t `(:not . ,explicit-check))))
 
 ;;; FIXME: This is quite similar to ASSERT-NEW-DEFINITION.
 (defun assert-global-function-definition-type (name fun)
   (declare (type functional fun))
-  (let ((type (info :function :type name))
-        (where (info :function :where-from name)))
-    (when (eq where :declared)
-      (let ((type (massage-global-definition-type type fun)))
-        (setf (leaf-type fun) type)
-        (assert-definition-type
-         fun type
-         :unwinnage-fun #'compiler-notify
-         :where "proclamation"
-         :really-assert (not (awhen (info :function :info name)
-                               (ir1-attributep (fun-info-attributes it)
-                                               explicit-check))))))))
+  (let ((where (info :function :where-from name))
+        (explicit-check (getf (functional-plist fun) 'explicit-check)))
+    (if (eq where :declared)
+        (let ((type
+               (massage-global-definition-type (global-ftype name) fun)))
+          (setf (leaf-type fun) type)
+          (assert-definition-type
+           fun type
+           :unwinnage-fun #'compiler-notify
+           :where "proclamation"
+           :really-assert (explicit-check->really-assert explicit-check)))
+        ;; Can't actually test this. DEFSTRUCTs declare this, but non-toplevel
+        ;; ones won't have an FTYPE at compile-time.
+        #+nil
+        (when explicit-check
+          (warn "Explicit-check without known FTYPE is meaningless")))))
 
 ;;; If the function has both &REST and &KEY, FIND-OPTIONAL-DISPATCH-TYPES
 ;;; doesn't complain about the type missing &REST -- which is good, because in
@@ -843,34 +922,103 @@
                      :returns (fun-type-returns type))
       type))
 
-;;; Call FUN with (arg-lvar arg-type)
-(defun map-combination-args-and-types (fun call)
+;;; Call FUN with (arg-lvar arg-type lvars &optional annotation)
+(defun map-combination-args-and-types (fun call &optional info
+                                                          unknown-keys-fun
+                                                          declared-only)
   (declare (type function fun) (type combination call))
-  (binding* ((type (lvar-type (combination-fun call)))
+  (binding* ((type (lvar-fun-type (combination-fun call) declared-only declared-only))
              (nil (fun-type-p type) :exit-if-null)
-             (args (combination-args call)))
-    (dolist (req (fun-type-required type))
-      (when (null args) (return-from map-combination-args-and-types))
-      (let ((arg (pop args)))
-        (funcall fun arg req)))
-    (dolist (opt (fun-type-optional type))
-      (when (null args) (return-from map-combination-args-and-types))
-      (let ((arg (pop args)))
-        (funcall fun arg opt)))
+             (annotation (and info
+                              (fun-info-annotation info)))
+             ((arg-lvars unknown-keys)
+              (resolve-key-args (combination-args call) type))
+             (args (combination-args call))
+             (i -1))
+    (flet ((positional-annotation ()
+             (and annotation
+                  (cdr (assoc (incf i)
+                              (fun-type-annotation-positional annotation)))))
+           (key-annotation (key)
+             (and annotation
+                  (getf (fun-type-annotation-key annotation) key)))
+           (call (arg type &optional annotation)
+             (funcall fun arg type arg-lvars annotation)))
+      (dolist (req (fun-type-required type))
+        (when (null args) (return-from map-combination-args-and-types))
+        (let ((arg (pop args)))
+          (call arg req (positional-annotation))))
+      (dolist (opt (fun-type-optional type))
+        (when (null args) (return-from map-combination-args-and-types))
+        (let ((arg (pop args)))
+          (call arg opt (positional-annotation))))
 
-    (let ((rest (fun-type-rest type)))
-      (when rest
-        (dolist (arg args)
-          (funcall fun arg rest))))
+      (let ((annotation (and annotation
+                             (fun-type-annotation-rest annotation)))
+            (rest (or (fun-type-rest type)
+                      (and annotation
+                           *universal-type*))))
+        (when (and rest
+                   (or annotation
+                       (neq rest *universal-type*)))
+          (let ((butlast (getf (cddr annotation) :butlast)))
+            (loop for (arg . next) on args
+                  when (or (not butlast)
+                           next)
+                  do
+                  (call arg rest annotation)))))
 
-    (dolist (key (fun-type-keywords type))
-      (let ((name (key-info-name key)))
-        (do ((arg args (cddr arg)))
-            ((null arg))
-          (let ((keyname (first arg)))
-            (when (and (constant-lvar-p keyname)
-                       (eq (lvar-value keyname) name))
-              (funcall fun (second arg) (key-info-type key)))))))))
+      (let ((key-args (nthcdr (+ (length (fun-type-optional type))
+                                 (length (fun-type-required type)))
+                              arg-lvars)))
+        (dolist (key (fun-type-keywords type))
+          (let* ((name (key-info-name key))
+                 (lvar (getf key-args name)))
+            (when lvar
+              (call lvar (key-info-type key) (key-annotation name)))))
+        (when (and unknown-keys-fun
+                   unknown-keys)
+          (funcall unknown-keys-fun))))))
+
+(defun assert-array-index-lvar-type (lvar type policy)
+  (let ((internal-lvar (make-lvar))
+        (dest (lvar-dest lvar)))
+    (substitute-lvar internal-lvar lvar)
+    (with-ir1-environment-from-node dest
+      (let ((cast (make-array-index-cast
+                   :asserted-type type
+                   :type-to-check (maybe-weaken-check type policy)
+                   :value lvar
+                   :derived-type (coerce-to-values type))))
+        (%insert-cast-before dest cast)
+        (use-lvar cast internal-lvar)
+        t))))
+
+(defun apply-type-annotation (fun-name arg type lvars policy &optional annotation)
+  (case (car annotation)
+    (function-designator
+     (assert-function-designator fun-name lvars arg (cdr annotation) policy)
+     t)
+    (t
+     (case (car annotation)
+       (modifying
+        (when (policy policy (> check-constant-modification 0))
+          (add-annotation arg
+                          (make-lvar-modified-annotation :caller fun-name))))
+       (type-specifier
+        (add-annotation arg
+                        (make-lvar-type-spec-annotation
+                         :hook
+                         (lambda (value)
+                           (unless (and (eql value :default)
+                                        (eq fun-name 'open))
+                             (compiler-specifier-type value))))))
+       ((proper-list proper-sequence
+                     proper-or-circular-list proper-or-dotted-list)
+        (add-annotation arg
+                        (make-lvar-proper-sequence-annotation
+                         :kind (car annotation)))))
+     (assert-lvar-type arg type policy))))
 
 ;;; Assert that CALL is to a function of the specified TYPE. It is
 ;;; assumed that the call is legal and has only constants in the
@@ -896,11 +1044,23 @@
                      (lvar-has-single-use-p lvar))
             (when (assert-lvar-type lvar returns policy)
               (reoptimize-lvar lvar)))))
-    (map-combination-args-and-types
-     (lambda (arg type)
-       (when (assert-lvar-type arg type policy)
-         (unless trusted (reoptimize-lvar arg))))
-     call))
+    (let* ((name (lvar-fun-name (combination-fun call) t))
+           (info (and name
+                      (info :function :info name))))
+      (if (and info
+               (fun-info-call-type-deriver info))
+          (funcall (fun-info-call-type-deriver info) call trusted)
+          (map-combination-args-and-types
+           (lambda (arg type lvars &optional annotation)
+             (when (and
+                    (apply-type-annotation name arg type
+                                           lvars policy annotation)
+                    (not trusted))
+               (reoptimize-lvar arg)))
+           call
+           info
+           nil
+           t))))
   (values))
 
 ;;;; FIXME: Move to some other file.
@@ -911,90 +1071,136 @@
       (let ((sources (lvar-all-sources tag)))
         (if (singleton-p sources)
             (compiler-style-warn
-             "~@<using ~S of type ~S as a catch tag (which ~
-                 tends to be unportable because THROW and CATCH ~
-                 use EQ comparison)~@:>"
-             (first sources)
-             (type-specifier (lvar-type tag)))
+              "~@<Using ~S of type ~/sb-impl:print-type/ as ~
+               a catch tag (which tends to be unportable because THROW ~
+               and CATCH use EQ comparison)~@:>"
+             (first sources) (lvar-type tag))
             (compiler-style-warn
-             "~@<using ~{~S~^~#[~; or ~:;, ~]~} in ~S of type ~S ~
-                 as a catch tag (which tends to be unportable ~
-                 because THROW and CATCH use EQ comparison)~@:>"
-             (rest sources) (first sources)
-             (type-specifier (lvar-type tag))))))))
+              "~@<Using ~{~S~^~#[~; or ~:;, ~]~} in ~S of type ~
+               ~/sb-impl:print-type/ as a catch tag (which tends to be ~
+               unportable because THROW and CATCH use EQ comparison)~@:>"
+             (rest sources) (first sources) (lvar-type tag)))))))
 
-(defun %compile-time-type-error (values atype dtype context)
+(defun %compile-time-type-error (values atype dtype detail code-context cast-context)
   (declare (ignore dtype))
-  (destructuring-bind (form . detail) context
-    (if (and (consp atype) (eq (car atype) 'values))
-        (if (singleton-p detail)
-            (error 'simple-type-error
-                   :datum (car values)
-                   :expected-type atype
-                   :format-control
-                   "~@<Value set ~2I~_[~{~S~^ ~}] ~I~_from ~S in ~2I~_~S ~I~_is ~
-                   not of type ~2I~_~S.~:>"
-                   :format-arguments (list values
-                                           (first detail) form
-                                           atype))
-            (error 'simple-type-error
-                   :datum (car values)
-                   :expected-type atype
-                   :format-control
-                   "~@<Value set ~2I~_[~{~S~^ ~}] ~
+  (cond ((eq cast-context :ftype)
+         (error 'simple-type-error
+                :datum (car values)
+                :expected-type atype
+                :format-control
+                "~@<Values ~2I~_[~{~S~^ ~}] ~I~_from ~S in~_~A ~
+                   ~I~_is not of the declared return type of the function ~
+                   ~2I~_~/sb-impl:print-type-specifier/.~:>"
+                :format-arguments (list values
+                                        (first detail) code-context
+                                        atype)))
+        ((and (consp atype) (eq (car atype) 'values))
+         (if (singleton-p detail)
+             (error 'simple-type-error
+                    :datum (car values)
+                    :expected-type atype
+                    :format-control
+                    "~@<Values ~2I~_[~{~S~^ ~}] ~I~_from ~S in~_~A ~
+                     ~I~_is not of type ~
+                    ~2I~_~/sb-impl:print-type-specifier/.~:>"
+                    :format-arguments (list values
+                                            (first detail) code-context
+                                            atype))
+             (error 'simple-type-error
+                    :datum (car values)
+                    :expected-type atype
+                    :format-control
+                    "~@<Values ~2I~_[~{~S~^ ~}] ~
                    ~I~_from ~2I~_~{~S~^~#[~; or ~:;, ~]~} ~
-                   ~I~_of ~2I~_~S ~I~_in ~2I~_~S ~I~_is not of type ~2I~_~S.~:>"
-                   :format-arguments (list values
-                                           (rest detail) (first detail)
-                                           form
-                                           atype)))
-        (if (singleton-p detail)
-            (error 'simple-type-error
-                   :datum (car values)
-                   :expected-type atype
-                   :format-control "~@<Value of ~S in ~2I~_~S ~I~_is ~2I~_~S, ~
-                                ~I~_not a ~2I~_~S.~:@>"
-                   :format-arguments (list (car detail) form
-                                           (car values)
-                                           atype))
-            (error 'simple-type-error
-                   :datum (car values)
-                   :expected-type atype
-                   :format-control "~@<Value from ~2I~_~{~S~^~#[~; or ~:;, ~]~} ~
-                                   ~I~_of ~2I~_~S ~I~_in ~2I~_~S ~I~_is ~2I~_~S, ~
-                                   ~I~_not a ~2I~_~S.~:@>"
-                   :format-arguments (list (rest detail) (first detail) form
-                                           (car values)
-                                           atype))))))
+                   ~I~_of ~2I~_~S ~I~_in~_~A ~I~_is not of type ~
+                   ~2I~_~/sb-impl:print-type-specifier/.~:>"
+                    :format-arguments (list values
+                                            (rest detail) (first detail)
+                                            code-context
+                                            atype))))
+        ((singleton-p detail)
+         (error 'simple-type-error
+                :datum (car values)
+                :expected-type atype
+                :format-control
+                "~@<Value of ~S in ~_~A ~I~_is ~2I~_~S, ~
+                   ~I~_not a ~2I~_~/sb-impl:print-type-specifier/.~:@>"
+                :format-arguments (list (car detail) code-context
+                                        (car values)
+                                        atype)))
+        (t
+         (error 'simple-type-error
+                :datum (car values)
+                :expected-type atype
+                :format-control
+                "~@<Value from ~2I~_~{~S~^~#[~; or ~:;, ~]~} ~
+                   ~I~_of ~2I~_~S ~I~_in~_~A ~I~_is ~2I~_~S, ~
+                   ~I~_not a ~2I~_~/sb-impl:print-type-specifier/.~:@>"
+                :format-arguments (list (rest detail) (first detail) code-context
+                                        (car values)
+                                        atype)))))
+
+(defun %compile-time-type-error-warn (node atype dtype detail
+                                      &key cast-context
+                                           (condition 'type-warning))
+  (let ((*compiler-error-context* node))
+    (cond ((eq atype nil))
+          ((eq cast-context :ftype)
+           (warn condition
+                 :format-control
+                 "~@<Derived type of ~S is ~2I~_~S, ~
+                    ~I~_conflicting with the declared function return type ~
+                    ~2I~_~/sb-impl:print-type-specifier/.~@:>"
+                 :format-arguments (list detail dtype atype)))
+          ((singleton-p detail)
+           (let ((detail (first detail)))
+             (if (constantp detail)
+                 (warn condition
+                       :format-control
+                       "~@<Constant ~2I~_~S ~Iconflicts with its ~
+                            asserted type ~
+                            ~2I~_~/sb-impl:print-type-specifier/.~@:>"
+                       :format-arguments (list (constant-form-value detail) atype))
+                 (warn condition
+                       :format-control
+                       "~@<Derived type of ~S is ~2I~_~S, ~
+                            ~I~_conflicting with its asserted type ~
+                            ~2I~_~/sb-impl:print-type-specifier/.~@:>"
+                       :format-arguments (list detail dtype atype)))))
+          (t
+           (warn condition
+                 :format-control
+                 "~@<Derived type of ~2I~_~{~S~^~#[~; and ~:;, ~
+                      ~]~} ~I~_in ~2I~_~S ~I~_is ~
+                      ~2I~_~/sb-impl:print-type-specifier/, ~
+                      ~I~_conflicting with their asserted type ~
+                      ~2I~_~/sb-impl:print-type-specifier/.~@:>"
+                 :format-arguments (list (rest detail) (first detail)
+                                         dtype atype))))))
+
 
 (defoptimizer (%compile-time-type-error ir2-convert)
-    ((objects atype dtype context) node block)
-  (declare (ignore objects))
-  (let ((*compiler-error-context* node))
-    (setf (node-source-path node)
-          (cdr (node-source-path node)))
-    (let ((atype (lvar-value atype))
-          (dtype (lvar-value dtype))
-          (detail (cdr (lvar-value context))))
-      (unless (eq atype nil)
-          (if (singleton-p detail)
-              (let ((detail (first detail)))
-                (if (constantp detail)
-                    (warn 'type-warning
-                          :format-control
-                          "~@<Constant ~2I~_~S ~Iconflicts with its ~
-                              asserted type ~2I~_~S.~@:>"
-                          :format-arguments (list (eval detail) atype))
-                    (warn 'type-warning
-                          :format-control
-                          "~@<Derived type of ~S is ~2I~_~S, ~
-                              ~I~_conflicting with ~
-                              its asserted type ~2I~_~S.~@:>"
-                          :format-arguments (list detail dtype atype))))
-              (warn 'type-warning
-                    :format-control
-                    "~@<Derived type of ~2I~_~{~S~^~#[~; and ~:;, ~]~} ~
-                     ~I~_in ~2I~_~S ~I~_is ~2I~_~S, ~I~_conflicting with ~
-                     their asserted type ~2I~_~S.~@:>"
-                    :format-arguments (list (rest detail) (first detail) dtype atype)))))
-    (ir2-convert-full-call node block)))
+    ((objects atype dtype detail code-context cast-context) node block)
+  (declare (ignore objects code-context))
+  ;; Remove %COMPILE-TIME-TYPE-ERROR bits
+  (setf (node-source-path node)
+        (cdr (node-source-path node)))
+  (%compile-time-type-error-warn node
+                                 (lvar-value atype)
+                                 (lvar-value dtype)
+                                 (lvar-value detail)
+                                 :cast-context (lvar-value cast-context))
+  (ir2-convert-full-call node block))
+
+(defoptimizer (%compile-time-type-style-warn ir2-convert)
+    ((objects atype dtype detail code-context cast-context) node block)
+  (declare (ignore objects code-context block))
+  ;; Remove %COMPILE-TIME-TYPE-ERROR bits
+  (setf (node-source-path node)
+        (cddr (node-source-path node)))
+  (%compile-time-type-error-warn node
+                                 (lvar-value atype)
+                                 (lvar-value dtype)
+                                 (lvar-value detail)
+                                 :cast-context (lvar-value cast-context)
+                                 :condition 'type-style-warning))

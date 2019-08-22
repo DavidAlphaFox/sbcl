@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; The component that is currently being compiled. TNs are allocated
 ;;; in this component.
@@ -109,21 +109,24 @@
 ;;; Create a packed TN of the specified primitive-type in the
 ;;; *COMPONENT-BEING-COMPILED*. We use the SCs from the primitive type
 ;;; to determine which SCs it can be packed in.
-(defun make-normal-tn (type)
-  (declare (type primitive-type type))
+(defun make-normal-tn (primitive-type &optional (type *universal-type*))
+  (declare (type primitive-type primitive-type)
+           (type ctype type))
   (let* ((component (component-info *component-being-compiled*))
          (res (make-tn (incf (ir2-component-global-tn-counter component))
-                       :normal type nil)))
+                       :normal primitive-type nil)))
+    (setf (tn-type res) (single-value-type type))
     (push-in tn-next res (ir2-component-normal-tns component))
     res))
 
 ;;; Create a normal packed TN with representation indicated by SCN.
-(defun make-representation-tn (ptype scn)
+(defun make-representation-tn (ptype scn &optional (type *universal-type*))
   (declare (type primitive-type ptype) (type sc-number scn))
   (let* ((component (component-info *component-being-compiled*))
          (res (make-tn (incf (ir2-component-global-tn-counter component))
                        :normal ptype
                        (svref *backend-sc-numbers* scn))))
+    (setf (tn-type res) (single-value-type type))
     (push-in tn-next res (ir2-component-normal-tns component))
     res))
 
@@ -131,7 +134,7 @@
 ;;; and FSC to record where it goes, and then put it on the current component's
 ;;; Wired-TNs list. Ptype is the TN's primitive-type, which may be NIL in VOP
 ;;; temporaries.
-(defun make-wired-tn (ptype scn offset)
+(defun make-wired-tn (ptype scn offset &optional (type *universal-type*))
   (declare (type (or primitive-type null) ptype)
            (type sc-number scn) (type unsigned-byte offset))
   (let* ((component (component-info *component-being-compiled*))
@@ -139,19 +142,33 @@
                        :normal ptype
                        (svref *backend-sc-numbers* scn))))
     (setf (tn-offset res) offset)
+    (when ptype
+      (setf (tn-type res) (if type
+                              (single-value-type type)
+                              *universal-type*)))
     (push-in tn-next res (ir2-component-wired-tns component))
     res))
+(defun sb-vm::make-wired-tn* (prim-type-name scn offset)
+  (make-wired-tn (primitive-type-or-lose prim-type-name) scn offset))
 
 ;;; Create a packed TN restricted to the SC with number SCN. Ptype is as
 ;;; for MAKE-WIRED-TN.
-(defun make-restricted-tn (ptype scn)
+(defun make-restricted-tn (ptype scn &optional (type *universal-type*))
   (declare (type (or primitive-type null) ptype) (type sc-number scn))
   (let* ((component (component-info *component-being-compiled*))
          (res (make-tn (incf (ir2-component-global-tn-counter component))
                        :normal ptype
                        (svref *backend-sc-numbers* scn))))
+    (when ptype
+      (setf (tn-type res) (if type
+                              (single-value-type type)
+                              *universal-type*)))
     (push-in tn-next res (ir2-component-restricted-tns component))
     res))
+
+(defun make-unused-tn ()
+  (make-tn (incf (ir2-component-global-tn-counter (component-info *component-being-compiled*)))
+           :unused nil nil))
 
 ;;; Make TN be live throughout PHYSENV. Return TN. In the DEBUG case,
 ;;; the TN is treated normally in blocks in the environment which
@@ -183,6 +200,7 @@
   tn)
 
 ;;; Specify that SAVE be used as the save location for TN. TN is returned.
+#-fp-and-pc-standard-save
 (defun specify-save-tn (tn save)
   (declare (type tn tn save))
   (aver (eq (tn-kind save) :normal))
@@ -195,47 +213,56 @@
          (component-info *component-being-compiled*)))
   tn)
 
-;;; Create a constant TN. The implementation dependent
+;;; Create a constant TN. The backend dependent
 ;;; IMMEDIATE-CONSTANT-SC function is used to determine whether the
 ;;; constant has an immediate representation.
-(defun make-constant-tn (constant boxedp)
+(defun make-constant-tn (constant)
   (declare (type constant constant))
-  (let* ((immed (immediate-constant-sc (constant-value constant)))
-         (use-immed-p (and immed
-                           (or (not boxedp)
-                               (boxed-immediate-sc-p immed)))))
-    (cond
-      ;; CONSTANT-TN uses two caches, one for boxed and one for unboxed uses.
-      ;;
-      ;; However, in the case of USE-IMMED-P we can have the same TN for both
-      ;; uses. The first two legs here take care of that by cross-pollinating the
-      ;; cached values.
-      ;;
-      ;; Similarly, when there is no immediate SC.
-      ((and (or use-immed-p (not immed)) boxedp (leaf-info constant)))
-      ((and (or use-immed-p (not immed)) (not boxedp) (constant-boxed-tn constant)))
-      (t
-       (let* ((component (component-info *component-being-compiled*))
-              (sc (svref *backend-sc-numbers*
-                         (if use-immed-p
-                             immed
-                             (sc-number-or-lose 'constant))))
-              (res (make-tn 0 :constant (primitive-type (leaf-type constant)) sc)))
-         (unless use-immed-p
-           (let ((constants (ir2-component-constants component)))
-             (setf (tn-offset res) (fill-pointer constants))
-             (vector-push-extend constant constants)))
-         (push-in tn-next res (ir2-component-constant-tns component))
-         (setf (tn-leaf res) constant)
-         res)))))
+  (or (leaf-info constant)
+      (multiple-value-bind (immed null-offset) (immediate-constant-sc (constant-value constant))
+        (if null-offset
+            (setf (leaf-info constant)
+                  (component-live-tn
+                   (make-wired-tn (primitive-type (leaf-type constant))
+                                  immed
+                                  null-offset)))
+            (let* ((boxed (or (not immed)
+                              (boxed-immediate-sc-p immed)))
+                   (component (component-info *component-being-compiled*))
+                   ;; If a constant have either an immediate or boxed
+                   ;; representation (e.g. double-float) postpone the SC
+                   ;; choice until SELECT-REPRESENTATIONS.
+                   (sc (and boxed
+                            (if immed
+                                (svref *backend-sc-numbers* immed)
+                                (sc-or-lose 'constant))))
+                   (res (make-tn 0 :constant (primitive-type (leaf-type constant)) sc)))
+              ;; Objects of type SYMBOL can be immediate but they still go in the constants
+              ;; because liveness depends on pointer tracing without looking at code-fixups.
+              (when (and sc
+                         (or (not immed)
+                             #+immobile-space
+                             (let ((val (constant-value constant)))
+                               (or (and (symbolp val) (not (sb-vm:static-symbol-p val)))
+                                   (typep val 'layout)))))
+                (let ((constants (ir2-component-constants component)))
+                  (setf (tn-offset res)
+                        (vector-push-extend constant constants))))
+              (when sc
+                (setf (leaf-info constant) res))
+              (push-in tn-next res (ir2-component-constant-tns component))
+              (setf (tn-type res) (leaf-type constant))
+              (setf (tn-leaf res) constant)
+              res)))))
 
 (defun make-load-time-value-tn (handle type)
   (let* ((component (component-info *component-being-compiled*))
          (sc (svref *backend-sc-numbers*
-                    (sc-number-or-lose 'constant)))
+                    sb-vm:constant-sc-number))
          (res (make-tn 0 :constant (primitive-type type) sc))
          (constants (ir2-component-constants component)))
-    (setf (tn-offset res) (fill-pointer constants))
+    (setf (tn-offset res) (fill-pointer constants)
+          (tn-type res) type)
     (vector-push-extend (cons :load-time-value handle) constants)
     (push-in tn-next res (ir2-component-constant-tns component))
     res))
@@ -246,7 +273,8 @@
   (let* ((component (component-info *component-being-compiled*))
          (res (make-tn (incf (ir2-component-global-tn-counter component))
                        :alias (tn-primitive-type tn) nil)))
-    (setf (tn-save-tn res) tn)
+    (setf (tn-save-tn res) tn
+          (tn-type res) (tn-type tn))
     (push-in tn-next res
              (ir2-component-alias-tns component))
     res))
@@ -260,10 +288,9 @@
          (res (make-tn 0
                        :constant
                        *backend-t-primitive-type*
-                       (svref *backend-sc-numbers*
-                              (sc-number-or-lose 'constant))))
+                       (svref *backend-sc-numbers* sb-vm:constant-sc-number)))
          (constants (ir2-component-constants component)))
-
+    (setf (tn-type res) *universal-type*)
     (do ((i 0 (1+ i)))
         ((= i (length constants))
          (setf (tn-offset res) i)
@@ -289,9 +316,12 @@
 (defun reference-tn (tn write-p)
   (declare (type tn tn) (type boolean write-p))
   (let ((res (make-tn-ref tn write-p)))
-    (if write-p
-        (push-in tn-ref-next res (tn-writes tn))
-        (push-in tn-ref-next res (tn-reads tn)))
+    (unless (eql (tn-kind tn) :unused)
+      (when (tn-primitive-type tn)
+        (aver (setf (tn-ref-type res) (tn-type tn))))
+      (if write-p
+          (push-in tn-ref-next res (tn-writes tn))
+          (push-in tn-ref-next res (tn-reads tn))))
     res))
 
 ;;; Make TN-REFS to reference each TN in TNs, linked together by
@@ -460,15 +490,13 @@
   (aver (eq (tn-kind tn) :constant))
   (constant-value (tn-leaf tn)))
 
-(defun immediate-tn-p (tn)
+(defun constant-tn-p (tn)
   (declare (type tn tn))
   (let ((leaf (tn-leaf tn)))
     ;; Leaves with KIND :CONSTANT can have NIL as the leaf if they
     ;; represent load time values.
     (and leaf
-         (eq (tn-kind tn) :constant)
-         (eq (immediate-constant-sc (constant-value leaf))
-             (sc-number-or-lose 'sb!vm::immediate)))))
+         (eq (tn-kind tn) :constant))))
 
 ;;; Force TN to be allocated in a SC that doesn't need to be saved: an
 ;;; unbounded non-save-p SC. We don't actually make it a real "restricted" TN,

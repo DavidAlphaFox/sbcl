@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; LENGTH
 
@@ -78,7 +78,3 @@
     (inst cmp ptr nil-value)
     (inst jmp :ne loop)
     DONE))
-
-(define-static-fun length (object) :translate length)
-(define-static-fun %coerce-callable-to-fun (callable)
-  :translate %coerce-callable-to-fun)

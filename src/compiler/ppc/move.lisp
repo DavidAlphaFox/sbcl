@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-move-fun (load-immediate 1) (vop x y)
   ((null immediate zero)
@@ -73,21 +73,18 @@
   (:args (x :target y
             :scs (any-reg descriptor-reg zero null)
             :load-if (not (location= x y))))
-  (:results (y :scs (any-reg descriptor-reg)
+  (:results (y :scs (any-reg descriptor-reg control-stack)
                :load-if (not (location= x y))))
-  (:effects)
-  (:affected)
   (:generator 0
-    (move y x)))
+    (cond ((location= x y))
+          ((sc-is y control-stack)
+           (store-stack-tn y x))
+          (t
+           (move y x)))))
 
 (define-move-vop move :move
   (any-reg descriptor-reg)
   (any-reg descriptor-reg))
-
-;;; Make MOVE the check VOP for T so that type check generation
-;;; doesn't think it is a hairy type.  This also allows checking of a
-;;; few of the values in a continuation to fall out.
-(primitive-type-vop move (:check) t)
 
 ;;; The MOVE-ARG VOP is used for moving descriptor values into another
 ;;; frame for argument or known value passing.
@@ -107,25 +104,6 @@
 (define-move-vop move-arg :move-arg
   (any-reg descriptor-reg)
   (any-reg descriptor-reg))
-
-
-
-;;;; ILLEGAL-MOVE
-
-;;; This VOP exists just to begin the lifetime of a TN that couldn't
-;;; be written legally due to a type error.  An error is signalled
-;;; before this VOP is so we don't need to do anything (not that there
-;;; would be anything sensible to do anyway.)
-(define-vop (illegal-move)
-  (:args (x) (type))
-  (:results (y))
-  (:ignore y)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 666
-    (error-call vop 'object-not-type-error x type)))
-
-
 
 ;;;; Moves and coercions:
 
@@ -151,7 +129,7 @@
   (:results (y :scs (signed-reg unsigned-reg)))
   (:note "constant load")
   (:generator 1
-    (cond ((sb!c::tn-leaf x)
+    (cond ((sb-c::tn-leaf x)
            (inst lr y (tn-value x)))
           (t
            (loadw y code-tn (tn-offset x) other-pointer-lowtag)
@@ -199,18 +177,45 @@
   (:note "signed word to integer coercion")
   (:generator 20
     (move x arg)
-    (let ((done (gen-label)))
-      (inst mtxer zero-tn)              ; clear sticky overflow bit in XER, CR0
-      (inst addo temp x x)              ; set XER OV if top two bits differ
-      (inst addo. temp temp temp)       ; set CR0 SO if any top three bits differ
-      (inst slwi y x n-fixnum-tag-bits) ; assume fixnum (tagged ok, maybe lost some high bits)
-      (inst bns done)
+    (inst mtxer zero-tn)              ; clear sticky overflow bit in XER, CR0
+    (inst addo temp x x)              ; set XER OV if top two bits differ
+    (inst addo. temp temp temp)       ; set CR0 SO if any top three bits differ
+    (inst slwi y x n-fixnum-tag-bits) ; assume fixnum (tagged ok, maybe lost some high bits)
+    (inst bns done)
 
-      (with-fixed-allocation (y pa-flag temp bignum-widetag (1+ bignum-digits-offset))
-        (storew x y bignum-digits-offset other-pointer-lowtag))
-      (emit-label done))))
+    (with-fixed-allocation (y pa-flag temp bignum-widetag (1+ bignum-digits-offset))
+      (storew x y bignum-digits-offset other-pointer-lowtag))
+    DONE))
 (define-move-vop move-from-signed :move
   (signed-reg) (descriptor-reg))
+
+(define-vop (move-from-fixnum+1)
+  (:args (arg :scs (signed-reg unsigned-reg) :target x))
+  (:results (y :scs (any-reg descriptor-reg)))
+  (:temporary (:scs (non-descriptor-reg) :from (:argument 0)) x temp)
+  (:vop-var vop)
+  (:generator 4
+    (move x arg)
+    (inst mtxer zero-tn)              ; clear sticky overflow bit in XER, CR0
+    (inst addo temp x x)              ; set XER OV if top two bits differ
+    (inst addo. temp temp temp)       ; set CR0 SO if any top three bits differ
+    (inst slwi y x n-fixnum-tag-bits) ; assume fixnum (tagged ok, maybe lost some high bits)
+    (inst bns done)
+    (load-constant vop (emit-constant (1+ sb-xc:most-positive-fixnum))
+                   y)
+    DONE))
+
+(define-vop (move-from-fixnum-1 move-from-fixnum+1)
+  (:generator 4
+    (move x arg)
+    (inst mtxer zero-tn)              ; clear sticky overflow bit in XER, CR0
+    (inst addo temp x x)              ; set XER OV if top two bits differ
+    (inst addo. temp temp temp)       ; set CR0 SO if any top three bits differ
+    (inst slwi y x n-fixnum-tag-bits) ; assume fixnum (tagged ok, maybe lost some high bits)
+    (inst bns done)
+    (load-constant vop (emit-constant (1- sb-xc:most-negative-fixnum))
+                   y)
+    DONE))
 
 ;;; Check for fixnum, and possibly allocate one or two word bignum
 ;;; result.  Use a worst-case cost to make sure people know they may
@@ -250,8 +255,6 @@
             :load-if (not (location= x y))))
   (:results (y :scs (signed-reg unsigned-reg)
                :load-if (not (location= x y))))
-  (:effects)
-  (:affected)
   (:note "word integer move")
   (:generator 0
     (move y x)))
@@ -264,7 +267,7 @@
   (:args (x :target y
             :scs (signed-reg unsigned-reg))
          (fp :scs (any-reg)
-             :load-if (not (sc-is y sap-reg))))
+             :load-if (not (sc-is y signed-reg unsigned-reg))))
   (:results (y))
   (:note "word integer argument move")
   (:generator 0

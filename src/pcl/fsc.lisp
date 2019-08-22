@@ -34,19 +34,29 @@
 (in-package "SB-PCL")
 
 (defmethod wrapper-fetcher ((class funcallable-standard-class))
-  'fsc-instance-wrapper)
+  '%funcallable-instance-layout)
 
 (defmethod slots-fetcher ((class funcallable-standard-class))
   'fsc-instance-slots)
 
 (defmethod raw-instance-allocator ((class funcallable-standard-class))
-  'allocate-standard-funcallable-instance)
+  (cond #+(and compact-instance-header immobile-code)
+        ((subtypep class 'generic-function)
+         'allocate-standard-funcallable-instance-immobile)
+        (t
+         'allocate-standard-funcallable-instance)))
 
-(defmethod allocate-instance
-           ((class funcallable-standard-class) &rest initargs)
-  (declare (ignore initargs))
-  (allocate-standard-funcallable-instance
-   (class-wrapper (ensure-class-finalized class))))
+(defmethod allocate-instance ((class funcallable-standard-class) &rest initargs)
+  (declare (inline ensure-class-finalized))
+  (cond #+(and compact-instance-header immobile-code)
+        ((subtypep class 'generic-function)
+         (allocate-standard-funcallable-instance-immobile
+          (class-wrapper (ensure-class-finalized class))
+          (getf initargs :name)))
+        (t
+         (allocate-standard-funcallable-instance
+          (class-wrapper (ensure-class-finalized class))
+          (getf initargs :name)))))
 
 (defmethod make-reader-method-function ((class funcallable-standard-class)
                                         slot-name)

@@ -56,6 +56,13 @@ foreign function interface definitions. @xref{sb-grovel}.
 SBCL provides a recursive event loop (@code{serve-event}) for doing
 non-blocking IO on multiple streams without using threads.
 
+@item Timeouts and Deadlines
+SBCL allows restricting the execution time of individual operations or
+parts of a computation using @code{:timeout} arguments to certain
+blocking operations, synchronous timeouts and asynchronous timeouts. The
+latter two affect operations without explicit timeout support (such as
+standard functions and macros). @xref{Timeouts and Deadlines}.
+
 @item Metaobject Protocol
 @code{sb-mop} package provides a metaobject protocol for the Common
 Lisp Object System as described in @cite{Art of Metaobject Protocol}.
@@ -115,7 +122,7 @@ standardization process.
 
 @item Executable Delivery
 The @code{:executable} argument to @ref{Function
-sb-ext:save-lisp-and-die} can produce a `standalone' executable
+sb-ext save-lisp-and-die} can produce a `standalone' executable
 containing both an image of the current Lisp session and an SBCL
 runtime.
 
@@ -258,9 +265,6 @@ e.g.
 @itemize
 
 @item
-@code{defmethod} without a preceding @code{defgeneric};
-
-@item
 multiple @code{defun}s of the same symbol in different units;
 
 @item
@@ -333,7 +337,7 @@ include the SBCL runtime itself, so no restrictions are placed on
 program functionality.  For example, a deployed program can call
 @code{compile} and @code{load}, which requires the compiler to be present
 in the executable.  For further information, @xref{Function
-sb-ext:save-lisp-and-die}.
+sb-ext save-lisp-and-die}.
 
 
 @node More SBCL Information

@@ -12,130 +12,113 @@
 (load "src/cold/defun-load-or-cload-xcompiler.lisp")
 (load-or-cload-xcompiler #'host-load-stem)
 
-(defun proclaim-target-optimization ()
-  (let ((debug (if (position :sb-show *shebang-features*) 2 1)))
-    (sb-xc:proclaim
-     `(optimize
-       (compilation-speed 1) (debug ,debug)
-       ;; CLISP's pretty-printer is fragile and tends to cause stack
-       ;; corruption or fail internal assertions, as of 2003-04-20; we
-       ;; therefore turn off as many notes as possible.
-       (sb!ext:inhibit-warnings #-clisp 2 #+clisp 3)
-       ;; SAFETY = SPEED (and < 3) should provide reasonable safety,
-       ;; but might skip some unreasonably expensive stuff
-       ;; (e.g. %DETECT-STACK-EXHAUSTION in sbcl-0.7.2).
-       (safety 2) (space 1) (speed 2)
-       ;; sbcl-internal optimization declarations:
-       ;;
-       ;; never insert stepper conditions
-       (sb!c:insert-step-conditions 0)
-       ;; save FP and PC for alien calls -- or not
-       (sb!c:alien-funcall-saves-fp-and-pc #!+x86 3 #!-x86 0)))))
-(compile 'proclaim-target-optimization)
-
-(defun in-target-cross-compilation-mode (fun)
-  "Call FUN with everything set up appropriately for cross-compiling
-   a target file."
-  (let (;; In order to increase microefficiency of the target Lisp,
-        ;; enable old CMU CL defined-function-types-never-change
-        ;; optimizations. (ANSI says users aren't supposed to
-        ;; redefine our functions anyway; and developers can
-        ;; fend for themselves.)
-        #!-sb-fluid
-        (sb!ext:*derive-function-types* t)
-        ;; Let the target know that we're the cross-compiler.
-        (*features* (cons :sb-xc *features*))
-        ;; We need to tweak the readtable..
-        (*readtable* (copy-readtable)))
-    ;; ..in order to make backquotes expand into target code
-    ;; instead of host code.
-    ;; FIXME: Isn't this now taken care of automatically by
-    ;; toplevel forms in the xcompiler backq.lisp file?
-    (set-macro-character #\` #'sb!impl::backquote-charmacro)
-    (set-macro-character #\, #'sb!impl::comma-charmacro)
-
-    (set-dispatch-macro-character #\# #\+ #'she-reader)
-    (set-dispatch-macro-character #\# #\- #'she-reader)
-    ;; Control optimization policy.
-    (proclaim-target-optimization)
-    ;; Specify where target machinery lives.
-    (with-additional-nickname ("SB-XC" "SB!XC")
-      (funcall fun))))
-(compile 'in-target-cross-compilation-mode)
-
-
 ;; Supress function/macro redefinition warnings under clisp.
 #+clisp (setf custom:*suppress-check-redefinition* t)
 
-(setf *target-compile-file* #'sb-xc:compile-file)
-(setf *target-assemble-file* #'sb!c:assemble-file)
-(setf *in-target-compilation-mode-fn* #'in-target-cross-compilation-mode)
-
 ;;; Run the cross-compiler to produce cold fasl files.
-;; This suppresses ~6000 lines of "undefined function" warnings from the
-;; cross-compiler stemming from the calls to INSTANCE-TYPEP that occur before
-;; src/code/class gets compiled. It magically converts efficiently,
-;; but IR1 is a little bit naive about how it happens.
-(dolist (f '(sb!kernel:layout-depthoid
-             sb!kernel:layout-inherits))
-  (setf (sb!int:info :function :kind f) :function
-        (sb!int:info :function :where-from f) :declared))
-;; ... and since the cross-compiler hasn't seen a DEFMACRO for QUASIQUOTE,
-;; make it think it has, otherwise it fails more-or-less immediately.
-(setf (sb!int:info :function :kind 'sb!int:quasiquote) :macro
-      (sb!int:info :function :macro-function 'sb!int:quasiquote)
-      (cl:macro-function 'sb!int:quasiquote))
-(setq sb!c::*track-full-called-fnames* :minimal) ; Change this as desired
-(progn ; Should be: sb-xc:with-compilation-unit () ... but
-  ;; leaving aside the question of building in any host - which shouldn't
-  ;; matter - building SBCL in SBCL can hang in a way I haven't tracked down.
-  (load "src/cold/compile-cold-sbcl.lisp"))
+(setq sb-c::*track-full-called-fnames* :minimal) ; Change this as desired
+(setq sb-c::*static-vop-usage-counts* (make-hash-table))
+(let (fail
+      variables
+      functions
+      types)
+  (sb-xc:with-compilation-unit ()
+    (let ((*feature-evaluation-results* nil))
+      (load "src/cold/compile-cold-sbcl.lisp")
+      (sanity-check-feature-evaluation))
+    ;; Enforce absence of unexpected forward-references to warm loaded code.
+    ;; Looking into a hidden detail of this compiler seems fair game.
+    (when (and sb-c::*undefined-warnings*
+               (feature-in-list-p
+                '(:or :x86 :x86-64 :arm64) ; until all the rest are clean
+                :target))
+      (setf fail t)
+      (dolist (warning sb-c::*undefined-warnings*)
+        (case (sb-c::undefined-warning-kind warning)
+          (:variable (setf variables t))
+          (:type (setf types t))
+          (:function (setf functions t))))))
+  ;; Exit the compilation unit so that the summary is printed. Then complain.
+  ;; win32 is not clean
+  (when (and fail (not (feature-in-list-p :win32 :target)))
+    (cerror "Proceed anyway"
+            "Undefined ~:[~;variables~] ~:[~;types~]~
+             ~:[~;functions (incomplete SB-COLD::*UNDEFINED-FUN-WHITELIST*?)~]"
+            variables types functions)))
 
-(when sb!c::*track-full-called-fnames*
+#-clisp ; DO-ALL-SYMBOLS seems to kill CLISP at random
+(do-all-symbols (s)
+  (when (and (sb-int:info :function :inlinep s)
+             (eq (sb-int:info :function :where-from s) :assumed))
+      (error "INLINE declaration for an undefined function: ~S?" s)))
+
+;; enable this too see which vops were or weren't used
+#+nil
+(when (hash-table-p sb-c::*static-vop-usage-counts*)
+  (format t "Vops used:~%")
+  (dolist (cell (sort (sb-int:%hash-table-alist sb-c::*static-vop-usage-counts*)
+                      #'> :key #'cdr))
+    (format t "~6d ~s~%" (cdr cell) (car cell))))
+
+(when sb-c::*track-full-called-fnames*
   (let (possibly-suspicious likely-suspicious)
-    (sb!c::call-with-each-globaldb-name
+    (sb-int:call-with-each-globaldb-name
      (lambda (name)
-       (let* ((cell (sb!int:info :function :emitted-full-calls name))
-              (inlinep (eq (sb!int:info :function :inlinep name) :inline))
-              (info (sb!int:info :function :info name)))
+       (let* ((cell (sb-int:info :function :emitted-full-calls name))
+              (inlinep (eq (sb-int:info :function :inlinep name) 'inline))
+              (source-xform (sb-int:info :function :source-transform name))
+              (info (sb-int:info :function :info name)))
          (if (and cell
                   (or inlinep
-                      (and info (sb!c::fun-info-templates info))
-                      (sb!int:info :function :compiler-macro-function name)
-                      (sb!int:info :function :source-transform name)))
-             (if inlinep
-                 ;; A full call to an inline function almost always indicates
-                 ;; an out-of-order definition. If not an inline function,
-                 ;; the call could be due to an inapplicable transformation.
-                 (push (cons name cell) likely-suspicious)
-                 (push (cons name cell) possibly-suspicious))))))
+                      source-xform
+                      (and info (sb-c::fun-info-templates info))
+                      (sb-int:info :function :compiler-macro-function name)))
+             (cond (inlinep
+                    ;; A full call to an inline function almost always indicates
+                    ;; an out-of-order definition. If not an inline function,
+                    ;; the call could be due to an inapplicable transformation.
+                    (push (cons name cell) likely-suspicious))
+                   ;; structure constructors aren't inlined by default,
+                   ;; though we have a source-xform.
+                   ((and (listp source-xform) (eq :constructor (cdr source-xform))))
+                   (t
+                    (push (cons name cell) possibly-suspicious)))))))
     (flet ((show (label list)
-             (format t "~%~A suspicious calls:~:{~%~*~4d ~0@*~S~*~@{~%     ~S~}~}~%"
-                     label (sort list #'> :key #'cadr))))
+             (when list
+               (format t "~%~A suspicious calls:~:{~%~4d ~S~@{~%     ~S~}~}~%"
+                       label
+                       (mapcar (lambda (x) (list* (ash (cadr x) -2) (car x) (cddr x)))
+                               (sort list #'> :key #'cadr))))))
       ;; Called inlines not in the presence of a declaration to the contrary
       ;; indicate that perhaps the function definition appeared too late.
       (show "Likely" likely-suspicious)
       ;; Failed transforms are considered not quite as suspicious
       ;; because it could either be too late, or that the transform failed.
-      (show "Possibly" possibly-suspicious))))
+      (show "Possibly" possibly-suspicious))
+    ;; As each platform's build becomes warning-free,
+    ;; it should be added to the list here to prevent regresssions.
+    (when (and likely-suspicious
+               (feature-in-list-p '(:and (:or :x86 :x86-64) (:or :linux :darwin))
+                                  :target))
+      (warn "Expected zero inlinining failures"))))
 
 ;; After cross-compiling, show me a list of types that checkgen
 ;; would have liked to use primitive traps for but couldn't.
 #+nil
-(let ((l (sb-impl::%hash-table-alist sb!c::*checkgen-used-types*)))
+(let ((l (sb-impl::%hash-table-alist sb-c::*checkgen-used-types*)))
   (format t "~&Types needed by checkgen: ('+' = has internal error number)~%")
   (setq l (sort l #'> :key #'cadr))
   (loop for (type-spec . (count . interr-p)) in l
         do (format t "~:[ ~;+~] ~5D ~S~%" interr-p count type-spec))
   (format t "~&Error numbers not used by checkgen:~%")
-  (loop for (spec . symbol) across sb!c::*backend-internal-errors*
+  (loop for (spec symbol) across sb-c:+backend-internal-errors+
         when (and (not (stringp spec))
-                  (not (gethash spec sb!c::*checkgen-used-types*)))
+                  (not (gethash spec sb-c::*checkgen-used-types*)))
         do (format t "       ~S~%" spec)))
 
-;; Print some information about how well the function caches performed
-(when sb!impl::*profile-hash-cache*
-  (sb!impl::show-hash-cache-statistics))
+;; Print some information about how well the type operator caches performed
+(when sb-impl::*profile-hash-cache*
+  (sb-impl::show-hash-cache-statistics))
 #|
 Sample output
 -------------
@@ -160,30 +143,19 @@ Sample output
     10416      9492 ( 91.1%)      668 (  6.4%)  256  100.0% TYPE-NEGATION-CACHE
 |#
 
-;;; miscellaneous tidying up and saving results
-(let ((filename "output/object-filenames-for-genesis.lisp-expr"))
-  (ensure-directories-exist filename :verbose t)
-  ;; save the initial-symbol-values before writing the object filenames.
-  (save-initial-symbol-values)
-  (with-open-file (s filename :direction :output :if-exists :supersede)
-    (write *target-object-file-names* :stream s :readably t)))
-
 ;;; Let's check that the type system was reasonably sane. (It's easy
 ;;; to spend a long time wandering around confused trying to debug
 ;;; cold init if it wasn't.)
-(when (position :sb-test *shebang-features*)
-  (load "tests/type.after-xc.lisp"))
+(load "tests/type.after-xc.lisp")
 
 ;;; If you're experimenting with the system under a cross-compilation
 ;;; host which supports CMU-CL-style SAVE-LISP, this can be a good
 ;;; time to run it. The resulting core isn't used in the normal build,
 ;;; but can be handy for experimenting with the system. (See slam.sh
 ;;; for an example.)
-(when (position :sb-after-xc-core *shebang-features*)
+#+sb-after-xc-core
+(progn
   #+cmu (ext:save-lisp "output/after-xc.core" :load-init-file nil)
-  #+sbcl (sb-ext:save-lisp-and-die "output/after-xc.core")
+  #+sbcl (host-sb-ext:save-lisp-and-die "output/after-xc.core")
   #+openmcl (ccl::save-application "output/after-xc.core")
   #+clisp (ext:saveinitmem "output/after-xc.core"))
-#+cmu (ext:quit)
-#+clisp (ext:quit)
-#+abcl (ext:quit)

@@ -9,14 +9,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Unary operations.
 
 (define-vop (fast-safe-arith-op)
-  (:policy :fast-safe)
-  (:effects)
-  (:affected))
+  (:policy :fast-safe))
 
 (define-vop (fixnum-unop fast-safe-arith-op)
   (:args (x :scs (any-reg)))
@@ -187,8 +185,6 @@
   (:results (r :scs (signed-reg)))
   (:result-types signed-num)
   (:note "inline (signed-byte 32) logical op"))
-
-(eval-when (:compile-toplevel :load-toplevel :execute)
 
 (defmacro !define-var-binop (translate untagged-penalty op
                              &optional arg-swap restore-fixnum-mask)
@@ -396,8 +392,6 @@
                   (inst ,op r temp low-half))))
              `(inst ,op r x y))))))
 
-); eval-when
-
 (!define-var-binop + 4 add)
 (!define-var-binop - 4 sub)
 (!define-var-binop logand 2 and)
@@ -422,38 +416,6 @@
 (!define-const-logop logand 2 andi.)
 (!define-const-logop logior 2 ori oris)
 (!define-const-logop logxor 2 xori xoris)
-
-
-;;; Special case fixnum + and - that trap on overflow.  Useful when we
-;;; don't know that the output type is a fixnum.
-;;;
-(define-vop (+/fixnum fast-+/fixnum=>fixnum)
-  (:policy :safe)
-  (:results (r :scs (any-reg descriptor-reg)))
-  (:result-types tagged-num)
-  (:note "safe inline fixnum arithmetic")
-  (:generator 4
-    (let* ((no-overflow (gen-label)))
-      (inst mtxer zero-tn)
-      (inst addo. r x y)
-      (inst bns no-overflow)
-      (inst unimp (logior (ash (reg-tn-encoding r) 5)
-                          fixnum-additive-overflow-trap))
-      (emit-label no-overflow))))
-
-(define-vop (-/fixnum fast--/fixnum=>fixnum)
-  (:policy :safe)
-  (:results (r :scs (any-reg descriptor-reg)))
-  (:result-types tagged-num)
-  (:note "safe inline fixnum arithmetic")
-  (:generator 4
-    (let* ((no-overflow (gen-label)))
-      (inst mtxer zero-tn)
-      (inst subo. r x y)
-      (inst bns no-overflow)
-      (inst unimp (logior (ash (reg-tn-encoding r) 5)
-                          fixnum-additive-overflow-trap))
-      (emit-label no-overflow))))
 
 (define-vop (fast-*/fixnum=>fixnum fast-fixnum-binop)
   (:temporary (:scs (non-descriptor-reg)) temp)
@@ -686,7 +648,7 @@
          ;; present in the input X physically.  RLWINM as used below would
          ;; mask these out with 0 even for negative inputs.
          (inst srawi res x phantom-bits)
-         (inst rlwinm res x
+         (inst rlwinm res res
                (mod (- 32 posn (- phantom-bits)) 32)
                (- 32 size n-fixnum-tag-bits)
                (- 31 n-fixnum-tag-bits)))
@@ -744,8 +706,8 @@
              fast-ash-left/unsigned=>unsigned))
 (deftransform ash-left-mod32 ((integer count)
                               ((unsigned-byte 32) (unsigned-byte 5)))
-  (when (sb!c::constant-lvar-p count)
-    (sb!c::give-up-ir1-transform))
+  (when (sb-c::constant-lvar-p count)
+    (sb-c::give-up-ir1-transform))
   '(%primitive fast-ash-left-mod32/unsigned=>unsigned integer count))
 
 (macrolet
@@ -778,8 +740,6 @@
 (define-vop (fast-conditional)
   (:conditional)
   (:info target not-p)
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-conditional/fixnum fast-conditional)
@@ -1042,22 +1002,22 @@
 ;;;; Bignum stuff.
 
 (define-vop (bignum-length get-header-data)
-  (:translate sb!bignum:%bignum-length)
+  (:translate sb-bignum:%bignum-length)
   (:policy :fast-safe))
 
 (define-vop (bignum-set-length set-header-data)
-  (:translate sb!bignum:%bignum-set-length)
+  (:translate sb-bignum:%bignum-set-length)
   (:policy :fast-safe))
 
 (define-vop (bignum-ref word-index-ref)
   (:variant bignum-digits-offset other-pointer-lowtag)
-  (:translate sb!bignum:%bignum-ref)
+  (:translate sb-bignum:%bignum-ref)
   (:results (value :scs (unsigned-reg)))
   (:result-types unsigned-num))
 
 (define-vop (bignum-set word-index-set)
   (:variant bignum-digits-offset other-pointer-lowtag)
-  (:translate sb!bignum:%bignum-set)
+  (:translate sb-bignum:%bignum-set)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg immediate zero))
          (value :scs (unsigned-reg)))
@@ -1066,7 +1026,7 @@
   (:result-types unsigned-num))
 
 (define-vop (digit-0-or-plus)
-  (:translate sb!bignum:%digit-0-or-plusp)
+  (:translate sb-bignum:%digit-0-or-plusp)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg)))
   (:arg-types unsigned-num)
@@ -1080,7 +1040,7 @@
       (emit-label done))))
 
 (define-vop (add-w/carry)
-  (:translate sb!bignum:%add-with-carry)
+  (:translate sb-bignum:%add-with-carry)
   (:policy :fast-safe)
   (:args (a :scs (unsigned-reg))
          (b :scs (unsigned-reg))
@@ -1096,7 +1056,7 @@
     (inst addze carry zero-tn)))
 
 (define-vop (sub-w/borrow)
-  (:translate sb!bignum:%subtract-with-borrow)
+  (:translate sb-bignum:%subtract-with-borrow)
   (:policy :fast-safe)
   (:args (a :scs (unsigned-reg))
          (b :scs (unsigned-reg))
@@ -1112,7 +1072,7 @@
     (inst addze borrow zero-tn)))
 
 (define-vop (bignum-mult-and-add-3-arg)
-  (:translate sb!bignum:%multiply-and-add)
+  (:translate sb-bignum:%multiply-and-add)
   (:policy :fast-safe)
   (:args (x :scs (unsigned-reg))
          (y :scs (unsigned-reg))
@@ -1131,7 +1091,7 @@
     (inst addze hi hi-temp)))
 
 (define-vop (bignum-mult-and-add-4-arg)
-  (:translate sb!bignum:%multiply-and-add)
+  (:translate sb-bignum:%multiply-and-add)
   (:policy :fast-safe)
   (:args (x :scs (unsigned-reg))
          (y :scs (unsigned-reg))
@@ -1153,7 +1113,7 @@
     (inst addze hi hi-temp)))
 
 (define-vop (bignum-mult)
-  (:translate sb!bignum:%multiply)
+  (:translate sb-bignum:%multiply)
   (:policy :fast-safe)
   (:args (x :scs (unsigned-reg) :to (:eval 1))
          (y :scs (unsigned-reg) :to (:eval 1)))
@@ -1165,7 +1125,6 @@
     (inst mullw lo x y)
     (inst mulhwu hi x y)))
 
-#!+multiply-high-vops
 (define-vop (mulhi)
   (:translate %multiply-high)
   (:policy :fast-safe)
@@ -1177,7 +1136,6 @@
   (:generator 20
     (inst mulhwu hi x y)))
 
-#!+multiply-high-vops
 (define-vop (mulhi/fx)
   (:translate %multiply-high)
   (:policy :fast-safe)
@@ -1194,10 +1152,10 @@
     (inst andc hi temp mask)))
 
 (define-vop (bignum-lognot lognot-mod32/unsigned=>unsigned)
-  (:translate sb!bignum:%lognot))
+  (:translate sb-bignum:%lognot))
 
 (define-vop (fixnum-to-digit)
-  (:translate sb!bignum:%fixnum-to-digit)
+  (:translate sb-bignum:%fixnum-to-digit)
   (:policy :fast-safe)
   (:args (fixnum :scs (any-reg)))
   (:arg-types tagged-num)
@@ -1206,63 +1164,48 @@
   (:generator 1
     (inst srawi digit fixnum n-fixnum-tag-bits)))
 
-
+;;; Algorithm from page 74 of of Power ISA version 2.07
+;;; under "Programming Note" for the divweu instruction.
 (define-vop (bignum-floor)
-  (:translate sb!bignum:%bigfloor)
+  (:translate sb-bignum:%bigfloor)
   (:policy :fast-safe)
-  (:args (num-high :scs (unsigned-reg) :target rem)
-         (num-low :scs (unsigned-reg) :target rem-low)
-         (denom :scs (unsigned-reg) :to (:eval 1)))
+  ;; I tried to tighten up the TN lifetimes for better packing
+  ;; (in fewer physical registers), but I got it wrong and everything broke.
+  ;; We have enough non-descriptor registers that this isn't a problem.
+  (:args (Dh :scs (unsigned-reg)) ; dividend high
+         (Dl :scs (unsigned-reg)) ; dividend low
+         (Dv :scs (unsigned-reg) :to :save)) ; divisor
   (:arg-types unsigned-num unsigned-num unsigned-num)
-  (:temporary (:scs (unsigned-reg) :from (:argument 1)) rem-low)
-  (:temporary (:scs (unsigned-reg) :from (:eval 0)) temp)
-  (:results (quo :scs (unsigned-reg) :from (:eval 0))
-            (rem :scs (unsigned-reg) :from (:argument 0)))
+  (:results (Q :scs (unsigned-reg))  ; quotient
+            (R :scs (unsigned-reg))) ; remainder
   (:result-types unsigned-num unsigned-num)
-  (:generator 325 ; number of inst assuming targeting works.
-    (move rem num-high)
-    (move rem-low num-low)
-    (flet ((maybe-subtract (&optional (guess temp))
-             (inst subi temp guess 1)
-             (inst and temp temp denom)
-             (inst sub rem rem temp))
-           (sltu (res x y)
-             (inst subfc res y x)
-             (inst subfe res res res)
-             (inst neg res res)))
-      (sltu quo rem denom)
-      (maybe-subtract quo)
-      (dotimes (i 32)
-        (inst slwi rem rem 1)
-        (inst srwi temp rem-low 31)
-        (inst or rem rem temp)
-        (inst slwi rem-low rem-low 1)
-        (sltu temp rem denom)
-        (inst slwi quo quo 1)
-        (inst or quo quo temp)
-        (maybe-subtract)))
-    (inst not quo quo)))
-
-#|
-
-(define-vop (bignum-floor)
-  (:translate sb!bignum:%bigfloor)
-  (:policy :fast-safe)
-  (:args (div-high :scs (unsigned-reg) :target rem)
-         (div-low :scs (unsigned-reg) :target quo)
-         (divisor :scs (unsigned-reg)))
-  (:arg-types unsigned-num unsigned-num unsigned-num)
-  (:results (quo :scs (unsigned-reg) :from (:argument 1))
-            (rem :scs (unsigned-reg) :from (:argument 0)))
-  (:result-types unsigned-num unsigned-num)
-  (:generator 300
-    (inst mtmq div-low)
-    (inst div quo div-high divisor)
-    (inst mfmq rem)))
-|#
+  (:temporary (:scs (non-descriptor-reg)) q1)
+  (:temporary (:scs (non-descriptor-reg)) q2)
+  (:temporary (:scs (non-descriptor-reg)) -r1)
+  (:temporary (:scs (non-descriptor-reg)) r2)
+  (:generator 15
+    ;; I don't know how we know when utilizing this vop
+    ;; that overflow won't occur. But the code for x86[-64]
+    ;; does not check for overflow either.
+    (inst divweu q1 Dh Dv)   ; q1
+    (inst divwu  q2 Dl Dv)   ; q2
+    (inst mullw -r1 q1 Dv)   ; -r1 = q1 * Dv
+    (inst mullw r2 q2 Dv)    ; temp = q2 * Dv
+    (inst subf r2 r2 Dl)     ; r2 = Dl - (q2 * Dv)
+    ;; move to result TNs
+    (inst add Q q1 q2)       ; Q = q1 + q2
+    (inst subf R -r1 r2)     ; R = r1 + r2
+    (inst cmplw R r2)        ; R < r2 ?
+    (inst blt ADJ)           ; must adjust Q and R if yes
+    (inst cmplw R Dv)        ; R >= Dv ?
+    (inst blt DONE)          ; must adjust Q and R if yes
+    ADJ
+    (inst addi Q Q 1)        ; Q = Q + 1
+    (inst subf R Dv R)       ; R = R - Dv
+    DONE))
 
 (define-vop (signify-digit)
-  (:translate sb!bignum:%fixnum-digit-with-correct-sign)
+  (:translate sb-bignum:%fixnum-digit-with-correct-sign)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg) :target res))
   (:arg-types unsigned-num)
@@ -1277,7 +1220,7 @@
 
 
 (define-vop (digit-ashr)
-  (:translate sb!bignum:%ashr)
+  (:translate sb-bignum:%ashr)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg))
          (count :scs (unsigned-reg)))
@@ -1288,41 +1231,16 @@
     (inst sraw result digit count)))
 
 (define-vop (digit-lshr digit-ashr)
-  (:translate sb!bignum:%digit-logical-shift-right)
+  (:translate sb-bignum:%digit-logical-shift-right)
   (:generator 1
     (inst srw result digit count)))
 
 (define-vop (digit-ashl digit-ashr)
-  (:translate sb!bignum:%ashl)
+  (:translate sb-bignum:%ashl)
   (:generator 1
     (inst slw result digit count)))
-
 
-;;;; Static funs.
-
-(define-static-fun two-arg-gcd (x y) :translate gcd)
-(define-static-fun two-arg-lcm (x y) :translate lcm)
-
-(define-static-fun two-arg-+ (x y) :translate +)
-(define-static-fun two-arg-- (x y) :translate -)
-(define-static-fun two-arg-* (x y) :translate *)
-(define-static-fun two-arg-/ (x y) :translate /)
-
-(define-static-fun two-arg-< (x y) :translate <)
-(define-static-fun two-arg-<= (x y) :translate <=)
-(define-static-fun two-arg-> (x y) :translate >)
-(define-static-fun two-arg->= (x y) :translate >=)
-(define-static-fun two-arg-= (x y) :translate =)
-(define-static-fun two-arg-/= (x y) :translate /=)
-
-(define-static-fun %negate (x) :translate %negate)
-
-(define-static-fun two-arg-and (x y) :translate logand)
-(define-static-fun two-arg-ior (x y) :translate logior)
-(define-static-fun two-arg-xor (x y) :translate logxor)
-(define-static-fun two-arg-eqv (x y) :translate logeqv)
-
-(in-package "SB!C")
+(in-package "SB-C")
 
 (deftransform * ((x y)
                  ((unsigned-byte 32) (constant-arg (unsigned-byte 32)))

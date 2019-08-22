@@ -23,8 +23,6 @@
 #endif
 #include "runtime.h"
 
-#if defined(LISP_FEATURE_SB_LDB)
-
 #include "globals.h"
 #include "vars.h"
 #include "parse.h"
@@ -121,8 +119,7 @@ static boolean lookup_variable(char *name, lispobj *result)
 }
 
 
-boolean more_p(ptr)
-char **ptr;
+boolean more_p(char **ptr)
 {
     skip_ws(ptr);
 
@@ -132,8 +129,7 @@ char **ptr;
         return 1;
 }
 
-char *parse_token(ptr)
-char **ptr;
+char *parse_token(char **ptr)
 {
     char *token;
 
@@ -155,49 +151,7 @@ char **ptr;
     return token;
 }
 
-#if 0
-static boolean number_p(token)
-char *token;
-{
-    char *okay;
-
-    if (token == NULL)
-        return 0;
-
-    okay = "abcdefABCDEF987654321d0";
-
-    if (token[0] == '0')
-        if (token[1] == 'x' || token[1] == 'X')
-            token += 2;
-        else {
-            token++;
-            okay += 14;
-        }
-    else if (token[0] == '#') {
-        switch (token[1]) {
-            case 'x':
-            case 'X':
-                break;
-            case 'o':
-            case 'O':
-                okay += 14;
-                break;
-            default:
-                return 0;
-        }
-    }
-    else
-        okay += 12;
-
-    while (*token != '\0')
-        if (index(okay, *token++) == NULL)
-            return 0;
-    return 1;
-}
-#endif
-
-uword_t parse_number(ptr)
-char **ptr;
+uword_t parse_number(char **ptr)
 {
     char *token = parse_token(ptr);
     uword_t result;
@@ -215,8 +169,7 @@ char **ptr;
     return 0;
 }
 
-char *parse_addr(ptr)
-char **ptr;
+char *parse_addr(char **ptr, boolean safely)
 {
     char *token = parse_token(ptr);
     lispobj result;
@@ -241,7 +194,7 @@ char **ptr;
         result = (value & ~3);
     }
 
-    if (!is_valid_lisp_addr((os_vm_address_t)result)) {
+    if (safely && !gc_managed_addr_p(result)) {
         printf("invalid Lisp-level address: %p\n", (void *)result);
         throw_to_monitor();
     }
@@ -249,40 +202,33 @@ char **ptr;
     return (char *)result;
 }
 
-static boolean lookup_symbol(char *name, lispobj *result)
+static lispobj lookup_symbol(char *name)
 {
-    int count;
-    lispobj *headerptr;
-
-    /* Search static space. */
-    headerptr = (lispobj *)STATIC_SPACE_START;
-    count =
-        (lispobj *)SymbolValue(STATIC_SPACE_FREE_POINTER,0) -
-        (lispobj *)STATIC_SPACE_START;
-    if (search_for_symbol(name, &headerptr, &count)) {
-        *result = make_lispobj(headerptr,OTHER_POINTER_LOWTAG);
-        return 1;
-    }
-
-    /* Search dynamic space. */
-#if defined(LISP_FEATURE_GENCGC)
-    headerptr = (lispobj *)DYNAMIC_SPACE_START;
-    count = (lispobj *)get_alloc_pointer() - headerptr;
-#else
-    headerptr = (lispobj *)current_dynamic_space;
-    count = dynamic_space_free_pointer - headerptr;
+    uword_t ranges[][2] = {
+      { STATIC_SPACE_START, (uword_t)static_space_free_pointer },
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+      { FIXEDOBJ_SPACE_START, (uword_t)fixedobj_free_pointer },
 #endif
+#if defined(LISP_FEATURE_GENCGC)
+      { DYNAMIC_SPACE_START, (uword_t)get_alloc_pointer() }
+#else
+      { (uword_t)current_dynamic_space, (uword_t)dynamic_space_free_pointer }
+#endif
+    };
 
-    if (search_for_symbol(name, &headerptr, &count)) {
-        *result = make_lispobj(headerptr, OTHER_POINTER_LOWTAG);
-        return 1;
-    }
-
+    lispobj *headerptr;
+    unsigned i;
+    for (i=0; i<(sizeof ranges/(2*sizeof (uword_t))); ++i)
+        if ((headerptr = search_for_symbol(name, ranges[i][0], ranges[i][1], 0)))
+            return make_lispobj(headerptr, OTHER_POINTER_LOWTAG);
+    // Try again, case-insensitively
+    for (i=0; i<(sizeof ranges/(2*sizeof (uword_t))); ++i)
+        if ((headerptr = search_for_symbol(name, ranges[i][0], ranges[i][1], 1)))
+            return make_lispobj(headerptr, OTHER_POINTER_LOWTAG);
     return 0;
 }
 
-static int
-parse_regnum(char *s)
+static int parse_regnum(char *s)
 {
     if ((s[1] == 'R') || (s[1] == 'r')) {
         int regnum;
@@ -311,8 +257,7 @@ parse_regnum(char *s)
     }
 }
 
-lispobj parse_lispobj(ptr)
-char **ptr;
+lispobj parse_lispobj(char **ptr)
 {
     struct thread *thread=arch_os_get_current_thread();
     char *token = parse_token(ptr);
@@ -329,14 +274,14 @@ char **ptr;
             int regnum;
             os_context_t *context;
 
-            free_ici = fixnum_value(SymbolValue(FREE_INTERRUPT_CONTEXT_INDEX,thread));
+            free_ici = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,thread));
 
             if (free_ici == 0) {
                 printf("Variable ``%s'' is not valid -- there is no current interrupt context.\n", token);
                 throw_to_monitor();
             }
 
-            context = thread->interrupt_contexts[free_ici - 1];
+            context = nth_interrupt_context(free_ici - 1, thread);
 
             regnum = parse_regnum(token);
             if (regnum < 0) {
@@ -352,7 +297,7 @@ char **ptr;
     } else if (token[0] == '@') {
         if (string_to_long(token+1, &pointer)) {
             pointer &= ~3;
-            if (is_valid_lisp_addr((os_vm_address_t)pointer))
+            if (gc_managed_addr_p(pointer))
                 result = *(lispobj *)pointer;
             else {
                 printf("invalid Lisp-level address: ``%s''\n", token+1);
@@ -366,7 +311,7 @@ char **ptr;
     }
     else if (string_to_long(token, &value))
         result = value;
-    else if (lookup_symbol(token, &result))
+    else if ((result = lookup_symbol(token)) != 0)
         ;
     else {
         printf("invalid Lisp object: ``%s''\n", token);
@@ -375,5 +320,3 @@ char **ptr;
 
     return result;
 }
-
-#endif /* defined(LISP_FEATURE_SB_LDB) */

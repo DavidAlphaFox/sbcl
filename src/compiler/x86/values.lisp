@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-vop (reset-stack-pointer)
   (:args (ptr :scs (any-reg)))
@@ -54,16 +54,15 @@
 ;;; bogus SC that reflects the costs of the memory-to-memory moves for each
 ;;; operand, but this seems unworthwhile.
 (define-vop (push-values)
-  (:args (vals :more t))
-  (:temporary (:sc unsigned-reg :to (:result 0) :target start) temp)
-  (:results (start) (count))
+  (:args (vals :more t
+               :scs (descriptor-reg)))
+  (:results (start :from :load) (count))
   (:info nvals)
   (:generator 20
-    (move temp esp-tn)                  ; WARN pointing 1 below
+    (move start esp-tn)                 ; WARN pointing 1 below
     (do ((val vals (tn-ref-across val)))
         ((null val))
-      (inst push (tn-ref-tn val)))
-    (move start temp)
+      (inst push (encode-value-if-immediate (tn-ref-tn val))))
     (inst mov count (fixnumize nvals))))
 
 ;;; Push a list of values on the stack, returning Start and Count as used in
@@ -93,7 +92,7 @@
     (inst and al-tn lowtag-mask)
     (inst cmp al-tn list-pointer-lowtag)
     (inst jmp :e loop)
-    (error-call vop 'bogus-arg-to-values-list-error list)
+    (cerror-call vop 'bogus-arg-to-values-list-error list)
 
     DONE
     (inst mov count start)              ; start is high address

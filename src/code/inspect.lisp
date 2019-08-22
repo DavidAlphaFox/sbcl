@@ -9,13 +9,9 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB-IMPL") ;(SB-IMPL, not SB!IMPL, since we're built in warm load.)
+(in-package "SB-IMPL") ;(SB-IMPL, not SB-IMPL, since we're built in warm load.)
 
 (defparameter *inspect-length* 10)
-
-;;; When *INSPECT-UNBOUND-OBJECT-MARKER* occurs in a parts list, it
-;;; indicates that that a slot is unbound.
-(defvar *inspect-unbound-object-marker* (gensym "INSPECT-UNBOUND-OBJECT-"))
 
 (defun inspector (object input-stream output-stream)
   (declare (ignore input-stream))
@@ -24,19 +20,17 @@
   (values))
 
 (defvar *inspect-fun* #'inspector
-  #+sb-doc
   "A function of three arguments OBJECT, INPUT, and OUTPUT which starts an interactive inspector.")
 
 (defvar *inspected*)
 
-#+sb-doc
 (setf (documentation '*inspected* 'variable)
       "the value currently being inspected in CL:INSPECT")
 
 (defun inspect (object)
   (funcall *inspect-fun* object *standard-input* *standard-output*))
 
-(defvar *help-for-inspect*
+(defconstant-eqx +help-for-inspect+
   "
 help for INSPECT:
   Q, E        -  Quit the inspector.
@@ -48,7 +42,7 @@ help for INSPECT:
 Within the inspector, the special variable SB-EXT:*INSPECTED* is bound
 to the current inspected object, so that it can be referred to in
 evaluated expressions.
-")
+" #'equal)
 
 (defun %inspect (*inspected* s)
   (named-let redisplay () ; "LAMBDA, the ultimate GOTO":-|
@@ -76,7 +70,7 @@ evaluated expressions.
                (cond ((< -1 command elements-length)
                       (let* ((element (nth command elements))
                              (value (if named-p (cdr element) element)))
-                        (cond ((eq value *inspect-unbound-object-marker*)
+                        (cond ((eq value sb-pcl:+slot-unbound+)
                                (format s "~%That slot is unbound.~%")
                                (return-from %inspect (reread)))
                               (t
@@ -101,7 +95,7 @@ evaluated expressions.
                (:r
                 (return-from %inspect (redisplay)))
                ((:h :? :help)
-                (write-string *help-for-inspect* s)
+                (write-string +help-for-inspect+ s)
                 (return-from %inspect (reread)))
                (t
                 (eval-for-inspect command s)
@@ -119,17 +113,21 @@ evaluated expressions.
     (format stream "~&~{~S~%~}" result-list)))
 
 (defun tty-display-inspected-parts (description named-p elements stream)
-  (format stream "~%~A" description)
-  (let ((index 0))
-    (dolist (element elements)
-      (if named-p
-          (destructuring-bind (name . value) element
-            (format stream "~W. ~A: ~W~%" index name
-                    (if (eq value *inspect-unbound-object-marker*)
-                        "unbound"
-                        value)))
-          (format stream "~W. ~W~%" index element))
-      (incf index))))
+  (let ((*suppress-print-errors*
+         (if (subtypep 'serious-condition *suppress-print-errors*)
+             *suppress-print-errors*
+             'serious-condition)))
+    (format stream "~%~A" description)
+    (loop for element in elements
+       for index from 0
+       do (multiple-value-bind (value name)
+              (if named-p
+                  (values (cdr element) (car element))
+                  element)
+            (format stream "~W. ~@[~A: ~]~W~%"
+                    index name (if (eq value sb-pcl:+slot-unbound+)
+                                   "unbound"
+                                   value))))))
 
 ;;;; INSPECTED-PARTS
 
@@ -159,10 +157,10 @@ evaluated expressions.
                 (cons "Package" (symbol-package object))
                 (cons "Value" (if (boundp object)
                                   (symbol-value object)
-                                  *inspect-unbound-object-marker*))
+                                  sb-pcl:+slot-unbound+))
                 (cons "Function" (if (fboundp object)
                                      (symbol-function object)
-                                     *inspect-unbound-object-marker*))
+                                     sb-pcl:+slot-unbound+))
                 (cons "Plist" (symbol-plist object)))))
 
 (defun inspected-structure-elements (object)
@@ -187,7 +185,7 @@ evaluated expressions.
       (let* ((slot-name (slot-value class-slot 'sb-pcl::name))
              (slot-value (if (slot-boundp object slot-name)
                              (slot-value object slot-name)
-                             *inspect-unbound-object-marker*)))
+                             sb-pcl:+slot-unbound+)))
         (push (cons slot-name slot-value) reversed-elements)))))
 
 (defmethod inspected-parts ((object standard-object))
@@ -223,29 +221,29 @@ evaluated expressions.
              (list
               (cons "Closed over values" (%closure-values object)))))))
 
-#+sb-eval
-(defmethod inspected-parts ((object sb-eval:interpreted-function))
-  (values (format nil "The object is an interpreted function named ~S.~%"
-                  (nth-value 2 (function-lambda-expression object)))
-          t
-          ;; Defined-from stuff used to be here. Someone took
-          ;; it out. FIXME: We should make it easy to get
-          ;; to DESCRIBE from the inspector.
-          (list
-           (cons "Lambda-list" (sb-eval:interpreted-function-lambda-list object))
-           (cons "Definition" (function-lambda-expression object))
-           (cons "Documentation" (sb-eval:interpreted-function-documentation object)))))
+#+(or sb-eval sb-fasteval)
+(defmethod inspected-parts ((object interpreted-function))
+  (multiple-value-bind (defn closurep name) (function-lambda-expression object)
+    (declare (ignore closurep))
+    (values (format nil "The object is an interpreted function named ~S.~%" name)
+            t
+            ;; Defined-from stuff used to be here. Someone took
+            ;; it out. FIXME: We should make it easy to get
+            ;; to DESCRIBE from the inspector.
+            (list
+             (cons "Lambda-list" (%fun-lambda-list object))
+             (cons "Definition" defn)
+             (cons "Documentation" (documentation object t))))))
 
 (defmethod inspected-parts ((object vector))
-  (values (format nil
-                  "The object is a ~:[~;displaced ~]VECTOR of length ~W.~%"
-                  (and (array-header-p object)
-                       (%array-displaced-p object))
-                  (length object))
-          nil
-          ;; FIXME: Should we respect *INSPECT-LENGTH* here? If not, what
-          ;; does *INSPECT-LENGTH* mean?
-          (coerce object 'list)))
+  (let ((length (min (array-total-size object) *inspect-length*)))
+    (values (format nil
+                    "The object is a ~:[~;displaced ~]VECTOR of length ~W.~%"
+                    (and (array-header-p object)
+                         (%array-displaced-p object))
+                    (length object))
+            nil
+            (coerce (subseq object 0 length) 'list))))
 
 (defun inspected-index-string (index rev-dimensions)
   (if (null rev-dimensions)
@@ -264,19 +262,17 @@ evaluated expressions.
                                       :displaced-to object))
          (dimensions (array-dimensions object))
          (reversed-elements nil))
-    ;; FIXME: Should we respect *INSPECT-LENGTH* here? If not, what does
-    ;; *INSPECT-LENGTH* mean?
     (dotimes (i length)
       (push (cons (format nil
                           "~A "
                           (inspected-index-string i (reverse dimensions)))
                   (aref reference-array i))
             reversed-elements))
-    (values (format nil "The object is ~:[a displaced~;an~] ARRAY of ~A.~%~
-                         Its dimensions are ~S.~%"
-                    (array-element-type object)
+    (values (format nil "The object is ~:[an~;a displaced~] ARRAY of ~A.~%~
+                         Its dimensions are ~:S.~%"
                     (and (array-header-p object)
                          (%array-displaced-p object))
+                    (array-element-type object)
                     dimensions)
             t
             (nreverse reversed-elements))))

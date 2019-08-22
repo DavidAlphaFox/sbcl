@@ -11,12 +11,8 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(load "test-util.lisp")
-(load "assertoid.lisp")
-(use-package "ASSERTOID")
-
 ;;; tests of MAP
-(with-test (:name :map)
+(with-test (:name (map :smoke))
   (assertoid (map 'vector #'+ '(1 2 3) '(30 20))
              :expected-equalp #(31 22))
   (assertoid (map 'list #'+ #(1 2) '(100) #(0) #(100 100))
@@ -24,7 +20,7 @@
 
 ;;; tests of MAP-INTO
 
-(with-test (:name :map-into)
+(with-test (:name (map-into :smoke))
   (assertoid (map-into (vector) #'+ '(1 2 3) '(30 20))
              :expected-equalp #())
   (assertoid (map-into (vector 99) #'+ '(1 2 3) '(30 20))
@@ -93,7 +89,7 @@
        ,@body
        (nreverse reversed-result))))
 
-(with-test (:name :map-nil)
+(with-test (:name (map nil))
   (assertoid (with-mapnil-test-fun fun
                (map nil #'fun #(1)))
              :expected-equal '((1)))
@@ -181,14 +177,49 @@
            :arg-seqs (*list-2* *list-2* *vector-30*)
            :arg-types (list list vector)))
 
-(with-test (:name :map-into-vector-from-list)
+(with-test (:name (map-into vector :from list))
   (map-into (eval (make-array 10))
             #'list
             (make-list 10))
-  (assert (equalp (funcall (compile nil
-                                   `(lambda (a)
-                                      (map-into (make-array 3) #'identity a)))
-                          '(1 2 3))
-                 #(1 2 3))))
+  (checked-compile-and-assert ()
+      `(lambda (a) (map-into (make-array 3) #'identity a))
+    (('(1 2 3)) #(1 2 3) :test #'equalp)))
 
-;;; success
+(with-test (:name (map-into type-error))
+  (checked-compile-and-assert (:optimize :safe)
+      `(lambda (x)
+         (map-into (make-array 1 :element-type '(signed-byte 16)) x))
+    (((constantly nil)) (condition 'type-error)))
+  (checked-compile-and-assert (:optimize :safe)
+      `(lambda (array x) (map-into array x))
+    (((make-array 1 :element-type '(signed-byte 16)) (constantly nil))
+     (condition 'type-error)))
+  (checked-compile-and-assert (:optimize :safe)
+      `(lambda (array x) (map-into array x))
+    (((cons 1 2) (constantly nil)) (condition 'type-error))))
+
+(with-test (:name (map type-error))
+  (checked-compile-and-assert (:optimize :safe)
+      `(lambda (x) (map '(vector (signed-byte 16) 1) #'identity x))
+    (('(1.0)) (condition 'type-error)))
+  (checked-compile-and-assert (:optimize :safe)
+      `(lambda (type x) (map type #'identity x))
+    (('(vector (signed-byte 16) 1) '(1.0)) (condition 'type-error))))
+
+(with-test (:name (map :out-of-line))
+  (flet ((test (map args expected)
+           (let ((fun (checked-compile `(lambda (&rest args)
+                                          (declare (notinline ,map))
+                                          (apply #',map args)))))
+             (assert (equal (apply fun args) expected)))))
+    (test 'mapcar (list #'+ '(1 2 3) '(3 2 1)) '(4 4 4))
+    (test 'maplist (list #'cons '(1 2 3) '(3 2 1))
+          '(((1 2 3) 3 2 1) ((2 3) 2 1) ((3) 1)))
+    (test 'mapcan (list #'cons '(1 2 3) '(3 2 1)) '(1 2 3 . 1))
+    (test 'mapcon (list #'list '(1 2 3) '(3 2 1))
+          '((1 2 3) (3 2 1) (2 3) (2 1) (3) (1)))
+    (test 'mapcan (list  #'identity '((3 4 . 5) nil (1 . 5)))
+          '(3 4 1 . 5))
+    (test 'mapcar (list  #'list '(1 2 3) '(4 5 6) '(7 8 9))
+          '((1 4 7) (2 5 8) (3 6 9)))
+    (test 'mapcan (list #'identity '(1)) 1)))

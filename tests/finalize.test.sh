@@ -33,12 +33,21 @@ echo //entering finalize.test.sh
 
 (gc :full t)
 (gc :full t)
+;; Stopping the finalizer thread ensures that queued finalizers execute.
+;; [I don't think it's possible for it to stop before draining the queue,
+;; but that isn't part of the contract with stopping. If this test fails,
+;; try inserting a call to RUN-PENDING-FINALIZERS after this line]
+#+sb-thread (sb-impl::finalizer-thread-stop)
+;; FIXME: turns out, it does fail:
+(sb-kernel:run-pending-finalizers)
 
 (if (= *count* 10000)
     (with-open-file (f "finalize-test-passed" :direction :output)
       (write-line "OK" f))
     (with-open-file (f "finalize-test-failed" :direction :output)
-      (format f "OOPS: ~A~%" *count*)))
+      (format f "OOPS: ~A~%" *count*)
+      (sb-kernel:run-pending-finalizers)
+      (format f "After sb-kernel:run-pending-finalizers: ~A~%" *count*)))
 
 (sb-ext:quit)
 EOF
@@ -53,7 +62,8 @@ while true; do
         rm finalize-test-passed
         exit $EXIT_TEST_WIN
     elif [ -f finalize-test-failed ]; then
-        echo "Failed"
+        wait
+        cat finalize-test-failed
         rm finalize-test-failed
         exit $EXIT_LOSE
     fi

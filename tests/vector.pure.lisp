@@ -9,8 +9,6 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(cl:in-package :cl-user)
-
 (with-test (:name :length)
     (funcall (lambda ()
                (let ((simple-t (make-array 35))
@@ -64,3 +62,10 @@
       (assert-error (test -1))
       (assert (= (test 0) 1))
       (assert-error (test 1)))))
+
+(with-test (:name :fill-pointer-transform)
+  (assert-error
+   (funcall (checked-compile `(lambda (x)
+                                (setf (fill-pointer x) 0)))
+            (make-array 2 :adjustable t))
+   type-error))

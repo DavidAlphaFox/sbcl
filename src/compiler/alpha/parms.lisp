@@ -7,43 +7,44 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
+
+(defconstant sb-assem:assem-scheduler-p nil)
+(defconstant sb-assem:+inst-alignment-bytes+ 4)
+
+(defconstant +backend-fasl-file-implementation+ :alpha)
+
+(defconstant +backend-page-bytes+ 8192)
 
 (eval-when  (:compile-toplevel :load-toplevel :execute)
 
 ;;; number of bits per word where a word holds one lisp descriptor
-(def!constant n-word-bits 32)
+(defconstant n-word-bits 32)
 
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
-(def!constant n-machine-word-bits 64)
+(defconstant n-machine-word-bits 64)
 
-;;; number of bits per byte where a byte is the smallest addressable
-;;; object
-(def!constant n-byte-bits 8)
+(defconstant float-sign-shift 31)
 
-(def!constant float-sign-shift 31)
-
-(def!constant single-float-bias 126)
+(defconstant single-float-bias 126)
 (defconstant-eqx single-float-exponent-byte (byte 8 23) #'equalp)
 (defconstant-eqx single-float-significand-byte (byte 23 0) #'equalp)
-(def!constant single-float-normal-exponent-min 1)
-(def!constant single-float-normal-exponent-max 254)
-(def!constant single-float-hidden-bit (ash 1 23))
-(def!constant single-float-trapping-nan-bit (ash 1 22))
+(defconstant single-float-normal-exponent-min 1)
+(defconstant single-float-normal-exponent-max 254)
+(defconstant single-float-hidden-bit (ash 1 23))
 
-(def!constant double-float-bias 1022)
+(defconstant double-float-bias 1022)
 (defconstant-eqx double-float-exponent-byte (byte 11 20)   #'equalp)
 (defconstant-eqx double-float-significand-byte (byte 20 0) #'equalp)
-(def!constant double-float-normal-exponent-min 1)
-(def!constant double-float-normal-exponent-max #x7FE)
-(def!constant double-float-hidden-bit (ash 1 20))
-(def!constant double-float-trapping-nan-bit (ash 1 19))
+(defconstant double-float-normal-exponent-min 1)
+(defconstant double-float-normal-exponent-max #x7FE)
+(defconstant double-float-hidden-bit (ash 1 20))
 
-(def!constant single-float-digits
+(defconstant single-float-digits
   (+ (byte-size single-float-significand-byte) 1))
 
-(def!constant double-float-digits
+(defconstant double-float-digits
   (+ (byte-size double-float-significand-byte) n-word-bits 1))
 
 ;;; These values are originally from the DEC Assembly Language
@@ -72,11 +73,11 @@
 ;;; <machine/fpu.h>
 
 ;;; trap enables are set in software (fp_control)
-(def!constant float-inexact-trap-bit        (ash 1 4)) ; rw
-(def!constant float-underflow-trap-bit      (ash 1 3)) ; rw
-(def!constant float-overflow-trap-bit       (ash 1 2)) ; ro
-(def!constant float-divide-by-zero-trap-bit (ash 1 1)) ; ro
-(def!constant float-invalid-trap-bit        (ash 1 0)) ; ro
+(defconstant float-inexact-trap-bit        (ash 1 4)) ; rw
+(defconstant float-underflow-trap-bit      (ash 1 3)) ; rw
+(defconstant float-overflow-trap-bit       (ash 1 2)) ; ro
+(defconstant float-divide-by-zero-trap-bit (ash 1 1)) ; ro
+(defconstant float-invalid-trap-bit        (ash 1 0)) ; ro
 (defconstant-eqx float-traps-byte          (byte 6  1) #'equalp)
 
 ;;; exceptions are also read/written in software (by syscalls, no less).
@@ -89,15 +90,15 @@
 (defconstant-eqx float-exceptions-byte (byte 6 17)  #'equalp)
 
 ;;; Rounding modes can only be set by frobbing the hardware fpcr directly
-(def!constant float-round-to-zero     0)
-(def!constant float-round-to-negative 1)
-(def!constant float-round-to-nearest  2)
-(def!constant float-round-to-positive 3)
+(defconstant float-round-to-zero     0)
+(defconstant float-round-to-negative 1)
+(defconstant float-round-to-nearest  2)
+(defconstant float-round-to-positive 3)
 (defconstant-eqx float-rounding-mode   (byte 2 58) #'equalp)
 
 ;;; Miscellaneous stuff - I think it's far to say that you deserve
 ;;; what you get if you ask for fast mode.
-(def!constant float-fast-bit 0)
+(defconstant float-fast-bit 0)
 
 ); eval-when
 
@@ -108,34 +109,25 @@
 ;;; Where to put the different spaces.
 ;;;
 
-#!+linux
+#+linux
 (progn
-  (def!constant read-only-space-start #x20000000)
-  (def!constant read-only-space-end   #x24000000))
+  (defconstant read-only-space-start #x20000000)
+  (defconstant read-only-space-end   #x24000000))
 
-#!+osf1
-(progn
-  (defconstant read-only-space-start #x10000000)
-  (defconstant read-only-space-end   #x25000000))
+(defconstant static-space-start    #x28000000)
+(defconstant static-space-end      #x2c000000)
 
-
-(def!constant static-space-start    #x28000000)
-(def!constant static-space-end      #x2c000000)
-
-(def!constant dynamic-0-space-start   #x30000000)
-(def!constant dynamic-0-space-end     #x3fff0000)
-
-(def!constant dynamic-1-space-start   #x40000000)
-(def!constant dynamic-1-space-end     #x4fff0000)
+(defparameter dynamic-0-space-start  #x30000000)
+(defparameter dynamic-0-space-end    #x3fff0000)
 
 ;;; FIXME nothing refers to either of these in alpha or x86 cmucl
 ;;; backend, so they could probably be removed.
 
 ;; The space-register holding the lisp heap.
-(def!constant lisp-heap-space 4)
+(defconstant lisp-heap-space 4)
 
 ;; The space-register holding the C text segment.
-(def!constant c-text-space 4)
+(defconstant c-text-space 4)
 
 ;;; the X86 port defines *nil-value* as (+ *target-static-space-start* #xB)
 ;;; here, but it seems to be the only port that needs to know the
@@ -146,7 +138,6 @@
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
-  error-trap
   cerror-trap
   breakpoint-trap
   fun-end-breakpoint-trap
@@ -155,7 +146,8 @@
   ;; are still needed to avoid undefined variable warnings during sbcl
   ;; build.
   single-step-around-trap
-  single-step-before-trap)
+  single-step-before-trap
+  error-trap)
 
 ;;;; static symbols
 
@@ -167,14 +159,12 @@
 ;;; space directly after the static symbols.  That way, the raw-addr
 ;;; can be loaded directly out of them by indirecting relative to NIL.
 ;;;
-(defparameter *static-symbols*
-  (append
-   *common-static-symbols*
-   *c-callable-static-symbols*
-   '()))
+(defconstant-eqx +static-symbols+
+  `#(,@+common-static-symbols+)
+  #'equalp)
 
-(defparameter *static-funs*
-  '(length
+(defconstant-eqx +static-fdefns+
+  #(length
     two-arg-+
     two-arg--
     two-arg-*
@@ -196,4 +186,5 @@
     two-arg-xor
     two-arg-eqv
     two-arg-gcd
-    two-arg-lcm))
+    two-arg-lcm)
+  #'equalp)

@@ -11,6 +11,29 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
+(defun set-bad-package (x)
+  (declare (optimize (safety 0)))
+  (setq *package* x))
+
+;; When interpreting, the error occurs in SET-BAD-PACKAGE,
+;; not at the INTERN call.
+(with-test (:name :set-bad-package :skipped-on :interpreter)
+  (set-bad-package :cl-user)
+  (assert-error (intern "FRED") type-error))
+
+;;; Expect an error about the nickname not being a string designator,
+;;; not about the nickname being taken by another package.
+(with-test (:name :nickname-is-string-designator)
+  (let ((errmsg (handler-case (make-package "X" :nicknames (list (find-package "CL")))
+                  (error (c) (princ-to-string c)))))
+    (assert (search "does not designate a string" errmsg))))
+
+(with-test (:name :packages-sanely-nicknamed)
+  (dolist (p (list-all-packages))
+    (let* ((nicks (package-nicknames p))
+           (check (remove-duplicates nicks :test 'string=)))
+      (assert (= (length check) (length nicks))))))
+
 (make-package "FOO")
 (defvar *foo* (find-package (coerce "FOO" 'base-string)))
 (rename-package "FOO" (make-array 0 :element-type nil))
@@ -294,10 +317,10 @@ if a restart was invoked."
 ;; This used to fail with "NIL does not name a package"
 (with-test (:name :with-package-iterator-nil-list)
   (with-package-iterator (iter '() :internal)
-    (print (nth-value 1 (iter)))))
+    (assert (null (iter)))))
 
 ;;; MAKE-PACKAGE error in another thread blocking FIND-PACKAGE & FIND-SYMBOL
-(with-test (:name :bug-511072 :skipped-on '(not :sb-thread))
+(with-test (:name :bug-511072 :skipped-on (not :sb-thread))
   (let* ((p (make-package :bug-511072))
          (sem1 (sb-thread:make-semaphore))
          (sem2 (sb-thread:make-semaphore))
@@ -307,10 +330,18 @@ if a restart was invoked."
                                                          (sb-thread:wait-on-semaphore sem2)
                                                          (abort c))))
                                    (make-package :bug-511072))))))
+    (declare (ignore p t2))
     (sb-thread:wait-on-semaphore sem1)
     (with-timeout 10
       (assert (eq 'cons (read-from-string "CL:CONS"))))
     (sb-thread:signal-semaphore sem2)))
+
+(defmacro handling ((condition restart-name) form)
+  `(handler-bind ((,condition (lambda (c)
+                                (declare (ignore c))
+                                (invoke-restart ',restart-name))))
+     ,form))
+
 
 (with-test (:name :quick-name-conflict-resolution-import)
   (let (p1 p2)
@@ -319,12 +350,10 @@ if a restart was invoked."
            (setf p1 (make-package "QUICK-NAME-CONFLICT-RESOLUTION-IMPORT.1")
                  p2 (make-package "QUICK-NAME-CONFLICT-RESOLUTION-IMPORT.2"))
            (intern "FOO" p1)
-           (handler-bind ((name-conflict (lambda (c)
-                                           (invoke-restart 'sb-impl::dont-import-it))))
+           (handling (name-conflict sb-impl::dont-import-it)
              (import (intern "FOO" p2) p1))
            (assert (not (eq (intern "FOO" p1) (intern "FOO" p2))))
-           (handler-bind ((name-conflict (lambda (c)
-                                           (invoke-restart 'sb-impl::shadowing-import-it))))
+           (handling (name-conflict sb-impl::shadowing-import-it)
              (import (intern "FOO" p2) p1))
            (assert (eq (intern "FOO" p1) (intern "FOO" p2))))
       (when p1 (delete-package p1))
@@ -338,8 +367,7 @@ if a restart was invoked."
                  p2 (make-package "QUICK-NAME-CONFLICT-RESOLUTION-EXPORT.2a"))
            (intern "FOO" p1)
            (use-package p2 p1)
-           (handler-bind ((name-conflict (lambda (c)
-                                           (invoke-restart 'sb-impl::keep-old))))
+           (handling (name-conflict sb-impl::keep-old)
              (export (intern "FOO" p2) p2))
            (assert (not (eq (intern "FOO" p1) (intern "FOO" p2)))))
       (when p1 (delete-package p1))
@@ -353,8 +381,7 @@ if a restart was invoked."
                  p2 (make-package "QUICK-NAME-CONFLICT-RESOLUTION-EXPORT.2b"))
            (intern "FOO" p1)
            (use-package p2 p1)
-           (handler-bind ((name-conflict (lambda (c)
-                                           (invoke-restart 'sb-impl::take-new))))
+           (handling (name-conflict sb-impl::take-new)
              (export (intern "FOO" p2) p2))
            (assert (eq (intern "FOO" p1) (intern "FOO" p2))))
       (when p1 (delete-package p1))
@@ -370,8 +397,7 @@ if a restart was invoked."
            (intern "BAR" p1)
            (export (intern "FOO" p2) p2)
            (export (intern "BAR" p2) p2)
-           (handler-bind ((name-conflict (lambda (c)
-                                           (invoke-restart 'sb-impl::keep-old))))
+           (handling (name-conflict sb-impl::keep-old)
              (use-package p2 p1))
            (assert (not (eq (intern "FOO" p1) (intern "FOO" p2))))
            (assert (not (eq (intern "BAR" p1) (intern "BAR" p2)))))
@@ -388,8 +414,7 @@ if a restart was invoked."
            (intern "BAR" p1)
            (export (intern "FOO" p2) p2)
            (export (intern "BAR" p2) p2)
-           (handler-bind ((name-conflict (lambda (c)
-                                           (invoke-restart 'sb-impl::take-new))))
+           (handling (name-conflict sb-impl::take-new)
              (use-package p2 p1))
            (assert (eq (intern "FOO" p1) (intern "FOO" p2)))
            (assert (eq (intern "BAR" p1) (intern "BAR" p2))))
@@ -404,15 +429,11 @@ if a restart was invoked."
            (setf p (eval `(defpackage :package-at-variance-restarts.1
                             (:use :cl)
                             (:shadow "CONS"))))
-           (handler-bind ((sb-kernel::package-at-variance-error
-                            (lambda (c)
-                              (invoke-restart 'sb-impl::keep-them))))
+           (handling (sb-kernel::package-at-variance-error sb-impl::keep-them)
              (eval `(defpackage :package-at-variance-restarts.1
                       (:use :cl))))
            (assert (not (eq 'cl:cons (intern "CONS" p))))
-           (handler-bind ((sb-kernel::package-at-variance-error
-                            (lambda (c)
-                              (invoke-restart 'sb-impl::drop-them))))
+           (handling (sb-kernel::package-at-variance-error sb-impl::drop-them)
              (eval `(defpackage :package-at-variance-restarts.1
                       (:use :cl))))
            (assert (eq 'cl:cons (intern "CONS" p))))
@@ -425,15 +446,11 @@ if a restart was invoked."
          (progn
            (setf p (eval `(defpackage :package-at-variance-restarts.2
                             (:use :cl))))
-           (handler-bind ((sb-kernel::package-at-variance-error
-                            (lambda (c)
-                              (invoke-restart 'sb-impl::keep-them))))
+           (handling (sb-kernel::package-at-variance-error sb-impl::keep-them)
              (eval `(defpackage :package-at-variance-restarts.2
                       (:use))))
            (assert (eq 'cl:cons (intern "CONS" p)))
-           (handler-bind ((sb-kernel::package-at-variance-error
-                            (lambda (c)
-                              (invoke-restart 'sb-impl::drop-them))))
+           (handling (sb-kernel::package-at-variance-error sb-impl::drop-them)
              (eval `(defpackage :package-at-variance-restarts.2
                       (:use))))
            (assert (not (eq 'cl:cons (intern "CONS" p)))))
@@ -446,14 +463,10 @@ if a restart was invoked."
          (progn
            (setf p (eval `(defpackage :package-at-variance-restarts.4
                             (:export "FOO"))))
-           (handler-bind ((sb-kernel::package-at-variance-error
-                            (lambda (c)
-                              (invoke-restart 'sb-impl::keep-them))))
+           (handling (sb-kernel::package-at-variance-error sb-impl::keep-them)
              (eval `(defpackage :package-at-variance-restarts.4)))
            (assert (eq :external (nth-value 1 (find-symbol "FOO" p))))
-           (handler-bind ((sb-kernel::package-at-variance-error
-                            (lambda (c)
-                              (invoke-restart 'sb-impl::drop-them))))
+           (handling (sb-kernel::package-at-variance-error sb-impl::drop-them)
              (eval `(defpackage :package-at-variance-restarts.4)))
            (assert (eq :internal (nth-value 1 (find-symbol "FOO" p)))))
       (when p (delete-package p)))))
@@ -465,14 +478,10 @@ if a restart was invoked."
          (progn
            (setf p (eval `(defpackage :package-at-variance-restarts.5
                             (:implement :sb-int))))
-           (handler-bind ((sb-kernel::package-at-variance-error
-                            (lambda (c)
-                              (invoke-restart 'sb-impl::keep-them))))
+           (handling (sb-kernel::package-at-variance-error sb-impl::keep-them)
              (eval `(defpackage :package-at-variance-restarts.5)))
            (assert (member p (package-implemented-by-list :sb-int)))
-           (handler-bind ((sb-kernel::package-at-variance-error
-                            (lambda (c)
-                              (invoke-restart 'sb-impl::drop-them))))
+           (handling (sb-kernel::package-at-variance-error sb-impl::drop-them)
              (eval `(defpackage :package-at-variance-restarts.5)))
            (assert (not (member p (package-implemented-by-list :sb-int)))))
       (when p (delete-package p)))))
@@ -647,6 +656,65 @@ if a restart was invoked."
                 (let ((*package* p1))
                   (intern "FOO" :own-nickname))))))
 
+(defun random-package-name (min max)
+  (let* ((s (make-string (+ min (random (- max min))))))
+    (dotimes (i (length s) s)
+      (setf (char s i) (code-char (+ (char-code #\A) (random 26)))))))
+
+;;; Hammer on the somewhat intricate structure that maintains the bidirection mapping
+;;; between PLNs and packages, and PLN ID to package.
+(with-test (:name :pln-data-structure-bashing)
+  (with-tmp-packages ((referencing-pkg (make-package "FOO")))
+    (prog (plns)
+       (dotimes (i 40)
+         (let ((package (make-package (random-package-name 10 12)))
+               (local-nick (random-package-name 3 6)))
+           (push (cons local-nick package) plns)
+           (add-package-local-nickname local-nick package referencing-pkg)))
+       iterate
+       ;; Test all 3 directions of the mapping
+       (dolist (entry plns)
+         ;; local nickname to package
+         (assert (eq (sb-impl::pkgnick-search-by-name (car entry) referencing-pkg)
+                     (cdr entry)))
+         ;; numeric id to package
+         (let ((id (sb-int:info-gethash (car entry) (car sb-impl::*package-nickname-ids*))))
+           (assert (eq (sb-impl::pkgnick-search-by-id id referencing-pkg)
+                       (cdr entry))))
+         ;; package to local nickname
+         (assert (string= (sb-impl::package-local-nickname (cdr entry)
+                                                           referencing-pkg)
+                          (car entry))))
+       ;; Delete a random package that has a local nickname
+       (let ((entry (nth (random (length plns)) plns)))
+         (delete-package (cdr entry))
+         ;; Deletion removes from local nicknames on attempted lookup
+         (assert (not (sb-impl::find-package-using-package (car entry) referencing-pkg)))
+         (setq plns (delete entry plns))
+         (assert (= (length (car (sb-impl::package-%local-nicknames referencing-pkg)))
+                    (* 2 (length plns)))))
+       (when plns (go iterate)))))
+
+(defun intern-in-fixed-pkg-designator (x) (intern x "PWELN"))
+(compile 'intern-in-fixed-pkg-designator)
+
+(with-test (:name :cached-find-package)
+  (with-tmp-packages
+      ((p1 (make-package "PKG-WITH-EXCEEDINGLY-LONG-NAME"))
+       (p2 (make-package "PKG-WHICH-EVERYONE-LOVES-NOW" :nicknames '("PWELN")))
+       (p3 (defpackage "USERPKG"
+             (:local-nicknames ("PWELN" "PKG-WITH-EXCEEDINGLY-LONG-NAME")
+                               ("FOOCL" "COMMON-LISP")))))
+      (let ((s (intern-in-fixed-pkg-designator "A")))
+        (assert (eq (symbol-package s) p2))) ; global PWELN package
+      (let ((s (let ((*package* p3))
+                 (intern-in-fixed-pkg-designator "A"))))
+        (assert (eq (symbol-package s) p1))) ; local PWELN package
+      (delete-package p1) ; will lazily delete "inbound" nicknames
+      (let ((s (let ((*package* p3))
+                 (intern-in-fixed-pkg-designator "A"))))
+        (assert (eq (symbol-package s) p2))))) ; global PWELN package
+
 (with-test (:name :delete-package-restart)
   (let* (ok
          (result
@@ -662,11 +730,14 @@ if a restart was invoked."
 ;; WITH-PACKAGE-ITERATOR isn't well-exercised by tests (though LOOP uses it)
 ;; so here's a basic correctness test with some complications involving
 ;; shadowing symbols.
-(make-package "P1" :use '("SB-FORMAT"))
+(make-package "FOOFORMAT" :use '("CL"))
+(export 'fooformat::format-error 'fooformat)
+(export 'fooformat::%compiler-walk-format-string 'fooformat)
+(make-package "P1" :use '("FOOFORMAT"))
 (make-package "P2")
 (export 'p1::foo 'p1)
 (shadow "FORMAT-ERROR" 'p1)
-(make-package "A" :use '("SB-FORMAT" "P1" "P2"))
+(make-package "A" :use '("FOOFORMAT" "P1" "P2"))
 (shadow '("PROG2" "FOO") 'a)
 (intern "BLAH" "P2")
 (export 'p2::(foo bar baz) 'p2)
@@ -685,12 +756,12 @@ if a restart was invoked."
            (a:goodfun :external "A")
            (p2:bar :inherited "A")
            (p2:baz :inherited "A")
-           (sb-format:%compiler-walk-format-string :inherited "A")
-           (sb-format:format-error :inherited "A")
+           (fooformat:%compiler-walk-format-string :inherited "A")
+           (fooformat:format-error :inherited "A")
            ;; ... P1
            (p1:foo :external "P1")
            (p1::format-error :internal "P1")
-           (sb-format:%compiler-walk-format-string :inherited "P1")
+           (fooformat:%compiler-walk-format-string :inherited "P1")
            ;; ... P2
            (p2::blah :internal "P2")
            (p2:foo :external "P2")
@@ -775,7 +846,7 @@ if a restart was invoked."
 ;; Concurrent FIND-SYMBOL was adversely affected by package rehash.
 ;; It's slightly difficult to show that this is fixed, because this
 ;; test only sometimes failed prior to the fix. Now it never fails though.
-(with-test (:name :concurrent-find-symbol :skipped-on '(not :sb-thread))
+(with-test (:name :concurrent-find-symbol :skipped-on (not :sb-thread))
  (let ((pkg (make-package (gensym)))
        (threads)
        (names)
@@ -807,3 +878,135 @@ if a restart was invoked."
    (let ((tot-missing 0))
      (dolist (thread threads (assert (zerop tot-missing)))
        (incf tot-missing (sb-thread:join-thread thread))))))
+
+(with-test (:name :defpackage-multiple-nicknames)
+  (let* ((name1 (string (gensym)))
+         (name2 (string (gensym)))
+         (names (package-nicknames
+                 (eval `(defpackage ,(gensym)
+                          (:nicknames ,name1)
+                          (:nicknames ,name2))))))
+    (assert (or (equal
+                 names
+                 (list name1 name2))
+                (equal
+                 names
+                 (list name2 name1))))))
+
+(with-test (:name (defpackage :local-nicknames :lock))
+  (destructuring-bind (name1 name2 name3)
+      (loop :repeat 3 :collect (string (gensym)))
+    (let ((package1 (eval `(defpackage ,name1)))
+          (package2 (eval `(defpackage ,name2
+                             (:local-nicknames (,name3 ,name1))
+                             (:lock t)))))
+      (assert (equal (package-local-nicknames package2) `((,name3 . ,package1))))
+      (assert (package-locked-p package2)))))
+
+(with-test (:name :locally-nicknamed-by-dedup)
+  (with-tmp-packages
+      ((p1 (make-package "LONGNAME.SAMPLE.FRED"))
+       (p2 (defpackage "BAZ"
+             (:local-nicknames (:fred "LONGNAME.SAMPLE.FRED")
+                               (:f "LONGNAME.SAMPLE.FRED")))))
+    (assert (equal (package-locally-nicknamed-by-list "LONGNAME.SAMPLE.FRED")
+                   (list (find-package "BAZ"))))))
+
+;;; Now a possibly useless test on an essentially useless function.
+;;; But we may as well get it right - assert that GENTEMP returns
+;;; a symbol that definitely did not exist in the specified package
+;;; even if multiple threads are calling it simultaneously.
+
+;;; We'll create about 25000 symbols, and mark the ones that were returned
+;;; by GENTEMP. Because *GENTEMP-COUNTER* isn't synchronized, but INTERN is,
+;;; returning an indicator of whether it created a symbol, it's simple enough
+;;; to make GENTEMP not accidentally return a symbol created by someone else.
+
+;;; Use array of fixnums because there're no atomic ops on array of word.
+;;; This is either 58000 useful bits or 126000 bits depending on word size.
+(defglobal *scoreboard* (make-array 2000))
+(defglobal *testpkg* (make-package "A-NICE-PACKAGE"))
+
+(defun hammer-on-gentemp (package n-iter)
+  (dotimes (i n-iter)
+    (let ((index (parse-integer (string (gentemp "T" package)) :start 1)))
+      ;; Mark this index in the scoreboard, failing if already set.
+      (multiple-value-bind (elt-index bit-index)
+          (floor index sb-vm:n-positive-fixnum-bits)
+        (let ((old (svref *scoreboard* elt-index)))
+          (loop
+           (when (logbitp bit-index old) (return-from hammer-on-gentemp :fail))
+           (let ((actual-old
+                  (cas (svref *scoreboard* elt-index)
+                       old (logior old (ash 1 bit-index)))))
+             (if (eq old actual-old) (return))
+             (setq old actual-old))))))))
+
+;; This test would consistently fail when GENTEMP first called FIND-SYMBOL
+;; and then INTERN when FIND-SYMBOL said that it found no symbol.
+(with-test (:name (gentemp :threadsafety) :skipped-on (not :sb-thread))
+  (let ((n-threads 5)
+        (n-iter 1000)
+        (threads))
+    (dotimes (i n-threads)
+      (push (sb-thread:make-thread #'hammer-on-gentemp
+                                   :arguments (list *testpkg* n-iter))
+            threads))
+    (let ((results (mapcar #'sb-thread:join-thread threads)))
+      (assert (not (find :fail results))))))
+
+;;; This test is a bit weak in that prior to the fix for what it tests,
+;;; it didn't fail often enough to convincingly show that there was a problem.
+;;; Nonetheless it did sometimes fail, and now should never fail.
+(with-test (:name :concurrent-intern-bad-published-symbol-package
+                  ;; No point in wasting time on concurrency bugs otherwise
+                  :skipped-on (not :sb-thread))
+  ;; Confirm that the compiler does not know that KEYWORDICATE
+  ;; returns a KEYWORD (so the answer isn't constant-folded)
+  (assert (sb-kernel:type= (sb-int:info :function :type 'sb-int:keywordicate)
+                           (sb-kernel:find-classoid 'function)))
+  (let ((sema (sb-thread:make-semaphore))
+        (n-threads 10))
+    (dotimes (i 10) ; number of trials
+      (let ((threads))
+        (dotimes (i n-threads)
+          (push (make-join-thread
+                 (lambda ()
+                   (sb-thread:wait-on-semaphore sema)
+                   (keywordp (sb-int:keywordicate "BLUB"))))
+                threads))
+        (sb-thread:signal-semaphore sema n-threads)
+        (let ((count 0))
+          (dolist (thread threads)
+            (when (sb-thread:join-thread thread) (incf count)))
+          (unintern (sb-int:keywordicate "BLUB") "KEYWORD")
+          (assert (= count n-threads)))))))
+
+(with-test (:name :name-conflict-non-pretty-message)
+  (make-package "SILLYPACKAGE1")
+  (export (intern "ASILLYSYM" 'sillypackage1) 'sillypackage1)
+  (make-package "SILLYPACKAGE2")
+  (export (intern "ASILLYSYM" 'sillypackage2) 'sillypackage2)
+  (use-package 'sillypackage1)
+  (handler-case (use-package 'sillypackage2)
+    (name-conflict (c) ; No silly string in the result
+      (assert (not (search "symbols:SILLY"
+                           (write-to-string c :pretty nil :escape nil)))))
+    (condition () (error "Should not get here"))
+    (:no-error (c) (declare (ignore c)) (error "Should not get here"))))
+
+;; git revision f7d1550c0e16262f28213c9e3c048f42e3f0b476 broke find-all-symbols
+(with-test (:name :find-all-symbols)
+  (find-all-symbols "FIXNUM"))
+
+(defun foo-intern (x) (intern x "PKG-A"))
+(compile 'foo-intern)
+;;; Basic smoke test of compiler transform of INTERN
+(with-test (:name :cached-find-package)
+  (assert-error (foo-intern "X"))
+  (make-package "PKG-A")
+  (locally (declare (notinline intern find-symbol))
+    (assert (eq (foo-intern "X") (find-symbol "X" "PKG-A")))
+    (delete-package "PKG-A")
+    (make-package "PKG-B" :nicknames '("PKG-A"))
+    (assert (eq (foo-intern "X") (find-symbol "X" "PKG-B")))))

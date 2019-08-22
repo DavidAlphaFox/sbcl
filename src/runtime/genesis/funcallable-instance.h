@@ -11,8 +11,8 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_FUNCALLABLE_INSTANCE
-#define SBCL_GENESIS_FUNCALLABLE_INSTANCE 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_FUNCALLABLE_INSTANCE
+#ifndef __ASSEMBLER__
 
 struct funcallable_instance {
     lispobj header;
@@ -21,7 +21,7 @@ struct funcallable_instance {
     lispobj info[1];
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
@@ -29,7 +29,8 @@ struct funcallable_instance {
 #define FUNCALLABLE_INSTANCE_TRAMPOLINE_OFFSET -3
 #define FUNCALLABLE_INSTANCE_FUNCTION_OFFSET 5
 #define FUNCALLABLE_INSTANCE_INFO_OFFSET 13
+#define FUNCALLABLE_INSTANCE_SIZE 3
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_FUNCALLABLE-INSTANCE */
+#endif

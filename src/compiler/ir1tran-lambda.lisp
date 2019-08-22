@@ -11,65 +11,77 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; LAMBDA hackery
 
+;;;; FIXME: where is that file?
 ;;;; Note: Take a look at the compiler-overview.tex section on "Hairy
 ;;;; function representation" before you seriously mess with this
 ;;;; stuff.
 
-;;; Verify that the NAME is a legal name for a variable and return a
-;;; VAR structure for it, filling in info if it is globally special.
-;;; If it is losing, we punt with a COMPILER-ERROR. NAMES-SO-FAR is a
-;;; list of names which have previously been bound. If the NAME is in
-;;; this list, then we error out.
-(declaim (ftype (sfunction (t list &optional t) lambda-var) varify-lambda-arg))
-(defun varify-lambda-arg (name names-so-far &optional (context "lambda list"))
-  (declare (inline member))
-  (unless (symbolp name)
-    (compiler-error "~S is not a symbol, and cannot be used as a variable." name))
-  (when (member name names-so-far :test #'eq)
-    (compiler-error "The variable ~S occurs more than once in the ~A."
-                    name
-                    context))
-  (let ((kind (info :variable :kind name)))
-    (cond ((keywordp name)
-           (compiler-error "~S is a keyword, and cannot be used as a local variable."
-                           name))
-          ((eq kind :constant)
-           (compiler-error "~@<~S names a defined constant, and cannot be used as a ~
-                            local variable.~:@>"
-                           name))
-          ((eq :global kind)
-           (compiler-error "~@<~S names a global lexical variable, and cannot be used ~
-                            as a local variable.~:@>"
-                           name))
-          ((eq kind :special)
-           (let ((specvar (find-free-var name)))
-             (make-lambda-var :%source-name name
-                              :type (leaf-type specvar)
-                              :where-from (leaf-where-from specvar)
-                              :specvar specvar)))
-          (t
-           (make-lambda-var :%source-name name)))))
+(declaim (ftype (sfunction * function) make-repeated-name-check))
+(defun make-repeated-name-check (&key
+                                   (kind "variable")
+                                   (context "lambda list")
+                                   (signal-via #'compiler-error))
+  (let ((seen '()))
+    (lambda (name)
+      (when (member name seen :test #'eq)
+        (funcall signal-via "~@<The ~A ~S occurs more than once in ~
+                             the ~A.~@:>"
+                 kind name context))
+      (push name seen)
+      name)))
 
-;;; Make the default keyword for a &KEY arg, checking that the keyword
-;;; isn't already used by one of the VARS.
-(declaim (ftype (sfunction (symbol list t) symbol) make-keyword-for-arg))
-(defun make-keyword-for-arg (symbol vars keywordify)
-  (let ((key (if (and keywordify (not (keywordp symbol)))
-                 (keywordicate symbol)
-                 symbol)))
-    (dolist (var vars)
-      (let ((info (lambda-var-arg-info var)))
-        (when (and info
-                   (eq (arg-info-kind info) :keyword)
-                   (eq (arg-info-key info) key))
-          (compiler-error
-           "The keyword ~S appears more than once in the lambda list."
-           key))))
-    key))
+;;; Verify that NAME is a legal name for a variable.
+(declaim (ftype (function (t &key
+                             (:context t) (:allow-special t) (:allow-symbol-macro t)
+                             (:signal-via (or symbol function)))
+                          (values symbol keyword))
+                check-variable-name-for-binding))
+(defun check-variable-name-for-binding (name
+                                        &key
+                                          context
+                                          (allow-special t)
+                                          (allow-symbol-macro t)
+                                          (signal-via #'compiler-error))
+  (check-variable-name name :signal-via signal-via)
+  (flet ((lose (kind)
+           (funcall signal-via
+                    (sb-format:tokens "~@<~/sb-ext:print-symbol-with-prefix/ names a ~
+                               ~A, and cannot be used in ~A.~:@>")
+                    name kind context)))
+    (let ((kind (info :variable :kind name)))
+      (case kind
+        (:macro
+         (unless allow-symbol-macro
+           (program-assert-symbol-home-package-unlocked
+            :compile name (format nil "lexically binding global ~
+                                       symbol-macro ~~A in ~A"
+                                  context))))
+        ((:constant)
+         (lose "defined constant"))
+        ((:global)
+         (lose "global lexical variable"))
+        (:special
+         (unless allow-special
+           (lose "special variable"))))
+      (values name kind))))
+
+;;; Return a VAR structure for NAME, filling in info if it is globally
+;;; special. If it is losing, we punt with a COMPILER-ERROR.
+(declaim (ftype (sfunction (symbol) lambda-var) varify-lambda-arg))
+(defun varify-lambda-arg (name)
+  (case (info :variable :kind name)
+    (:special
+     (let ((variable (find-free-var name)))
+       (make-lambda-var :%source-name name
+                        :type (leaf-type variable)
+                        :where-from (leaf-where-from variable)
+                        :specvar variable)))
+    (t
+     (make-lambda-var :%source-name name))))
 
 ;;; Parse a lambda list into a list of VAR structures, stripping off
 ;;; any &AUX bindings. Each arg name is checked for legality, and
@@ -86,122 +98,58 @@
 (declaim (ftype (sfunction (list) (values list boolean boolean list list))
                 make-lambda-vars))
 (defun make-lambda-vars (list)
-  (multiple-value-bind (required optional restp rest keyp keys allowp auxp aux
-                        morep more-context more-count)
-      (parse-lambda-list list)
-    (declare (ignore auxp)) ; since we just iterate over AUX regardless
+  (multiple-value-bind (llks required optional rest/more keys aux)
+      (multiple-value-call #'check-lambda-list-names (parse-lambda-list list))
     (collect ((vars)
-              (names-so-far)
               (aux-vars)
               (aux-vals))
-      (flet (;; PARSE-DEFAULT deals with defaults and supplied-p args
-             ;; for optionals and keywords args.
-             (parse-default (spec info)
-               (when (consp (cdr spec))
-                 (setf (arg-info-default info) (second spec))
-                 (when (consp (cddr spec))
-                   (let* ((supplied-p (third spec))
-                          (supplied-var (varify-lambda-arg supplied-p
-                                                           (names-so-far))))
-                     (setf (arg-info-supplied-p info) supplied-var)
-                     (names-so-far supplied-p)
-                     (when (> (length (the list spec)) 3)
-                       (compiler-error
-                        "The list ~S is too long to be an arg specifier."
-                        spec)))))))
-
-        (dolist (name required)
-          (let ((var (varify-lambda-arg name (names-so-far))))
-            (vars var)
-            (names-so-far name)))
-
+      (flet ((add-var (name)
+               (let ((var (varify-lambda-arg name)))
+                 (vars var)
+                 var))
+             (add-info (var kind &key (default nil defaultp) suppliedp-var key)
+               (let ((info (make-arg-info :kind kind)))
+                 (when defaultp
+                   (setf (arg-info-default info) default))
+                 (when suppliedp-var
+                   (setf (arg-info-supplied-p info)
+                         (varify-lambda-arg suppliedp-var)))
+                 (when key
+                   (setf (arg-info-key info) key))
+                 (setf (lambda-var-arg-info var) info))))
+        ;; Required
+        (mapc #'add-var required)
+        ;; Optional
         (dolist (spec optional)
-          (if (atom spec)
-              (let ((var (varify-lambda-arg spec (names-so-far))))
-                (setf (lambda-var-arg-info var)
-                      (make-arg-info :kind :optional))
-                (vars var)
-                (names-so-far spec))
-              (let* ((name (first spec))
-                     (var (varify-lambda-arg name (names-so-far)))
-                     (info (make-arg-info :kind :optional)))
-                (setf (lambda-var-arg-info var) info)
-                (vars var)
-                (names-so-far name)
-                (parse-default spec info))))
-
-        (when restp
-          (let ((var (varify-lambda-arg rest (names-so-far))))
-            (setf (lambda-var-arg-info var) (make-arg-info :kind :rest))
-            (vars var)
-            (names-so-far rest)))
-
-        (when morep
-          (let ((var (varify-lambda-arg more-context (names-so-far))))
-            (setf (lambda-var-arg-info var)
-                  (make-arg-info :kind :more-context))
-            (vars var)
-            (names-so-far more-context))
-          (let ((var (varify-lambda-arg more-count (names-so-far))))
-            (setf (lambda-var-arg-info var)
-                  (make-arg-info :kind :more-count))
-            (vars var)
-            (names-so-far more-count)))
-
+          (multiple-value-bind (name default suppliedp-var defaultp)
+              (parse-optional-arg-spec spec)
+            (apply #'add-info (add-var name) :optional
+                   :suppliedp-var (first suppliedp-var)
+                   (when defaultp (list :default default)))))
+        ;; Rest/more
+        (when rest/more
+          (mapc (lambda (name kind)
+                  (add-info (add-var name) kind))
+                rest/more (let ((morep (eq (ll-kwds-restp llks) '&more)))
+                            (if morep '(:more-context :more-count) '(:rest)))))
+        ;; Keys
         (dolist (spec keys)
-          (cond
-           ((atom spec)
-            (let ((var (varify-lambda-arg spec (names-so-far))))
-              (setf (lambda-var-arg-info var)
-                    (make-arg-info :kind :keyword
-                                   :key (make-keyword-for-arg spec
-                                                              (vars)
-                                                              t)))
-              (vars var)
-              (names-so-far spec)))
-           ((atom (first spec))
-            (let* ((name (first spec))
-                   (var (varify-lambda-arg name (names-so-far)))
-                   (info (make-arg-info
-                          :kind :keyword
-                          :key (make-keyword-for-arg name (vars) t))))
-              (setf (lambda-var-arg-info var) info)
-              (vars var)
-              (names-so-far name)
-              (parse-default spec info)))
-           (t
-            (let ((head (first spec)))
-              (unless (proper-list-of-length-p head 2)
-                (error "malformed &KEY argument specifier: ~S" spec))
-              (let* ((name (second head))
-                     (var (varify-lambda-arg name (names-so-far)))
-                     (info (make-arg-info
-                            :kind :keyword
-                            :key (make-keyword-for-arg (first head)
-                                                       (vars)
-                                                       nil))))
-                (setf (lambda-var-arg-info var) info)
-                (vars var)
-                (names-so-far name)
-                (parse-default spec info))))))
-
+          (multiple-value-bind (keyword name default suppliedp-var defaultp)
+              (parse-key-arg-spec spec)
+            (apply #'add-info (add-var name) :keyword
+                   :suppliedp-var (first suppliedp-var)
+                   :key keyword
+                   (when defaultp (list :default default)))))
+        ;; Aux
         (dolist (spec aux)
-          (cond ((atom spec)
-                 (let ((var (varify-lambda-arg spec nil)))
-                   (aux-vars var)
-                   (aux-vals nil)
-                   (names-so-far spec)))
-                (t
-                 (unless (proper-list-of-length-p spec 1 2)
-                   (compiler-error "malformed &AUX binding specifier: ~S"
-                                   spec))
-                 (let* ((name (first spec))
-                        (var (varify-lambda-arg name nil)))
-                   (aux-vars var)
-                   (aux-vals (second spec))
-                   (names-so-far name)))))
+          (multiple-value-bind (name val)
+              (if (atom spec) spec (values (car spec) (cadr spec)))
+            (let ((var (varify-lambda-arg name)))
+              (aux-vars var)
+              (aux-vals val))))
 
-        (values (vars) keyp allowp (aux-vars) (aux-vals))))))
+        (values (vars) (ll-kwds-keyp llks) (ll-kwds-allowp llks)
+                (aux-vars) (aux-vals))))))
 
 ;;; This is similar to IR1-CONVERT-PROGN-BODY except that we
 ;;; sequentially bind each AUX-VAR to the corresponding AUX-VAL before
@@ -216,7 +164,7 @@
   (declare (type ctran start next) (type (or lvar null) result)
            (list body aux-vars aux-vals))
   (if (null aux-vars)
-      (let ((*lexenv* (make-lexenv :vars (copy-list post-binding-lexenv))))
+      (let ((*lexenv* (make-lexenv :vars post-binding-lexenv)))
         (ir1-convert-progn-body start next result body))
       (let ((ctran (make-ctran))
             (fun-lvar (make-lvar))
@@ -259,7 +207,7 @@
           (bind-ctran (make-ctran))
           (cleanup-ctran (make-ctran)))
       (ir1-convert start bind-ctran nil
-                   `(%special-bind ',(lambda-var-specvar var) ,var))
+                   `(%special-bind ',(leaf-source-name (lambda-var-specvar var)) ,var))
       (setf (cleanup-mess-up cleanup) (ctran-use bind-ctran))
       (let ((*lexenv* (make-lexenv :cleanup cleanup)))
         (ir1-convert bind-ctran cleanup-ctran nil '(%cleanup-point))
@@ -404,14 +352,17 @@
          (fun (collect ((default-bindings)
                         (default-vals))
                 (dolist (default defaults)
-                  (if (sb!xc:constantp default)
+                  (if (sb-xc:constantp default)
                       (default-vals default)
-                      (let ((var (sb!xc:gensym)))
+                      (let ((var (sb-xc:gensym)))
                         (default-bindings `(,var ,default))
                         (default-vals var))))
                 (let ((bindings (default-bindings))
                       (call
                        `(locally
+                         ;; See lengthy comment at top of 'seqtran'
+                         ;; as to why muffling is not done during xc.
+                            #-sb-xc-host
                             (declare (muffle-conditions code-deletion-note))
                           (%funcall ,fun ,@(reverse vals) ,@(default-vals)))))
                   (ir1-convert-lambda-body (if bindings
@@ -434,7 +385,7 @@
     fun))
 
 ;;; This function deals with supplied-p vars in optional arguments. If
-;;; the there is no supplied-p arg, then we just call
+;;; there is no supplied-p arg, then we just call
 ;;; IR1-CONVERT-HAIRY-ARGS on the remaining arguments, and generate a
 ;;; optional entry that calls the result. If there is a supplied-p
 ;;; var, then we add it into the default vars and throw a T into the
@@ -455,7 +406,7 @@
          (default (arg-info-default info))
          (supplied-p (arg-info-supplied-p info))
          (force (or force
-                    (not (sb!xc:constantp (arg-info-default info)))))
+                    (not (sb-xc:constantp (arg-info-default info)))))
          (ep (if supplied-p
                  (ir1-convert-hairy-args
                   res
@@ -488,7 +439,12 @@
                                   default-vars default-vals
                                   (if supplied-p (list default nil) (list default))
                                   name)
-          (let* ((default `',(constant-form-value default))
+          (let* ((value (constant-form-value default))
+                 ;; One-and-only-once-more: MAYBE-EMIT-MAKE-LOAD-FORMS has a similar test.
+                 (namedp-not-eql-comparable
+                  (and (symbolp default)
+                       (not (typep value '(or symbol character number)))))
+                 (default (if namedp-not-eql-comparable default `',value))
                  (defaults (if supplied-p (list default nil) (list default))))
             ;; DEFAULT can contain a reference to a
             ;; to-be-optimized-away function/block/tag, so better to
@@ -538,11 +494,13 @@
                                  :type (leaf-type var)
                                  :where-from (leaf-where-from var))))
 
-    (let* ((n-context (sb!xc:gensym "N-CONTEXT-"))
-           (context-temp (make-lambda-var :%source-name n-context))
-           (n-count (sb!xc:gensym "N-COUNT-"))
+    (let* ((n-context (sb-xc:gensym "N-CONTEXT-"))
+           (context-temp (make-lambda-var :%source-name n-context
+                                          :arg-info (make-arg-info :kind :more-context)))
+           (n-count (sb-xc:gensym "N-COUNT-"))
            (count-temp (make-lambda-var :%source-name n-count
-                                        :type (specifier-type 'index))))
+                                        :type (specifier-type 'index)
+                                        :arg-info (make-arg-info :kind :more-count))))
 
       (arg-vars context-temp count-temp)
 
@@ -559,24 +517,24 @@
       ;; and take advantage of the base+index+displacement addressing
       ;; mode on x86oids.)
       (when (optional-dispatch-keyp res)
-        (let ((n-index (sb!xc:gensym "N-INDEX-"))
-              (n-key (sb!xc:gensym "N-KEY-"))
-              (n-value-temp (sb!xc:gensym "N-VALUE-TEMP-"))
-              (n-allowp (sb!xc:gensym "N-ALLOWP-"))
-              (n-lose (sb!xc:gensym "N-LOSE-"))
-              (n-losep (sb!xc:gensym "N-LOSEP-"))
+        (let ((n-index (sb-xc:gensym "N-INDEX-"))
+              (n-key (sb-xc:gensym "N-KEY-"))
+              (n-value-temp (sb-xc:gensym "N-VALUE-TEMP-"))
+              (n-allowp (sb-xc:gensym "N-ALLOWP-"))
+              (n-lose (sb-xc:gensym "N-LOSE-"))
+              (n-losep (sb-xc:gensym "N-LOSEP-"))
               (allowp (or (optional-dispatch-allowp res)
                           (policy *lexenv* (zerop safety))))
               (found-allow-p nil))
 
-          (temps #!-stack-grows-downward-not-upward
+          (temps #-stack-grows-downward-not-upward
                  `(,n-index (1- ,n-count))
-                 #!+stack-grows-downward-not-upward
+                 #+stack-grows-downward-not-upward
                  `(,n-index (- (1- ,n-count)))
-                 #!-stack-grows-downward-not-upward n-value-temp
-                 #!-stack-grows-downward-not-upward n-key)
+                 #-stack-grows-downward-not-upward n-value-temp
+                 #-stack-grows-downward-not-upward n-key)
           (body `(declare (fixnum ,n-index)
-                          #!-stack-grows-downward-not-upward
+                          #-stack-grows-downward-not-upward
                           (ignorable ,n-value-temp ,n-key)))
 
           (collect ((tests))
@@ -585,13 +543,19 @@
                      (default (arg-info-default info))
                      (keyword (arg-info-key info))
                      (supplied-p (arg-info-supplied-p info))
-                     (n-value (sb!xc:gensym "N-VALUE-"))
+                     (supplied-used-p (arg-info-supplied-used-p info))
+                     (n-value (sb-xc:gensym "N-VALUE-"))
                      (clause (cond (supplied-p
-                                    (let ((n-supplied (sb!xc:gensym "N-SUPPLIED-")))
-                                      (temps n-supplied)
+                                    (let ((n-supplied (sb-xc:gensym "N-SUPPLIED-")))
+                                      (temps (list n-supplied
+                                                   (if supplied-used-p
+                                                       nil
+                                                       0)))
                                       (arg-vals n-value n-supplied)
                                       `((eq ,n-key ',keyword)
-                                        (setq ,n-supplied t)
+                                        (setq ,n-supplied ,(if supplied-used-p
+                                                               t
+                                                               1))
                                         (setq ,n-value ,n-value-temp))))
                                    (t
                                     (arg-vals n-value)
@@ -606,20 +570,22 @@
                 (tests clause)))
 
             (unless allowp
-              (temps n-allowp n-lose n-losep)
+              (temps n-allowp
+                     (list n-lose 0)
+                     (list n-losep 0))
               (unless found-allow-p
                 (tests `((eq ,n-key :allow-other-keys)
                          (setq ,n-allowp ,n-value-temp))))
               (tests `(t
                        (setq ,n-lose ,n-key
-                             ,n-losep t))))
+                             ,n-losep 1))))
 
             (body
              `(when (oddp ,n-count)
                 (%odd-key-args-error)))
 
             (body
-             #!-stack-grows-downward-not-upward
+             #-stack-grows-downward-not-upward
              `(locally
                 (declare (optimize (safety 0)))
                 (loop
@@ -629,7 +595,7 @@
                   (setq ,n-key (%more-arg ,n-context ,n-index))
                   (decf ,n-index)
                   (cond ,@(tests))))
-             #!+stack-grows-downward-not-upward
+             #+stack-grows-downward-not-upward
              `(locally (declare (optimize (safety 0)))
                 (loop
                   (when (plusp ,n-index) (return))
@@ -640,8 +606,10 @@
                     (cond ,@(tests))))))
 
             (unless allowp
-              (body `(when (and ,n-losep (not ,n-allowp))
-                       (%unknown-key-arg-error ,n-lose)))))))
+              (let ((location (make-restart-location)))
+                (body `(if (and (/= ,n-losep 0) (not ,n-allowp))
+                           (%unknown-key-arg-error ,n-lose ,location)
+                           (restart-point ,location))))))))
 
       (let ((ep (ir1-convert-lambda-body
                  `((let ,(temps)
@@ -692,10 +660,10 @@
         ;; Make up two extra variables, and squirrel them away in
         ;; ARG-INFO-DEFAULT for transforming (VALUES-LIST REST) into
         ;; (%MORE-ARG-VALUES CONTEXT 0 COUNT) when possible.
-        (let* ((context-name (sb!xc:gensym "REST-CONTEXT-"))
+        (let* ((context-name (sb-xc:gensym "REST-CONTEXT-"))
                (context (make-lambda-var :%source-name context-name
                                          :arg-info (make-arg-info :kind :more-context)))
-               (count-name (sb!xc:gensym "REST-COUNT-"))
+               (count-name (sb-xc:gensym "REST-COUNT-"))
                (count (make-lambda-var :%source-name count-name
                                        :arg-info (make-arg-info :kind :more-count)
                                        :type (specifier-type 'index))))
@@ -713,7 +681,7 @@
     (dolist (key keys)
       (let* ((info (lambda-var-arg-info key))
              (default (arg-info-default info))
-             (hairy-default (not (sb!xc:constantp default)))
+             (hairy-default (not (sb-xc:constantp default)))
              (supplied-p (arg-info-supplied-p info))
              ;; was: (format nil "~A-DEFAULTING-TEMP" (leaf-source-name key))
              (n-val (make-symbol ".DEFAULTING-TEMP."))
@@ -721,17 +689,25 @@
         (main-vars val-temp)
         (bind-vars key)
         (cond ((or hairy-default supplied-p)
-               (let* ((n-supplied (sb!xc:gensym "N-SUPPLIED-"))
+               (let* ((n-supplied (sb-xc:gensym "N-SUPPLIED-"))
                       (supplied-temp (make-lambda-var
                                       :%source-name n-supplied)))
                  (unless supplied-p
                    (setf (arg-info-supplied-p info) supplied-temp))
                  (when hairy-default
-                   (setf (arg-info-default info) nil))
+                   (setf (arg-info-default info) nil)
+                   (unless supplied-p
+                     (setf (arg-info-supplied-used-p info) nil)))
                  (main-vars supplied-temp)
                  (cond (hairy-default
-                        (main-vals nil nil)
-                        (bind-vals `(if ,n-supplied ,n-val ,default)))
+                        (main-vals nil
+                                   (if supplied-p
+                                       nil
+                                       0))
+                        (bind-vals
+                         (if supplied-p
+                             `(if ,n-supplied ,n-val ,default)
+                             `(if (eq ,n-supplied 0) ,default ,n-val))))
                        (t
                         (main-vals default nil)
                         (bind-vals n-val)))
@@ -947,59 +923,66 @@
     (bug "Both SYSTEM-LAMBDA and MAYBE-ADD-DEBUG-CATCH specified"))
   (unless (or debug-name (neq '.anonymous. source-name))
     (setf debug-name (name-lambdalike form)))
-  (multiple-value-bind (vars keyp allow-other-keys aux-vars aux-vals)
-      (make-lambda-vars (cadr form))
-    (multiple-value-bind (forms decls doc) (parse-body (cddr form))
-      (binding* (((*lexenv* result-type post-binding-lexenv)
-                  (process-decls decls (append aux-vars vars) nil
-                                 :binding-form-p t))
-                 (debug-catch-p (and maybe-add-debug-catch
-                                     *allow-instrumenting*
-                                     (policy *lexenv*
-                                             (>= insert-debug-catch 2))))
-                 (forms (if debug-catch-p
-                            (wrap-forms-in-debug-catch forms)
-                            forms))
-                 (forms (if (eq result-type *wild-type*)
-                            forms
-                            `((the ,(type-specifier result-type) (progn ,@forms)))))
-                 (*allow-instrumenting* (and (not system-lambda) *allow-instrumenting*))
-                 (res (cond ((or (find-if #'lambda-var-arg-info vars) keyp)
-                             (ir1-convert-hairy-lambda forms vars keyp
-                                                       allow-other-keys
-                                                       aux-vars aux-vals
-                                                       :post-binding-lexenv post-binding-lexenv
-                                                       :source-name source-name
-                                                       :debug-name debug-name
-                                                       :system-lambda system-lambda))
-                            (t
-                             (ir1-convert-lambda-body forms vars
-                                                      :aux-vars aux-vars
-                                                      :aux-vals aux-vals
-                                                      :post-binding-lexenv post-binding-lexenv
-                                                      :source-name source-name
-                                                      :debug-name debug-name
-                                                      :system-lambda system-lambda)))))
-        (setf (functional-inline-expansion res) form)
-        (setf (functional-arg-documentation res) (cadr form))
-        (setf (functional-documentation res) doc)
-        (when (boundp '*lambda-conversions*)
-          ;; KLUDGE: Not counting TL-XEPs is a lie, of course, but
-          ;; keeps things less confusing to users of TIME, where this
-          ;; count gets used.
-          (unless (and (consp debug-name) (eq 'tl-xep (car debug-name)))
-            (incf *lambda-conversions*)))
-        res))))
+  (multiple-value-bind (forms decls doc) (parse-body (cddr form) t)
+    (let ((*lexenv* (process-muffle-decls decls *lexenv*)))
+      (multiple-value-bind (vars keyp allow-other-keys aux-vars aux-vals)
+          (make-lambda-vars (cadr form))
+        (binding* (((*lexenv* result-type post-binding-lexenv
+                              lambda-list explicit-check)
+                    (process-decls decls (append aux-vars vars) nil
+                                   :binding-form-p t :allow-lambda-list t))
+                   (debug-catch-p (and maybe-add-debug-catch
+                                       *allow-instrumenting*
+                                       (policy *lexenv*
+                                           (>= insert-debug-catch 2))))
+                   (forms (if debug-catch-p
+                              (wrap-forms-in-debug-catch forms)
+                              forms))
+                   (forms (if (eq result-type *wild-type*)
+                              forms
+                              `((the ,(type-specifier result-type) (progn ,@forms)))))
+                   (*allow-instrumenting* (and (not system-lambda) *allow-instrumenting*))
+                   (res (cond ((or (find-if #'lambda-var-arg-info vars) keyp)
+                               (ir1-convert-hairy-lambda forms vars keyp
+                                                         allow-other-keys
+                                                         aux-vars aux-vals
+                                                         :post-binding-lexenv post-binding-lexenv
+                                                         :source-name source-name
+                                                         :debug-name debug-name
+                                                         :system-lambda system-lambda))
+                              (t
+                               (ir1-convert-lambda-body forms vars
+                                                        :aux-vars aux-vars
+                                                        :aux-vals aux-vals
+                                                        :post-binding-lexenv post-binding-lexenv
+                                                        :source-name source-name
+                                                        :debug-name debug-name
+                                                        :system-lambda system-lambda)))))
+          (when explicit-check
+            (setf (getf (functional-plist res) 'explicit-check) explicit-check))
+          (setf (functional-inline-expansion res) form)
+          (setf (functional-arg-documentation res)
+                (if (eq lambda-list :unspecified)
+                    (strip-lambda-list (cadr form) :arglist)
+                    lambda-list))
+          (setf (functional-documentation res) doc)
+          (when (boundp '*lambda-conversions*)
+            ;; KLUDGE: Not counting TL-XEPs is a lie, of course, but
+            ;; keeps things less confusing to users of TIME, where this
+            ;; count gets used.
+            (unless (and (consp debug-name) (eq 'tl-xep (car debug-name)))
+              (incf *lambda-conversions*)))
+          res)))))
 
 (defun wrap-forms-in-debug-catch (forms)
-  #!+unwind-to-frame-and-call-vop
+  #+unwind-to-frame-and-call-vop
   `((multiple-value-prog1
       (progn
         ,@forms)
       ;; Just ensure that there won't be any tail-calls, IR2 magic will
       ;; handle the rest.
       (values)))
-  #!-unwind-to-frame-and-call-vop
+  #-unwind-to-frame-and-call-vop
   `( ;; Normally, we'll return from this block with the below RETURN-FROM.
     (block
         return-value-tag
@@ -1021,6 +1004,14 @@
            (return-from return-value-tag
              (progn
                ,@forms))))))))
+
+;; FIXME: really should be an aspect of the lexical environment,
+;; but LEXENVs don't know whether they are toplevel or not.
+(defun has-toplevelness-decl (lambda-expr)
+  (dolist (expr (cddr lambda-expr)) ; Skip over (LAMBDA (ARGS))
+    (cond ((equal expr '(declare (top-level-form))) (return t))
+          ((typep expr '(or (cons (eql declare)) string))) ; DECL | DOCSTRING
+          (t (return nil)))))
 
 ;;; helper for LAMBDA-like things, to massage them into a form
 ;;; suitable for IR1-CONVERT-LAMBDA.
@@ -1045,10 +1036,12 @@
                                           :maybe-add-debug-catch t
                                           :source-name name))
                  (info (info :function :info name)))
+             (when (has-toplevelness-decl lambda-expression)
+               (setf (functional-top-level-defun-p res) t))
              (assert-global-function-definition-type name res)
              (push res (defined-fun-functionals defined-fun-res))
              (unless (or
-                      (eq (defined-fun-inlinep defined-fun-res) :notinline)
+                      (eq (defined-fun-inlinep defined-fun-res) 'notinline)
                       ;; Don't treat recursive stubs like CAR as self-calls
                       ;; Maybe just use the fact that it is a known function?
                       ;; Though a known function may be used
@@ -1074,7 +1067,36 @@
                                 :source-name source-name
                                 :debug-name debug-name))))
 
-;;;; defining global functions
+;;; Convert the forms produced by RECONSTRUCT-LEXENV to LEXENV
+(defun process-inline-lexenv (inline-lexenv)
+  (labels ((recurse (inline-lexenv lexenv)
+             (let ((*lexenv* lexenv))
+               (if (null inline-lexenv)
+                   lexenv
+                   (destructuring-bind (type bindings &optional body) inline-lexenv
+                     (case type
+                       (:declare
+                        (recurse body
+                                 (process-decls `((declare ,@bindings)) nil nil)))
+                       (:macro
+                        (let ((macros
+                               (mapcar (lambda (binding)
+                                         ;; XC compile-in-lexenv ignores its second arg
+                                         #+sb-xc-host (aver (null-lexenv-p lexenv))
+                                         (list* (car binding) 'macro
+                                                (compile-in-lexenv (cdr binding) lexenv
+                                                                   nil nil nil t nil)))
+                                       bindings)))
+                          (recurse body
+                                   (make-lexenv :default lexenv
+                                                :funs macros))))
+                       (:symbol-macro
+                        (funcall-in-symbol-macrolet-lexenv bindings
+                                                           (lambda (&optional vars)
+                                                             (declare (ignore vars))
+                                                             (recurse body *lexenv*))
+                                                           :compile))))))))
+    (recurse inline-lexenv (make-null-lexenv))))
 
 ;;; Convert FUN as a lambda in the null environment, but use the
 ;;; current compilation policy. Note that FUN may be a
@@ -1084,59 +1106,55 @@
                                   &key
                                   (source-name '.anonymous.)
                                   debug-name
-                                  system-lambda)
+                                  system-lambda
+                                  (policy (lexenv-policy *lexenv*)))
   (when (and (not debug-name) (eq '.anonymous. source-name))
     (setf debug-name (name-lambdalike fun)))
-  (destructuring-bind (decls macros symbol-macros &rest body)
-      (if (eq (car fun) 'lambda-with-lexenv)
-          (cdr fun)
-          `(() () () . ,(cdr fun)))
-    (let* ((*lexenv* (make-lexenv
-                      :default (process-decls decls nil nil
-                                              :lexenv (make-null-lexenv))
-                      :vars (copy-list symbol-macros)
-                      :funs (mapcar (lambda (x)
-                                      `(,(car x) .
-                                         (macro . ,(coerce (cdr x) 'function))))
-                                    macros)
-                      ;; Inherit MUFFLE-CONDITIONS from the call-site lexenv
-                      ;; rather than the definition-site lexenv, since it seems
-                      ;; like a much more common case.
-                      :handled-conditions (lexenv-handled-conditions *lexenv*)
-                      :policy (lexenv-policy *lexenv*)))
-           (clambda (ir1-convert-lambda `(lambda ,@body)
-                                        :source-name source-name
-                                        :debug-name debug-name
-                                        :system-lambda system-lambda)))
-      (setf (functional-inline-expanded clambda) t)
-      clambda)))
-
+  (let* ((lambda-with-lexenv-p (eq (car fun) 'lambda-with-lexenv))
+         (body (if lambda-with-lexenv-p
+                   `(lambda ,@(cddr fun))
+                   fun))
+         (*lexenv*
+           (if lambda-with-lexenv-p
+               (make-lexenv
+                :default (process-inline-lexenv (second fun))
+                :handled-conditions (lexenv-handled-conditions *lexenv*)
+                :policy policy
+                :flushable (lexenv-flushable *lexenv*))
+               (make-almost-null-lexenv
+                policy
+                ;; Inherit MUFFLE-CONDITIONS from the call-site lexenv
+                ;; rather than the definition-site lexenv, since it seems
+                ;; like a much more common case.
+                (lexenv-handled-conditions *lexenv*)
+                (lexenv-flushable *lexenv*))))
+         (clambda (ir1-convert-lambda body
+                                      :source-name source-name
+                                      :debug-name debug-name
+                                      :system-lambda system-lambda)))
+    (setf (functional-inline-expanded clambda) t)
+    clambda))
+;;;; defining global functions
 ;;; Given a lambda-list, return a FUN-TYPE object representing the signature:
 ;;; return type is *, and each individual arguments type is T -- but we get
 ;;; the argument counts and keywords.
+;;; TODO: enhance this to optionally accept an alist of (var . type)
+;;; and use that lieu of SB-INTERPRETER:APPROXIMATE-PROTO-FN-TYPE.
 (defun ftype-from-lambda-list (lambda-list)
-  (multiple-value-bind (req opt restp rest-name keyp key-list allowp morep)
-      (parse-lambda-list lambda-list)
-    (declare (ignore rest-name))
-    (flet ((t (list)
-             (mapcar (constantly t) list)))
-      (let ((reqs (t req))
-            (opts (when opt (cons '&optional (t opt))))
+  (multiple-value-bind (llks req opt rest key-list)
+      (parse-lambda-list lambda-list :silent t)
+    (flet ((list-of-t (list) (mapcar (constantly t) list)))
+      (let ((reqs (list-of-t req))
+            (opts (when opt (cons '&optional (list-of-t opt))))
             ;; When it comes to building a type, &REST means pretty much the
             ;; same thing as &MORE.
-            (rest (when (or morep restp) (list '&rest t)))
-            (keys (when keyp
+            (rest (when rest '(&rest t)))
+            (keys (when (ll-kwds-keyp llks)
                     (cons '&key (mapcar (lambda (spec)
-                                          (let ((key/var (if (consp spec)
-                                                             (car spec)
-                                                             spec)))
-                                            (list (if (consp key/var)
-                                                      (car key/var)
-                                                      (keywordicate key/var))
-                                                  t)))
+                                          (list (parse-key-arg-spec spec) t))
                                         key-list))))
-            (allow (when allowp (list '&allow-other-keys))))
-        (specifier-type `(function (,@reqs ,@opts ,@rest ,@keys ,@allow) *))))))
+            (allow (when (ll-kwds-allowp llks) '(&allow-other-keys))))
+        (careful-specifier-type `(function (,@reqs ,@opts ,@rest ,@keys ,@allow) *))))))
 
 ;;; Get a DEFINED-FUN object for a function we are about to define. If
 ;;; the function has been forward referenced, then substitute for the
@@ -1156,8 +1174,8 @@
                                           :defined-here)
                           :type (if (eq :declared where-from)
                                     (leaf-type found)
-                                    (if lp
-                                        (ftype-from-lambda-list lambda-list)
+                                    (or (and lp
+                                             (ftype-from-lambda-list lambda-list))
                                         (specifier-type 'function))))))
                (substitute-leaf res found)
                (setf (gethash name *free-funs*) res)))
@@ -1174,28 +1192,29 @@
 ;;; EXPLICIT-CHECK attribute, which is specified on functions that
 ;;; check their argument types as a consequence of type dispatching.
 ;;; This avoids redundant checks such as NUMBERP on the args to +, etc.
+;;; FIXME: this seems to have nothing at all to do with adding "new"
+;;; definitions, as it is only called from IR1-CONVERT-INLINE-EXPANSION.
 (defun assert-new-definition (var fun)
-  (let ((type (leaf-type var))
-        (for-real (eq (leaf-where-from var) :declared))
-        (info (info :function :info (leaf-source-name var))))
+  (let* ((type (leaf-type var))
+         (for-real (eq (leaf-where-from var) :declared))
+         (name (leaf-source-name var))
+         (info (info :function :info name))
+         (explicit-check (getf (functional-plist fun) 'explicit-check)))
     (assert-definition-type
      fun type
      ;; KLUDGE: Common Lisp is such a dynamic language that in general
-     ;; all we can do here in general is issue a STYLE-WARNING. It
-     ;; would be nice to issue a full WARNING in the special case of
-     ;; of type mismatches within a compilation unit (as in section
-     ;; 3.2.2.3 of the spec) but at least as of sbcl-0.6.11, we don't
-     ;; keep track of whether the mismatched data came from the same
-     ;; compilation unit, so we can't do that. -- WHN 2001-02-11
+     ;; all we can do here is issue a STYLE-WARNING. It would be nice
+     ;; to issue a full WARNING in the special case of type mismatches
+     ;; within a compilation unit (as in section 3.2.2.3 of the spec)
+     ;; but at least as of sbcl-0.6.11, we don't keep track of whether
+     ;; the mismatched data came from the same compilation unit, so we
+     ;; can't do that. -- WHN 2001-02-11
      :lossage-fun #'compiler-style-warn
      :unwinnage-fun (cond (info #'compiler-style-warn)
                           (for-real #'compiler-notify)
                           (t nil))
-     :really-assert
-     (and for-real
-          (not (and info
-                    (ir1-attributep (fun-info-attributes info)
-                                    explicit-check))))
+     :really-assert (if for-real
+                        (explicit-check->really-assert explicit-check))
      :where (if for-real
                 "previous declaration"
                 "previous definition"))))
@@ -1204,10 +1223,10 @@
 ;;; used by %DEFUN too. FIXME: And now it's probably worth rethinking
 ;;; whether this function is a good idea at all.
 (defun ir1-convert-inline-expansion (name expansion var inlinep info)
-  ;; Unless a :INLINE function, we temporarily clobber the inline
+  ;; Unless a INLINE function, we temporarily clobber the inline
   ;; expansion. This prevents recursive inline expansion of
   ;; opportunistic pseudo-inlines.
-  (unless (eq inlinep :inline)
+  (unless (eq inlinep 'inline)
     (setf (defined-fun-inline-expansion var) nil))
   (let ((fun (ir1-convert-inline-lambda expansion
                                         :source-name name
@@ -1239,7 +1258,7 @@
         (note-inlining (optional-dispatch-more-entry fun))
         (mapc #'note-inlining (optional-dispatch-entry-points fun))))
     ;; substitute for any old references
-    (unless (or (not *block-compile*)
+    (unless (or (not (block-compile *compilation*))
                 (and info
                      (or (fun-info-transforms info)
                          (fun-info-templates info)
@@ -1247,35 +1266,98 @@
       (substitute-leaf fun var))
     fun))
 
-(defun %set-inline-expansion (name defined-fun inline-lambda)
-  (cond (inline-lambda
-         (setf (info :function :inline-expansion-designator name)
-               inline-lambda)
-         (when defined-fun
-           (setf (defined-fun-inline-expansion defined-fun)
-                 inline-lambda)))
+;;; Store INLINE-LAMBDA as the inline expansion of NAME.
+;;; EXTRA-INFO is either a keyword denoting that NAME pertains to
+;;; an auto-generated defstruct function, or else it is the list of
+;;; funargs that could be auto-dxified.
+(defun %set-inline-expansion (name defined-fun inline-lambda extra-info
+                                   &aux (defstruct-snippet
+                                          (when (keywordp extra-info)
+                                            extra-info))
+                                        (dxable-args
+                                          (unless (keywordp extra-info)
+                                            extra-info)))
+  (cond (defstruct-snippet
+         ;; In this case, NAME is a system-generated function. Warn if blowing away
+         ;; a previously existing inline expansion coming from an ordinary DEFUN.
+         ;; FIXME: It's tricky to correctly warn about stomping on a constructor
+         ;; because it might actually be the right inline lambda.
+         ;; Probably should compare with EQUALP.
+         ;; FIXME: what does the below KLUDGE mean ?
+         (unless (eq defstruct-snippet :constructor)
+           (let ((old (info :function :inlining-data name)))
+           ;; KLUDGE: This is like (NTH-VALUE 1 (FUN-NAME-INLINE-EXPANSION))
+           ;; but expressed in a way that doesn't crash in cold-init.
+             (when (or (typep old 'inlining-data) (consp old))
+             ;; Any inline expansion that existed can't be useful.
+               (warn "structure ~(~A~) ~S clobbers inline function"
+                     defstruct-snippet name)))))
         (t
-         (clear-info :function :inline-expansion-designator name))))
+         (let ((info (info :function :source-transform name)))
+           ;; If NAME was a defstruct snippet, and now it isn't, then warn
+           ;; and remove the transform.
+           (when (consp info)
+             (clear-info :function :source-transform name)
+             ;; This is serious enough that you can get two warnings:
+             ;; - one because you redefined a function at all,
+             ;; - and one because the source-transform is erased.
+             (warn "redefinition of ~S clobbers structure ~:[accessor~;~(~a~)~]"
+                   name (symbolp (cdr info)) (cdr info))))))
+  ;; says CLHS: "Only an implementation that was willing to be responsible
+  ;; for recompiling f if the definition of g changed incompatibly could
+  ;; legitimately stack allocate the list argument to g in f."
+  ;; Yeah, well, we're not going be responsible for bupkis.
+  ;; If you want to do something dangerous, then do it.
+  ;; Of course it would be nice NOT to warn when we haven't actually baked-in
+  ;; any assumptions about callees, but I don't feel like adding more metadata
+  ;; to track when we assumed something.
+  (let ((old (fun-name-dx-args name)))
+    (when (and old (not (subsetp old dxable-args)))
+      (warn "redefinition of ~S with differing DYNAMIC-EXTENT declarations ~
+is potentially harmful to any already-compiled callers using (SAFETY 0)."
+            name)))
+  (if (or inline-lambda dxable-args)
+      (setf (info :function :inlining-data name)
+            (if dxable-args
+                (if inline-lambda
+                    (make-inlining-data inline-lambda dxable-args)
+                    (make-dxable-args dxable-args))
+                inline-lambda))
+      (clear-info :function :inlining-data name))
+  (when (and inline-lambda defined-fun)
+    (setf (defined-fun-inline-expansion defined-fun)
+          inline-lambda)))
 
 ;;; the even-at-compile-time part of DEFUN
 ;;;
-;;; The INLINE-LAMBDA is a LAMBDA-WITH-LEXENV, or NIL if there is no
-;;; inline expansion.
-(defun %compiler-defun (name inline-lambda compile-toplevel)
+;;; INLINE-LAMBDA is either (LAMBDA (...) ...) or (LAMBDA-WITH-LEXENV ...)
+;;; EXTRA-INFO is one of:
+;;; * a symbol in {:ACCESSOR, :PREDICATE, :COPIER, :CONSTRUCTOR} if the function
+;;;   came from defstruct; or
+;;; * a possibly empty list of dynamic extent arguments.
+;;; The inline lambda will be NIL for a structure accessor, predicate, or copier
+;;; since those can always be reconstructed from a defstruct description.
+(defun %compiler-defun (name compile-toplevel inline-lambda extra-info)
   (let ((defined-fun nil)) ; will be set below if we're in the compiler
     (when compile-toplevel
       (with-single-package-locked-error
           (:symbol name "defining ~S as a function")
         (setf defined-fun
-              (if inline-lambda
-                  (get-defined-fun name (fifth inline-lambda))
-                  (get-defined-fun name))))
+              ;; Try to pass the lambda-list to GET-DEFINED-FUN if we can.
+              (if (atom inline-lambda)
+                  (get-defined-fun name)
+                  (get-defined-fun
+                   name (ecase (car inline-lambda)
+                         (lambda-with-lexenv (third inline-lambda))
+                         (lambda (second inline-lambda)))))))
       (when (boundp '*lexenv*)
-        (aver (fasl-output-p *compile-object*))
-        (if (member name *fun-names-in-this-file* :test #'equal)
+        (aver (producing-fasl-file))
+        (if (member name (fun-names-in-this-file *compilation*) :test #'equal)
             (warn 'duplicate-definition :name name)
-            (push name *fun-names-in-this-file*)))
-      (%set-inline-expansion name defined-fun inline-lambda))
+            (push name (fun-names-in-this-file *compilation*))))
+      ;; I don't know why this is guarded by (WHEN compile-toplevel),
+      ;; because regular old %DEFUN is going to call this anyway.
+      (%set-inline-expansion name defined-fun inline-lambda extra-info))
 
     (become-defined-fun-name name)
 
@@ -1306,14 +1388,14 @@
 ;; and not flat-out wrong, though there is indeed some waste in the fasl.
 ;;
 ;; KIND is the globaldb KIND of this NAME
-(defun %compiler-defmacro (kind name compile-toplevel)
-  (when compile-toplevel
-    (let ((name-key `(,kind ,name)))
-      (when (boundp '*lexenv*)
-        (aver (fasl-output-p *compile-object*))
-        (if (member name-key *fun-names-in-this-file* :test #'equal)
-            (compiler-style-warn 'same-file-redefinition-warning :name name)
-            (push name-key *fun-names-in-this-file*))))))
+(defun %compiler-defmacro (kind name)
+  (let ((name-key `(,kind ,name)))
+    (when (boundp '*lexenv*)
+      (aver (producing-fasl-file))
+      ;; a slight OAOO issue here wrt %COMPILER-DEFUN
+      (if (member name-key (fun-names-in-this-file *compilation*) :test #'equal)
+          (compiler-style-warn 'same-file-redefinition-warning :name name)
+          (push name-key (fun-names-in-this-file *compilation*))))))
 
 
 ;;; Entry point utilities

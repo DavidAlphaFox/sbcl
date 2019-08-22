@@ -24,7 +24,40 @@
 (in-package "SB-PCL")
 
 (!fix-early-generic-functions)
-(!fix-ensure-accessor-specializers)
+
+(fmakunbound 'ensure-accessor)
+(defun ensure-accessor (fun-name) ; Make FUN-NAME exist as a GF if it doesn't
+  (destructuring-bind (slot-name method) (cddr fun-name)
+    ;; FIXME: change SLOT-OBJECT here to T to get SLOT-MISSING
+    ;; behaviour for non-slot-objects too?
+    (let ((reader-specializers (load-time-value (list (find-class 'slot-object)) t))
+          (writer-specializers (load-time-value (list (find-class 't)
+                                                      (find-class 'slot-object)) t)))
+      (multiple-value-bind (lambda-list specializers method-class initargs doc)
+          (ecase method
+            (reader
+             (values '(object) reader-specializers 'global-reader-method
+                     (make-std-reader-method-function 'slot-object slot-name)
+                     "automatically-generated reader method"))
+            (writer
+             (values '(new-value object) writer-specializers
+                     'global-writer-method
+                     (make-std-writer-method-function 'slot-object slot-name)
+                     "automatically-generated writer method"))
+            (boundp
+             (values '(object) reader-specializers 'global-boundp-method
+                     (make-std-boundp-method-function 'slot-object slot-name)
+                     "automatically-generated boundp method")))
+        (let ((gf (ensure-generic-function fun-name :lambda-list lambda-list)))
+          (add-method gf (make-a-method method-class
+                                        () lambda-list specializers
+                                        initargs doc :slot-name slot-name)))))))
+
+(dolist (gf-name *!temporary-ensure-accessor-functions*)
+  ; (format t "~&Genericizing ~S~%" gf-name)
+  (fmakunbound gf-name)
+  (ensure-accessor gf-name))
+
 (compute-standard-slot-locations)
 (dolist (s '(condition function structure-object))
   (dohash ((k v) (classoid-subclasses (find-classoid s)))
@@ -32,60 +65,6 @@
     (find-class (classoid-name k))))
 (setq **boot-state** 'complete)
 
-(defun print-std-instance (instance stream depth)
-  (declare (ignore depth))
-  (print-object instance stream))
-
-(setf (compiler-macro-function 'slot-value) nil)
-(setf (compiler-macro-function 'set-slot-value) nil)
-
-(in-package "SB-C")
-
-(defknown slot-value (t symbol) t (any))
-(defknown (slot-boundp slot-exists-p) (t symbol) boolean)
-(defknown sb-pcl::set-slot-value (t symbol t) t (any))
-
-(defknown find-class (symbol &optional t lexenv-designator)
-  (or class null))
-(defknown class-of (t) class (flushable))
-(defknown class-name (class) symbol (flushable))
-
-(deftransform slot-value ((object slot-name) (t (constant-arg symbol)) *
-                          :node node)
-  (let ((c-slot-name (lvar-value slot-name)))
-    (if (sb-pcl::interned-symbol-p c-slot-name)
-        (let* ((type (lvar-type object))
-               (dd (when (structure-classoid-p type)
-                     (find-defstruct-description
-                      (sb-kernel::structure-classoid-name type))))
-               (dsd (when dd
-                      (find c-slot-name (dd-slots dd) :key #'dsd-name))))
-          (cond (dsd
-                 `(,(dsd-accessor-name dsd) object))
-                (t
-                 (delay-ir1-transform node :constraint)
-                 `(sb-pcl::accessor-slot-value object ',c-slot-name))))
-        (give-up-ir1-transform "slot name is not an interned symbol"))))
-
-(deftransform sb-pcl::set-slot-value ((object slot-name new-value)
-                                      (t (constant-arg symbol) t)
-                                      * :node node)
-  (let ((c-slot-name (lvar-value slot-name)))
-    (if (sb-pcl::interned-symbol-p c-slot-name)
-        (let* ((type (lvar-type object))
-               (dd (when (structure-classoid-p type)
-                     (find-defstruct-description
-                      (sb-kernel::structure-classoid-name type))))
-               (dsd (when dd
-                      (find c-slot-name (dd-slots dd) :key #'dsd-name))))
-          (cond (dsd
-                 `(setf (,(dsd-accessor-name dsd) object) new-value))
-                ((policy node (= safety 3))
-                 ;; Safe code wants to check the type, and the global
-                 ;; accessor won't do that. Also see the comment in the
-                 ;; compiler-macro.
-                 (give-up-ir1-transform "cannot use optimized accessor in safe code"))
-                (t
-                 (delay-ir1-transform node :constraint)
-                 `(sb-pcl::accessor-set-slot-value object ',c-slot-name new-value))))
-        (give-up-ir1-transform "slot name is not an interned symbol"))))
+;;; CLASS-PROTOTYPE for FUNCTION should not use ALLOCATE-INSTANCE.
+(let ((class (find-class 'function)))
+  (setf (slot-value class 'prototype) #'identity))

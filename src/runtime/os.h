@@ -20,6 +20,24 @@
 #include "sbcl.h"
 #include "runtime.h"
 
+#include <inttypes.h>
+
+#if defined(LISP_FEATURE_GENCGC) && !defined(ENABLE_PAGE_PROTECTION)
+/* Should we use page protection to help avoid the scavenging of pages
+ * that don't have pointers to younger generations?
+ * You can change this to 0 if you want SBCL not to install the handlers
+ * for SIGSEGV and SIGBUS. That will slow down GC, but might be desirable
+ * for debugging or for exploring GC strategies such as remembered sets */
+#define ENABLE_PAGE_PROTECTION 1
+#endif
+
+#ifdef LISP_FEATURE_CHENEYGC
+#define INSTALL_SIG_MEMORY_FAULT_HANDLER 1
+#endif
+#ifdef LISP_FEATURE_GENCGC
+#define INSTALL_SIG_MEMORY_FAULT_HANDLER ENABLE_PAGE_PROTECTION
+#endif
+
 /* Some standard preprocessor definitions and typedefs are needed from
  * the OS-specific #include files. This is an attempt to document
  * them on 20000729, by WHN the impatient reverse engineer.
@@ -48,6 +66,13 @@
 
 extern os_vm_size_t os_vm_page_size;
 
+#if (defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)) \
+  || defined(LISP_FEATURE_LINUX)
+boolean os_preinit(char *argv[], char *envp[]);
+#else
+#define os_preinit(dummy1,dummy2) (0)
+#endif
+
 /* Do anything we need to do when starting up the runtime environment
  * in this OS. */
 extern void os_init(char *argv[], char *envp[]);
@@ -68,12 +93,19 @@ extern void os_install_interrupt_handlers(void);
  * and simplify if the difference isn't too large. */
 extern void os_zero(os_vm_address_t addr, os_vm_size_t length);
 
-/* It looks as though this function allocates 'len' bytes at 'addr',
+/* Allocate 'len' bytes at 'addr',
  * or at an OS-chosen address if 'addr' is zero.
- *
- * FIXME: There was some documentation for these functions in
- * "hp-ux.c" in the old CMU CL code. Perhaps move/merge it in here. */
-extern os_vm_address_t os_validate(os_vm_address_t addr, os_vm_size_t len);
+ * If 'movable' then 'addr' is a preference, not a requirement.
+ * These are discrete bits, not opaque enumerated values.
+ * i.e. the consuming code might test via either (x & bit)
+ * or (x == bit) depending on the use-case */
+#define NOT_MOVABLE      0
+#define MOVABLE          1
+#define MOVABLE_LOW      2
+#define IS_THREAD_STRUCT 4
+extern os_vm_address_t os_validate(int movable,
+                                   os_vm_address_t addr,
+                                   os_vm_size_t len);
 
 #ifdef LISP_FEATURE_WIN32
 void* os_validate_recommit(os_vm_address_t addr, os_vm_size_t len);
@@ -84,10 +116,10 @@ extern void os_invalidate(os_vm_address_t addr, os_vm_size_t len);
 
 /* This maps a file into memory, or calls lose(..) for various
  * failures. */
-extern os_vm_address_t os_map(int fd,
-                              int offset,
-                              os_vm_address_t addr,
-                              os_vm_size_t len);
+extern void os_map(int fd,
+                   int offset,
+                   os_vm_address_t addr,
+                   os_vm_size_t len);
 
 /* This presumably flushes the instruction cache, if that can be done
  * explicitly. (It doesn't seem to be an issue for the i386 port,
@@ -102,8 +134,11 @@ extern void os_protect(os_vm_address_t addr,
                        os_vm_size_t len,
                        os_vm_prot_t protection);
 
-/* This returns true for an address which makes sense at the Lisp level. */
-extern boolean is_valid_lisp_addr(os_vm_address_t test);
+/* Return true for an address (with or without lowtag bits) within
+ * any range of memory understood by the garbage collector. */
+extern boolean gc_managed_addr_p(lispobj addr);
+/* As for above, but consider only the heap spaces, not stacks */
+extern boolean gc_managed_heap_space_p(lispobj addr);
 
 /* Given a signal context, return the address for storage of the
  * register, of the specified offset, for that context. The offset is
@@ -112,14 +147,8 @@ extern boolean is_valid_lisp_addr(os_vm_address_t test);
 os_context_register_t *
 os_context_register_addr(os_context_t *context, int offset);
 
-/* FIXME: Pending investigation, this #ifdef stays as alpha. If it
- * turns out that the alpha truly requires this, it can change to
- * ARCH_HAS_FLOAT_REGISTERS (currently #defined in alpha-arch.h -- CSR
- * 2002-02-04 */
-#ifdef LISP_FEATURE_ALPHA
 os_context_register_t *
 os_context_float_register_addr(os_context_t *context, int offset);
-#endif
 
 /* Given a signal context, return the address for storage of the
  * program counter for that context. */
@@ -135,6 +164,13 @@ os_context_register_t *os_context_lr_addr(os_context_t *context);
  * system stack pointer for that context. */
 #ifdef ARCH_HAS_STACK_POINTER
 os_context_register_t *os_context_sp_addr(os_context_t *context);
+#if (defined(LISP_FEATURE_X86)||defined(LISP_FEATURE_X86_64)) && \
+    (defined(LISP_FEATURE_DARWIN)||defined(LISP_FEATURE_LINUX)||defined(LISP_FEATURE_WIN32))
+os_context_register_t *os_context_fp_addr(os_context_t *context);
+#define os_context_frame_pointer(context) *os_context_fp_addr(context)
+#else
+#define os_context_frame_pointer(context) 0
+#endif
 #endif
 /* Given a signal context, return the address for storage of the
  * signal mask for that context. */
@@ -152,18 +188,13 @@ sigset_t *os_context_sigmask_addr(os_context_t *context);
 extern os_vm_address_t os_allocate(os_vm_size_t len);
 extern void os_deallocate(os_vm_address_t addr, os_vm_size_t len);
 
-/* FIXME: The os_trunc_foo(..) and os_round_foo(..) macros here could
- * be functions. */
-
-#define os_trunc_to_page(addr) \
-    (os_vm_address_t)(((uword_t)(addr))&~(os_vm_page_size-1))
-#define os_round_up_to_page(addr) \
-    os_trunc_to_page((addr)+(os_vm_page_size-1))
+#define os_trunc_to_page(addr) PTR_ALIGN_DOWN(addr, os_vm_page_size)
+#define os_round_up_to_page(addr) PTR_ALIGN_UP(addr, os_vm_page_size)
 
 #define os_trunc_size_to_page(size) \
-    (os_vm_size_t)(((uword_t)(size))&~(os_vm_page_size-1))
+    (os_vm_size_t)ALIGN_DOWN((uword_t)size, os_vm_page_size)
 #define os_round_up_size_to_page(size) \
-    os_trunc_size_to_page((size)+(os_vm_page_size-1))
+    (os_vm_size_t)ALIGN_UP((uword_t)size, os_vm_page_size)
 
 /* KLUDGE: The errno error reporting system is an ugly nonreentrant
  * botch which nonetheless wasn't too painful in the old days.
@@ -185,24 +216,8 @@ extern char *os_get_runtime_executable_path(int external_path);
 
 /* Write platforms specific ones when necessary. This is to get us off
  * the ground. */
-#if N_WORD_BITS == 32
-# define OS_VM_SIZE_FMT "u"
-# define OS_VM_SIZE_FMTX "x"
-#else
-#if defined(LISP_FEATURE_SB_WIN32)
-# define OS_VM_SIZE_FMT "Iu"
-# define OS_VM_SIZE_FMTX "Ix"
-#else
-# define OS_VM_SIZE_FMT "lu"
-# define OS_VM_SIZE_FMTX "lx"
-#endif
-#endif
-
-/* FIXME: this is not the right place for this, but here we have
- * a convenient base type to hand. If it turns out we can just use
- * size_t everywhere, this can more to runtime.h. */
-typedef os_vm_size_t word_t;
-#define WORD_FMTX OS_VM_SIZE_FMTX
+#define OS_VM_SIZE_FMT PRIuPTR
+#define OS_VM_SIZE_FMTX PRIxPTR
 
 #ifdef LISP_FEATURE_SB_THREAD
 #  ifndef CANNOT_USE_POSIX_SEM_T

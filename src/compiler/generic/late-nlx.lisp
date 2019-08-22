@@ -9,16 +9,16 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Return a list of TNs that can be used to snapshot the dynamic
 ;;; state for use with the SAVE- and RESTORE-DYNAMIC-ENVIRONMENT VOPs.
 (defun make-dynamic-state-tns ()
   (make-n-tns #.(let ((nsave
-                       (sb!c::vop-info-num-results
+                       (sb-c::vop-info-num-results
                         (template-or-lose 'save-dynamic-state)))
                       (nrestore
-                       (sb!c::vop-info-num-args
+                       (sb-c::vop-info-num-args
                         (template-or-lose 'restore-dynamic-state))))
                   (aver (= nsave nrestore))
                   nsave)

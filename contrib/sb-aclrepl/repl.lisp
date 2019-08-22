@@ -325,7 +325,7 @@
             ;; loop in case more threads get created while trying to exit
             (do ((threads other-threads (other-threads)))
                 ((eq nil threads))
-              (map nil #'sb-thread:destroy-thread threads)
+              (map nil #'sb-thread:terminate-thread threads)
               (sleep 0.2))
             (return-from exit-cmd)))))
   (sb-ext:exit :code status)
@@ -491,7 +491,7 @@
   (values))
 
 (defun bt-cmd (&optional (n most-positive-fixnum))
-  (sb-debug::backtrace n))
+  (sb-debug:print-backtrace :count n))
 
 (defun current-cmd ()
   (sb-debug::describe-debug-command))
@@ -580,7 +580,7 @@
       (if found
           (progn
             (format *output* "~&Destroying thread ~A" thread)
-            (sb-thread:destroy-thread found))
+            (sb-thread:terminate-thread found))
           (format *output* "~&Thread ~A not found" thread))))
   #-sb-thread
   (declare (ignore selected-threads))

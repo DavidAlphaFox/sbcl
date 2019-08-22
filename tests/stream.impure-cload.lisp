@@ -25,11 +25,11 @@
 ;;; The code below tests only UNREAD-CHAR. It would be nice to test
 ;;; CLEAR-INPUT too, but I'm not sure how to do it cleanly and
 ;;; portably in a noninteractive test. -- WHN 2001-05-05
-(defparameter *scratch-file-name* "sbcl-wrapped-stream-test-data.tmp")
+(defparameter *scratch-file-name* (scratch-file-name))
 (defvar *scratch-file-stream*)
 (dolist (scratch-file-length '(1 ; everyone's favorite corner case
                                200123)) ; hopefully much bigger than buffer
-  (format t "/SCRATCH-FILE-LENGTH=~W~%" scratch-file-length)
+  ; (format t "/SCRATCH-FILE-LENGTH=~W~%" scratch-file-length)
   (with-open-file (s *scratch-file-name* :direction :output)
     (dotimes (i scratch-file-length)
       (write-char #\x s)))
@@ -43,7 +43,7 @@
                  (lambda (wrapped-stream-name)
                    (make-concatenated-stream (symbol-value wrapped-stream-name)
                                              (make-string-input-stream "")))))
-    (format t "/WRAP-NAMED-STREAM-FN=~S~%" wrap-named-stream-fn)
+    ; (format t "/WRAP-NAMED-STREAM-FN=~S~%" wrap-named-stream-fn)
     (with-open-file (*scratch-file-stream* *scratch-file-name*
                                            :direction :input)
       (let ((ss (funcall wrap-named-stream-fn '*scratch-file-stream*)))

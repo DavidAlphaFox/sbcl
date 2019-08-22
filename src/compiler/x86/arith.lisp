@@ -9,14 +9,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; unary operations
 
 (define-vop (fast-safe-arith-op)
-  (:policy :fast-safe)
-  (:effects)
-  (:affected))
+  (:policy :fast-safe))
 
 (define-vop (fixnum-unop fast-safe-arith-op)
   (:args (x :scs (any-reg) :target res))
@@ -47,6 +45,14 @@
 (define-vop (fast-negate/unsigned signed-unop)
   (:args (x :scs (unsigned-reg) :target res))
   (:arg-types unsigned-num)
+  (:translate %negate)
+  (:generator 3
+    (move res x)
+    (inst neg res)))
+
+(define-vop (fast-negate/signed-unsigned signed-unop)
+  (:results (res :scs (unsigned-reg)))
+  (:result-types unsigned-num)
   (:translate %negate)
   (:generator 3
     (move res x)
@@ -191,7 +197,7 @@
                        ;; -C/SIGNED=>UNSIGNED, below, when the
                        ;; higher-level lisp code can't optimize away the
                        ;; non-trivial identity.
-                       `(unless (= y #.(1- (ash 1 n-word-bits)))
+                       `(unless (= y most-positive-word)
                           (inst ,op r y))
                        `(inst ,op r y)))))))
   (define-binop - 4 sub)
@@ -200,10 +206,10 @@
   (define-binop logxor 2 xor))
 
 (define-vop (fast-logior-unsigned-signed=>signed fast-safe-arith-op)
-  (:args (x :scs (unsigned-reg))
+  (:args (x :scs (unsigned-reg) :to (:result 1))
          (y :target r :scs (signed-reg)))
   (:arg-types unsigned-num signed-num)
-  (:results (r :scs (signed-reg) :from (:argument 1)))
+  (:results (r :scs (signed-reg)))
   (:result-types signed-num)
   (:note "inline (unsigned-byte 32) arithmetic")
   (:translate logior)
@@ -244,7 +250,7 @@
   (:generator 2
     (cond ((and (sc-is x any-reg) (sc-is y any-reg) (sc-is r any-reg)
                 (not (location= x r)))
-           (inst lea r (make-ea :dword :base x :index y :scale 1)))
+           (inst lea r (make-ea :dword :base x :index y)))
           (t
            (move r x)
            (inst add r y)))))
@@ -283,7 +289,7 @@
   (:generator 5
     (cond ((and (sc-is x signed-reg) (sc-is y signed-reg) (sc-is r signed-reg)
                 (not (location= x r)))
-           (inst lea r (make-ea :dword :base x :index y :scale 1)))
+           (inst lea r (make-ea :dword :base x :index y)))
           (t
            (move r x)
            (inst add r y)))))
@@ -314,6 +320,43 @@
                                (location= x r))))
          (y :scs (signed-reg signed-stack)))
   (:arg-types unsigned-num signed-num))
+
+(define-vop (mask-signed-field-fixnum)
+  (:translate sb-c::mask-signed-field)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg) :target r))
+  (:arg-types (:constant (eql #.n-fixnum-bits)) t)
+  (:results (r :scs (any-reg)))
+  (:result-types fixnum)
+  (:info width)
+  (:ignore width)
+  (:generator 5
+    (move r x)
+    (generate-fixnum-test r)
+    (inst jmp :z DONE)
+    (loadw r r bignum-digits-offset other-pointer-lowtag)
+    (inst shl r (- n-word-bits n-fixnum-bits))
+    DONE))
+
+(define-vop (logand-word-mask)
+  (:translate logand)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types t (:constant word))
+  (:results (r :scs (unsigned-reg)))
+  (:info mask)
+  (:result-types unsigned-num)
+  (:generator 10
+    (move r x)
+    (generate-fixnum-test r)
+    (inst jmp :nz BIGNUM)
+    (inst sar r n-fixnum-tag-bits)
+    (inst jmp DONE)
+    BIGNUM
+    (loadw r x bignum-digits-offset other-pointer-lowtag)
+    DONE
+    (unless (= mask most-positive-word)
+      (inst and r mask))))
 
 
 (define-vop (fast-+-c/signed=>signed fast-safe-arith-op)
@@ -354,7 +397,7 @@
   (:generator 5
     (cond ((and (sc-is x unsigned-reg) (sc-is y unsigned-reg)
                 (sc-is r unsigned-reg) (not (location= x r)))
-           (inst lea r (make-ea :dword :base x :index y :scale 1)))
+           (inst lea r (make-ea :dword :base x :index y)))
           (t
            (move r x)
            (inst add r y)))))
@@ -445,7 +488,6 @@
   (:result-types unsigned-num)
   (:note "inline (unsigned-byte 32) arithmetic")
   (:vop-var vop)
-  (:save-p :compute-only)
   (:generator 6
     (move eax x)
     (inst mul eax y)
@@ -497,7 +539,6 @@
   (:result-types tagged-num tagged-num)
   (:note "inline fixnum arithmetic")
   (:vop-var vop)
-  (:save-p :compute-only)
   (:generator 30
     (move eax x)
     (inst cdq)
@@ -551,7 +592,6 @@
   (:result-types unsigned-num unsigned-num)
   (:note "inline (unsigned-byte 32) arithmetic")
   (:vop-var vop)
-  (:save-p :compute-only)
   (:generator 32
     (move eax x)
     (inst xor edx edx)
@@ -602,7 +642,6 @@
   (:result-types signed-num signed-num)
   (:note "inline (signed-byte 32) arithmetic")
   (:vop-var vop)
-  (:save-p :compute-only)
   (:generator 32
     (move eax x)
     (inst cdq)
@@ -842,7 +881,6 @@ constant shift greater than word length")))
 
     DONE))
 
-#!+ash-right-vops
 (define-vop (fast-%ash/right/unsigned)
   (:translate %ash/right)
   (:policy :fast-safe)
@@ -857,7 +895,6 @@ constant shift greater than word length")))
     (move ecx amount)
     (inst shr result :cl)))
 
-#!+ash-right-vops
 (define-vop (fast-%ash/right/signed)
   (:translate %ash/right)
   (:policy :fast-safe)
@@ -872,7 +909,6 @@ constant shift greater than word length")))
     (move ecx amount)
     (inst sar result :cl)))
 
-#!+ash-right-vops
 (define-vop (fast-%ash/right/fixnum)
   (:translate %ash/right)
   (:policy :fast-safe)
@@ -888,7 +924,7 @@ constant shift greater than word length")))
     (inst sar result :cl)
     (inst and result (lognot fixnum-tag-mask))))
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (defknown %lea (integer integer (member 1 2 4 8) (signed-byte 32))
   integer
@@ -917,7 +953,7 @@ constant shift greater than word length")))
 (defun %lea (base index scale disp)
   (+ base (* index scale) disp))
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-vop (%lea/unsigned=>unsigned)
   (:translate %lea)
@@ -1039,6 +1075,20 @@ constant shift greater than word length")))
     (inst xor res res)
     DONE))
 
+;; The code on which this was based existed in no less than three varieties,
+;; differing in response to 0 input: produce NIL, -1, or signal an error.
+;; To avoid a thorny issue of proper semantics, this VOP is used only by
+;; %BIT-POSITION which happens to declare zero safety, but always pre-checks
+;; for zero. (the ltn-policy of :fast is actually irrelevant)
+(define-vop (unsigned-word-find-first-bit)
+  (:policy :fast)
+  (:args (arg :scs (unsigned-reg)))
+  (:arg-types unsigned-num)
+  (:results (res :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:generator 1
+    (inst bsf res arg)))
+
 (define-vop (unsigned-byte-32-count)
   (:translate logcount)
   (:note "inline (unsigned-byte 32) logcount")
@@ -1095,8 +1145,6 @@ constant shift greater than word length")))
 
 (define-vop (fast-conditional)
   (:conditional :e)
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-conditional/fixnum fast-conditional)
@@ -1371,18 +1419,18 @@ constant shift greater than word length")))
      (:translate ,function)))
 
 (macrolet ((def (name -c-p)
-             (let ((fun32 (intern (format nil "~S-MOD32" name)))
-                   (vopu (intern (format nil "FAST-~S/UNSIGNED=>UNSIGNED" name)))
-                   (vopcu (intern (format nil "FAST-~S-C/UNSIGNED=>UNSIGNED" name)))
-                   (vopf (intern (format nil "FAST-~S/FIXNUM=>FIXNUM" name)))
-                   (vopcf (intern (format nil "FAST-~S-C/FIXNUM=>FIXNUM" name)))
-                   (vop32u (intern (format nil "FAST-~S-MOD32/WORD=>UNSIGNED" name)))
-                   (vop32f (intern (format nil "FAST-~S-MOD32/FIXNUM=>FIXNUM" name)))
-                   (vop32cu (intern (format nil "FAST-~S-MOD32-C/WORD=>UNSIGNED" name)))
-                   (vop32cf (intern (format nil "FAST-~S-MOD32-C/FIXNUM=>FIXNUM" name)))
-                   (funfx (intern (format nil "~S-MODFX" name)))
-                   (vopfxf (intern (format nil "FAST-~S-MODFX/FIXNUM=>FIXNUM" name)))
-                   (vopfxcf (intern (format nil "FAST-~S-MODFX-C/FIXNUM=>FIXNUM" name))))
+             (let ((fun32   (symbolicate name "-MOD32"))
+                   (funfx   (symbolicate name "-MODFX"))
+                   (vopu    (symbolicate "FAST-" name "/UNSIGNED=>UNSIGNED"))
+                   (vopcu   (symbolicate "FAST-" name "-C/UNSIGNED=>UNSIGNED"))
+                   (vopf    (symbolicate "FAST-" name "/FIXNUM=>FIXNUM"))
+                   (vopcf   (symbolicate "FAST-" name "-C/FIXNUM=>FIXNUM"))
+                   (vop32u  (symbolicate "FAST-" name "-MOD32/WORD=>UNSIGNED"))
+                   (vop32f  (symbolicate "FAST-" name "-MOD32/FIXNUM=>FIXNUM"))
+                   (vop32cu (symbolicate "FAST-" name "-MOD32-C/WORD=>UNSIGNED"))
+                   (vop32cf (symbolicate "FAST-" name "-MOD32-C/FIXNUM=>FIXNUM"))
+                   (vopfxf  (symbolicate "FAST-" name "-MODFX/FIXNUM=>FIXNUM"))
+                   (vopfxcf (symbolicate "FAST-" name "-MODFX-C/FIXNUM=>FIXNUM")))
                (declare (ignore vop32cf)) ; maybe someone will want it some day
                `(progn
                   (define-modular-fun ,fun32 (x y) ,name :untagged nil 32)
@@ -1424,8 +1472,8 @@ constant shift greater than word length")))
              fast-ash-left/unsigned=>unsigned))
 (deftransform ash-left-mod32 ((integer count)
                               ((unsigned-byte 32) (unsigned-byte 5)))
-  (when (sb!c::constant-lvar-p count)
-    (sb!c::give-up-ir1-transform))
+  (when (sb-c::constant-lvar-p count)
+    (sb-c::give-up-ir1-transform))
   '(%primitive fast-ash-left-mod32/unsigned=>unsigned integer count))
 
 (define-vop (fast-ash-left-modfx-c/fixnum=>fixnum
@@ -1437,16 +1485,16 @@ constant shift greater than word length")))
              fast-ash-left/fixnum=>fixnum))
 (deftransform ash-left-modfx ((integer count)
                               (fixnum (unsigned-byte 5)))
-  (when (sb!c::constant-lvar-p count)
-    (sb!c::give-up-ir1-transform))
+  (when (sb-c::constant-lvar-p count)
+    (sb-c::give-up-ir1-transform))
   '(%primitive fast-ash-left-modfx/fixnum=>fixnum integer count))
 
-(in-package "SB!C")
+(in-package "SB-C")
 
-(defknown sb!vm::%lea-mod32 (integer integer (member 1 2 4 8) (signed-byte 32))
+(defknown sb-vm::%lea-mod32 (integer integer (member 1 2 4 8) (signed-byte 32))
   (unsigned-byte 32)
   (foldable flushable movable))
-(defknown sb!vm::%lea-modfx (integer integer (member 1 2 4 8) (signed-byte 32))
+(defknown sb-vm::%lea-modfx (integer integer (member 1 2 4 8) (signed-byte 32))
   fixnum
   (foldable flushable movable))
 
@@ -1456,39 +1504,38 @@ constant shift greater than word length")))
              (constant-lvar-p disp))
     (cut-to-width base :untagged width nil)
     (cut-to-width index :untagged width nil)
-    'sb!vm::%lea-mod32))
+    'sb-vm::%lea-mod32))
 (define-modular-fun-optimizer %lea ((base index scale disp) :tagged t :width width)
-  (when (and (<= width (- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits))
+  (when (and (<= width (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits))
              (constant-lvar-p scale)
              (constant-lvar-p disp))
     (cut-to-width base :tagged width t)
     (cut-to-width index :tagged width t)
-    'sb!vm::%lea-modfx))
+    'sb-vm::%lea-modfx))
 
 #+sb-xc-host
 (progn
-  (defun sb!vm::%lea-mod32 (base index scale disp)
+  (defun sb-vm::%lea-mod32 (base index scale disp)
     (ldb (byte 32 0) (%lea base index scale disp)))
-  (defun sb!vm::%lea-modfx (base index scale disp)
-    (mask-signed-field (- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits)
+  (defun sb-vm::%lea-modfx (base index scale disp)
+    (mask-signed-field (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits)
                        (%lea base index scale disp))))
 #-sb-xc-host
 (progn
-  (defun sb!vm::%lea-mod32 (base index scale disp)
+  (defun sb-vm::%lea-mod32 (base index scale disp)
     (let ((base (logand base #xffffffff))
           (index (logand index #xffffffff)))
       ;; can't use modular version of %LEA, as we only have VOPs for
       ;; constant SCALE and DISP.
       (ldb (byte 32 0) (+ base (* index scale) disp))))
-  (defun sb!vm::%lea-modfx (base index scale disp)
-    (let* ((fixnum-width (- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits))
-           (base (mask-signed-field fixnum-width base))
-           (index (mask-signed-field fixnum-width index)))
+  (defun sb-vm::%lea-modfx (base index scale disp)
+    (let ((base (mask-signed-field sb-vm:n-fixnum-bits base))
+          (index (mask-signed-field sb-vm:n-fixnum-bits index)))
       ;; can't use modular version of %LEA, as we only have VOPs for
       ;; constant SCALE and DISP.
-      (mask-signed-field fixnum-width (+ base (* index scale) disp)))))
+      (mask-signed-field sb-vm:n-fixnum-bits (+ base (* index scale) disp)))))
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-vop (%lea-mod32/unsigned=>unsigned
              %lea/unsigned=>unsigned)
@@ -1541,23 +1588,23 @@ constant shift greater than word length")))
 ;;;; bignum stuff
 
 (define-vop (bignum-length get-header-data)
-  (:translate sb!bignum:%bignum-length)
+  (:translate sb-bignum:%bignum-length)
   (:policy :fast-safe))
 
 (define-vop (bignum-set-length set-header-data)
-  (:translate sb!bignum:%bignum-set-length)
+  (:translate sb-bignum:%bignum-set-length)
   (:policy :fast-safe))
 
 (define-full-reffer bignum-ref * bignum-digits-offset other-pointer-lowtag
-  (unsigned-reg) unsigned-num sb!bignum:%bignum-ref)
+  (unsigned-reg) unsigned-num sb-bignum:%bignum-ref)
 (define-full-reffer+offset bignum-ref-with-offset *
   bignum-digits-offset other-pointer-lowtag
-  (unsigned-reg) unsigned-num sb!bignum:%bignum-ref-with-offset)
+  (unsigned-reg) unsigned-num sb-bignum:%bignum-ref-with-offset)
 (define-full-setter bignum-set * bignum-digits-offset other-pointer-lowtag
-  (unsigned-reg) unsigned-num sb!bignum:%bignum-set)
+  (unsigned-reg) unsigned-num sb-bignum:%bignum-set)
 
 (define-vop (digit-0-or-plus)
-  (:translate sb!bignum:%digit-0-or-plusp)
+  (:translate sb-bignum:%digit-0-or-plusp)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg)))
   (:arg-types unsigned-num)
@@ -1566,16 +1613,15 @@ constant shift greater than word length")))
     (inst test digit digit)))
 
 
-;;; For add and sub with carry the sc of carry argument is any-reg so
-;;; that it may be passed as a fixnum or word and thus may be 0, 1, or
-;;; 4. This is easy to deal with and may save a fixnum-word
-;;; conversion.
+;;; For add and sub with carry, the sc of carry argument is unsigned-reg
+;;; or any-reg so that it may be passed either as tagged or untagged.
+;;; This is easy to deal with and may save a fixnum-word conversion.
 (define-vop (add-w/carry)
-  (:translate sb!bignum:%add-with-carry)
+  (:translate sb-bignum:%add-with-carry)
   (:policy :fast-safe)
   (:args (a :scs (unsigned-reg) :target result)
          (b :scs (unsigned-reg unsigned-stack) :to :eval)
-         (c :scs (any-reg) :target temp))
+         (c :scs (any-reg unsigned-reg control-stack) :target temp))
   (:arg-types unsigned-num unsigned-num positive-fixnum)
   (:temporary (:sc any-reg :from (:argument 2) :to :eval) temp)
   (:results (result :scs (unsigned-reg) :from (:argument 0))
@@ -1586,17 +1632,17 @@ constant shift greater than word length")))
     (move temp c)
     (inst neg temp) ; Set the carry flag to 0 if c=0 else to 1
     (inst adc result b)
-    (inst mov carry 0)
-    (inst adc carry carry)))
+    (inst set carry :c)
+    (inst and carry 1)))
 
 ;;; Note: the borrow is 1 for no borrow and 0 for a borrow, the opposite
 ;;; of the x86 convention.
 (define-vop (sub-w/borrow)
-  (:translate sb!bignum:%subtract-with-borrow)
+  (:translate sb-bignum:%subtract-with-borrow)
   (:policy :fast-safe)
   (:args (a :scs (unsigned-reg) :to :eval :target result)
          (b :scs (unsigned-reg unsigned-stack) :to :result)
-         (c :scs (any-reg control-stack)))
+         (c :scs (any-reg unsigned-reg control-stack)))
   (:arg-types unsigned-num unsigned-num positive-fixnum)
   (:results (result :scs (unsigned-reg) :from :eval)
             (borrow :scs (unsigned-reg)))
@@ -1610,7 +1656,7 @@ constant shift greater than word length")))
 
 
 (define-vop (bignum-mult-and-add-3-arg)
-  (:translate sb!bignum:%multiply-and-add)
+  (:translate sb-bignum:%multiply-and-add)
   (:policy :fast-safe)
   (:args (x :scs (unsigned-reg) :target eax)
          (y :scs (unsigned-reg unsigned-stack))
@@ -1632,7 +1678,7 @@ constant shift greater than word length")))
     (move lo eax)))
 
 (define-vop (bignum-mult-and-add-4-arg)
-  (:translate sb!bignum:%multiply-and-add)
+  (:translate sb-bignum:%multiply-and-add)
   (:policy :fast-safe)
   (:args (x :scs (unsigned-reg) :target eax)
          (y :scs (unsigned-reg unsigned-stack))
@@ -1658,7 +1704,7 @@ constant shift greater than word length")))
 
 
 (define-vop (bignum-mult)
-  (:translate sb!bignum:%multiply)
+  (:translate sb-bignum:%multiply)
   (:policy :fast-safe)
   (:args (x :scs (unsigned-reg) :target eax)
          (y :scs (unsigned-reg unsigned-stack)))
@@ -1676,7 +1722,6 @@ constant shift greater than word length")))
     (move hi edx)
     (move lo eax)))
 
-#!+multiply-high-vops
 (define-vop (mulhi)
   (:translate %multiply-high)
   (:policy :fast-safe)
@@ -1694,7 +1739,6 @@ constant shift greater than word length")))
     (inst mul eax y)
     (move hi edx)))
 
-#!+multiply-high-vops
 (define-vop (mulhi/fx)
   (:translate %multiply-high)
   (:policy :fast-safe)
@@ -1713,10 +1757,10 @@ constant shift greater than word length")))
     (inst and hi (lognot fixnum-tag-mask))))
 
 (define-vop (bignum-lognot lognot-mod32/word=>unsigned)
-  (:translate sb!bignum:%lognot))
+  (:translate sb-bignum:%lognot))
 
 (define-vop (fixnum-to-digit)
-  (:translate sb!bignum:%fixnum-to-digit)
+  (:translate sb-bignum:%fixnum-to-digit)
   (:policy :fast-safe)
   (:args (fixnum :scs (any-reg control-stack) :target digit))
   (:arg-types tagged-num)
@@ -1730,7 +1774,7 @@ constant shift greater than word length")))
     (inst sar digit n-fixnum-tag-bits)))
 
 (define-vop (bignum-floor)
-  (:translate sb!bignum:%bigfloor)
+  (:translate sb-bignum:%bigfloor)
   (:policy :fast-safe)
   (:args (div-high :scs (unsigned-reg) :target edx)
          (div-low :scs (unsigned-reg) :target eax)
@@ -1751,7 +1795,7 @@ constant shift greater than word length")))
     (move rem edx)))
 
 (define-vop (signify-digit)
-  (:translate sb!bignum:%fixnum-digit-with-correct-sign)
+  (:translate sb-bignum:%fixnum-digit-with-correct-sign)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg unsigned-stack) :target res))
   (:arg-types unsigned-num)
@@ -1766,7 +1810,7 @@ constant shift greater than word length")))
       (inst shl res n-fixnum-tag-bits))))
 
 (define-vop (digit-ashr)
-  (:translate sb!bignum:%ashr)
+  (:translate sb-bignum:%ashr)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg unsigned-stack) :target result)
          (count :scs (unsigned-reg) :target ecx))
@@ -1782,7 +1826,7 @@ constant shift greater than word length")))
     (inst sar result :cl)))
 
 (define-vop (digit-ashr/c)
-  (:translate sb!bignum:%ashr)
+  (:translate sb-bignum:%ashr)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg unsigned-stack) :target result))
   (:arg-types unsigned-num (:constant (integer 0 31)))
@@ -1796,30 +1840,18 @@ constant shift greater than word length")))
     (inst sar result count)))
 
 (define-vop (digit-lshr digit-ashr)
-  (:translate sb!bignum:%digit-logical-shift-right)
+  (:translate sb-bignum:%digit-logical-shift-right)
   (:generator 1
     (move result digit)
     (move ecx count)
     (inst shr result :cl)))
 
 (define-vop (digit-ashl digit-ashr)
-  (:translate sb!bignum:%ashl)
+  (:translate sb-bignum:%ashl)
   (:generator 1
     (move result digit)
     (move ecx count)
     (inst shl result :cl)))
-
-;;;; static functions
-
-(define-static-fun two-arg-/ (x y) :translate /)
-
-(define-static-fun two-arg-gcd (x y) :translate gcd)
-(define-static-fun two-arg-lcm (x y) :translate lcm)
-
-(define-static-fun two-arg-and (x y) :translate logand)
-(define-static-fun two-arg-ior (x y) :translate logior)
-(define-static-fun two-arg-xor (x y) :translate logxor)
-
 
 ;;; Support for the Mersenne Twister, MT19937, random number generator
 ;;; due to Matsumoto and Nishimura.
@@ -1876,7 +1908,7 @@ constant shift greater than word length")))
     (inst shr tmp 18)
     (inst xor y tmp)))
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (defun mask-result (class width result)
   (ecase class
@@ -1958,14 +1990,14 @@ constant shift greater than word length")))
               (t (incf count)))))
     (decompose-multiplication class width arg x n-bits condensed)))
 
-(defun *-transformer (class width y)
+(defun *-transformer (class width y &optional (fun '%lea))
   (cond
     ((= y (ash 1 (integer-length y)))
      ;; there's a generic transform for y = 2^k
      (give-up-ir1-transform))
     ((member y '(3 5 9))
      ;; we can do these multiplications directly using LEA
-     `(%lea x x ,(1- y) 0))
+     `(,fun x x ,(1- y) 0))
     ((member :pentium4 *backend-subfeatures*)
      ;; the pentium4's multiply unit is reportedly very good
      (give-up-ir1-transform))
@@ -1982,25 +2014,26 @@ constant shift greater than word length")))
   "recode as leas, shifts and adds"
   (let ((y (lvar-value y)))
     (*-transformer :unsigned 32 y)))
-(deftransform sb!vm::*-mod32
+(deftransform sb-vm::*-mod32
     ((x y) ((unsigned-byte 32) (constant-arg (unsigned-byte 32)))
      (unsigned-byte 32))
   "recode as leas, shifts and adds"
   (let ((y (lvar-value y)))
-    (*-transformer :unsigned 32 y)))
+    (*-transformer :unsigned 32 y 'sb-vm::%lea-mod32)))
 
 (deftransform * ((x y)
                  (fixnum (constant-arg (unsigned-byte 32)))
                  fixnum)
   "recode as leas, shifts and adds"
   (let ((y (lvar-value y)))
-    (*-transformer :signed (- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits) y)))
-(deftransform sb!vm::*-modfx
+    (*-transformer :signed (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits) y)))
+(deftransform sb-vm::*-modfx
     ((x y) (fixnum (constant-arg (unsigned-byte 32)))
      fixnum)
   "recode as leas, shifts and adds"
   (let ((y (lvar-value y)))
-    (*-transformer :signed (- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits) y)))
+    (*-transformer :signed (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits) y
+                   'sb-vm::%lea-modfx)))
 
 ;;; FIXME: we should also be able to write an optimizer or two to
 ;;; convert (+ (* x 2) 17), (- (* x 9) 5) to a %LEA.

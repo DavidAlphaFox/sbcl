@@ -32,8 +32,6 @@
 ;;; some extra sanity checks
 (compile (defun compiled-vector-t-p (x) (typep x '(vector t))))
 (compile (defun compiled-simple-vector-p (x) (typep x 'simple-vector)))
-(declaim (notinline opaque-identity))
-(defun opaque-identity (x) x)
 (defun evaluated-vector-t-p (x) (typep x (opaque-identity '(vector t))))
 (defun evaluated-simple-vector-p (x)
   (typep x (opaque-identity 'simple-vector)))
@@ -77,3 +75,16 @@
   (frob *array-displaced-to-simple-vector* nil nil)
   (frob *array-displaced-to-adjustable-vector-t* nil nil)
   (frob *simple-array* nil nil))
+
+;;; While it's true that we might actually want NOT to zero-fill
+;;; all dx-vectors, the zero-fill code for x86-64 was broken with ':msan'
+;;; in features because it reused 'rcx' as the count after rcx was
+;;; already decremented to 0 by the shadow unpoisoning loop.
+(with-test (:name :dx-char-vector-zeroized)
+  (checked-compile-and-assert
+      ()
+      `(lambda (n)
+         (sb-int:dx-let ((v (make-array (the (mod 200) n)
+                                        :element-type 'base-char)))
+           (find #\null v :test #'char/=)))
+    ((40) nil)))

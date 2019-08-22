@@ -9,20 +9,19 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!DYNCOUNT")
+(in-package "SB-DYNCOUNT")
 
 (defvar *collect-dynamic-statistics* nil
-  #!+sb-doc
   "When T, emit extra code to collect dynamic statistics about vop usages.")
 
 (defvar *dynamic-counts-tn* nil
-  #!+sb-doc
   "Holds the TN for the counts vector.")
 
-(def!struct (dyncount-info (:make-load-form-fun just-dump-it-normally))
+(def!struct (dyncount-info)
   for
   (costs (missing-arg) :type (simple-array (unsigned-byte 32) (*)))
   (counts (missing-arg) :type (simple-array (unsigned-byte 32) (*))))
+(!set-load-form-method dyncount-info (:target))
 
 (defprinter (dyncount-info)
   for

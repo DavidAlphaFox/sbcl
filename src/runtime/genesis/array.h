@@ -11,8 +11,8 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_ARRAY
-#define SBCL_GENESIS_ARRAY 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_ARRAY
+#ifndef __ASSEMBLER__
 
 struct array {
     lispobj header;
@@ -26,7 +26,7 @@ struct array {
     lispobj dimensions[1];
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
@@ -39,7 +39,8 @@ struct array {
 #define ARRAY_DISPLACED_P_OFFSET 33
 #define ARRAY_DISPLACED_FROM_OFFSET 41
 #define ARRAY_DIMENSIONS_OFFSET 49
+#define ARRAY_SIZE 8
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_ARRAY */
+#endif

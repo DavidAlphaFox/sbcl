@@ -14,24 +14,138 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(load "assertoid.lisp")
-(use-package "ASSERTOID")
+
+;;;; Pathname accessors
 
-(load "test-util.lisp")
-(use-package "TEST-UTIL")
+(with-test (:name (pathname :accessors :stream-not-associated-to-file type-error))
+  (let ((*stream* (make-string-output-stream)))
+    (declare (special *stream*))
+    (checked-compile-and-assert ()
+        '(lambda (pathname) (pathname-host pathname))
+      (((make-string-output-stream))     (condition 'type-error))
+      (((make-synonym-stream '*stream*)) (condition 'type-error)))))
+
+(with-test (:name (pathname :accessors file-stream))
+  (let* ((name "pathnames.impure")
+         (type "lisp"))
+    (with-open-file (stream (make-pathname :name name :type type))
+      (assert (equal (pathname-name stream) name))
+      (assert (equal (pathname-type stream) type)))))
+
+(with-test (:name (pathname :accessors synonym-stream))
+  (let* ((name "pathnames.impure")
+         (type "lisp"))
+    (with-open-file (stream (make-pathname :name name :type type))
+      (let* ((*stream1* stream)
+             (stream1 (make-synonym-stream '*stream1*))
+             (*stream2* stream1)
+             (stream2 (make-synonym-stream '*stream2*)))
+        (declare (special *stream1* *stream2*))
+        (assert (equal (pathname-name stream1) name))
+        (assert (equal (pathname-name stream2) name))
+        (assert (equal (pathname-type stream1) type))
+        (assert (equal (pathname-type stream2) type))))))
+
+(labels ((unpattern (thing)
+           (typecase thing
+             (cons
+              (list* (unpattern (first thing))
+                     (map 'list #'unpattern (rest thing))))
+             (sb-impl::pattern
+              (sb-impl::pattern-pieces thing))
+             (t
+              thing)))
+         (pattern (thing)
+           (typecase thing
+             ((cons (member :absolute :relative))
+              (list* (pattern (first thing))
+                     (map 'list #'pattern (cdr thing))))
+             (cons
+              (sb-impl::make-pattern thing))
+             (t
+              thing)))
+         (accessor-cases (initarg accessor cases)
+           (map nil (lambda (test-case)
+                      (destructuring-bind (pathname case expected) test-case
+                        ;; Check accessor directory.
+                        (let ((result (funcall accessor pathname :case case)))
+                          (assert (equal (unpattern result) expected)))
+                        ;; Check roundtrip.
+                        (let* ((pathname (make-pathname initarg (pattern expected) :case case))
+                               (result (funcall accessor pathname :case case)))
+                          (assert (equal (unpattern result) expected)))))
+                cases)))
+
+  (with-test (:name (pathname-device :case))
+    (accessor-cases
+     :device #'pathname-device
+     `((,(make-pathname :device "foo") :local  "foo")
+       (,(make-pathname :device "FOO") :local  "FOO")
+       (,(make-pathname :device "Foo") :local  "Foo")
+
+       (,(make-pathname :device "foo") :common "FOO")
+       (,(make-pathname :device "FOO") :common "foo")
+       (,(make-pathname :device "Foo") :common "Foo"))))
+
+  (with-test (:name (pathname-directory :case))
+    (accessor-cases
+     :directory #'pathname-directory
+     `((,#P"/ab/cd/" :local  (:absolute "ab" "cd"))
+       (,#P"/AB/CD/" :local  (:absolute "AB" "CD"))
+       (,#P"/Ab/Cd/" :local  (:absolute "Ab" "Cd"))
+       (,#P"/AB/cd/" :local  (:absolute "AB" "cd"))
+       (,#P"/a*b/"   :local  (:absolute ("a" :multi-char-wild "b")))
+
+       (,#P"/ab/cd/" :common (:absolute "AB" "CD"))
+       (,#P"/AB/CD/" :common (:absolute "ab" "cd"))
+       (,#P"/Ab/Cd/" :common (:absolute "Ab" "Cd"))
+       (,#P"/AB/cd/" :common (:absolute "ab" "CD"))
+       (,#P"/a*b/"   :common (:absolute ("A" :multi-char-wild "B"))))))
+
+  (with-test (:name (pathname-name :case))
+    (accessor-cases
+     :name #'pathname-name
+     `((,#P"foo" :local  "foo")
+       (,#P"FOO" :local  "FOO")
+       (,#P"Foo" :local  "Foo")
+       (,#P"a*b" :local  ("a" :multi-char-wild "b"))
+
+       (,#P"foo" :common "FOO")
+       (,#P"FOO" :common "foo")
+       (,#P"Foo" :common "Foo")
+       (,#P"a*b" :common ("A" :multi-char-wild "B")))))
+
+  (with-test (:name (pathname-type :case))
+    (accessor-cases
+     :type #'pathname-type
+     `((,#P"n.foo" :local  "foo")
+       (,#P"n.FOO" :local  "FOO")
+       (,#P"n.Foo" :local  "Foo")
+       (,#P"n.a*b" :local  ("a" :multi-char-wild "b"))
+
+       (,#P"n.foo" :common "FOO")
+       (,#P"n.FOO" :common "foo")
+       (,#P"n.Foo" :common "Foo")
+       (,#P"n.a*b" :common ("A" :multi-char-wild "B"))))))
+
+
+;;;; Logical pathnames
 
 (setf (logical-pathname-translations "demo0")
       '(("**;*.*.*" "/tmp/")))
 
 ;;; In case of a parse error we want to get a condition of type TYPE-ERROR,
 ;;; because ANSI says so. (This used to be PARSE-ERROR.)
-(assert
-  (typep (grab-condition (logical-pathname "demo0::bla;file.lisp"))
-         'type-error))
+(with-test (:name (logical-pathname :signals type-error))
+  (mapc (lambda (namestring)
+          (assert-error (logical-pathname namestring) type-error))
+        '("demo0::bla;file.lisp"
+          "FOO.txt"
+          "SYS:%")))
 
 ;;; some things SBCL-0.6.9 used not to parse correctly:
 ;;;
-;;; SBCL used to throw an error saying there's no translation.
+;;; SBCL used to signal an error saying there's no translation.
 (with-test (:name (:logical-pathname 1))
   (assert (equal (namestring (translate-logical-pathname "demo0:file.lisp"))
                  "/tmp/file.lisp")))
@@ -209,7 +323,7 @@
   (setf (logical-pathname-translations "scratch")
         '(("**;*.*.*" "/usr/local/doc/**/*"))))
 
-(with-test (:name (:merge-pathname 1))
+(with-test (:name (merge-pathnames 1))
   (loop for (expected-result . params) in
         `( ;; trivial merge
           (#P"/usr/local/doc/foo" #p"foo" #p"/usr/local/doc/")
@@ -295,7 +409,7 @@
                (frob pathname-type)))))
 
 ;;; host-namestring testing
-(with-test (:name :host-namestring)
+(with-test (:name host-namestring)
   (assert (string=
            (namestring (parse-namestring "/foo" (host-namestring #p"/bar")))
            "/foo"))
@@ -317,50 +431,55 @@
 ;;; had difficulty with non-FILE-STREAM stream arguments to pathname
 ;;; functions (they would cause memory protection errors).  Make sure
 ;;; that those errors are gone:
-(with-test (:name (:string-streams-as-pathnames 1))
-  (assert-error (pathname (make-string-input-stream "FOO"))
-                type-error)
-  (assert-error (merge-pathnames (make-string-output-stream))
-                type-error))
+(with-test (:name (string-stream :not-a pathname))
+  (flet ((test (form)
+           (multiple-value-bind (fun failurep warnings)
+               (checked-compile
+                `(lambda () ,form) :allow-warnings 'sb-int:type-warning)
+             (declare (ignore failurep))
+             (assert (= 1 (length warnings)))
+             (assert-error (funcall fun) type-error))))
+    (test '(pathname (make-string-input-stream "FOO")))
+    (test '(merge-pathnames (make-string-output-stream)))))
 
 ;;; ensure print-read consistency (or print-not-readable-error) on
 ;;; pathnames:
 (with-test (:name :print/read-consistency)
-  (let ((pathnames (list
-                    (make-pathname :name "foo" :type "txt" :version :newest)
-                    (make-pathname :name "foo" :type "txt" :version 1)
-                    (make-pathname :name "foo" :type ".txt")
-                    (make-pathname :name "foo." :type "txt")
-                    (make-pathname :name "\\" :type "txt")
-                    (make-pathname :name "^" :type "txt")
-                    (make-pathname :name "foo*" :type "txt")
-                    (make-pathname :name "foo[" :type "txt")
-                    (parse-namestring "SCRATCH:FOO.TXT.1")
-                    (parse-namestring "SCRATCH:FOO.TXT.NEWEST")
-                    (parse-namestring "SCRATCH:FOO.TXT"))))
-    (dolist (p pathnames)
-      (print p)
-      (handler-case
-          (let* ((*print-readably* t)
-                 (new (read-from-string (format nil "~S" p))))
-            (unless (equal new p)
-              (let ((*print-readably* nil))
-                (error "oops: host:~S device:~S dir:~S version:~S~% ->~%~
-                             host:~S device:~S dir:~S version:~S"
-                       (pathname-host p) (pathname-device p)
-                       (pathname-directory p) (pathname-version p)
-                       (pathname-host new) (pathname-device new)
-                       (pathname-directory new) (pathname-version new)))))
-        (print-not-readable ()
-          nil)))))
+  (dolist (p (list (make-pathname :name ".")
+                   (make-pathname :name "foo" :type "txt" :version :newest)
+                   (make-pathname :name "foo" :type "txt" :version 1)
+                   (make-pathname :name "foo" :type ".txt")
+                   (make-pathname :name "foo." :type "txt")
+                   (make-pathname :name #-win32 "\\" #+win32 "^^" :type "txt")
+                   (make-pathname :name "^" :type "txt")
+                   (make-pathname :name "foo*" :type "txt")
+                   (make-pathname :name "foo[" :type "txt")
+                   (make-pathname :name "foo.bar" :type "txt")
+                   (make-pathname :name "foo" :type "txt.gz")
+                   (make-pathname :name "foo.bar" :type "txt.gz")
+                   (make-pathname :name "foo.bar")
+                   (parse-namestring "SCRATCH:FOO.TXT.1")
+                   (parse-namestring "SCRATCH:FOO.TXT.NEWEST")
+                   (parse-namestring "SCRATCH:FOO.TXT")))
+    (let* ((*print-readably* t)
+           (new (read-from-string (format nil "~S" p))))
+      (unless (equal new p)
+        (let ((*print-readably* nil))
+          (error ":host ~S :device ~S :directory ~S :name ~S :type ~S :version ~S~@
+                  -> :host ~S :device ~S :directory ~S :name ~S :type ~S :version ~S"
+                 (pathname-host p) (pathname-device p)
+                 (pathname-directory p) (pathname-name p)
+                 (pathname-type p) (pathname-version p)
+                 (pathname-host new) (pathname-device new)
+                 (pathname-directory new) (pathname-name new)
+                 (pathname-type new) (pathname-version new)))))))
 
 ;;; BUG 330: "PARSE-NAMESTRING should accept namestrings as the
 ;;; default argument" ...and streams as well
-(with-test (:name :parse-namestring/stream)
+(with-test (:name (parse-namestring stream))
   (assert (equal (parse-namestring "foo" nil "/")
                  (parse-namestring "foo" nil #P"/")))
-  (let ((test "parse-namestring-test.tmp"))
-    (unwind-protect
+  (with-scratch-file (test "tmp")
         (with-open-file (f test :direction :output)
           ;; FIXME: This test is a bit flaky, since we only check that
           ;; no error is signalled. The dilemma here is "what is the
@@ -368,19 +487,103 @@
           ;; directory". Currently (0.8.10.73) we get #P"foo" here (as
           ;; opposed to eg. #P"/path/to/current/foo"), which is
           ;; possibly mildly surprising but probably conformant.
-          (assert (parse-namestring "foo" nil f)))
-      (when (probe-file test)
-        (delete-file test)))))
+          (assert (parse-namestring "foo" nil f)))))
 
 ;;; ENOUGH-NAMESTRING should probably not fail when the namestring in
 ;;; question has a :RELATIVE pathname.
-(with-test (:name :enough-namestring)
+(with-test (:name enough-namestring)
   (assert (equal (enough-namestring #p"foo" #p"./") "foo")))
 
+;;;; NAMESTRING
+
 ;;; bug reported by Artem V. Andreev: :WILD not handled in unparsing
-;;; directory lists.
-(with-test (:name :unparse-wild)
-  (assert (equal (namestring #p"/tmp/*/") "/tmp/*/")))
+;;; directory lists. lp#1738775, reported by Richard M. Kreuter, added
+;;; more cases.
+(with-test (:name (namestring :wild :wild-inferiors :up :lp-1738775))
+  (flet ((test (expected pathname)
+           (assert (equal (namestring pathname) expected))))
+    ;; The second variant using MAKE-PATHNAME makes sure we don't just
+    ;; return the original namestring.
+    (test "/tmp/*/" #P"/tmp/*/")
+    (test "/tmp/*/" (make-pathname :directory '(:absolute "tmp" :wild)))
+
+    ;; lp#1738775 reported breakage in case FIRST in (:absolute FIRST
+    ;; ...) is not of type STRING.
+    (test "/*/" #P"/*/")
+    (test "/*/" (make-pathname :directory '(:absolute :wild)))
+
+    (test "/**/" #P"/**/")
+    (test "/**/" (make-pathname :directory '(:absolute :wild-inferiors)))
+
+    ;; FIXME "Invalid combinations" in 19.2.2.4.3 requires :ABSOLUTE
+    ;; :UP to signal a FILE-ERROR, but we don't.
+    (test "/../" #P"/../")
+    (test "/../" (make-pathname :directory '(:absolute :up)))))
+
+(with-test (:name (namestring :escape-pattern-pieces))
+  (labels ((prepare (namestring)
+             #-win32 (substitute #\\ #\E namestring)
+             #+win32 (substitute #\^ #\E namestring))
+           (test (expected namestring)
+             (let ((pathname (pathname (prepare namestring))))
+               (assert (string= (prepare expected) (namestring pathname))))))
+    #-win32 (test "*E?"    "*E?")
+    #-win32 (test "*E*"    "*E*")
+            (test "*E[ab]" "*E[ab]")
+            (test "*EE"    "*EE")))
+
+(with-test (:name (namestring :escape-dot))
+  (labels ((prepare (namestring)
+             #-win32 (substitute #\\ #\E namestring)
+             #+win32 (substitute #\^ #\E namestring))
+           (test (expected &rest args)
+             (let* ((expected (prepare expected))
+                    (args (loop for (key value) on args by #'cddr
+                                collect key collect (prepare value)))
+                    (pathname (pathname (apply #'make-pathname args))))
+               (assert (string= expected (namestring pathname)))
+               (assert (equal (parse-namestring expected) pathname)))))
+    (test "."                :name ".")
+    (test "foo"              :name "foo")
+    (test ".foo"             :name ".foo")
+    (test "fooE.baz"         :name "foo.baz")
+    (test "fooEE"            :name "fooE")
+    (test "fooEEEE"          :name "fooEE")
+
+    (test "..bar"            :name "."       :type "bar")
+    (test "foo.bar"          :name "foo"     :type "bar")
+    (test ".foo.bar"         :name ".foo"    :type "bar")
+    (test "foo.baz.bar"      :name "foo.baz" :type "bar")
+    (test "fooEE.bar"        :name "fooE"    :type "bar")
+    (test "fooEEEE.bar"      :name "fooEE"   :type "bar")
+
+    (test "..E.bar"          :name "."       :type ".bar")
+    (test "foo.E.bar"        :name "foo"     :type ".bar")
+    (test ".foo.E.bar"       :name ".foo"    :type ".bar")
+    (test "foo.baz.E.bar"    :name "foo.baz" :type ".bar")
+    (test "fooEE.E.bar"      :name "fooE"    :type ".bar")
+    (test "fooEEEE.E.bar"    :name "fooEE"   :type ".bar")
+
+    (test "..barE.fez"       :name "."       :type "bar.fez")
+    (test "foo.barE.fez"     :name "foo"     :type "bar.fez")
+    (test ".foo.barE.fez"    :name ".foo"    :type "bar.fez")
+    (test "foo.baz.barE.fez" :name "foo.baz" :type "bar.fez")
+    (test "fooEE.barE.fez"   :name "fooE"    :type "bar.fez")
+    (test "fooEEEE.barE.fez" :name "fooEE"   :type "bar.fez")
+
+    (test "..barE."          :name "."       :type "bar.")
+    (test "foo.barE."        :name "foo"     :type "bar.")
+    (test ".foo.barE."       :name ".foo"    :type "bar.")
+    (test "foo.baz.barE."    :name "foo.baz" :type "bar.")
+    (test "fooEE.barE."      :name "fooE"    :type "bar.")
+    (test "fooEEEE.barE."    :name "fooEE"   :type "bar.")
+
+    (test "..EEbar"          :name "."       :type "Ebar")
+    (test "foo.EEbar"        :name "foo"     :type "Ebar")
+    (test ".foo.EEbar"       :name ".foo"    :type "Ebar")
+    (test "foo.baz.EEbar"    :name "foo.baz" :type "Ebar")
+    (test "fooEE.EEbar"      :name "fooE"    :type "Ebar")
+    (test "fooEEEE.EEbar"    :name "fooEE"   :type "Ebar")))
 
 ;;; Printing of pathnames; see CLHS 22.1.3.1. This section was started
 ;;; to confirm that pathnames are printed as their namestrings under
@@ -409,11 +612,18 @@
 
 ;;; we failed to unparse logical pathnames with :NAME :WILD :TYPE NIL.
 ;;; (Reported by Pascal Bourguignon.
-(with-test (:name :unparse-logical-wild)
+(with-test (:name (namestring :unparse-logical-wild))
   (let ((pathname (make-pathname :host "SYS" :directory '(:absolute :wild-inferiors)
                                  :name :wild :type nil)))
     (assert (string= (namestring pathname) "SYS:**;*"))
     (assert (string= (write-to-string pathname :readably t) "#P\"SYS:**;*\""))))
+
+(with-test (:name (namestring :signals file-error))
+  (flet ((test (&rest initargs)
+           (let ((pathname (apply #'make-pathname initargs)))
+             (assert-error (namestring pathname) file-error))))
+    (test :name "")
+    (test :type "foo")))
 
 ;;; reported by James Y Knight on sbcl-devel 2006-05-17
 (with-test (:name :merge-back)
@@ -422,9 +632,19 @@
     (assert (equal (merge-pathnames p1 p2)
                    (make-pathname :directory '(:relative :back "foo" "bar"))))))
 
+(with-test (:name (native-namestring :signals file-error :unix))
+  (flet ((test (&rest initargs)
+           (let ((pathname (apply #'make-pathname initargs)))
+             (assert-error (native-namestring pathname) file-error))))
+    (test :directory '(:absolute (:home "no-such-user")))
+    (test :directory '(:absolute :wild))
+    (test :name :wild)
+    (test :name "foo" :type :wild)
+    (test :type "bar")))
+
 ;;; construct native namestrings even if the directory is empty (means
 ;;; that same as if (:relative))
-(with-test (:name :native-namestring)
+(with-test (:name (sb-ext:native-namestring 1))
   (assert (equal (sb-ext:native-namestring (make-pathname :directory '(:relative)
                                                           :name "foo"
                                                           :type "txt"))
@@ -484,7 +704,7 @@
 ;;; non-NIL strings in NATIVE-NAMESTRING implementations.  Revised by
 ;;; RMK 2007-11-28, attempting to preserve the apparent intended
 ;;; denotation of SBCL's then-current pathname implementation.
-(with-test (:name (:native-namestring 2))
+(with-test (:name (sb-ext:native-namestring 2))
   (assert (equal
            (loop with components = (list nil :unspecific "" "a")
                  for name in components
@@ -511,11 +731,16 @@
   #|""         |#     "C:\\tmp\\"   "C:\\tmp\\"   "C:\\tmp\\."  "C:\\tmp\\.a"
   #|"a"        |#     "C:\\tmp\\a"  "C:\\tmp\\a"  "C:\\tmp\\a." "C:\\tmp\\a.a"))))
 
-(with-test (:name :delete-file-logical-pathname)
+(defun scratch-dir-truename ()
+  (with-scratch-file (name)
+    (truename (make-pathname :directory (pathname-directory name)))))
+
+(with-test (:name (delete-file logical-pathname))
   (setf (logical-pathname-translations "SB-TEST")
         (list (list "**;*.*.*" (make-pathname :name :wild
                                               :type :wild
-                                              :defaults (truename ".")))))
+                                              :defaults
+                                              (scratch-dir-truename)))))
   (let ((test (pathname "SB-TEST:delete-logical-pathname.tmp")))
     (assert (typep test 'logical-pathname))
     (with-open-file (f test :direction :output)
@@ -524,25 +749,16 @@
     (assert (delete-file test))
     (assert (not (probe-file test)))))
 
-(with-test (:name :logical-pathname-type-error)
-  (assert (eq :type-error-ok
-              (handler-case (logical-pathname "FOO.txt")
-                (type-error () :type-error-ok))))
-  (assert (eq :type-error-ok
-              (handler-case (logical-pathname "SYS:%")
-                (type-error () :type-error-ok)))))
-
 ;;; Reported by Willem Broekema: Reading #p"\\\\" caused an error due
 ;;; to insufficient sanity in input testing in EXTRACT-DEVICE (in
 ;;; src;code;win32-pathname).
-(with-test (:name :bug-489698 :skipped-on '(not :win32))
+(with-test (:name :bug-489698 :skipped-on (not :win32))
   (assert (equal (make-pathname :directory '(:absolute))
                  (read-from-string "#p\"\\\\\\\\\""))))
 
 (with-test (:name :load-logical-pathname-translations)
-  (let* ((cwd (truename "."))
-         (foo (merge-pathnames "llpnt-foo.translations" cwd))
-         (bar (merge-pathnames "llpnt-bar.translations" cwd))
+  (let* ((foo (scratch-file-name "translations"))
+         (bar (scratch-file-name "translations"))
          (translations (logical-pathname-translations "SYS")))
     (unwind-protect
          (progn
@@ -556,8 +772,8 @@
                                         :directory '(:absolute "my" "bar")
                                         :name :wild :type "lisp"))) f))
            (setf (logical-pathname-translations "SYS")
-                 (list* (list "SITE;LLPNT-FOO.TRANSLATIONS.NEWEST" foo)
-                        (list "SITE;LLPNT-BAR.TRANSLATIONS.NEWEST" bar)
+                 (list* (list "SITE;LLPNT-FOO.TRANSLATIONS.NEWEST" (truename foo))
+                        (list "SITE;LLPNT-BAR.TRANSLATIONS.NEWEST" (truename bar))
                         translations))
            (assert (load-logical-pathname-translations "LLPNT-FOO"))
            (assert (load-logical-pathname-translations "LLPNT-BAR"))
@@ -589,20 +805,25 @@
 
 ;;; lp#673625
 (with-test (:name :pathname-escape-first-directory-component
-                  :fails-on :win32)
+            :fails-on :win32)
   ;; ~ / :HOME
-  (assert (equal (pathname-directory #p"\\~/foo/") '(:relative "~" "foo")))
-  (assert (equal (native-namestring #p"\\~/foo/") "~/foo/"))
+  (assert (equal (pathname-directory #-win32 #p"\\~/foo/"
+                                     #+win32 #p"^~/foo/")
+                 '(:relative "~" "foo")))
+  (assert (equal (native-namestring #-win32 #p"\\~/foo/"
+                                    #+win32 #p"^~/foo/")
+                 #-win32 "~/foo/"
+                 #+win32 "~\\foo\\"))
   (assert (equal (namestring (make-pathname :directory '(:absolute "~zot")))
                  "\\~zot/"))
   ;; * / :WILD
   (assert (equal (pathname-directory #p"\\*/") '(:relative "*"))))
 
-(with-test (:name :ensure-directories-exist-with-odd-d-p-d)
+(with-test (:name (ensure-directories-exist :with-odd-d-p-d))
   (let ((*default-pathname-defaults* #p"/tmp/foo"))
     (ensure-directories-exist "/")))
 
-(with-test (:name :long-file-name :skipped-on '(not :win32))
+(with-test (:name :long-file-name :skipped-on (not :win32))
   (let* ((x '("hint--if-you-are-having-trouble-deleting-this-test-directory"
               "use-the-7zip-file-manager"))
          (base (truename
@@ -624,11 +845,37 @@
     (assert (not (probe-file shallow)))))
 
 #+unix
-(with-test (:name :simplify-namestring)
+(with-test (:name sb-int:simplify-namestring)
   (assert (string= (sb-int:simplify-namestring "./a/b/../c/")
                    "a/c/")))
 
 (with-test (:name :back-and-truename)
   (probe-file (make-pathname :directory '(:absolute "a" "b" :back))))
 
-;;;; success
+(with-test (:name (parse-namestring :displaced))
+  (let* ((string "abc")
+         (disp (make-array 0 :element-type (array-element-type string)
+                             :displaced-to string
+                             :displaced-index-offset 1)))
+    (multiple-value-bind (path pos)
+        (parse-namestring disp)
+      (assert (equal path #P""))
+      (assert (zerop pos)))))
+
+(with-test (:name (sb-ext:parse-native-namestring :displaced))
+  (let* ((string "abc")
+         (disp (make-array 0 :element-type (array-element-type string)
+                             :displaced-to string
+                             :displaced-index-offset 1)))
+    (multiple-value-bind (path pos)
+        (sb-ext:parse-native-namestring disp)
+      (assert (equal path #P""))
+      (assert (zerop pos)))))
+
+(with-test (:name (:parse-logical-pathname :displaced))
+  (let* ((string "XSYS:ABC.LISP")
+         (disp (make-array (1- (length string))
+                           :element-type (array-element-type string)
+                           :displaced-to string
+                           :displaced-index-offset 1)))
+    (assert (equal (parse-namestring disp) #p"SYS:ABC.LISP"))))

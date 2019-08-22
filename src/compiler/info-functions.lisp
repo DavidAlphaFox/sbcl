@@ -15,9 +15,23 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; internal utilities defined in terms of INFO
+
+(defun check-variable-name (name &key
+                                   (context "local variable")
+                                   (signal-via #'compiler-error))
+  (unless (legal-variable-name-p name)
+    (funcall signal-via "~@<~S~[~; is a keyword and~; is not a symbol and~
+                         ~] cannot be used as a ~A.~@:>"
+             name
+             (typecase name
+               (null    0)
+               (keyword 1)
+               (t       2))
+             context))
+  name)
 
 ;;; Check that NAME is a valid function name, returning the name if
 ;;; OK, and signalling an error if not. In addition to checking for
@@ -27,13 +41,14 @@
   (typecase name
     (list
      (unless (legal-fun-name-p name)
-       (compiler-error "illegal function name: ~S" name)))
+       (compiler-error "~@<Illegal function name: ~S.~@:>" name)))
     (symbol
      (when (eq (info :function :kind name) :special-form)
-       (compiler-error "Special form is an illegal function name: ~S" name)))
+       (compiler-error "~@<Special form is an illegal function name: ~S.~@:>"
+                       name)))
     (t
-     (compiler-error "illegal function name: ~S" name)))
-  (values))
+     (compiler-error "~@<Illegal function name: ~S.~@:>" name)))
+  name)
 
 ;;; Record a new function definition, and check its legality.
 (defun proclaim-as-fun-name (name)
@@ -61,7 +76,10 @@
 
         (unless (eq :function kind)
           (assert-it)
-          (setf (info :function :kind name) :function)))))
+          ;; There's no reason to store (:FUNCTION :KIND) for names which
+          ;; could only be of kind :FUNCTION if anything.
+          (unless (pcl-methodfn-name-p name)
+            (setf (info :function :kind name) :function))))))
 
   ;; scrubbing old data II: dangling forward references
   ;;
@@ -73,20 +91,6 @@
   (when (boundp '*free-funs*)       ; when compiling
     (remhash name *free-funs*))
 
-  ;; It's uncommon for users to define both a SETF macro and function for
-  ;; the same thing, so usually we warn about it, but offer a somewhat arbitrary
-  ;; escape to avoid a warning - if the function gets an ftype proclaimed
-  ;; before DEFSETF (or -EXPANDER) is used, we don't complain about the macro.
-  ;; SBCL itself provides most SETFable things both ways even when CLHS does not
-  ;; say specifically that #'(SETF x) exists.
-  ;; But when building SBCL the order of function/macro definition is not
-  ;; directly controlled because most SETF functions are defined en masse by
-  ;; 'setf-funs' with no regard for what exists, and we also have to respect
-  ;; all other constraints on build order to make bootstrap work.
-  ;; So, ... just don't warn when running the cross-compiler, which means
-  ;; don't compile this line in when building the cross-compiler.
-  #-sb-xc-host(note-if-setf-fun-and-macro name)
-
   (values))
 
 ;;; This is called to do something about SETF functions that overlap
@@ -95,14 +99,17 @@
 ;;; warning. Due to the weak semantics of the (SETF FUNCTION) name, we
 ;;; can't assume that they aren't just naming a function (SETF FOO)
 ;;; for the heck of it. NAME is already known to be well-formed.
-(defun note-if-setf-fun-and-macro (name)
-  (when (and (consp name)
-             (eq (car name) 'setf))
-    (let ((stem (second name)))
-      (when (or (info :setf :inverse stem) (info :setf :expander stem))
-        (compiler-style-warn
+(defun warn-if-setf-macro (name)
+  ;; Never warn about this situation when running the cross-compiler.
+  ;; SBCL provides expanders/inverses *and* functions for most SETFable things
+  ;; even when CLHS does not specifically state that #'(SETF x) exists.
+  #+sb-xc-host (declare (ignore name))
+  #-sb-xc-host
+  (let ((stem (second name)))
+    (when (info :setf :expander stem)
+      (compiler-style-warn
          "defining function ~S when ~S already has a SETF macro"
-         name stem))))
+         name stem)))
   (values))
 
 ;;; Make NAME no longer be a function name: clear everything back to
@@ -112,22 +119,20 @@
     (macrolet ((frob (&rest types)
                  `(clear-info-values
                    name ',(mapcar (lambda (x)
-                                    (type-info-number
-                                     (type-info-or-lose :function x)))
+                                    (meta-info-number (meta-info :function x)))
                                   types))))
       ;; Note that this does not clear the :DEFINITION.
       ;; That's correct, because if we lose the association between a
       ;; symbol and its #<fdefn> object, it could lead to creation of
       ;; a non-unique #<fdefn> for a name.
       (frob :info
-            :type
-            :where-from
+            :type ; Hmm. What if it was proclaimed- shouldn't it stay?
+            :where-from ; Ditto.
             :inlinep
             :kind
             :macro-function
-            :inline-expansion-designator
+            :inlining-data
             :source-transform
-            :structure-accessor
             :assumed-type)))
   (values))
 
@@ -140,33 +145,55 @@
     (if (info :function :assumed-type name)
         (clear-info :function :assumed-type name))))
 
-;;; Decode any raw (INFO :FUNCTION :INLINE-EXPANSION-DESIGNATOR FUN-NAME)
-;;; value into a lambda expression, or return NIL if there is none.
-(declaim (ftype (function ((or symbol cons)) list) fun-name-inline-expansion))
+;;; Unpack (INFO :FUNCTION :INLINING-DATA FUN-NAME). If an explicit expansion
+;;; is not stored but FUN-NAME is a structure constructor, reconstitute the
+;;; expansion from the defstruct description. Secondary value is T if the expansion
+;;; was explicit. See SAVE-INLINE-EXPANSION-P for why we care.
+;;; (Essentially, once stored then always stored, lest inconsistency result)
+;;; If we have just a DXABLE-ARGS, or nothing at all, return NIL and NIL.
+(declaim (ftype (sfunction ((or symbol cons)) (values list boolean))
+                fun-name-inline-expansion))
 (defun fun-name-inline-expansion (fun-name)
-  (let ((info (info :function :inline-expansion-designator fun-name)))
-    (if (functionp info)
-        (funcall info)
-        info)))
+  (multiple-value-bind (answer winp) (info :function :inlining-data fun-name)
+    (typecase answer
+      ;; an INLINING-DATA is a DXABLE-ARGS, so test it first
+      (inlining-data (setq answer (inlining-data-expansion answer)))
+      (dxable-args   (setq answer nil winp nil)))
+    (when (and (not winp) (symbolp fun-name))
+      (let ((info (info :function :source-transform fun-name)))
+        (when (typep info '(cons defstruct-description (eql :constructor)))
+          (let* ((dd (car info)) (spec (assq fun-name (dd-constructors dd))))
+            (aver spec)
+            (setq answer `(lambda ,@(structure-ctor-lambda-parts dd (cdr spec))))))))
+    (values answer winp)))
+(defun fun-name-dx-args (fun-name)
+  (let ((answer (info :function :inlining-data fun-name)))
+    (when (typep answer 'dxable-args)
+      (dxable-args-list answer))))
 
 ;;;; ANSI Common Lisp functions which are defined in terms of the info
 ;;;; database
 
-(defun sb!xc:macro-function (symbol &optional env)
-  #!+sb-doc
+(defun sb-xc:macro-function (symbol &optional env)
   "If SYMBOL names a macro in ENV, returns the expansion function,
 else returns NIL. If ENV is unspecified or NIL, use the global environment
 only."
-  (declare (symbol symbol))
-  (let* ((fenv (when env (lexenv-funs env)))
-         (local-def (cdr (assoc symbol fenv))))
-    (if local-def
-        (if (and (consp local-def) (eq (car local-def) 'macro))
-            (cdr local-def)
-            nil)
-        (values (info :function :macro-function symbol)))))
+  ;; local function definitions (ordinary) can shadow a global macro
+  (typecase env
+    #+(and sb-fasteval (not sb-xc-host))
+    (sb-interpreter:basic-env
+     (multiple-value-bind (kind def)
+         (sb-interpreter:find-lexical-fun env symbol)
+       (when def
+         (return-from sb-xc:macro-function (when (eq kind :macro) def)))))
+    (lexenv
+     (let ((def (cdr (assoc symbol (lexenv-funs env)))))
+       (when def
+         (return-from sb-xc:macro-function
+           (when (typep def '(cons (eql macro))) (cdr def)))))))
+  (values (info :function :macro-function symbol)))
 
-(defun (setf sb!xc:macro-function) (function symbol &optional environment)
+(defun (setf sb-xc:macro-function) (function symbol &optional environment)
   (declare (symbol symbol) (type function function))
   (when environment
     ;; Note: Technically there could be an ENV optional argument to SETF
@@ -179,28 +206,13 @@ only."
   (when (eq (info :function :kind symbol) :special-form)
     (error "~S names a special form." symbol))
   (with-single-package-locked-error (:symbol symbol "setting the macro-function of ~S")
+    (clear-info :function :type symbol)
     (setf (info :function :kind symbol) :macro)
     (setf (info :function :macro-function symbol) function)
-    ;; This is a nice thing to have in the target SBCL, but in the
-    ;; cross-compilation host it's not nice to mess with
-    ;; (SYMBOL-FUNCTION FOO) where FOO might be a symbol in the
-    ;; cross-compilation host's COMMON-LISP package.
-    #-sb-xc-host
-    (setf (symbol-function symbol)
-          (lambda (&rest args)
-            (declare (ignore args))
-            ;; (ANSI specification of FUNCALL says that this should be
-            ;; an error of type UNDEFINED-FUNCTION, not just SIMPLE-ERROR.)
-            (error 'undefined-function :name symbol))))
+    #-sb-xc-host (install-guard-function symbol `(:macro ,symbol)))
   function)
 
-(defun fun-locally-defined-p (name env)
-  (and env
-       (let ((fun (cdr (assoc name (lexenv-funs env) :test #'equal))))
-         (and fun (not (global-var-p fun))))))
-
-(defun sb!xc:compiler-macro-function (name &optional env)
-  #!+sb-doc
+(defun sb-xc:compiler-macro-function (name &optional env)
   "If NAME names a compiler-macro in ENV, return the expansion function, else
 return NIL. Can be set with SETF when ENV is NIL."
   (legal-fun-name-or-type-error name)
@@ -218,7 +230,8 @@ return NIL. Can be set with SETF when ENV is NIL."
     ;; we don't do it.
     (values (info :function :compiler-macro-function name))))
 
-(defun (setf sb!xc:compiler-macro-function) (function name &optional env)
+;;; FIXME: we don't generate redefinition warnings for these.
+(defun (setf sb-xc:compiler-macro-function) (function name &optional env)
   (declare (type (or symbol list) name)
            (type (or function null) function))
   (when env
@@ -233,104 +246,18 @@ return NIL. Can be set with SETF when ENV is NIL."
 
 ;;;; a subset of DOCUMENTATION functionality for bootstrapping
 
-;;; FDOCUMENTATION is like DOCUMENTATION, but with less functionality,
-;;; and implemented with DEFUN instead of DEFGENERIC so that it can
-;;; run before CLOS is set up. Supported DOC-TYPE values are
-;;;   FUNCTION
-;;;   SETF
-;;;   STRUCTURE
-;;;   T
-;;;   TYPE
-;;;   VARIABLE
-;;; FIXME: Other types end up in INFO :RANDOM-DOCUMENTATION :STUFF. I
-;;; should add some code to monitor this and make sure that nothing is
-;;; unintentionally being sent to never never land this way.
-;;; FIXME: Rename FDOCUMENTATION to BDOCUMENTATION, by analogy with
-;;; DEF!STRUCT and DEF!MACRO and so forth. And consider simply saving
-;;; all the BDOCUMENTATION entries in a *BDOCUMENTATION* hash table
-;;; and slamming them into PCL once PCL gets going.
-(defun fdocumentation (x doc-type)
-  (case doc-type
-    (variable
-     (typecase x
-       (symbol (values (info :variable :documentation x)))))
-    ;; FUNCTION is not used at the momemnt, just here for symmetry.
-    (function
-     (cond ((functionp x)
-            (%fun-doc x))
-           ((and (legal-fun-name-p x) (fboundp x))
-            (%fun-doc (or (and (symbolp x) (macro-function x))
-                          (fdefinition x))))))
-    (structure
-     (typecase x
-       (symbol (cond
-                 ((eq (info :type :kind x) :instance)
-                  (values (info :type :documentation x)))
-                 ((info :typed-structure :info x)
-                  (values (info :typed-structure :documentation x)))))))
-    (type
-     (typecase x
-       (structure-class (values (info :type :documentation (class-name x))))
-       (t (and (typep x 'symbol) (values (info :type :documentation x))))))
-    (setf (values (info :setf :documentation x)))
-    ((t)
-     (typecase x
-       (function (%fun-doc x))
-       (package (package-doc-string x))
-       (structure-class (values (info :type :documentation (class-name x))))
-       ((or symbol cons)
-        (random-documentation x doc-type))))
-    (t
-     (when (typep x '(or symbol cons))
-       (random-documentation x doc-type)))))
-
-(defun (setf fdocumentation) (string name doc-type)
-  (declare (type (or null string) string))
-  (let ((info-number
-         (macrolet ((info-number (class type)
-                      (type-info-number (type-info-or-lose class type))))
-           (case doc-type
-             (variable (info-number :variable :documentation))
-             (structure
-              (cond ((eq (info :type :kind name) :instance)
-                     (info-number :type :documentation))
-                    ((info :typed-structure :info name)
-                     (info-number :typed-structure :documentation))))
-             (type (info-number :type :documentation))
-             (setf (info-number :setf :documentation))))))
-    (cond (info-number
-           (if string
-               (set-info-value name info-number string)
-               (clear-info-values name (list info-number))))
-          ((eq doc-type 'function)
-           ;; FIXME: this silently loses
-           ;; * (setf (documentation '(a bad name) 'function) "x") => "x"
-           ;; * (documentation '(a bad name) 'function) => NIL
-           ;; which is fine because as noted in pcl/documentation.lsp
-           ;;   even for supported doc types an implementation is permitted
-           ;;   to discard docs at any time
-           ;; but should a warning be issued just as for an unknown DOC-TYPE?
-           ;;
-           ;; And there's additional weirdness if you do, in this order -
-           ;;  * (setf (documentation 'foo 'function) "hi")
-           ;;  * (defun foo () "hey" 1)
-           ;;  * (documentation 'foo 'function) => "hi" ; should be "hey"
-           ;; CLHS says regarding DEFUN:
-           ;; " Documentation is attached as a documentation string to
-           ;;   /name/ (as kind function) and to the /function object/."
-           (when (legal-fun-name-p name)
-             (setf (%fun-doc (fdefinition name)) string)))
-          ((typep name '(or symbol cons))
-           (setf (random-documentation name doc-type) string))))
-  string)
-
-(defun random-documentation (name type)
-  (cdr (assoc type (info :random-documentation :stuff name))))
-
-(defun (setf random-documentation) (new-value name type)
-  (let ((pair (assoc type (info :random-documentation :stuff name))))
-    (if pair
-        (setf (cdr pair) new-value)
-        (push (cons type new-value)
-              (info :random-documentation :stuff name))))
-  new-value)
+;; Return the number of calls to NAME that IR2 emitted as full calls,
+;; not counting calls via #'F that went untracked.
+;; Return 0 if the answer is nonzero but a warning was already signaled
+;; about any full calls were emitted. This return convention satisfies the
+;; intended use of this statistic - to decide whether to generate a warning
+;; about failure to inline NAME, which is shown at most once per name
+;; to avoid unleashing a flood of identical warnings.
+(defun emitted-full-call-count (name)
+  (let ((status (car (info :function :emitted-full-calls name))))
+     (and (integerp status)
+          ;; Bit 0 tells whether any call was NOT in the presence of
+          ;; a 'notinline' declaration, thus eligible to be inline.
+          ;; Bit 1 tells whether any warning was emitted yet.
+          (= (logand status 3) #b01)
+          (ash status -2)))) ; the call count as tracked by IR2

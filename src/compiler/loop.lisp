@@ -12,7 +12,7 @@
 ;;; Stuff to annotate the flow graph with information about the loops in it.
 ;;;
 ;;; Written by Rob MacLachlan
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; FIND-DOMINATORS  --  Internal
 ;;;
@@ -43,6 +43,9 @@
          (when dom (sset-adjoin block dom))))
      (unless changed (return)))))
 
+(defun clear-dominators (component)
+  (do-blocks (block component)
+    (setf (block-dominators block) nil)))
 
 ;;; DOMINATES-P  --  Internal
 ;;;

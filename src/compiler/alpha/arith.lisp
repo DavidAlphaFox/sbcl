@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; unary operations
 
@@ -60,8 +60,6 @@
   (:results (r :scs (any-reg)))
   (:result-types tagged-num)
   (:note "inline fixnum arithmetic")
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-unsigned-binop)
@@ -71,8 +69,6 @@
   (:results (r :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:note "inline (unsigned-byte 64) arithmetic")
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-signed-binop)
@@ -82,8 +78,6 @@
   (:results (r :scs (signed-reg)))
   (:result-types signed-num)
   (:note "inline (signed-byte 64) arithmetic")
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-fixnum-c-binop fast-fixnum-binop)
@@ -407,8 +401,8 @@
              fast-ash-left/unsigned=>unsigned))
 (deftransform ash-left-mod64 ((integer count)
                               ((unsigned-byte 64) (unsigned-byte 6)))
-  (when (sb!c::constant-lvar-p count)
-    (sb!c::give-up-ir1-transform))
+  (when (sb-c::constant-lvar-p count)
+    (sb-c::give-up-ir1-transform))
   '(%primitive fast-ash-left-mod64/unsigned=>unsigned integer count))
 
 (macrolet
@@ -443,8 +437,6 @@
 (define-vop (fast-conditional)
   (:conditional)
   (:info target not-p)
-  (:effects)
-  (:affected)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:policy :fast-safe))
 
@@ -629,21 +621,21 @@
 ;;;; bignum stuff
 
 (define-vop (bignum-length get-header-data)
-  (:translate sb!bignum:%bignum-length)
+  (:translate sb-bignum:%bignum-length)
   (:policy :fast-safe))
 
 (define-vop (bignum-set-length set-header-data)
-  (:translate sb!bignum:%bignum-set-length)
+  (:translate sb-bignum:%bignum-set-length)
   (:policy :fast-safe))
 
 (define-full-reffer bignum-ref * bignum-digits-offset other-pointer-lowtag
-  (unsigned-reg) unsigned-num sb!bignum:%bignum-ref)
+  (unsigned-reg) unsigned-num sb-bignum:%bignum-ref)
 
 (define-full-setter bignum-set * bignum-digits-offset other-pointer-lowtag
-  (unsigned-reg) unsigned-num sb!bignum:%bignum-set #!+gengc nil)
+  (unsigned-reg) unsigned-num sb-bignum:%bignum-set #+gengc nil)
 
 (define-vop (digit-0-or-plus)
-  (:translate sb!bignum:%digit-0-or-plusp)
+  (:translate sb-bignum:%digit-0-or-plusp)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg)))
   (:arg-types unsigned-num)
@@ -657,7 +649,7 @@
         (inst bge temp target))))
 
 (define-vop (add-w/carry)
-  (:translate sb!bignum:%add-with-carry)
+  (:translate sb-bignum:%add-with-carry)
   (:policy :fast-safe)
   (:args (a :scs (unsigned-reg))
          (b :scs (unsigned-reg))
@@ -673,7 +665,7 @@
     (inst mskll result 4 result)))
 
 (define-vop (sub-w/borrow)
-  (:translate sb!bignum:%subtract-with-borrow)
+  (:translate sb-bignum:%subtract-with-borrow)
   (:policy :fast-safe)
   (:args (a :scs (unsigned-reg))
          (b :scs (unsigned-reg))
@@ -691,7 +683,7 @@
     (inst mskll result 4 result)))
 
 (define-vop (bignum-mult-and-add-3-arg)
-  (:translate sb!bignum:%multiply-and-add)
+  (:translate sb-bignum:%multiply-and-add)
   (:policy :fast-safe)
   (:args (x :scs (unsigned-reg))
          (y :scs (unsigned-reg))
@@ -708,7 +700,7 @@
 
 
 (define-vop (bignum-mult-and-add-4-arg)
-  (:translate sb!bignum:%multiply-and-add)
+  (:translate sb-bignum:%multiply-and-add)
   (:policy :fast-safe)
   (:args (x :scs (unsigned-reg))
          (y :scs (unsigned-reg))
@@ -726,7 +718,7 @@
     (inst mskll lo 4 lo)))
 
 (define-vop (bignum-mult)
-  (:translate sb!bignum:%multiply)
+  (:translate sb-bignum:%multiply)
   (:policy :fast-safe)
   (:args (x :scs (unsigned-reg))
          (y :scs (unsigned-reg)))
@@ -740,7 +732,7 @@
     (inst mskll lo 4 lo)))
 
 (define-vop (bignum-lognot)
-  (:translate sb!bignum:%lognot)
+  (:translate sb-bignum:%lognot)
   (:policy :fast-safe)
   (:args (x :scs (unsigned-reg)))
   (:arg-types unsigned-num)
@@ -751,7 +743,7 @@
     (inst mskll r 4 r)))
 
 (define-vop (fixnum-to-digit)
-  (:translate sb!bignum:%fixnum-to-digit)
+  (:translate sb-bignum:%fixnum-to-digit)
   (:policy :fast-safe)
   (:args (fixnum :scs (any-reg)))
   (:arg-types tagged-num)
@@ -761,7 +753,7 @@
     (inst sra fixnum n-fixnum-tag-bits digit)))
 
 (define-vop (bignum-floor)
-  (:translate sb!bignum:%bigfloor)
+  (:translate sb-bignum:%bigfloor)
   (:policy :fast-safe)
   (:args (num-high :scs (unsigned-reg))
          (num-low :scs (unsigned-reg))
@@ -791,7 +783,7 @@
         (emit-label shift2)))))
 
 (define-vop (signify-digit)
-  (:translate sb!bignum:%fixnum-digit-with-correct-sign)
+  (:translate sb-bignum:%fixnum-digit-with-correct-sign)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg) :target res))
   (:arg-types unsigned-num)
@@ -808,7 +800,7 @@
 
 
 (define-vop (digit-ashr)
-  (:translate sb!bignum:%ashr)
+  (:translate sb-bignum:%ashr)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg))
          (count :scs (unsigned-reg)))
@@ -821,35 +813,11 @@
     (inst srl result 32 result)))
 
 (define-vop (digit-lshr digit-ashr)
-  (:translate sb!bignum:%digit-logical-shift-right)
+  (:translate sb-bignum:%digit-logical-shift-right)
   (:generator 1
     (inst srl digit count result)))
 
 (define-vop (digit-ashl digit-ashr)
-  (:translate sb!bignum:%ashl)
+  (:translate sb-bignum:%ashl)
   (:generator 1
     (inst sll digit count result)))
-
-;;;; static functions
-
-(define-static-fun two-arg-gcd (x y) :translate gcd)
-(define-static-fun two-arg-lcm (x y) :translate lcm)
-
-(define-static-fun two-arg-+ (x y) :translate +)
-(define-static-fun two-arg-- (x y) :translate -)
-(define-static-fun two-arg-* (x y) :translate *)
-(define-static-fun two-arg-/ (x y) :translate /)
-
-(define-static-fun two-arg-< (x y) :translate <)
-(define-static-fun two-arg-<= (x y) :translate <=)
-(define-static-fun two-arg-> (x y) :translate >)
-(define-static-fun two-arg->= (x y) :translate >=)
-(define-static-fun two-arg-= (x y) :translate =)
-(define-static-fun two-arg-/= (x y) :translate /=)
-
-(define-static-fun %negate (x) :translate %negate)
-
-(define-static-fun two-arg-and (x y) :translate logand)
-(define-static-fun two-arg-ior (x y) :translate logior)
-(define-static-fun two-arg-xor (x y) :translate logxor)
-(define-static-fun two-arg-eqv (x y) :translate logeqv)

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; In the interest of ``once and only once'' this macro contains the
 ;;; framework necessary to implement a peek-char function, which has
@@ -26,7 +26,7 @@
 ;;; SKIPPED-CHAR-FORM - the form to execute when skipping a character
 ;;; EOF-DETECTED-FORM - the form to execute when EOF has been detected
 ;;;                     (this will default to EOF-RESULT)
-(sb!xc:defmacro generalized-peeking-mechanism
+(sb-xc:defmacro generalized-peeking-mechanism
     (peek-type eof-value char-var read-form read-eof unread-form
      &optional (skipped-char-form nil) (eof-detected-form nil))
   `(let ((,char-var ,read-form))
@@ -68,7 +68,7 @@
 ;;; unread-char, read-byte, listen here that was removed because these
 ;;; functions are redefined when simple-streams are loaded.
 
-#!-sb-fluid (declaim (inline ansi-stream-peek-char))
+#-sb-fluid (declaim (inline ansi-stream-peek-char))
 (defun ansi-stream-peek-char (peek-type stream eof-error-p eof-value
                               recursive-p)
   (cond ((typep stream 'echo-stream)
@@ -88,8 +88,8 @@
                             (eof-error-p t)
                             eof-value
                             recursive-p)
-  (the (or character boolean) peek-type)
-  (let ((stream (in-synonym-of stream)))
+  (declare (type (or character boolean) peek-type) (explicit-check))
+  (let ((stream (in-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-peek-char peek-type stream eof-error-p eof-value
                                recursive-p)
@@ -126,7 +126,13 @@
        (let ((in-type (stream-element-type in))
              (out-type (stream-element-type out)))
          (if (equal in-type out-type)
-             in-type `(and ,in-type ,out-type))))
+             in-type
+             `(and ,in-type ,out-type))))
+      (:element-mode
+       (let ((in-mode (stream-element-mode in))
+             (out-mode (stream-element-mode out)))
+         (when (equal in-mode out-mode)
+           in-mode)))
       (:close
        (set-closed-flame stream))
       (:peek-char
@@ -171,4 +177,3 @@
            (if (ansi-stream-p out)
                (funcall (ansi-stream-misc out) out operation arg1 arg2)
                (stream-misc-dispatch out operation arg1 arg2)))))))
-

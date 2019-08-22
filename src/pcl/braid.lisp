@@ -31,47 +31,54 @@
 
 (in-package "SB-PCL")
 
-(defun allocate-standard-instance (wrapper
-                                   &optional (slots-init nil slots-init-p))
-  (let ((instance (%make-standard-instance nil (get-instance-hash-code)))
-        (no-of-slots (wrapper-no-of-instance-slots wrapper)))
-    (setf (std-instance-wrapper instance) wrapper)
-    (setf (std-instance-slots instance)
-          (cond (slots-init-p
-                 ;; Inline the slots vector allocation and initialization.
-                 (let ((slots (make-array no-of-slots :initial-element 0)))
-                   (do ((rem-slots slots-init (rest rem-slots))
-                        (i 0 (1+ i)))
-                       ((>= i no-of-slots)) ;endp rem-slots))
-                     (declare (list rem-slots)
-                              (type index i))
-                     (setf (aref slots i) (first rem-slots)))
-                   slots))
-                (t
-                 (make-array no-of-slots
-                             :initial-element +slot-unbound+))))
+(defun allocate-standard-instance (wrapper)
+  (let ((instance (%make-standard-instance
+                   (make-array (layout-length wrapper)
+                               :initial-element +slot-unbound+)
+                   #-compact-instance-header 0)))
+    (setf (%instance-layout instance) wrapper)
     instance))
-
-(defmacro allocate-standard-funcallable-instance-slots
-    (wrapper &optional slots-init-p slots-init)
-  `(let ((no-of-slots (wrapper-no-of-instance-slots ,wrapper)))
-    ,(if slots-init-p
-         `(if ,slots-init-p
-           (make-array no-of-slots :initial-contents ,slots-init)
-           (make-array no-of-slots :initial-element +slot-unbound+))
-         `(make-array no-of-slots :initial-element +slot-unbound+))))
 
 (define-condition unset-funcallable-instance-function
     (reference-condition simple-error)
   ()
   (:default-initargs
-   :references (list '(:amop :generic-function allocate-instance)
-                     '(:amop :function set-funcallable-instance-function))))
+   :references '((:amop :generic-function allocate-instance)
+                 (:amop :function set-funcallable-instance-function))))
 
-(defun allocate-standard-funcallable-instance
-    (wrapper &optional (slots-init nil slots-init-p))
-  (let ((fin (%make-standard-funcallable-instance
-              nil nil (get-instance-hash-code))))
+(defun allocate-standard-funcallable-instance-immobile (wrapper name)
+  (allocate-standard-funcallable-instance wrapper name
+                                          #+(and compact-instance-header immobile-code) t))
+
+(defun allocate-standard-funcallable-instance (wrapper name &optional
+                                                              #+(and compact-instance-header immobile-code)
+                                                              immobile)
+  (declare (layout wrapper))
+  (let* ((hash (if name
+                   (mix (sxhash name) (sxhash :generic-function)) ; arb. constant
+                   (sb-impl::new-instance-hash-code)))
+         (slots (make-array (layout-length wrapper) :initial-element +slot-unbound+))
+         (fin (cond #+(and compact-instance-header immobile-code)
+                    ((and immobile
+                          (not (eql (layout-bitmap wrapper) -1)))
+                     (truly-the funcallable-instance
+                                (sb-vm::make-immobile-gf wrapper slots)))
+                    (t
+                     (let ((f (truly-the funcallable-instance
+                                         (%make-standard-funcallable-instance
+                                          slots
+                                          #-compact-instance-header hash))))
+                       (setf (%funcallable-instance-layout f) wrapper)
+                       f)))))
+    ;; Compact-instance-header uses the high 32 bits of the slot vector's
+    ;; header word. Mix down the full hash, then shift left 24 bits
+    ;; which when shifted by N-WIDETAG-BITS puts it in the upper 32.
+    ;; The contraint on size is that we must not touch the byte for immobile
+    ;; GC's generation. But, you might say, vector's don't go in immobile
+    ;; space. That's true for the time being, but might not be true always.
+    #+compact-instance-header
+    (set-header-data slots (ash (ldb (byte 32 0) (logxor (ash hash -32) hash))
+                                24))
     (set-funcallable-instance-function
      fin
      #'(lambda (&rest args)
@@ -80,10 +87,6 @@
                 :format-control "~@<The function of funcallable instance ~
                                  ~S has not been set.~@:>"
                 :format-arguments (list fin))))
-    (setf (fsc-instance-wrapper fin) wrapper
-          (fsc-instance-slots fin)
-          (allocate-standard-funcallable-instance-slots
-           wrapper slots-init-p slots-init))
     fin))
 
 (defun classify-slotds (slotds)
@@ -119,7 +122,7 @@
                    `(setf ,wr ,(if (eq class 'standard-generic-function)
                                    '*sgf-wrapper*
                                    `(!boot-make-wrapper
-                                     (early-class-size ',class)
+                                     (!early-class-size ',class)
                                      ',class))
                           ,class (allocate-standard-instance
                                   ,(if (eq class 'standard-generic-function)
@@ -154,7 +157,7 @@
     ;; First, make a class metaobject for each of the early classes. For
     ;; each metaobject we also set its wrapper. Except for the class T,
     ;; the wrapper is always that of STANDARD-CLASS.
-    (dolist (definition *early-class-definitions*)
+    (dolist (definition *!early-class-definitions*)
       (let* ((name (ecd-class-name definition))
              (meta (ecd-metaclass definition))
              (wrapper (ecase meta
@@ -169,7 +172,7 @@
              (class (or (find-class name nil)
                         (allocate-standard-instance wrapper))))
         (setf (find-class name) class)))
-    (dolist (definition *early-class-definitions*)
+    (dolist (definition *!early-class-definitions*)
       (let ((name (ecd-class-name definition))
             (meta (ecd-metaclass definition))
             (source (ecd-source-location definition))
@@ -179,7 +182,7 @@
         (let ((direct-default-initargs
                (getf other-initargs :direct-default-initargs)))
           (multiple-value-bind (slots cpl default-initargs direct-subclasses)
-              (early-collect-inheritance name)
+              (!early-collect-inheritance name)
             (let* ((class (find-class name))
                    (wrapper (cond ((eq class slot-class)
                                    slot-class-wrapper)
@@ -206,8 +209,9 @@
                                   (t
                                    (!boot-make-wrapper (length slots) name))))
                    (proto nil))
-              (when (eq name t) (setq *the-wrapper-of-t* wrapper))
-              (set (make-class-symbol name) class)
+              (let ((symbol (make-class-symbol name)))
+                (when (eq (info :variable :kind symbol) :global)
+                  (set symbol class)))
               (dolist (slot slots)
                 (unless (eq (getf slot :allocation :instance) :instance)
                   (error "Slot allocation ~S is not supported in bootstrap."
@@ -217,7 +221,7 @@
                 (setf (layout-slot-list wrapper) slots))
 
               (setq proto (if (eq meta 'funcallable-standard-class)
-                              (allocate-standard-funcallable-instance wrapper)
+                              (allocate-standard-funcallable-instance wrapper name)
                               (allocate-standard-instance wrapper)))
 
               (setq direct-slots
@@ -269,23 +273,48 @@
     (setq **standard-method-classes**
           (mapcar (lambda (name)
                     (symbol-value (make-class-symbol name)))
-                  *standard-method-class-names*))
+                  +standard-method-class-names+))
 
-    (let* ((smc-class (find-class 'standard-method-combination))
-           (smc-wrapper (!bootstrap-get-slot 'standard-class
-                                             smc-class
-                                             'wrapper))
-           (smc (allocate-standard-instance smc-wrapper)))
-      (flet ((set-slot (name value)
-               (!bootstrap-set-slot 'standard-method-combination
-                                    smc
-                                    name
-                                    value)))
-        (set-slot 'source nil)
-        (set-slot 'type-name 'standard)
-        (set-slot '%documentation "The standard method combination.")
-        (set-slot 'options ()))
-      (setq *standard-method-combination* smc))))
+    (flet ((make-method-combination (class-name)
+             (let* ((class (find-class class-name))
+                    (wrapper (!bootstrap-get-slot
+                              'standard-class class 'wrapper))
+                    (instance (allocate-standard-instance wrapper)))
+               (flet ((set-slot (name value)
+                        (!bootstrap-set-slot class-name instance name value)))
+                 (values instance #'set-slot)))))
+      ;; Create the STANDARD method combination object.
+      (multiple-value-bind (method-combination set-slot)
+          (make-method-combination 'standard-method-combination)
+        (funcall set-slot 'source nil)
+        (funcall set-slot 'type-name 'standard)
+        (funcall set-slot 'options '())
+        (funcall set-slot '%generic-functions (make-gf-hash-table))
+        (funcall set-slot '%documentation "The standard method combination.")
+        (setq *standard-method-combination* method-combination))
+      ;; Create an OR method combination object.
+      (multiple-value-bind (method-combination set-slot)
+          (make-method-combination 'short-method-combination)
+        (funcall set-slot 'source 'nil)
+        (funcall set-slot 'type-name 'or)
+        (funcall set-slot 'operator 'or)
+        (funcall set-slot 'identity-with-one-argument t)
+        (funcall set-slot '%generic-functions (make-gf-hash-table))
+        (funcall set-slot '%documentation nil)
+        (funcall set-slot 'options '(:most-specific-first))
+        (setq *or-method-combination* method-combination)))))
+
+;;; I have no idea why we care so much about being able to create an instance
+;;; of STRUCTURE-OBJECT, when (almost) no other structure class in the system
+;;; begins life such that MAKE-INSTANCE works on it.
+;;; And ALLOCATE-INSTANCE seems to work fine anyway. e.g. you can call
+;;; (ALLOCATE-INSTANCE (FIND-CLASS 'HASH-TABLE)).
+;;; Anyway, see below in !BOOTSTRAP-INITIALIZE-CLASS where we refer to
+;;; the name of this seemingly useless constructor function.
+(defun |STRUCTURE-OBJECT class constructor| ()
+  (sb-kernel:%make-structure-instance
+   #.(sb-kernel:find-defstruct-description 'structure-object)
+   nil))
 
 ;;; Initialize a class metaobject.
 (defun !bootstrap-initialize-class
@@ -349,7 +378,7 @@
       (let* ((super (find-class super))
              (subclasses (!bootstrap-get-slot metaclass-name super
                                               'direct-subclasses)))
-        (cond ((eq +slot-unbound+ subclasses)
+        (cond ((unbound-marker-p subclasses)
                (!bootstrap-set-slot metaclass-name super 'direct-subclasses
                                     (list class)))
               ((not (memq class subclasses))
@@ -425,7 +454,7 @@
 
 (defun !bootstrap-accessor-definitions (early-p)
   (let ((*early-p* early-p))
-    (dolist (definition *early-class-definitions*)
+    (dolist (definition *!early-class-definitions*)
       (let ((name (ecd-class-name definition))
             (meta (ecd-metaclass definition)))
         (unless (or (eq meta 'built-in-class) (eq meta 'system-class))
@@ -477,7 +506,7 @@
                                      :slot-name slot-name
                                      :object-class class-name
                                      :method-class-function (constantly (find-class accessor-class))
-                                     :definition-source source-location))))))
+                                     'source source-location))))))
 
 (defun !bootstrap-accessor-definitions1 (class-name
                                          slot-name
@@ -506,16 +535,6 @@
     (dolist (reader readers) (do-reader-definition reader))
     (dolist (writer writers) (do-writer-definition writer))
     (dolist (boundp boundps) (do-boundp-definition boundp))))
-
-;;; FIXME: find a better name.
-(defun !bootstrap-class-predicates (early-p)
-  (let ((*early-p* early-p)
-        (source-loc (sb-c:source-location)))
-    (dolist (ecp *!early-class-predicates*)
-      (let ((class-name (car ecp))
-            (predicate-name (cadr ecp)))
-        (!make-class-predicate (find-class class-name) predicate-name
-                               source-loc)))))
 
 (defun !bootstrap-built-in-classes ()
 
@@ -549,8 +568,6 @@
         (let* ((class (find-class name))
                (lclass (find-classoid name))
                (wrapper (classoid-layout lclass)))
-          (set (get-built-in-class-symbol name) class)
-          (set (get-built-in-wrapper-symbol name) wrapper)
           (setf (classoid-pcl-class lclass) class)
 
           (!bootstrap-initialize-class 'built-in-class class
@@ -560,6 +577,7 @@
                                        wrapper prototype))))))
 
 (defun class-of (x)
+  (declare (explicit-check))
   (wrapper-class* (layout-of x)))
 
 (defun eval-form (form)
@@ -616,7 +634,7 @@
 
 (defun !make-class-predicate (class name source-location)
   (let* ((gf (ensure-generic-function name :lambda-list '(object)
-                                      :definition-source source-location))
+                                      'source source-location))
          (mlist (if (eq **boot-state** 'complete)
                     (early-gf-methods gf)
                     (generic-function-methods gf))))
@@ -667,30 +685,9 @@
         (when (and name (symbolp name) (eq name (classoid-name classoid)))
           (setf (find-classoid name) classoid))))))
 
-(defun %set-class-type-translation (class classoid)
-  (when (not (typep classoid 'classoid))
-    (setq classoid (find-classoid classoid nil)))
-  (etypecase classoid
-    (null)
-    (built-in-classoid
-     (let ((translation (built-in-classoid-translation classoid)))
-       (cond
-         (translation
-          (aver (ctype-p translation))
-          (setf (info :type :translator class)
-                (lambda (spec) (declare (ignore spec)) translation)))
-         (t
-          (setf (info :type :translator class)
-                (lambda (spec) (declare (ignore spec)) classoid))))))
-    (classoid
-     (setf (info :type :translator class)
-           (lambda (spec) (declare (ignore spec)) classoid)))))
-
 (!bootstrap-meta-braid)
 (!bootstrap-accessor-definitions t)
-(!bootstrap-class-predicates t)
 (!bootstrap-accessor-definitions nil)
-(!bootstrap-class-predicates nil)
 (!bootstrap-built-in-classes)
 
 (loop for (name . x)
@@ -717,54 +714,90 @@
             (t
              (setf (find-classoid name) lclass)))
 
-      (%set-class-type-translation class name))))
+      )))
 
 (setq **boot-state** 'braid)
 
-(defmethod no-applicable-method (generic-function &rest args)
-  (error "~@<There is no applicable method for the generic function ~2I~_~S~
-          ~I~_when called with arguments ~2I~_~S.~:>"
-         generic-function
-         args))
+(define-condition effective-method-condition (reference-condition)
+  ((generic-function :initarg :generic-function
+                     :reader effective-method-condition-generic-function)
+   (method :initarg :method :initform nil
+           :reader effective-method-condition-method)
+   (args :initarg :args
+         :reader effective-method-condition-args))
+  (:default-initargs
+   :generic-function (missing-arg)
+   :args (missing-arg)))
 
+(define-condition effective-method-error (error
+                                          effective-method-condition)
+  ((problem :initarg :problem :reader effective-method-error-problem))
+  (:default-initargs :problem (missing-arg))
+  (:report
+   (lambda (condition stream)
+     (format stream "~@<~A for the generic function ~2I~_~S ~I~_when ~
+                     called ~@[from method ~2I~_~S~I~_~]with arguments ~
+                     ~2I~_~S.~:>"
+             (effective-method-error-problem condition)
+             (effective-method-condition-generic-function condition)
+             (effective-method-condition-method condition)
+             (effective-method-condition-args condition)))))
+
+(define-condition no-applicable-method-error (effective-method-error)
+  ()
+  (:default-initargs
+   :problem "There is no applicable method"
+   :references '((:ansi-cl :section (7 6 6)))))
+(defmethod no-applicable-method (generic-function &rest args)
+  (error 'no-applicable-method-error
+         :generic-function generic-function
+         :args args))
+
+(define-condition no-next-method-error (effective-method-error)
+  ()
+  (:default-initargs
+   :problem "There is no next method"
+   :references '((:ansi-cl :section (7 6 6 2)))))
 (defmethod no-next-method ((generic-function standard-generic-function)
                            (method standard-method) &rest args)
-  (error "~@<There is no next method for the generic function ~2I~_~S~
-          ~I~_when called from method ~2I~_~S~I~_with arguments ~2I~_~S.~:>"
-         generic-function
-         method
-         args))
+  (error 'no-next-method-error
+         :generic-function generic-function
+         :method method
+         :args args))
 
 ;;; An extension to the ANSI standard: in the presence of e.g. a
 ;;; :BEFORE method, it would seem that going through
 ;;; NO-APPLICABLE-METHOD is prohibited, as in fact there is an
 ;;; applicable method.  -- CSR, 2002-11-15
-(define-condition no-primary-method (reference-condition error)
-  ((generic-function :initarg :generic-function :reader no-primary-method-generic-function)
-   (args :initarg :args :reader no-primary-method-args))
-  (:report
-   (lambda (c s)
-     (format s "~@<There is no primary method for the generic function ~2I~_~S~
-                ~I~_when called with arguments ~2I~_~S.~:>"
-             (no-primary-method-generic-function c)
-             (no-primary-method-args c))))
-  (:default-initargs :references (list '(:ansi-cl :section (7 6 6 2)))))
+(define-condition no-primary-method-error (effective-method-error)
+  ()
+  (:default-initargs
+   :problem "There is no primary method"
+   :references '((:ansi-cl :section (7 6 6 2)))))
 (defmethod no-primary-method (generic-function &rest args)
-  (error 'no-primary-method :generic-function generic-function :args args))
+  (error 'no-primary-method-error
+         :generic-function generic-function
+         :args args))
 
+;; FIXME shouldn't this specialize on STANDARD-METHOD-COMBINATION?
 (defmethod invalid-qualifiers ((gf generic-function)
                                combin
                                method)
-  (let ((qualifiers (method-qualifiers method)))
-    (let ((why (cond
-                 ((cdr qualifiers) "has too many qualifiers")
-                 (t (aver (not (member (car qualifiers)
-                                       '(:around :before :after))))
-                    "has an invalid qualifier"))))
-      (invalid-method-error
-       method
-       "The method ~S on ~S ~A.~%~
-        Standard method combination requires all methods to have one~%~
-        of the single qualifiers :AROUND, :BEFORE and :AFTER or to~%~
-        have no qualifier at all."
-       method gf why))))
+  (let* ((qualifiers (method-qualifiers method))
+         (qualifier (first qualifiers))
+         (type-name (method-combination-type-name combin))
+         (why (cond
+                ((cdr qualifiers)
+                 "has too many qualifiers")
+                (t
+                 (aver (not (standard-method-combination-qualifier-p
+                             qualifier)))
+                 "has an invalid qualifier"))))
+    (invalid-method-error
+     method
+     "~@<The method ~S on ~S ~A.~
+      ~@:_~@:_~
+      ~@(~A~) method combination requires all methods to have one of ~
+      the single qualifiers ~{~S~#[~; and ~:;, ~]~} or to have no ~
+      qualifier at all.~@:>"
+     method gf why type-name +standard-method-combination-qualifiers+)))

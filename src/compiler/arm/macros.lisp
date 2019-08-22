@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Instruction-like macros.
 
@@ -103,7 +103,7 @@
 (defmacro lisp-jump (function)
   "Jump to the lisp function FUNCTION."
   `(inst add pc-tn ,function
-         (- (ash simple-fun-code-offset word-shift)
+         (- (ash simple-fun-insts-offset word-shift)
             fun-pointer-lowtag)))
 
 (defmacro lisp-return (return-pc return-style)
@@ -131,20 +131,44 @@
 ;;;; Stack TN's
 
 ;;; Move a stack TN to a register and vice-versa.
+(defun load-stack-offset (reg stack stack-tn &optional (predicate :al))
+  (let ((offset (tn-byte-offset stack-tn)))
+    (cond ((or (tn-p offset)
+               (typep offset '(unsigned-byte 12)))
+           (inst ldr predicate reg (@ stack offset)))
+          (t
+           (load-immediate-word reg offset)
+           (inst ldr predicate reg (@ stack reg))))))
+
 (defmacro load-stack-tn (reg stack &optional (predicate :al))
   `(let ((reg ,reg)
          (stack ,stack))
-     (let ((offset (tn-offset stack)))
-       (sc-case stack
-         ((control-stack)
-          (loadw reg cfp-tn offset 0 ,predicate))))))
+     (sc-case stack
+       ((control-stack)
+        (load-stack-offset reg cfp-tn stack ,predicate)))))
+
+(defun store-stack-offset (reg stack stack-tn &optional (predicate :al))
+  (let ((offset (tn-byte-offset stack-tn)))
+    (cond ((or (typep offset '(unsigned-byte 12))
+               (tn-p offset))
+           (inst str predicate reg (@ stack offset)))
+          (t
+           (let ((low (ldb (byte 12 0) offset))
+                 (high (mask-field (byte 20 12) offset)))
+             ;; KLUDGE:
+             ;; Have to do this because it is used in move vops
+             ;; which do not have temporary registers.
+             ;; The debugger will be not happy.
+             (composite-immediate-instruction add stack stack high)
+             (inst str predicate reg (@ stack low))
+             (composite-immediate-instruction sub stack stack high))))))
+
 (defmacro store-stack-tn (stack reg &optional (predicate :al))
   `(let ((stack ,stack)
          (reg ,reg))
-     (let ((offset (tn-offset stack)))
-       (sc-case stack
-         ((control-stack)
-          (storew reg cfp-tn offset 0 ,predicate))))))
+     (sc-case stack
+       ((control-stack)
+        (store-stack-offset reg cfp-tn stack ,predicate)))))
 
 (defmacro maybe-load-stack-tn (reg reg-or-stack)
   "Move the TN Reg-Or-Stack into Reg if it isn't already there."
@@ -156,7 +180,7 @@
           ((any-reg descriptor-reg)
            (move ,n-reg ,n-stack))
           ((control-stack)
-           (loadw ,n-reg cfp-tn (tn-offset ,n-stack))))))))
+           (load-stack-offset ,n-reg cfp-tn ,n-stack)))))))
 
 ;;;; Storage allocation:
 
@@ -175,21 +199,19 @@
 ;;; surround a call to ALLOCATION anyway), and to indicate that the
 ;;; P-A FLAG-TN is also acceptable here.
 
-#!+gencgc
+#+gencgc
 (defun allocation-tramp (alloc-tn size back-label)
   (let ((fixup (gen-label)))
     (when (integerp size)
       (load-immediate-word alloc-tn size))
-    (emit-word sb!assem::**current-segment** (logior #xe92d0000
-                                                     (ash 1 (if (integerp size)
-                                                                (tn-offset alloc-tn)
-                                                                (tn-offset size)))
-                                                     (ash 1 (tn-offset lr-tn))))
+    (inst word (logior #xe92d0000
+                       (ash 1 (if (integerp size) (tn-offset alloc-tn) (tn-offset size)))
+                       (ash 1 (tn-offset lr-tn))))
     (inst load-from-label alloc-tn alloc-tn fixup)
     (inst blx alloc-tn)
-    (emit-word sb!assem::**current-segment** (logior #xe8bd0000
-                                                     (ash 1 (tn-offset alloc-tn))
-                                                     (ash 1 (tn-offset lr-tn))))
+    (inst word (logior #xe8bd0000
+                       (ash 1 (tn-offset alloc-tn))
+                       (ash 1 (tn-offset lr-tn))))
     (inst b back-label)
     (emit-label fixup)
     (inst word (make-fixup "alloc_tramp" :foreign))))
@@ -214,7 +236,7 @@
             ;; stack pointer has been stored.
             (storew null-tn ,result-tn -1 0 :ne)
             (inst orr ,result-tn ,result-tn ,lowtag))
-           #!-gencgc
+           #-gencgc
            (t
             (load-symbol-value ,flag-tn *allocation-pointer*)
             (inst add ,result-tn ,flag-tn ,lowtag)
@@ -222,7 +244,7 @@
                 (composite-immediate-instruction add ,flag-tn ,flag-tn ,size)
                 (inst add ,flag-tn ,flag-tn ,size))
             (store-symbol-value ,flag-tn *allocation-pointer*))
-           #!+gencgc
+           #+gencgc
            (t
             (let ((fixup (gen-label))
                   (alloc (gen-label))
@@ -246,11 +268,11 @@
               (when ,lowtag
                 (inst orr ,result-tn ,result-tn ,lowtag))
 
-              (assemble (*elsewhere*)
+              (assemble (:elsewhere)
                 (emit-label ALLOC)
                 (allocation-tramp ,result-tn ,size BACK-FROM-ALLOC)
                 (emit-label FIXUP)
-                (inst word (make-fixup "boxed_region" :foreign))))))))
+                (inst word (make-fixup "gc_alloc_region" :foreign))))))))
 
 (defmacro with-fixed-allocation ((result-tn flag-tn type-code size
                                             &key (lowtag other-pointer-lowtag)
@@ -268,8 +290,7 @@
                    :flag-tn ,flag-tn
                    :stack-allocate-p ,stack-allocate-p)
        (when ,type-code
-         (inst mov ,flag-tn (ash (1- ,size) n-widetag-bits))
-         (inst orr ,flag-tn ,flag-tn ,type-code)
+         (load-immediate-word ,flag-tn (compute-object-header ,size ,type-code))
          (storew ,flag-tn ,result-tn 0 ,lowtag))
        ,@body)))
 
@@ -281,29 +302,13 @@
     ;; Use the magic officially-undefined instruction that Linux
     ;; treats as generating SIGTRAP.
     (inst debug-trap)
-    ;; The rest of this is "just" the encoded error details.
-    (inst byte kind)
-    (with-adjustable-vector (vector)
-      (write-var-integer code vector)
-      (dolist (tn values)
-        (write-var-integer (make-sc-offset (sc-number (tn-sc tn))
-                                           (or (tn-offset tn) 0))
-                           vector))
-      (inst byte (length vector))
-      (dotimes (i (length vector))
-        (inst byte (aref vector i)))
-      (emit-alignment word-shift))))
-
-(defun error-call (vop error-code &rest values)
-  #!+sb-doc
-  "Cause an error.  ERROR-CODE is the error to cause."
-  (emit-error-break vop error-trap (error-number-or-lose error-code) values))
+    (emit-internal-error kind code values)
+    (emit-alignment word-shift)))
 
 (defun generate-error-code (vop error-code &rest values)
-  #!+sb-doc
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
-  (assemble (*elsewhere*)
+  (assemble (:elsewhere)
     (let ((start-lab (gen-label)))
       (emit-label start-lab)
       (emit-error-break vop error-trap (error-number-or-lose error-code) values)
@@ -311,19 +316,15 @@
 
 ;;;; PSEUDO-ATOMIC
 
+
 ;;; handy macro for making sequences look atomic
-;;;
-;;; FLAG-TN must be wired to R7.  If a deferred interrupt happens
-;;; while we have *PSEUDO-ATOMIC* set to non-nil, then
-;;; *PSEUDO-ATOMIC-INTERRUPTED* will be changed from NIL to the fixnum
-;;; #x000f0001 (so, #x003c0004), which is the syscall number for
-;;; BREAK_POINT.  This value is less than #x0800000b (NIL).  The
-;;; runtime "knows" that an SWI with a condition code of :LT instead
-;;; of the normal :AL is a pseudo-atomic interrupted trap.
-(defmacro pseudo-atomic ((flag-tn) &body forms)
+
+;;; With LINK being NIL this doesn't store the next PC in LR when
+;;; calling do_pending_interrupt.
+;;; This used by allocate-vector-on-heap, there's a comment explaining
+;;; why it needs that.
+(defmacro pseudo-atomic ((flag-tn &key (link t)) &body forms)
   `(progn
-     (aver (and (sc-is ,flag-tn non-descriptor-reg)
-                (= (tn-offset ,flag-tn) 7)))
      (without-scheduling ()
        (store-symbol-value pc-tn *pseudo-atomic-atomic*))
      (assemble ()
@@ -331,9 +332,12 @@
      (without-scheduling ()
        (store-symbol-value null-tn *pseudo-atomic-atomic*)
        (load-symbol-value ,flag-tn *pseudo-atomic-interrupted*)
-       (inst cmp ,flag-tn null-tn)
-       (inst mov :lt ,flag-tn (lsr ,flag-tn n-fixnum-tag-bits))
-       (inst swi :lt 0))))
+       ;; When *pseudo-atomic-interrupted* is not 0 it contains the address of
+       ;; do_pending_interrupt
+       (inst cmp ,flag-tn 0)
+       ,(if link
+            `(inst blx :ne ,flag-tn)
+            `(inst bx :ne ,flag-tn)))))
 
 ;;;; memory accessor vop generators
 
@@ -412,18 +416,3 @@
        (inst ,(ecase size (:byte 'strb) (:short 'strh))
              value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))
        (move result value))))
-
-(def!macro with-pinned-objects ((&rest objects) &body body)
-  "Arrange with the garbage collector that the pages occupied by
-OBJECTS will not be moved in memory for the duration of BODY.
-Useful for e.g. foreign calls where another thread may trigger
-garbage collection.  This is currently implemented by disabling GC"
-  #!-gencgc
-  (declare (ignore objects))            ; should we eval these for side-effect?
-  #!-gencgc
-  `(without-gcing
-    ,@body)
-  #!+gencgc
-  `(let ((*pinned-objects* (list* ,@objects *pinned-objects*)))
-     (declare (truly-dynamic-extent *pinned-objects*))
-     ,@body))

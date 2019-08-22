@@ -142,7 +142,7 @@ fi
 
 if [ ! \( -f $SBCL_RELEASE_DIR/sbcl-$VERSION-source.tar -o -f $SBCL_RELEASE_DIR/sbcl-$VERSION-source.tar.bz2 \) ]; then
   cd $SBCL_DIR
-  (. $SBCL_DIR/generate-version.sh; generate_version)
+  $SBCL_DIR/generate-version.sh
   mkdir -p CVS
   sh ./distclean.sh
   rm -rf .git
@@ -315,6 +315,7 @@ echo TODO:
 echo 
 echo perform administrative tasks:
 echo 
+echo \* rebuild documentation with modern texinfo
 echo \* visit https://sourceforge.net/projects/sbcl/files/
 echo \* select sbcl -> $VERSION -> "view details" for the source
 echo \ \ tarball, "Select all" and Save

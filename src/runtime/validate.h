@@ -24,11 +24,6 @@
 #define DEFAULT_CONTROL_STACK_SIZE (2*1024*1024)
 
 /* constants derived from the fundamental constants in passed by GENESIS */
-#ifdef LISP_FEATURE_GENCGC
-#define DEFAULT_DYNAMIC_SPACE_SIZE (DYNAMIC_SPACE_END - DYNAMIC_SPACE_START)
-#else
-#define DEFAULT_DYNAMIC_SPACE_SIZE (DYNAMIC_0_SPACE_END - DYNAMIC_0_SPACE_START)
-#endif
 #define READ_ONLY_SPACE_SIZE (READ_ONLY_SPACE_END - READ_ONLY_SPACE_START)
 #define STATIC_SPACE_SIZE (STATIC_SPACE_END - STATIC_SPACE_START)
 #ifdef LISP_FEATURE_LINKAGE_TABLE
@@ -36,8 +31,8 @@
     (LINKAGE_TABLE_SPACE_END - LINKAGE_TABLE_SPACE_START)
 #endif
 
-#if !defined(LANGUAGE_ASSEMBLY)
-#include <thread.h>
+#if !defined(__ASSEMBLER__)
+#include "thread.h"
 
 #ifdef LISP_FEATURE_STACK_GROWS_DOWNWARD_NOT_UPWARD
 
@@ -67,7 +62,7 @@
 #define ALIEN_STACK_RETURN_GUARD_PAGE(th) \
     (ALIEN_STACK_GUARD_PAGE(th) + os_vm_page_size)
 
-#elif ALIEN_STACK_GROWS_UPWARD
+#elif defined(ALIEN_STACK_GROWS_UPWARD)
 
 #define ALIEN_STACK_HARD_GUARD_PAGE(th)                            \
     (((os_vm_address_t)th->alien_stack_start) + ALIEN_STACK_SIZE - \
@@ -89,7 +84,8 @@
 #define BINDING_STACK_RETURN_GUARD_PAGE(th) \
     (BINDING_STACK_GUARD_PAGE(th) - os_vm_page_size)
 
-extern void validate(void);
+extern void allocate_spaces(boolean);
+extern boolean allocate_hardwired_spaces(boolean);
 
 extern void
 protect_control_stack_hard_guard_page(int protect_p, struct thread *thread);

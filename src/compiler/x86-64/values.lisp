@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-vop (reset-stack-pointer)
   (:args (ptr :scs (any-reg)))
@@ -40,7 +40,7 @@
     (inst jmp :be LOOP)
     (inst cld)
     DONE
-    (inst lea rsp-tn (make-ea :qword :base rdi :disp n-word-bytes))
+    (inst lea rsp-tn (ea n-word-bytes rdi))
     (inst sub rdi rsi)
     (loop for moved = moved-ptrs then (tn-ref-across moved)
           while moved
@@ -54,17 +54,20 @@
 ;;; bogus SC that reflects the costs of the memory-to-memory moves for each
 ;;; operand, but this seems unworthwhile.
 (define-vop (push-values)
-  (:args (vals :more t))
-  (:temporary (:sc unsigned-reg :to (:result 0) :target start) temp)
-  (:results (start) (count))
+  (:args (vals :more t
+               :scs (descriptor-reg)))
+  (:results (start :from :load) (count))
   (:info nvals)
   (:generator 20
-    (move temp rsp-tn)                  ; WARN pointing 1 below
+    (move start rsp-tn)
     (do ((val vals (tn-ref-across val)))
         ((null val))
-      (inst push (tn-ref-tn val)))
-    (move start temp)
-    (inst mov count (fixnumize nvals))))
+      (inst push (let ((value (encode-value-if-immediate (tn-ref-tn val))))
+                   (if (integerp value)
+                       (constantize value)
+                       value))))
+    (unless (eq (tn-kind count) :unused)
+      (inst mov count (fixnumize nvals)))))
 
 ;;; Push a list of values on the stack, returning Start and Count as used in
 ;;; unknown values continuations.
@@ -75,8 +78,7 @@
   (:results (start :scs (any-reg))
             (count :scs (any-reg)))
   (:temporary (:sc descriptor-reg :from (:argument 0) :to (:result 1)) list)
-  (:temporary (:sc dword-reg :offset eax-offset :to (:result 1)) eax)
-  (:ignore eax)
+  (:temporary (:sc unsigned-reg :offset rax-offset :to (:result 1)) rax)
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 0
@@ -88,14 +90,15 @@
     (inst jmp :e DONE)
     (pushw list cons-car-slot list-pointer-lowtag)
     (loadw list list cons-cdr-slot list-pointer-lowtag)
-    (%test-lowtag list LOOP nil list-pointer-lowtag)
-    (error-call vop 'bogus-arg-to-values-list-error list)
+    (%test-lowtag list rax LOOP nil list-pointer-lowtag)
+    (cerror-call vop 'bogus-arg-to-values-list-error list)
 
     DONE
-    (inst mov count start)              ; start is high address
-    (inst sub count rsp-tn)             ; stackp is low address
-    #!-#.(cl:if (cl:= sb!vm:word-shift sb!vm:n-fixnum-tag-bits) '(and) '(or))
-    (inst shr count (- word-shift n-fixnum-tag-bits))))
+    (unless (eq (tn-kind count) :unused)
+      (inst mov count start)            ; start is high address
+      (inst sub count rsp-tn)           ; stackp is low address
+      #-#.(cl:if (cl:= sb-vm:word-shift sb-vm:n-fixnum-tag-bits) '(and) '(or))
+      (inst shr count (- word-shift n-fixnum-tag-bits)))))
 
 ;;; Copy the more arg block to the top of the stack so we can use them
 ;;; as function arguments.
@@ -108,11 +111,11 @@
 (define-vop (%more-arg-values)
   (:args (context :scs (descriptor-reg any-reg) :target src)
          (skip :scs (any-reg immediate))
-         (num :scs (any-reg) :target count))
+         (num :scs (any-reg) :target loop-index))
   (:arg-types * positive-fixnum positive-fixnum)
   (:temporary (:sc any-reg :offset rsi-offset :from (:argument 0)) src)
   (:temporary (:sc descriptor-reg :offset rax-offset) temp)
-  (:temporary (:sc unsigned-reg :offset rcx-offset) loop-index)
+  (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 2)) loop-index)
   (:results (start :scs (any-reg))
             (count :scs (any-reg)))
   (:generator 20
@@ -120,9 +123,7 @@
       (immediate
        (if (zerop (tn-value skip))
            (move src context)
-           (inst lea src (make-ea :dword :base context
-                                  :disp (- (* (tn-value skip)
-                                              n-word-bytes))))))
+           (inst lea src (ea (- (* (tn-value skip) n-word-bytes)) context))))
       (any-reg
        (cond ((= word-shift n-fixnum-tag-bits)
               (move src context)
@@ -133,13 +134,14 @@
               ;; With a stack size of about 2MB, the limit is absurd anyway.
               (inst neg skip)
               (inst lea src
-                    (make-ea :qword :base context :index skip
-                             :scale (ash 1 (- word-shift n-fixnum-tag-bits))))
+                    (ea context skip (ash 1 (- word-shift n-fixnum-tag-bits))))
               (inst neg skip)))))
-    (move count num)
 
-    (inst lea loop-index (make-ea :byte :index count
-                                  :scale (ash 1 (- word-shift n-fixnum-tag-bits))))
+    (unless (eq (tn-kind count) :unused)
+      (move count num))
+    (if (location= loop-index num)
+        (inst shl num (- word-shift n-fixnum-tag-bits))
+        (inst lea loop-index (ea nil num (ash 1 (- word-shift n-fixnum-tag-bits)))))
     (inst mov start rsp-tn)
     (inst jrcxz DONE)  ; check for 0 count?
 
@@ -147,9 +149,9 @@
     (inst sub src loop-index)
 
     LOOP
-    (inst mov temp (make-ea :qword :base src :index loop-index))
+    (inst mov temp (ea src loop-index))
     (inst sub loop-index n-word-bytes)
-    (inst mov (make-ea :qword :base rsp-tn :index loop-index) temp)
+    (inst mov (ea rsp-tn loop-index) temp)
     (inst jmp :nz LOOP)
 
     DONE))

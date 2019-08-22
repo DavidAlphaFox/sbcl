@@ -10,6 +10,7 @@
 #include "interrupt.h"
 #include "x86-darwin-os.h"
 #include "genesis/fdefn.h"
+#include "gc-internal.h" // for gencgc_handle_wp_violation
 
 #include <mach/mach.h>
 #include <mach/mach_error.h>
@@ -85,17 +86,15 @@ int arch_os_thread_init(struct thread *thread) {
 #endif
 #ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
     mach_lisp_thread_init(thread);
-#endif
-
-#ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+#elif defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)
     stack_t sigstack;
 
     /* Signal handlers are run on the control stack, so if it is exhausted
      * we had better use an alternate stack for whatever signal tells us
      * we've exhausted it */
-    sigstack.ss_sp=((void *) thread)+dynamic_values_bytes;
-    sigstack.ss_flags=0;
-    sigstack.ss_size = 32*SIGSTKSZ;
+    sigstack.ss_sp    = calc_altstack_base(thread);
+    sigstack.ss_flags = 0;
+    sigstack.ss_size  = calc_altstack_size(thread;
     sigaltstack(&sigstack,0);
 #endif
     return 1;                  /* success */
@@ -131,7 +130,7 @@ void memory_fault_handler(int signal, siginfo_t *siginfo,
 void build_fake_signal_context(os_context_t *context,
                                x86_thread_state32_t *thread_state,
                                x86_float_state32_t *float_state) {
-    pthread_sigmask(0, NULL, &context->uc_sigmask);
+    thread_sigmask(0, NULL, &context->uc_sigmask);
     context->uc_mcontext->SS = *thread_state;
     context->uc_mcontext->FS = *float_state;
 }
@@ -143,7 +142,7 @@ void update_thread_state_from_context(x86_thread_state32_t *thread_state,
                                       os_context_t *context) {
     *thread_state = context->uc_mcontext->SS;
     *float_state = context->uc_mcontext->FS;
-    pthread_sigmask(SIG_SETMASK, &context->uc_sigmask, NULL);
+    thread_sigmask(SIG_SETMASK, &context->uc_sigmask, NULL);
 }
 
 /* Modify a context to push new data on its stack. */
@@ -238,25 +237,10 @@ void signal_emulation_wrapper(x86_thread_state32_t *thread_state,
                               void (*handler)(int, siginfo_t *, void *))
 {
 
-    /* CLH: FIXME **NOTE: HACK ALERT!** Ideally, we would allocate
-     * context and regs on the stack as local variables, but this
-     * causes problems for the lisp debugger. When it walks the stack
-     * for a back trace, it sees the 1) address of the local variable
-     * on the stack and thinks that is a frame pointer to a lisp
-     * frame, and, 2) the address of the sap that we alloc'ed in
-     * dynamic space and thinks that is a return address, so it,
-     * heuristicly (and wrongly), chooses that this should be
-     * interpreted as a lisp frame instead of as a C frame.
-     * We can work around this in this case by os_validating the
-     * context (and regs just for symmetry).
-     */
+    os_context_t context;
+    _STRUCT_MCONTEXT32 regs;
 
-    os_context_t *context;
-    mcontext_t *regs;
-
-    context = (os_context_t*) os_validate(0, sizeof(os_context_t));
-    regs = (mcontext_t*) os_validate(0, sizeof(mcontext_t));
-    context->uc_mcontext = regs;
+    context.uc_mcontext = &regs;
 
     /* when BSD signals are fired, they mask they signals in sa_mask
        which always seem to be the blockable_sigset, for us, so we
@@ -265,17 +249,13 @@ void signal_emulation_wrapper(x86_thread_state32_t *thread_state,
        2) block blockable signals
        3) call the signal handler
        4) restore the sigmask */
+    build_fake_signal_context(&context, thread_state, float_state);
 
-    build_fake_signal_context(context, thread_state, float_state);
+    block_blockable_signals(0);
 
-    block_blockable_signals(0, 0);
+    handler(signal, siginfo, &context);
 
-    handler(signal, siginfo, context);
-
-    update_thread_state_from_context(thread_state, float_state, context);
-
-    os_invalidate((os_vm_address_t)context, sizeof(os_context_t));
-    os_invalidate((os_vm_address_t)regs, sizeof(mcontext_t));
+    update_thread_state_from_context(thread_state, float_state, &context);
 
     /* Trap to restore the signal context. */
     asm volatile (".long 0xffff0b0f"
@@ -287,7 +267,7 @@ void call_handler_on_thread(mach_port_t thread,
                             x86_thread_state32_t *thread_state,
                             int signal,
                             siginfo_t *siginfo,
-                            void (*handler)(int, siginfo_t *, void *))
+                            void (*handler)(int, siginfo_t *, os_context_t *))
 {
     x86_thread_state32_t new_state;
     x86_thread_state32_t *save_thread_state;
@@ -371,7 +351,7 @@ void dump_context(x86_thread_state32_t *thread_state)
 void
 control_stack_exhausted_handler(int signal, siginfo_t *siginfo,
                                 os_context_t *context) {
-
+    extern void unblock_signals_in_context_and_maybe_warn(os_context_t*);
     unblock_signals_in_context_and_maybe_warn(context);
     arrange_return_to_lisp_function
         (context, StaticSymbolFunction(CONTROL_STACK_EXHAUSTED_ERROR));
@@ -393,21 +373,21 @@ catch_exception_raise(mach_port_t exception_port,
 {
     x86_thread_state32_t thread_state;
     mach_msg_type_number_t state_count;
-    vm_address_t region_addr;
-    vm_size_t region_size;
-    vm_region_basic_info_data_t region_info;
-    mach_msg_type_number_t info_count;
-    mach_port_t region_name;
     void *addr = NULL;
     int signal = 0;
-    void (*handler)(int, siginfo_t *, void *) = NULL;
+    void (*handler)(int, siginfo_t *, os_context_t *) = NULL;
     siginfo_t siginfo;
-    kern_return_t ret, dealloc_ret;
+    kern_return_t ret = KERN_SUCCESS, dealloc_ret;
 
     struct thread *th;
 
     FSHOW((stderr,"/entering catch_exception_raise with exception: %d\n", exception));
-    th = *(struct thread**)exception_port;
+
+    if (mach_port_get_context(mach_task_self(), exception_port, (mach_vm_address_t *)&th)
+        != KERN_SUCCESS) {
+        lose("Can't find the thread for an exception %u", exception_port);
+    }
+
     /* Get state and info */
     state_count = x86_THREAD_STATE32_COUNT;
     if ((ret = thread_get_state(thread,
@@ -424,6 +404,14 @@ catch_exception_raise(mach_port_t exception_port,
             break;
         }
         addr = (void*)code_vector[1];
+        /* Just need to unprotect the page and do some bookkeeping, no need
+         * to run it from the faulting thread.
+         * And because the GC uses signals to stop the world it might
+         * interfere with that bookkeeping, because there's a window
+         * before block_blockable_signals is performed. */
+        if (gencgc_handle_wp_violation(addr))
+            goto do_not_handle;
+
         /* Undefined alien */
         if (os_trunc_to_page(addr) == undefined_alien_address) {
             handler = undefined_alien_handler;
@@ -494,6 +482,19 @@ catch_exception_raise(mach_port_t exception_port,
         /* Trap call */
         handler = sigtrap_handler;
         break;
+    case EXC_BREAKPOINT:
+        if (single_stepping) {
+            signal = SIGTRAP;
+            /* Clear TF or the signal emulation wrapper won't proceed
+               with single stepping enabled. */
+            thread_state.EFLAGS &= ~0x100;
+            handler = sigtrap_handler;
+            break;
+        } else if (*(unsigned char*)(thread_state.EIP-1) == 0xCC) {
+            signal = SIGTRAP;
+            handler = sigtrap_handler;
+            break;
+        }
     default:
         ret = KERN_INVALID_RIGHT;
     }
@@ -504,15 +505,13 @@ catch_exception_raise(mach_port_t exception_port,
       call_handler_on_thread(thread, &thread_state, signal, &siginfo, handler);
     }
 
-    if (current_mach_task == MACH_PORT_NULL)
-        current_mach_task = mach_task_self();
-
-    dealloc_ret = mach_port_deallocate (current_mach_task, thread);
+  do_not_handle:
+    dealloc_ret = mach_port_deallocate (mach_task_self(), thread);
     if (dealloc_ret) {
       lose("mach_port_deallocate (thread) failed with return_code %d\n", dealloc_ret);
     }
 
-    dealloc_ret = mach_port_deallocate (current_mach_task, task);
+    dealloc_ret = mach_port_deallocate (mach_task_self(), task);
     if (dealloc_ret) {
       lose("mach_port_deallocate (task) failed with return_code %d\n", dealloc_ret);
     }

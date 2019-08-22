@@ -13,16 +13,7 @@ HTMLFILES=sbcl.html asdf.html
 # Lisp's `pathname' function).
 DOCSTRINGDIR="docstrings/"
 CONTRIB_SRC_DIR="../../contrib/"
-CONTRIB_OBJ_DIR="../../obj/asdf-cache/"
 I_FLAGS=-I $(DOCSTRINGDIR) -I $(CONTRIB_SRC_DIR)
-# List of contrib modules that docstring docs will be created for.
-MODULES=':sb-md5 :sb-queue :sb-concurrency :sb-rotate-byte :sb-grovel \
-         :sb-sprof :sb-bsd-sockets :sb-cover :sb-posix'
-# List of package names that docstring docs will be created for.
-PACKAGES=":COMMON-LISP :SB-ALIEN :SB-DEBUG :SB-EXT :SB-GRAY :SB-MOP \
-          :SB-PCL :SB-SYS :SB-SEQUENCE :SB-UNICODE \
-          :SB-PROFILE :SB-THREAD :SB-MD5 :SB-QUEUE :SB-ROTATE-BYTE  \
-          :SB-SPROF :SB-BSD-SOCKETS :SB-COVER :SB-POSIX :SB-CONCURRENCY"
 
 # SBCL_SYSTEM is an optional argument to this make program. If this
 # variable is set, its contents are used as the command line for
@@ -44,7 +35,7 @@ ifeq ($(DVIPS),)
 endif
 
 .PHONY: all
-all: asdf.texinfo ps pdf info html
+all: $(ASDFTEXI) ps pdf info html
 
 .PHONY: dist
 dist: html pdf
@@ -52,6 +43,10 @@ dist: html pdf
 asdf.texinfo:
 	rm -f asdf.texinfo
 	ln -s ../../contrib/asdf/asdf.texinfo
+
+version.texinfo:
+	rm -f version.texinfo
+	ln -s ../../contrib/asdf/version.texinfo
 
 # html documentation; output in $(HTMLDIRS)
 .PHONY: html
@@ -62,8 +57,8 @@ html-stamp: $(DOCFILES) docstrings
 	@rm -f $(HTMLFILES)
 #	$(MAKEINFO) $(I_FLAGS) --html --css-include=style-multi.css $(SBCLTEXI)
 #	$(MAKEINFO) --html --css-include=style-multi.css $(ASDFTEXI)
-	$(MAKEINFO) $(I_FLAGS) --html --no-split --css-include=style-single.css $(SBCLTEXI)
-	$(MAKEINFO) --html --no-split --css-include=style-single.css $(ASDFTEXI)
+	$(MAKEINFO) $(I_FLAGS) --html --no-split --css-include=style-common.css --css-include=style-single.css $(SBCLTEXI)
+	$(MAKEINFO) --html --no-split --css-include=style-common.css --css-include=style-single.css $(ASDFTEXI)
 	touch html-stamp
 
 # Postscript documentation
@@ -71,18 +66,18 @@ html-stamp: $(DOCFILES) docstrings
 ps: $(PSFILES)
 
 %.ps: %.dvi
-	dvips -o $@ $<
+	dvips -q -o $@ $<
 
 # DVI generation
 %.dvi: %.texinfo $(DOCFILES) docstrings
-	texi2dvi $(I_FLAGS) $<
+	texi2dvi -q $(I_FLAGS) $<
 
 # PDF documentation
 .PHONY: pdf
 pdf: $(PDFFILES)
 
 %.pdf: %.texinfo $(DOCFILES) docstrings
-	$(TEXI2PDF) $(I_FLAGS) $<
+	$(TEXI2PDF) -q $(I_FLAGS) $<
 
 # info docfiles
 .PHONY: info
@@ -92,20 +87,8 @@ info: $(INFOFILES)
 	$(MAKEINFO) $(I_FLAGS) $<
 
 # Texinfo docstring snippets
-# Note: assumes contrib module names are the same as the names of
-# directories containing the modules, and that these directories
-# are in $(CONTRIB_OBJ_DIR).
-CONTRIB_FASLS=$(shell find $(shell echo $(MODULES) | sed "s|:|$(CONTRIB_OBJ_DIR)|g") -name '*.fasl')
-docstrings: $(CONTRIB_FASLS) tempfiles-stamp
-	for module in $(shell echo $(MODULES)); do \
-		test -f $(CONTRIB_OBJ_DIR)/`echo $$module | tr -d :`/test-passed.test-report \
-		|| { echo "The documented contrib $$module seems \
-                           to have failed its tests." && exit 1; } \
-	done
-	DOCSTRINGDIR=$(DOCSTRINGDIR) \
-	PACKAGES=$(PACKAGES) \
-	MODULES=$(MODULES) \
-	sh make-tempfiles.sh "$(SBCL_SYSTEM)" && touch $(DOCSTRINGDIR)
+docstrings variables.texinfo: tempfiles-stamp
+	sh make-tempfiles.sh "$(SBCL_SYSTEM)" "$(DOCSTRINGDIR)" && touch $(DOCSTRINGDIR)
 
 tempfiles-stamp:
 	touch tempfiles-stamp

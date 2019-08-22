@@ -11,22 +11,26 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_CONS
-#define SBCL_GENESIS_CONS 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_CONS
+#ifndef __ASSEMBLER__
 
 struct cons {
     lispobj car;
     lispobj cdr;
 };
+static inline struct cons* CONS(lispobj obj) {
+  return (struct cons*)(obj - 7);
+}
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
 #define CONS_CAR_OFFSET -7
 #define CONS_CDR_OFFSET 1
+#define CONS_SIZE 2
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_CONS */
+#endif

@@ -24,12 +24,7 @@
 ;;; be an interesting exercise for the reader.  (As would fixing some
 ;;; other marked issues).
 
-(defpackage "MOP-27"
-  (:use "CL" "SB-MOP"))
-
-(in-package "MOP-27")
-
-(defclass pattern-specializer (specializer)
+(defclass pattern-specializer (sb-mop:specializer)
   ((pattern :initarg pattern :reader pattern)
    (direct-methods :initform nil :reader specializer-direct-methods)))
 
@@ -42,20 +37,19 @@
 
 ;;; only one arg for now
 (defclass pattern-gf/1 (standard-generic-function) ()
-  (:metaclass funcallable-standard-class))
+  (:metaclass sb-mop:funcallable-standard-class))
 
-(defmethod compute-discriminating-function ((generic-function pattern-gf/1))
-  (lambda (arg)
-    (let* ((methods (generic-function-methods generic-function))
-           (function (method-interpreting-function methods generic-function)))
-      (set-funcallable-instance-function generic-function function)
-      (funcall function arg))))
-
-(defun method-interpreting-function (methods gf)
-  (lambda (arg)
-    (dolist (method methods (no-applicable-method gf (list arg)))
-      (when (matchesp arg (pattern (car (method-specializers method))))
-        (return (funcall (method-function method) (list arg) nil))))))
+(defmethod sb-pcl:specializer-type-specifier
+    ((proto-generic-function pattern-gf/1)
+     (proto-method t)
+     (specializer pattern-specializer))
+  (labels ((to-type (pattern)
+             (cond
+               ((null pattern) 't)
+               ((atom pattern) `(eql ,pattern))
+               (t `(cons ,(to-type (car pattern))
+                         ,(to-type (cdr pattern)))))))
+    (to-type (pattern specializer))))
 
 (defun matchesp (arg pattern)
   (cond
@@ -64,13 +58,25 @@
     (t (and (matchesp (car arg) (car pattern))
             (matchesp (cdr arg) (cdr pattern))))))
 
+(defun method-interpreting-function (methods gf)
+  (lambda (arg)
+    (dolist (method methods (no-applicable-method gf (list arg)))
+      (when (matchesp arg (pattern (first (sb-mop:method-specializers method))))
+        (return (funcall (sb-mop:method-function method) (list arg) nil))))))
+
+(defmethod sb-mop:compute-discriminating-function ((generic-function pattern-gf/1))
+  (lambda (arg)
+    (let* ((methods (sb-mop:generic-function-methods generic-function))
+           (function (method-interpreting-function methods generic-function)))
+      (sb-mop:set-funcallable-instance-function generic-function function)
+      (funcall function arg))))
 
 ;;; protocol functions.  SPECIALIZER-DIRECT-METHODS is implemented by
 ;;; a reader on the specializer.  FIXME: implement
 ;;; SPECIALIZER-DIRECT-GENERIC-FUNCTIONS.
-(defmethod add-direct-method ((specializer pattern-specializer) method)
+(defmethod sb-mop:add-direct-method ((specializer pattern-specializer) method)
   (pushnew method (slot-value specializer 'direct-methods)))
-(defmethod remove-direct-method ((specializer pattern-specializer) method)
+(defmethod sb-mop:remove-direct-method ((specializer pattern-specializer) method)
   (setf (slot-value specializer 'direct-methods)
         (remove method (slot-value specializer 'direct-methods))))
 
@@ -88,6 +94,8 @@
 (let ((specializer (ensure-pattern-specializer '(* 0 nil))))
   (eval `(defmethod simplify ((x ,specializer)) 0)))
 
-(assert (eql (simplify '(* 0 3)) 0))
-(assert (eql (simplify '(* (+ x y) 0)) 0))
-(assert (equal (simplify '(+ x y)) '(+ x y)))
+
+(with-test (:name (:mop-27))
+  (assert (eql (simplify '(* 0 3)) 0))
+  (assert (eql (simplify '(* (+ x y) 0)) 0))
+  (assert (equal (simplify '(+ x y)) '(+ x y))))

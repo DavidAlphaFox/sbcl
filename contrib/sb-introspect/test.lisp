@@ -66,7 +66,7 @@
 
 (define-modify-macro q (x) logand)
 
-(define-method-combination r nil)
+(define-method-combination r)
 
 (define-setf-expander s (a b)
   (format t "~a ~a~%" a b))
@@ -76,3 +76,20 @@
     :foo))
 
 (sb-ext:defglobal **global** 'value)
+
+(sb-alien:define-alien-type test-alien-type sb-alien:long)
+
+(sb-alien:define-alien-type nil
+  (struct test-alien-struct
+          (x sb-alien:system-area-pointer)))
+
+(sb-alien:define-alien-variable ("errno" test-alien-var) sb-alien:int)
+
+(define-condition test-condition (error)
+  ((a :reader condition-slot-reader
+      :writer condition-slot-writer)))
+
+(defun with-a-local-function ()
+  (flet ((x ()))
+    (declare (notinline x))
+    (x)))

@@ -76,6 +76,12 @@ os_context_sp_addr(os_context_t *context)
 }
 
 os_context_register_t *
+os_context_fp_addr(os_context_t *context)
+{
+    return CONTEXT_ADDR_FROM_STEM(rbp);
+}
+
+os_context_register_t *
 os_context_pc_addr(os_context_t *context)
 {
     return CONTEXT_ADDR_FROM_STEM(rip);
@@ -143,7 +149,6 @@ os_flush_icache(os_vm_address_t address, os_vm_size_t length)
 }
 
 int arch_os_thread_init(struct thread *thread) {
-    stack_t sigstack;
 #ifdef LISP_FEATURE_SB_THREAD
 #ifdef LISP_FEATURE_GCC_TLS
     current_thread = thread;
@@ -154,15 +159,14 @@ int arch_os_thread_init(struct thread *thread) {
 
 #ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
     mach_lisp_thread_init(thread);
-#endif
-
-#ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+#elif defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)
     /* Signal handlers are run on the control stack, so if it is exhausted
      * we had better use an alternate stack for whatever signal tells us
      * we've exhausted it */
-    sigstack.ss_sp=((void *) thread)+dynamic_values_bytes;
-    sigstack.ss_flags=0;
-    sigstack.ss_size = 32*SIGSTKSZ;
+    stack_t sigstack;
+    sigstack.ss_sp    = calc_altstack_base(thread);
+    sigstack.ss_flags = 0;
+    sigstack.ss_size  = calc_altstack_size(thread);
     sigaltstack(&sigstack,0);
 #endif
     return 1;                  /* success */
@@ -208,5 +212,11 @@ os_restore_fp_control(os_context_t *context)
         asm ("ldmxcsr %0" : : "m" (mxcsr));
         asm ("fldcw %0" : : "m" (cw));
     }
+}
+
+os_context_register_t *
+os_context_float_register_addr(os_context_t *context, int offset)
+{
+    return (os_context_register_t *)&context->sc_fpstate->fx_xmm[offset];
 }
 #endif

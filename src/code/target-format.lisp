@@ -9,12 +9,71 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!FORMAT")
+(in-package "SB-FORMAT")
 
 ;;;; FORMAT
 
+;;; This funcallable instance is used only as plain-old-data (conveying
+;;; just its slots, not the funcallable nature). Being a function, it
+;;; satisfies the type for the format-control argument of FORMAT, ERROR etc.
+;;; Also note that (DEFTYPE FORMAT-CONTROL) = (OR STRING FUNCTION).
+;;; And it's possible that we could decide to install a closure as
+;;; the fin-fun but I don't think that's necessary.
+(sb-kernel::!defstruct-with-alternate-metaclass fmt-control
+  :slot-names (string symbols memo)
+  :constructor %make-fmt-control
+  :superclass-name function
+  :metaclass-name static-classoid
+  :metaclass-constructor make-static-classoid
+  :dd-type funcallable-structure)
+
+(declaim (freeze-type fmt-control))
+
+(defmethod print-object ((self fmt-control) stream)
+  (print-unreadable-object (self stream :type t)
+    (write-string (unparse-fmt-control self) stream)))
+
+(defmethod print-object ((x format-directive) stream)
+  (print-unreadable-object (x stream)
+    (let ((fun (directive-function x)))
+      (write-string (directive-string x)
+                    stream
+                    :start (directive-start x)
+                    :end (- (directive-end x) (if fun 1 0)))
+      (when fun
+        (print-symbol-with-prefix stream fun)
+        (write-char #\/ stream)))))
+
+(defun dummy (&rest args) (error "Should not be called: ~S~%" args))
+
+(defun make-fmt-control (string symbols)
+  (let ((f (%make-fmt-control string symbols nil)))
+    (setf (%funcallable-instance-fun f) #'dummy)
+    f))
+
+(defun unparse-fmt-control (fmt)
+  (with-simple-output-to-string (s)
+    (write-char #\" s)
+    (let ((symbols (fmt-control-symbols fmt)))
+      (dolist (piece (tokenize-control-string (fmt-control-string fmt)))
+        (cond ((stringp piece)
+               (if (find #\Newline piece)
+                   (dovector (c piece)
+                     (if (char= c #\newline) (write-string "~%" s) (write-char c s)))
+                   (write-string piece s)))
+              (t
+               (let* ((userfun (eql (directive-character piece) #\/))
+                      (end (- (directive-end piece) (if userfun 1 0))))
+                 (write-string (directive-string piece)
+                               s
+                               :start (directive-start piece)
+                               :end end)
+                 (when userfun
+                   (print-symbol-with-prefix s (pop symbols))
+                   (write-char #\/ s)))))))
+    (write-char #\" s)))
+
 (defun format (destination control-string &rest format-arguments)
-  #!+sb-doc
   "Provides various facilities for formatting output.
   CONTROL-STRING contains a string to be output, possibly with embedded
   directives, which are flagged with the escape character \"~\". Directives
@@ -37,12 +96,14 @@
 
   FORMAT has many additional capabilities not described here. Consult the
   manual for details."
+  (declare (explicit-check)
+           (dynamic-extent format-arguments))
   (etypecase destination
     (null
-     (with-output-to-string (stream)
+     (with-simple-output-to-string (stream)
        (%format stream control-string format-arguments)))
     (string
-     (with-output-to-string (stream destination)
+     (with-simple-output-to-string (stream destination)
        (%format stream control-string format-arguments)))
     ((member t)
      (%format *standard-output* control-string format-arguments)
@@ -51,99 +112,94 @@
      (%format destination control-string format-arguments)
      nil)))
 
-(define-compiler-macro format (&whole form destination control &rest args)
-  (declare (ignore control args))
-  (when (stringp destination)
-    (warn "Literal string as destination in FORMAT:~%  ~S" form))
-  form)
-
 (defun %format (stream string-or-fun orig-args &optional (args orig-args))
-  (if (functionp string-or-fun)
+  (if (and (functionp string-or-fun) (not (typep string-or-fun 'fmt-control)))
       (apply string-or-fun stream args)
       (catch 'up-and-out
         (let* ((string (etypecase string-or-fun
                          (simple-string
                           string-or-fun)
                          (string
-                          (coerce string-or-fun 'simple-string))))
+                          (coerce string-or-fun 'simple-string))
+                         (fmt-control
+                          (fmt-control-string string-or-fun))))
                (*default-format-error-control-string* string)
-               (*logical-block-popper* nil))
-          (interpret-directive-list stream (tokenize-control-string string)
-                                    orig-args args)))))
+               (*logical-block-popper* nil)
+               (tokens
+                (if (functionp string-or-fun)
+                    (or (fmt-control-memo string-or-fun)
+                        ;; Memoize the parse back into the object
+                        (setf (fmt-control-memo string-or-fun)
+                              (%tokenize-control-string
+                               string 0 (length string)
+                               (fmt-control-symbols string-or-fun))))
+                    (tokenize-control-string string))))
+          (interpret-directive-list stream tokens orig-args args)))))
 
 (defun interpret-directive-list (stream directives orig-args args)
-  (if directives
-      (let ((directive (car directives)))
-        (etypecase directive
-          (simple-string
-           (write-string directive stream)
-           (interpret-directive-list stream (cdr directives) orig-args args))
-          (format-directive
-           (multiple-value-bind (new-directives new-args)
-               (let* ((character (format-directive-character directive))
-                      (function
-                       (typecase character
-                         (base-char
-                          (svref *format-directive-interpreters* (char-code character)))))
-                      (*default-format-error-offset*
-                       (1- (format-directive-end directive))))
-                 (unless function
-                   (error 'format-error
-                          :complaint "unknown format directive ~@[(character: ~A)~]"
-                          :args (list (char-name character))))
-                 (multiple-value-bind (new-directives new-args)
-                     (funcall function stream directive
-                              (cdr directives) orig-args args)
-                   (values new-directives new-args)))
-             (interpret-directive-list stream new-directives
-                                       orig-args new-args)))))
-      args))
+  (loop
+   (unless directives
+     (return args))
+   (let ((directive (car directives)))
+     (etypecase directive
+      (simple-string
+       (pop directives)
+       (write-string directive stream))
+      (format-directive
+       (let ((function (svref *format-directive-interpreters*
+                              (directive-code directive))))
+         (multiple-value-setq
+          (directives args)
+          (let ((*default-format-error-offset*
+                 (1- (directive-end directive))))
+            (if (functionp function)
+                (funcall function stream directive
+                         (cdr directives) orig-args args)
+                (format-error "Unknown format directive ~@[(character: ~A)~]"
+                              (directive-char-name directive)))))))))))
 
 ;;;; FORMAT directive definition macros and runtime support
 
-(eval-when (:compile-toplevel :execute)
-
 ;;; This macro is used to extract the next argument from the current arg list.
 ;;; This is the version used by format directive interpreters.
-(sb!xc:defmacro next-arg (&optional offset)
+(defmacro next-arg (&optional offset)
   `(progn
      (when (null args)
-       (error 'format-error
-              :complaint "no more arguments"
-              ,@(when offset
-                  `(:offset ,offset))))
+       (,@(if offset
+              `(format-error-at nil ,offset)
+              '(format-error))
+          "No more arguments"))
      (when *logical-block-popper*
        (funcall *logical-block-popper*))
      (pop args)))
 
-(sb!xc:defmacro def-complex-format-interpreter (char lambda-list &body body)
+(defmacro def-complex-format-interpreter (char lambda-list &body body)
   (let ((defun-name
             (intern (format nil
                             "~:@(~:C~)-FORMAT-DIRECTIVE-INTERPRETER"
                             char)))
-        (directive (sb!xc:gensym "DIRECTIVE"))
-        (directives (if lambda-list (car (last lambda-list)) (sb!xc:gensym "DIRECTIVES"))))
-    `(progn
-       (defun ,defun-name (stream ,directive ,directives orig-args args)
+        (directive '.directive) ; expose this var to the lambda. it's easiest
+        (directives (if lambda-list (car (last lambda-list)) (sb-xc:gensym "DIRECTIVES"))))
+    `(setf
+       (aref *format-directive-interpreters* (sb-xc:char-code (char-upcase ,char)))
+       (named-lambda ,defun-name (stream ,directive ,directives orig-args args)
          (declare (ignorable stream orig-args args))
          ,@(if lambda-list
                `((let ,(mapcar (lambda (var)
                                  `(,var
-                                   (,(symbolicate "FORMAT-DIRECTIVE-" var)
-                                    ,directive)))
+                                   (,(symbolicate "DIRECTIVE-" var) ,directive)))
                                (butlast lambda-list))
                    (values (progn ,@body) args)))
                `((declare (ignore ,directive ,directives))
-                 ,@body)))
-       (%set-format-directive-interpreter ,char #',defun-name))))
+                 ,@body))))))
 
-(sb!xc:defmacro def-format-interpreter (char lambda-list &body body)
-  (let ((directives (sb!xc:gensym "DIRECTIVES")))
+(defmacro def-format-interpreter (char lambda-list &body body)
+  (let ((directives (sb-xc:gensym "DIRECTIVES")))
     `(def-complex-format-interpreter ,char (,@lambda-list ,directives)
        ,@body
        ,directives)))
 
-(sb!xc:defmacro interpret-bind-defaults (specs params &body body)
+(defmacro interpret-bind-defaults (specs params &body body)
   (once-only ((params params))
     (collect ((bindings))
       (dolist (spec specs)
@@ -158,26 +214,20 @@
                                (t param)))))))
       `(let* ,(bindings)
          (when ,params
-           (error 'format-error
-                  :complaint
-                  "too many parameters, expected no more than ~W"
-                  :args (list ,(length specs))
-                  :offset (caar ,params)))
+           (format-error-at
+            nil (caar ,params)
+            "Too many parameters, expected no more than ~W" ,(length specs)))
          ,@body))))
-
-) ; EVAL-WHEN
 
 ;;;; format interpreters and support functions for simple output
 
 (defun format-write-field (stream string mincol colinc minpad padchar padleft)
   (when (and colinc (<= colinc 0))
-    (error 'format-error
-           :complaint "The value of colinc is ~a, should be a positive integer"
-           :args (list colinc)))
+    (format-error "The value of colinc is ~A, should be a positive integer"
+                  colinc))
   (when (and mincol (< mincol 0))
-    (error 'format-error
-           :complaint "The value of mincol is ~a, should be a non-negative integer"
-           :args (list mincol)))
+    (format-error "The value of mincol is ~A, should be a non-negative integer"
+                  mincol))
   (unless padleft
     (write-string string stream))
   (dotimes (i minpad)
@@ -236,9 +286,7 @@
   (interpret-bind-defaults () params
     (let ((arg (next-arg)))
       (unless (typep arg 'character)
-        (error 'format-error
-               :complaint "~s is not of type CHARACTER."
-               :args (list arg)))
+        (format-error "~S is not of type CHARACTER." arg))
       (cond (colonp
              (format-print-named-character arg stream))
             (atsignp
@@ -300,8 +348,7 @@
                    :start2 src :end2 (+ src commainterval)))
         new-string))))
 
-(eval-when (:compile-toplevel :execute)
-(sb!xc:defmacro interpret-format-integer (base)
+(defmacro interpret-format-integer (base)
   `(if (or colonp atsignp params)
        (interpret-bind-defaults
            ((mincol 0) (padchar #\space) (commachar #\,) (commainterval 3))
@@ -309,10 +356,8 @@
          (format-print-integer stream (next-arg) colonp atsignp ,base mincol
                                padchar commachar commainterval))
        (let ((*print-base* ,base)
-             (*print-radix* nil)
-             (*print-escape* nil))
-         (output-object (next-arg) stream))))
-) ; EVAL-WHEN
+             (*print-radix* nil))
+         (princ (next-arg) stream))))
 
 (def-format-interpreter #\D (colonp atsignp params)
   (interpret-format-integer 10))
@@ -332,11 +377,8 @@
        (commainterval 3))
       params
     (let ((arg (next-arg)))
-      (unless (or base
-                  (integerp arg))
-        (error 'format-error
-               :complaint "~s is not of type INTEGER."
-               :args (list arg)))
+      (unless (or base (integerp arg))
+        (format-error "~S is not of type INTEGER." arg))
       (if base
           (format-print-integer stream arg colonp atsignp base mincol
                                 padchar commachar commainterval)
@@ -348,50 +390,50 @@
                   (format-print-ordinal stream arg)
                   (format-print-cardinal stream arg)))))))
 
-(defparameter *cardinal-ones*
+(defconstant +cardinal-ones+
   #(nil "one" "two" "three" "four" "five" "six" "seven" "eight" "nine"))
 
-(defparameter *cardinal-tens*
+(defconstant +cardinal-tens+
   #(nil nil "twenty" "thirty" "forty"
         "fifty" "sixty" "seventy" "eighty" "ninety"))
 
-(defparameter *cardinal-teens*
+(defconstant +cardinal-teens+
   #("ten" "eleven" "twelve" "thirteen" "fourteen"  ;;; RAD
     "fifteen" "sixteen" "seventeen" "eighteen" "nineteen"))
 
-(defparameter *cardinal-periods*
+(defconstant +cardinal-periods+
   #("" " thousand" " million" " billion" " trillion" " quadrillion"
     " quintillion" " sextillion" " septillion" " octillion" " nonillion"
     " decillion" " undecillion" " duodecillion" " tredecillion"
     " quattuordecillion" " quindecillion" " sexdecillion" " septendecillion"
     " octodecillion" " novemdecillion" " vigintillion"))
 
-(defparameter *ordinal-ones*
+(defconstant +ordinal-ones+
   #(nil "first" "second" "third" "fourth"
         "fifth" "sixth" "seventh" "eighth" "ninth"))
 
-(defparameter *ordinal-tens*
+(defconstant +ordinal-tens+
   #(nil "tenth" "twentieth" "thirtieth" "fortieth"
         "fiftieth" "sixtieth" "seventieth" "eightieth" "ninetieth"))
 
 (defun format-print-small-cardinal (stream n)
   (multiple-value-bind (hundreds rem) (truncate n 100)
     (when (plusp hundreds)
-      (write-string (svref *cardinal-ones* hundreds) stream)
+      (write-string (svref +cardinal-ones+ hundreds) stream)
       (write-string " hundred" stream)
       (when (plusp rem)
         (write-char #\space stream)))
     (when (plusp rem)
       (multiple-value-bind (tens ones) (truncate rem 10)
         (cond ((< 1 tens)
-              (write-string (svref *cardinal-tens* tens) stream)
+              (write-string (svref +cardinal-tens+ tens) stream)
               (when (plusp ones)
                 (write-char #\- stream)
-                (write-string (svref *cardinal-ones* ones) stream)))
+                (write-string (svref +cardinal-ones+ ones) stream)))
              ((= tens 1)
-              (write-string (svref *cardinal-teens* ones) stream))
+              (write-string (svref +cardinal-teens+ ones) stream))
              ((plusp ones)
-              (write-string (svref *cardinal-ones* ones) stream)))))))
+              (write-string (svref +cardinal-ones+ ones) stream)))))))
 
 (defun format-print-cardinal (stream n)
   (cond ((minusp n)
@@ -405,14 +447,14 @@
 (defun format-print-cardinal-aux (stream n period err)
   (multiple-value-bind (beyond here) (truncate n 1000)
     (unless (<= period 21)
-      (error "number too large to print in English: ~:D" err))
+      (error "Number too large to print in English: ~:D" err))
     (unless (zerop beyond)
       (format-print-cardinal-aux stream beyond (1+ period) err))
     (unless (zerop here)
       (unless (zerop beyond)
         (write-char #\space stream))
       (format-print-small-cardinal stream here)
-      (write-string (svref *cardinal-periods* period) stream))))
+      (write-string (svref +cardinal-periods+ period) stream))))
 
 (defun format-print-ordinal (stream n)
   (when (minusp n)
@@ -426,16 +468,16 @@
       (multiple-value-bind (tens ones) (truncate bot 10)
         (cond ((= bot 12) (write-string "twelfth" stream))
               ((= tens 1)
-               (write-string (svref *cardinal-teens* ones) stream);;;RAD
+               (write-string (svref +cardinal-teens+ ones) stream);;;RAD
                (write-string "th" stream))
               ((and (zerop tens) (plusp ones))
-               (write-string (svref *ordinal-ones* ones) stream))
+               (write-string (svref +ordinal-ones+ ones) stream))
               ((and (zerop ones)(plusp tens))
-               (write-string (svref *ordinal-tens* tens) stream))
+               (write-string (svref +ordinal-tens+ tens) stream))
               ((plusp bot)
-               (write-string (svref *cardinal-tens* tens) stream)
+               (write-string (svref +cardinal-tens+ tens) stream)
                (write-char #\- stream)
-               (write-string (svref *ordinal-ones* ones) stream))
+               (write-string (svref +ordinal-ones+ ones) stream))
               ((plusp number)
                (write-string "th" stream))
               (t
@@ -484,8 +526,7 @@
   (interpret-bind-defaults () params
     (let ((arg (if colonp
                    (if (eq orig-args args)
-                       (error 'format-error
-                              :complaint "no previous argument")
+                       (format-error "No previous argument")
                        (do ((arg-ptr orig-args (cdr arg-ptr)))
                            ((eq (cdr arg-ptr) args)
                             (car arg-ptr))))
@@ -499,11 +540,13 @@
 (defun decimal-string (n)
   (write-to-string n :base 10 :radix nil :escape nil))
 
+;;; TODO: many of the the CHECK-MODIFIER calls in the directive interpreters
+;;; can be checked at tokenization time, which benefits from the fact that
+;;; a string is only tokenized once (unless evicted from cache).
+;;; Repeated calls using the same format control need not repeatedly check
+;;; for correctness of the string.
 (def-format-interpreter #\F (colonp atsignp params)
-  (when colonp
-    (error 'format-error
-           :complaint
-           "cannot specify the colon modifier with this directive"))
+  (check-modifier "colon" colonp)
   (interpret-bind-defaults ((w nil) (d nil) (k nil) (ovf nil) (pad #\space))
                            params
     (format-fixed stream (next-arg) w d k ovf pad atsignp)))
@@ -518,7 +561,8 @@
     (number
      (format-write-field stream (decimal-string number) w 1 0 #\space t))
     (t
-     (format-princ stream number nil nil w 1 0 pad))))
+     (let ((*print-base* 10))
+      (format-princ stream number nil nil w 1 0 pad)))))
 
 ;;; We return true if we overflowed, so that ~G can output the overflow char
 ;;; instead of spaces.
@@ -530,13 +574,13 @@
      (prin1 number stream)
      nil)
     (t
-     (sb!impl::string-dispatch (single-float double-float)
+     (sb-impl::string-dispatch (single-float double-float)
          number
        (let ((spaceleft w))
-         (when (and w (or atsign (minusp (float-sign number))))
+         (when (and w (or atsign (= (float-sign-bit number) 1)))
            (decf spaceleft))
          (multiple-value-bind (str len lpoint tpoint)
-             (sb!impl::flonum-to-string (abs number) spaceleft d k)
+             (sb-impl::flonum-to-string (abs number) spaceleft d k)
            ;; if caller specifically requested no fraction digits, suppress the
            ;; optional trailing zero
            (when (and d (zerop d))
@@ -562,7 +606,7 @@
                   (when w
                     (dotimes (i spaceleft)
                       (write-char pad stream)))
-                  (if (minusp (float-sign number))
+                  (if (= (float-sign-bit number) 1)
                       (write-char #\- stream)
                       (when atsign
                         (write-char #\+ stream)))
@@ -574,10 +618,7 @@
                   nil))))))))
 
 (def-format-interpreter #\E (colonp atsignp params)
-  (when colonp
-    (error 'format-error
-           :complaint
-           "cannot specify the colon modifier with this directive"))
+  (check-modifier "colon" colonp)
   (interpret-bind-defaults
       ((w nil) (d nil) (e nil) (k 1) (ovf nil) (pad #\space) (mark nil))
       params
@@ -594,10 +635,18 @@
               (format-write-field stream
                                   (decimal-string number)
                                   w 1 0 #\space t)))
-      (format-princ stream number nil nil w 1 0 pad)))
+      (let ((*print-base* 10))
+        (format-princ stream number nil nil w 1 0 pad))))
 
 (defun format-exponent-marker (number)
-  (if (typep number *read-default-float-format*)
+  (if (case *read-default-float-format*
+        ((short-float single-float)
+         (typep number 'single-float))
+        ((double-float #-long-float long-float)
+         (typep number 'double-float))
+        #+long-float
+        (long-float
+         (typep number 'long-float)))
       #\e
       (typecase number
         (single-float #\f)
@@ -622,22 +671,22 @@
   (if (or (float-infinity-p number)
           (float-nan-p number))
       (prin1 number stream)
-      (multiple-value-bind (num expt) (sb!impl::scale-exponent (abs number))
-        (let* ((k (if (= num 1.0) (1- k) k))
+      (multiple-value-bind (num expt) (sb-impl::scale-exponent (abs number))
+        (let* ((k (if (= num $1.0) (1- k) k))
                (expt (- expt k))
                (estr (decimal-string (abs expt)))
                (elen (if e (max (length estr) e) (length estr)))
                spaceleft)
           (when w
             (setf spaceleft (- w 2 elen))
-            (when (or atsign (minusp (float-sign number)))
+            (when (or atsign (= (float-sign-bit number) 1))
               (decf spaceleft)))
           (if (and w ovf e (> elen e))  ;exponent overflow
               (dotimes (i w) (write-char ovf stream))
               (let* ((fdig (if d (if (plusp k) (1+ (- d k)) d) nil))
                      (fmin (if (minusp k) 1 fdig)))
                 (multiple-value-bind (fstr flen lpoint tpoint)
-                    (sb!impl::flonum-to-string num spaceleft fdig k fmin)
+                    (sb-impl::flonum-to-string num spaceleft fdig k fmin)
                   (when (and d (zerop d)) (setq tpoint nil))
                   (when w
                     (decf spaceleft flen)
@@ -652,7 +701,7 @@
                          (dotimes (i w) (write-char ovf stream)))
                         (t (when w
                              (dotimes (i spaceleft) (write-char pad stream)))
-                           (if (minusp (float-sign number))
+                           (if (= (float-sign-bit number) 1)
                                (write-char #\- stream)
                                (if atsign (write-char #\+ stream)))
                            (when lpoint (write-char #\0 stream))
@@ -669,10 +718,7 @@
                            (write-string estr stream))))))))))
 
 (def-format-interpreter #\G (colonp atsignp params)
-  (when colonp
-    (error 'format-error
-           :complaint
-           "cannot specify the colon modifier with this directive"))
+  (check-modifier "colon" colonp)
   (interpret-bind-defaults
       ((w nil) (d nil) (e nil) (k nil) (ovf nil) (pad #\space) (mark nil))
       params
@@ -689,7 +735,8 @@
               (format-write-field stream
                                   (decimal-string number)
                                   w 1 0 #\space t)))
-      (format-princ stream number nil nil w 1 0 pad)))
+      (let ((*print-base* 10))
+        (format-princ stream number nil nil w 1 0 pad))))
 
 ;;; Raymond Toy writes: same change as for format-exp-aux
 (defun format-general-aux (stream number w d e k ovf pad marker atsign)
@@ -697,7 +744,7 @@
   (if (or (float-infinity-p number)
           (float-nan-p number))
       (prin1 number stream)
-      (multiple-value-bind (ignore n) (sb!impl::scale-exponent (abs number))
+      (multiple-value-bind (ignore n) (sb-impl::scale-exponent (abs number))
         (declare (ignore ignore))
         ;; KLUDGE: Default d if omitted. The procedure is taken directly from
         ;; the definition given in the manual, and is not very efficient, since
@@ -705,7 +752,7 @@
         ;; improve on this. -- rtoy?? 1998??
         (unless d
           (multiple-value-bind (str len)
-              (sb!impl::flonum-to-string (abs number))
+              (sb-impl::flonum-to-string (abs number))
             (declare (ignore str))
             (let ((q (if (= len 1) 1 (1- len))))
               (setq d (max q (min n 7))))))
@@ -734,12 +781,12 @@
     ;; thing, and at least the user shouldn't be surprised.
     (setq number (coerce number 'single-float)))
   (if (floatp number)
-      (let* ((signstr (if (minusp (float-sign number))
+      (let* ((signstr (if (= (float-sign-bit number) 1)
                           "-"
                           (if atsign "+" "")))
              (signlen (length signstr)))
         (multiple-value-bind (str strlen ig2 ig3 pointplace)
-            (sb!impl::flonum-to-string number nil d nil)
+            (sb-impl::flonum-to-string (abs number) nil d nil)
           (declare (ignore ig2 ig3 strlen))
           (when colon
             (write-string signstr stream))
@@ -750,26 +797,23 @@
           (dotimes (i (- n pointplace))
             (write-char #\0 stream))
           (write-string str stream)))
-      (format-write-field stream
-                          (decimal-string number)
-                          w 1 0 #\space t)))
+      (let ((*print-base* 10))
+        (format-write-field stream
+                            (princ-to-string number)
+                            w 1 0 #\space t))))
 
 ;;;; FORMAT interpreters and support functions for line/page breaks etc.
 
 (def-format-interpreter #\% (colonp atsignp params)
-  (when (or colonp atsignp)
-    (error 'format-error
-           :complaint
-           "cannot specify either colon or atsign for this directive"))
+  (check-modifier "colon" colonp)
+  (check-modifier "at-sign" atsignp)
   (interpret-bind-defaults ((count 1)) params
     (dotimes (i count)
       (terpri stream))))
 
 (def-format-interpreter #\& (colonp atsignp params)
-  (when (or colonp atsignp)
-    (error 'format-error
-           :complaint
-           "cannot specify either colon or atsign for this directive"))
+  (check-modifier "colon" colonp)
+  (check-modifier "at-sign" atsignp)
   (interpret-bind-defaults ((count 1)) params
     (when (plusp count)
       (fresh-line stream)
@@ -777,38 +821,25 @@
        (terpri stream)))))
 
 (def-format-interpreter #\| (colonp atsignp params)
-  (when (or colonp atsignp)
-    (error 'format-error
-           :complaint
-           "cannot specify either colon or atsign for this directive"))
+  (check-modifier "colon" colonp)
+  (check-modifier "at-sign" atsignp)
   (interpret-bind-defaults ((count 1)) params
     (dotimes (i count)
       (write-char (code-char form-feed-char-code) stream))))
 
 (def-format-interpreter #\~ (colonp atsignp params)
-  (when (or colonp atsignp)
-    (error 'format-error
-           :complaint
-           "cannot specify either colon or atsign for this directive"))
+  (check-modifier "colon" colonp)
+  (check-modifier "at-sign" atsignp)
   (interpret-bind-defaults ((count 1)) params
     (dotimes (i count)
       (write-char #\~ stream))))
 
+;;; We'll only get here when the directive usage is illegal.
+;;; COMBINE-DIRECTIVES would have handled a legal directive.
 (def-complex-format-interpreter #\newline (colonp atsignp params directives)
-  (when (and colonp atsignp)
-    (error 'format-error
-           :complaint
-           "cannot specify both colon and atsign for this directive"))
-  (interpret-bind-defaults () params
-    (when atsignp
-      (write-char #\newline stream)))
-  (if (and (not colonp)
-           directives
-           (simple-string-p (car directives)))
-      (cons (string-left-trim *format-whitespace-chars*
-                              (car directives))
-            (cdr directives))
-      directives))
+  (check-modifier '("colon" "at-sign") (and colonp atsignp))
+  (interpret-bind-defaults () params)
+  (bug "Unreachable ~S" directives))
 
 ;;;; format interpreters and support functions for tabs and simple pretty
 ;;;; printing
@@ -833,18 +864,18 @@
     (write-string spaces stream :end n)))
 
 (defun format-relative-tab (stream colrel colinc)
-  (if (sb!pretty:pretty-stream-p stream)
+  (if (sb-pretty:pretty-stream-p stream)
       (pprint-tab :line-relative colrel colinc stream)
-      (let* ((cur (sb!impl::charpos stream))
+      (let* ((cur (sb-impl::charpos stream))
              (spaces (if (and cur (plusp colinc))
                          (- (* (ceiling (+ cur colrel) colinc) colinc) cur)
                          colrel)))
         (output-spaces stream spaces))))
 
 (defun format-absolute-tab (stream colnum colinc)
-  (if (sb!pretty:pretty-stream-p stream)
+  (if (sb-pretty:pretty-stream-p stream)
       (pprint-tab :line colnum colinc stream)
-      (let ((cur (sb!impl::charpos stream)))
+      (let ((cur (sb-impl::charpos stream)))
         (cond ((null cur)
                (write-string "  " stream))
               ((< cur colnum)
@@ -866,61 +897,48 @@
                     stream)))
 
 (def-format-interpreter #\I (colonp atsignp params)
-  (when atsignp
-    (error 'format-error
-           :complaint "cannot specify the at-sign modifier"))
+  (check-modifier "at-sign" atsignp)
   (interpret-bind-defaults ((n 0)) params
     (pprint-indent (if colonp :current :block) n stream)))
 
 ;;;; format interpreter for ~*
 
 (def-format-interpreter #\* (colonp atsignp params)
-  (if atsignp
-      (if colonp
-          (error 'format-error
-                 :complaint "cannot specify both colon and at-sign")
-          (interpret-bind-defaults ((posn 0)) params
-            (if (<= 0 posn (length orig-args))
-                (setf args (nthcdr posn orig-args))
-                (error 'format-error
-                       :complaint "Index ~W is out of bounds. (It should ~
-                                   have been between 0 and ~W.)"
-                       :args (list posn (length orig-args))))))
-      (if colonp
-          (interpret-bind-defaults ((n 1)) params
-            (do ((cur-posn 0 (1+ cur-posn))
-                 (arg-ptr orig-args (cdr arg-ptr)))
-                ((eq arg-ptr args)
-                 (let ((new-posn (- cur-posn n)))
-                   (if (<= 0 new-posn (length orig-args))
-                       (setf args (nthcdr new-posn orig-args))
-                       (error 'format-error
-                              :complaint
-                              "Index ~W is out of bounds. (It should
-                               have been between 0 and ~W.)"
-                              :args
-                              (list new-posn (length orig-args))))))))
-          (interpret-bind-defaults ((n 1)) params
-            (dotimes (i n)
-              (next-arg))))))
+  (check-modifier '("colon" "at-sign") (and colonp atsignp))
+  (flet ((lose (index)
+           (format-error "Index ~W is out of bounds. It should have ~
+                          been between 0 and ~W."
+                         index (length orig-args))))
+    (if atsignp
+        (interpret-bind-defaults ((posn 0)) params
+          (if (<= 0 posn (length orig-args))
+              (setf args (nthcdr posn orig-args))
+              (lose posn)))
+        (if colonp
+            (interpret-bind-defaults ((n 1)) params
+              (do ((cur-posn 0 (1+ cur-posn))
+                   (arg-ptr orig-args (cdr arg-ptr)))
+                  ((eq arg-ptr args)
+                   (let ((new-posn (- cur-posn n)))
+                     (if (<= 0 new-posn (length orig-args))
+                         (setf args (nthcdr new-posn orig-args))
+                         (lose new-posn))))))
+            (interpret-bind-defaults ((n 1)) params
+              (dotimes (i n)
+                (next-arg)))))))
 
 ;;;; format interpreter for indirection
 
 (def-format-interpreter #\? (colonp atsignp params string end)
-  (when colonp
-    (error 'format-error
-           :complaint "cannot specify the colon modifier"))
+  (check-modifier "colon" colonp)
   (interpret-bind-defaults () params
     (handler-bind
         ((format-error
           (lambda (condition)
-            (error 'format-error
-                   :complaint
-                   "~A~%while processing indirect format string:"
-                   :args (list condition)
-                   :print-banner nil
-                   :control-string string
-                   :offset (1- end)))))
+            (format-error-at*
+             string (1- end)
+             "~A~%while processing indirect format string:" (list condition)
+             :print-banner nil))))
       (if atsignp
           (setf args (%format stream (next-arg) orig-args args))
           (%format stream (next-arg) (next-arg))))))
@@ -928,10 +946,8 @@
 ;;;; format interpreters for capitalization
 
 (def-complex-format-interpreter #\( (colonp atsignp params directives)
-  (let ((close (find-directive directives #\) nil)))
-    (unless close
-      (error 'format-error
-             :complaint "no corresponding close paren"))
+  (let ((close (or (find-directive directives #\) nil)
+                   (format-error "No corresponding close paren"))))
     (interpret-bind-defaults () params
       (let* ((posn (position close directives))
              (before (subseq directives 0 posn))
@@ -948,77 +964,65 @@
         after))))
 
 (def-complex-format-interpreter #\) ()
-  (error 'format-error
-         :complaint "no corresponding open paren"))
+  (format-error "no corresponding open paren"))
 
 ;;;; format interpreters and support functions for conditionalization
 
 (def-complex-format-interpreter #\[ (colonp atsignp params directives)
+  (check-modifier '("colon" "at-sign") (and atsignp colonp))
   (multiple-value-bind (sublists last-semi-with-colon-p remaining)
       (parse-conditional-directive directives)
     (setf args
-          (if atsignp
-              (if colonp
-                  (error 'format-error
-                         :complaint
-                     "cannot specify both the colon and at-sign modifiers")
-                  (if (cdr sublists)
-                      (error 'format-error
-                             :complaint
-                             "can only specify one section")
-                      (interpret-bind-defaults () params
-                        (let ((prev-args args)
-                              (arg (next-arg)))
-                          (if arg
-                              (interpret-directive-list stream
-                                                        (car sublists)
-                                                        orig-args
-                                                        prev-args)
-                              args)))))
-              (if colonp
-                  (if (= (length sublists) 2)
-                      (interpret-bind-defaults () params
-                        (if (next-arg)
-                            (interpret-directive-list stream (car sublists)
-                                                      orig-args args)
-                            (interpret-directive-list stream (cadr sublists)
-                                                      orig-args args)))
-                      (error 'format-error
-                             :complaint
-                             "must specify exactly two sections"))
-                  (interpret-bind-defaults ((index (next-arg))) params
-                    (let* ((default (and last-semi-with-colon-p
-                                         (pop sublists)))
-                           (last (1- (length sublists)))
-                           (sublist
-                            (if (<= 0 index last)
-                                (nth (- last index) sublists)
-                                default)))
-                      (interpret-directive-list stream sublist orig-args
-                                                args))))))
+          (cond
+            (atsignp
+             (when (cdr sublists)
+               (format-error "Can only specify one section"))
+             (interpret-bind-defaults () params
+               (let ((prev-args args)
+                     (arg (next-arg)))
+                 (if arg
+                     (interpret-directive-list
+                      stream (car sublists) orig-args prev-args)
+                     args))))
+            (colonp
+             (unless (= (length sublists) 2)
+               (format-error "Must specify exactly two sections"))
+             (interpret-bind-defaults () params
+               (if (next-arg)
+                   (interpret-directive-list stream (car sublists)
+                                             orig-args args)
+                   (interpret-directive-list stream (cadr sublists)
+                                             orig-args args))))
+            (t
+             (interpret-bind-defaults ((index (next-arg))) params
+               (let ((default (and last-semi-with-colon-p
+                                   (pop sublists)))
+                     (last (1- (length sublists))))
+                 (unless (integerp index)
+                   (format-error
+                    "The argument to ~~[ is not an integer: ~A" index))
+                 (interpret-directive-list stream
+                                           (if (<= 0 index last)
+                                               (nth (- last index) sublists)
+                                               default)
+                                           orig-args
+                                           args))))))
     remaining))
 
 (def-complex-format-interpreter #\; ()
-  (error 'format-error
-         :complaint
-         "~~; not contained within either ~~[...~~] or ~~<...~~>"))
+  (format-error "~~; not contained within either ~~[...~~] or ~~<...~~>"))
 
 (def-complex-format-interpreter #\] ()
-  (error 'format-error
-         :complaint
-         "no corresponding open bracket"))
+  (format-error "No corresponding open bracket"))
 
 ;;;; format interpreter for up-and-out
 
 (defvar *outside-args*)
 
 (def-format-interpreter #\^ (colonp atsignp params)
-  (when atsignp
-    (error 'format-error
-           :complaint "cannot specify the at-sign modifier"))
+  (check-modifier "at-sign" atsignp)
   (when (and colonp (not *up-up-and-out-allowed*))
-    (error 'format-error
-           :complaint "attempt to use ~~:^ outside a ~~:{...~~} construct"))
+    (format-error "Attempt to use ~~:^ outside a ~~:{...~~} construct"))
   (when (interpret-bind-defaults ((arg1 nil) (arg2 nil) (arg3 nil)) params
           (cond (arg3 (<= arg1 arg2 arg3))
                 (arg2 (eql arg1 arg2))
@@ -1033,13 +1037,10 @@
 
 (def-complex-format-interpreter #\{
                                 (colonp atsignp params string end directives)
-  (let ((close (find-directive directives #\} nil)))
-    (unless close
-      (error 'format-error
-             :complaint
-             "no corresponding close brace"))
+  (let ((close (or (find-directive directives #\} nil)
+                   (format-error "No corresponding close brace"))))
     (interpret-bind-defaults ((max-count nil)) params
-      (let* ((closed-with-colon (format-directive-colonp close))
+      (let* ((closed-with-colon (directive-colonp close))
              (posn (position close directives))
              (insides (if (zerop posn)
                           (next-arg)
@@ -1051,14 +1052,11 @@
                    (handler-bind
                        ((format-error
                          (lambda (condition)
-                           (error
-                            'format-error
-                            :complaint
+                           (format-error-at*
+                            string (1- end)
                             "~A~%while processing indirect format string:"
-                            :args (list condition)
-                            :print-banner nil
-                            :control-string string
-                            :offset (1- end)))))
+                            (list condition)
+                            :print-banner nil))))
                      (%format stream insides orig-args args))
                    (interpret-directive-list stream insides
                                              orig-args args)))
@@ -1090,8 +1088,7 @@
           (nthcdr (1+ posn) directives))))))
 
 (def-complex-format-interpreter #\} ()
-  (error 'format-error
-         :complaint "no corresponding open brace"))
+  (format-error "No corresponding open brace"))
 
 ;;;; format interpreters and support functions for justification
 
@@ -1100,7 +1097,7 @@
   (multiple-value-bind (segments first-semi close remaining)
       (parse-format-justification directives)
     (setf args
-          (if (format-directive-colonp close) ; logical block vs. justification
+          (if (directive-colonp close) ; logical block vs. justification
               (multiple-value-bind (prefix per-line-p insides suffix)
                   (parse-format-logical-block segments colonp first-semi
                                               close params string end)
@@ -1111,20 +1108,20 @@
                 (when (> count 0)
                   ;; ANSI specifies that "an error is signalled" in this
                   ;; situation.
-                  (error 'format-error
-                         :complaint "~D illegal directive~:P found inside justification block"
-                         :args (list count)
-                         :references (list '(:ansi-cl :section (22 3 5 2)))))
+                  (format-error*
+                   "~D illegal directive~:P found inside justification block"
+                   (list count)
+                   :references '((:ansi-cl :section (22 3 5 2)))))
                 ;; ANSI does not explicitly say that an error should
                 ;; be signalled, but the @ modifier is not explicitly
                 ;; allowed for ~> either.
-                (when (format-directive-atsignp close)
-                  (error 'format-error
-                         :complaint "@ modifier not allowed in close ~
-                         directive of justification ~
-                         block (i.e. ~~<...~~@>."
-                         :offset (1- (format-directive-end close))
-                         :references (list '(:ansi-cl :section (22 3 6 2)))))
+                (when (directive-atsignp close)
+                  (format-error-at*
+                   nil (1- (directive-end close))
+                   "@ modifier not allowed in close directive of ~
+                    justification block (i.e. ~~<...~~@>."
+                   '()
+                   :references '((:ansi-cl :section (22 3 6 2)))))
                 (interpret-format-justification stream orig-args args
                                                 segments colonp atsignp
                                                 first-semi params))))
@@ -1141,13 +1138,13 @@
           (line-len 0))
       (setf args
             (catch 'up-and-out
-              (when (and first-semi (format-directive-colonp first-semi))
+              (when (and first-semi (directive-colonp first-semi))
                 (interpret-bind-defaults
                     ((extra 0)
-                     (len (or (sb!impl::line-length stream) 72)))
-                    (format-directive-params first-semi)
+                     (len (or (sb-impl::line-length stream) 72)))
+                    (directive-params first-semi)
                   (setf newline-string
-                        (with-output-to-string (stream)
+                        (with-simple-output-to-string (stream)
                           (setf args
                                 (interpret-directive-list stream
                                                           (pop segments)
@@ -1156,7 +1153,7 @@
                   (setf extra-space extra)
                   (setf line-len len)))
               (dolist (segment segments)
-                (push (with-output-to-string (stream)
+                (push (with-simple-output-to-string (stream)
                         (setf args
                               (interpret-directive-list stream segment
                                                         orig-args args)))
@@ -1181,7 +1178,7 @@
                      mincol))
          (padding (+ (- length chars) (* num-gaps minpad))))
     (when (and newline-prefix
-               (> (+ (or (sb!impl::charpos stream) 0)
+               (> (+ (or (sb-impl::charpos stream) 0)
                      length extra-space)
                   line-len))
       (write-string newline-prefix stream))
@@ -1223,7 +1220,8 @@
 ;;;; format interpreter and support functions for user-defined method
 
 (def-format-interpreter #\/ (string start end colonp atsignp params)
-  (let ((symbol (extract-user-fun-name string start end)))
+  (let ((symbol (or (directive-function .directive)
+                    (the symbol (extract-user-fun-name string start end)))))
     (collect ((args))
       (dolist (param-and-offset params)
         (let ((param (cdr param-and-offset)))
@@ -1231,4 +1229,11 @@
             (:arg (args (next-arg)))
             (:remaining (args (length args)))
             (t (args param)))))
-      (apply (fdefinition symbol) stream (next-arg) colonp atsignp (args)))))
+      (apply symbol stream (next-arg) colonp atsignp (args)))))
+
+(push '("SB-FORMAT"
+        def-format-directive def-complex-format-directive
+        def-format-interpreter def-complex-format-interpreter
+        interpret-bind-defaults interpret-format-integer next-arg
+        %set-format-directive-expander)
+      *!removable-symbols*)

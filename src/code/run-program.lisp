@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB-IMPL") ;(SB-IMPL, not SB!IMPL, since we're built in warm load.)
+(in-package "SB-IMPL")
 
 ;;;; hacking the Unix environment
 ;;;;
@@ -49,7 +49,6 @@
 (progn
   (define-alien-routine wrapped-environ (* c-string))
   (defun posix-environ ()
-    #+sb-doc
     "Return the Unix environment (\"man environ\") as a list of SIMPLE-STRINGs."
     (c-strings->string-list (wrapped-environ))))
 
@@ -104,8 +103,6 @@
        (concatenate 'simple-string (symbol-name key) "=" val)))
    cmucl))
 
-;;;; Import wait3(2) from Unix.
-
 #-win32
 (define-alien-routine ("waitpid" c-waitpid) int
   (pid int)
@@ -113,33 +110,29 @@
   (options int))
 
 #-win32
-(defun waitpid (pid &optional do-not-hang check-for-stopped)
-  #+sb-doc
+(defun waitpid (pid)
   "Return any available status information on child process with PID."
   (multiple-value-bind (pid status)
       (c-waitpid pid
-                 (logior (if do-not-hang
-                             sb-unix:wnohang
-                             0)
-                         (if check-for-stopped
-                             sb-unix:wuntraced
-                             0)))
+                 (logior sb-unix:wnohang sb-unix:wuntraced sb-unix:wcontinued))
     (cond ((or (minusp pid)
                (zerop pid))
-           nil)
-          ((eql (ldb (byte 8 0) status)
-                sb-unix:wstopped)
-           (values pid
-                   :stopped
-                   (ldb (byte 8 8) status)))
+           (values nil nil nil))
+          ((wifcontinued status)
+           (values :running
+                   nil
+                   nil))
+          ((wifstopped status)
+           (values :stopped
+                   (ldb (byte 8 8) status)
+                   nil))
           ((zerop (ldb (byte 7 0) status))
-           (values pid
-                   :exited
-                   (ldb (byte 8 8) status)))
+           (values :exited
+                   (ldb (byte 8 8) status)
+                   nil))
           (t
            (let ((signal (ldb (byte 7 0) status)))
-             (values pid
-                     (if (position signal
+             (values (if (position signal
                                    #.(vector
                                       sb-unix:sigstop
                                       sb-unix:sigtstp
@@ -149,14 +142,24 @@
                          :signaled)
                      signal
                      (not (zerop (ldb (byte 1 7) status)))))))))
+
+#-win32
+(define-alien-routine wifcontinued boolean
+  (status int))
+
+#-win32
+(define-alien-routine wifstopped boolean
+  (status int))
 
 ;;;; process control stuff
-(defvar *active-processes* nil
-  #+sb-doc
+(define-load-time-global *active-processes* nil
   "List of process structures for all active processes.")
 
-(defvar *active-processes-lock*
+(define-load-time-global *active-processes-lock*
   (sb-thread:make-mutex :name "Lock for active processes."))
+
+(define-load-time-global *spawn-lock*
+  (sb-thread:make-mutex :name "Around spawn()."))
 
 ;;; *ACTIVE-PROCESSES* can be accessed from multiple threads so a
 ;;; mutex is needed. More importantly the sigchld signal handler also
@@ -165,33 +168,33 @@
   `(sb-thread::with-system-mutex (*active-processes-lock*)
      ,@body))
 
+(deftype process-status ()
+  '(member :running :stopped :exited :signaled))
+
 (defstruct (process (:copier nil))
-  pid                 ; PID of child process
-  %status             ; either :RUNNING, :STOPPED, :EXITED, or :SIGNALED
-  %exit-code          ; either exit code or signal
-  core-dumped         ; T if a core image was dumped
-  #-win32 pty                 ; stream to child's pty, or NIL
-  input               ; stream to child's input, or NIL
-  output              ; stream from child's output, or NIL
-  error               ; stream from child's error output, or NIL
-  status-hook         ; closure to call when PROC changes status
-  plist               ; a place for clients to stash things
-  cookie)             ; list of the number of pipes from the subproc
+  (pid     nil :type word :read-only t) ; PID of child process
+  (%status nil :type process-status)
+  %exit-code                            ; either exit code or signal
+  core-dumped                           ; T if a core image was dumped
+  #-win32 pty                           ; stream to child's pty, or NIL
+  input                                 ; stream to child's input, or NIL
+  output                                ; stream from child's output, or NIL
+  error                                 ; stream from child's error output, or NIL
+  status-hook                           ; closure to call when PROC changes status
+  plist                                 ; a place for clients to stash things
+  (cookie nil :type cons :read-only t)  ; list of the number of pipes from the subproc
+  #+win32 copiers ; list of sb-win32::io-copier
+  #+win32 (handle nil :type (or null (signed-byte 32)))
+  #-win32
+  serve-event-pipe)
 
 (defmethod print-object ((process process) stream)
   (print-unreadable-object (process stream :type t)
     (let ((status (process-status process)))
-     (if (eq :exited status)
-         (format stream "~S ~S" status (process-%exit-code process))
-         (format stream "~S ~S" (process-pid process) status)))
+      (if (eq :exited status)
+          (format stream "~S ~S" status (process-%exit-code process))
+          (format stream "~S ~S" (process-pid process) status)))
     process))
-
-#+sb-doc
-(setf (documentation 'process-p 'function)
-      "T if OBJECT is a PROCESS, NIL otherwise.")
-
-#+sb-doc
-(setf (documentation 'process-pid 'function) "The pid of the child process.")
 
 #+win32
 (define-alien-routine ("GetExitCodeProcess" get-exit-code-process)
@@ -199,77 +202,89 @@
   (handle unsigned) (exit-code unsigned :out))
 
 (defun process-exit-code (process)
-  #+sb-doc
   "Return the exit code of PROCESS."
   (or (process-%exit-code process)
       (progn (get-processes-status-changes)
              (process-%exit-code process))))
 
 (defun process-status (process)
-  #+sb-doc
   "Return the current status of PROCESS.  The result is one of :RUNNING,
    :STOPPED, :EXITED, or :SIGNALED."
   (get-processes-status-changes)
   (process-%status process))
 
-#+sb-doc
 (setf (documentation 'process-exit-code 'function)
-      "The exit code or the signal of a stopped process.")
+      "The exit code or the signal of a stopped process."
+      (documentation 'process-core-dumped 'function)
+      "T if a core image was dumped by the process."
+      (documentation 'process-pty 'function)
+      "The pty stream of the process or NIL."
+      (documentation 'process-input 'function)
+      "The input stream of the process or NIL."
+      (documentation 'process-output 'function)
+      "The output stream of the process or NIL."
+      (documentation 'process-error 'function)
+      "The error stream of the process or NIL."
+      (documentation 'process-status-hook 'function) "A function that is called when PROCESS changes its status.
+The function is called with PROCESS as its only argument."
+      (documentation 'process-plist 'function)
+      "A place for clients to stash things."
+      (documentation 'process-p 'function)
+      "T if OBJECT is a PROCESS, NIL otherwise."
+      (documentation 'process-pid 'function) "The pid of the child process.")
 
-#+sb-doc
-(setf (documentation 'process-core-dumped 'function)
-      "T if a core image was dumped by the process.")
+#-win32
+(defun setup-serve-event-pipe (process)
+  (unless (process-serve-event-pipe process)
+    (multiple-value-bind (read-fd write-fd) (sb-unix:unix-pipe)
+      (let (handler)
+        (setf handler
+              (add-fd-handler read-fd :input
+                              (lambda (fd)
+                                (setf (process-serve-event-pipe process) nil)
+                                (remove-fd-handler handler)
+                                (sb-unix:unix-close fd))))
+        (setf (process-serve-event-pipe process) (list* read-fd write-fd handler))))))
 
-#+sb-doc
-(setf (documentation 'process-pty 'function)
-      "The pty stream of the process or NIL.")
+#-win32
+(defun close-serve-event-pipe (process)
+  (let ((pipe (process-serve-event-pipe process)))
+    (when pipe
+      (setf (process-serve-event-pipe process) nil)
+      (destructuring-bind (read write . handler) pipe
+        (remove-fd-handler handler)
+        (sb-unix:unix-close read)
+        (when write
+          (sb-unix:unix-close write))))))
 
-#+sb-doc
-(setf (documentation 'process-input 'function)
-      "The input stream of the process or NIL.")
-
-#+sb-doc
-(setf (documentation 'process-output 'function)
-      "The output stream of the process or NIL.")
-
-#+sb-doc
-(setf (documentation 'process-error 'function)
-      "The error stream of the process or NIL.")
-
-#+sb-doc
-(setf (documentation 'process-status-hook  'function)
-      "A function that is called when PROCESS changes its status.
-The function is called with PROCESS as its only argument.")
-
-#+sb-doc
-(setf (documentation 'process-plist  'function)
-      "A place for clients to stash things.")
+(defun wake-serve-event (process)
+  #+win32 (declare (ignorable process))
+  #-win32
+  (let ((pipe (process-serve-event-pipe process)))
+    (when pipe
+      (sb-unix:unix-close (shiftf (cadr pipe) nil)))))
 
 (defun process-wait (process &optional check-for-stopped)
-  #+sb-doc
   "Wait for PROCESS to quit running for some reason. When
 CHECK-FOR-STOPPED is T, also returns when PROCESS is stopped. Returns
 PROCESS."
   (declare (ignorable check-for-stopped))
   #+win32
-  (let ((pid (process-pid process)))
-    (when (and pid (plusp pid))
-      (without-interrupts
-        (do ()
-            ((= 0
-                (with-local-interrupts
-                  (sb-win32:wait-object-or-signal pid))))))))
+  (sb-win32::win32-process-wait process)
   #-win32
-  (loop
-      (case (process-status process)
-        (:running)
-        (:stopped
-         (when check-for-stopped
-           (return)))
-        (t
-         (when (zerop (car (process-cookie process)))
-           (return))))
-      (serve-all-events 1))
+  (progn
+    (setup-serve-event-pipe process)
+    (loop
+     (case (process-status process)
+       (:running)
+       (:stopped
+        (when check-for-stopped
+          (return)))
+       (t
+        (when (zerop (car (process-cookie process)))
+          (return))))
+     (serve-all-events 10))
+    (close-serve-event-pipe process))
   process)
 
 #-win32
@@ -288,7 +303,6 @@ PROCESS."
 
 #-win32
 (defun process-kill (process signal &optional (whom :pid))
-  #+sb-doc
   "Hand SIGNAL to PROCESS. If WHOM is :PID, use the kill Unix system call. If
    WHOM is :PROCESS-GROUP, use the killpg Unix system call. If WHOM is
    :PTY-PROCESS-GROUP deliver the signal to whichever process group is
@@ -298,27 +312,22 @@ PROCESS."
                 (process-pid process))
                (:pty-process-group
                 (find-current-foreground-process process)))))
-    (multiple-value-bind
-          (okay errno)
-        (case whom
-          ((:process-group)
-           (sb-unix:unix-killpg pid signal))
-          (t
-           (sb-unix:unix-kill pid signal)))
-      (cond ((not okay)
-             (values nil errno))
-            ((and (eql pid (process-pid process))
-                  (= signal sb-unix:sigcont))
-             (setf (process-%status process) :running)
-             (setf (process-%exit-code process) nil)
-             (when (process-status-hook process)
-               (funcall (process-status-hook process) process))
-             t)
-            (t
-             t)))))
+    (let ((result (if (eq whom :process-group)
+                      (sb-unix:unix-killpg pid signal)
+                      (sb-unix:unix-kill pid signal))))
+      (or (zerop result)
+          (values nil (sb-unix::get-errno))))))
+
+#+win32
+(defun process-kill (process signal &optional (whom :pid))
+  (declare (ignore signal whom))
+  (get-processes-status-changes)
+  (let ((handle (process-handle process)))
+    (when handle
+      (prog1 (sb-win32::terminate-process handle 1)
+        (get-processes-status-changes)))))
 
 (defun process-alive-p (process)
-  #+sb-doc
   "Return T if PROCESS is still alive, NIL otherwise."
   (let ((status (process-status process)))
     (if (or (eq status :running)
@@ -327,7 +336,6 @@ PROCESS."
         nil)))
 
 (defun process-close (process)
-  #+sb-doc
   "Close all streams connected to PROCESS and stop maintaining the
 status slot."
   (macrolet ((frob (stream abort)
@@ -342,14 +350,14 @@ status slot."
   (with-active-processes-lock ()
    (setf *active-processes* (delete process *active-processes*)))
   #+win32
-  (let ((handle (shiftf (process-pid process) nil)))
-    (when (and handle (plusp handle))
-      (or (sb-win32:close-handle handle)
+  (let ((handle (shiftf (process-handle process) nil)))
+    (when handle
+      (or (plusp (sb-win32:close-handle handle))
           (sb-win32::win32-error 'process-close))))
   process)
 
 (defun get-processes-status-changes ()
-  (let (exited)
+  (let (changed)
     (with-active-processes-lock ()
       (setf *active-processes*
             (delete-if #-win32
@@ -359,36 +367,40 @@ status slot."
                          ;; WAIT3 call here, but that makes direct
                          ;; WAIT, WAITPID usage impossible due to the
                          ;; race with the SIGCHLD signal handler.
-                         (multiple-value-bind (pid what code core)
-                             (waitpid (process-pid proc) t t)
-                           (when pid
-                             (setf (process-%status proc) what)
+                         (multiple-value-bind (status code core)
+                             (waitpid (process-pid proc))
+                           (when status
+                             (wake-serve-event proc)
+                             (setf (process-%status proc) status)
                              (setf (process-%exit-code proc) code)
-                             (setf (process-core-dumped proc) core)
                              (when (process-status-hook proc)
-                               (push proc exited))
-                             t)))
+                               (push proc changed))
+                             (when (member status '(:exited :signaled))
+                               (setf (process-core-dumped proc) core)
+                               t))))
                        #+win32
                        (lambda (proc)
-                         (let ((pid (process-pid proc)))
-                           (when pid
+                         (let ((handle (process-handle proc)))
+                           (when handle
                              (multiple-value-bind (ok code)
-                                 (sb-win32::get-exit-code-process pid)
-                               (when (and (plusp ok) (/= code 259))
+                                 (sb-win32::get-exit-code-process handle)
+                               (when (and (plusp ok)
+                                          (/= code sb-win32::still-active))
                                  (setf (process-%status proc) :exited
                                        (process-%exit-code proc) code)
+                                 (sb-win32::close-handle handle)
+                                 (setf (process-handle proc) nil)
                                  (when (process-status-hook proc)
-                                   (push proc exited))
+                                   (push proc changed))
                                  t)))))
                        *active-processes*)))
     ;; Can't call the hooks before all the processes have been deal
     ;; with, as calling a hook may cause re-entry to
-    ;; GET-PROCESS-STATUS-CHANGES. That may be OK when using waitpid,
+    ;; GET-PROCESSES-STATUS-CHANGES. That may be OK when using waitpid,
     ;; but in the Windows implementation it would be deeply bad.
-    (dolist (proc exited)
+    (dolist (proc changed)
       (let ((hook (process-status-hook proc)))
-        (when hook
-          (funcall hook proc))))))
+        (funcall hook proc)))))
 
 ;;;; RUN-PROGRAM and close friends
 
@@ -398,9 +410,7 @@ status slot."
 ;;; list of file descriptors to close when RUN-PROGRAM returns in the parent
 (defvar *close-in-parent* nil)
 
-;;; list of handlers installed by RUN-PROGRAM.  FIXME: nothing seems
-;;; to set this.
-#-win32
+;;; list of handlers installed by RUN-PROGRAM.
 (defvar *handlers-installed* nil)
 
 ;;; Find an unused pty. Return three values: the file descriptor for
@@ -414,11 +424,10 @@ status slot."
 
   (defun find-a-pty ()
     ;; First try to use the Unix98 pty api.
-    (let* ((master-name (coerce (format nil "/dev/ptmx") 'base-string))
-           (master-fd (sb-unix:unix-open master-name
-                                         (logior sb-unix:o_rdwr
-                                                 sb-unix:o_noctty)
-                                         #o666)))
+    (let ((master-fd (sb-unix:unix-open "/dev/ptmx"
+                                        (logior sb-unix:o_rdwr
+                                                sb-unix:o_noctty)
+                                        #o666)))
       (when master-fd
         (grantpt master-fd)
         (unlockpt master-fd)
@@ -437,15 +446,15 @@ status slot."
     ;; No dice, try using the old-school method.
     (dolist (char '(#\p #\q))
       (dotimes (digit 16)
-        (let* ((master-name (coerce (format nil "/dev/pty~C~X" char digit)
-                                    'base-string))
+        (let* ((master-name (with-simple-output-to-string (str nil base-char)
+                              (format str "/dev/pty~C~X" char digit)))
                (master-fd (sb-unix:unix-open master-name
                                              (logior sb-unix:o_rdwr
                                                      sb-unix:o_noctty)
                                              #o666)))
           (when master-fd
-            (let* ((slave-name (coerce (format nil "/dev/tty~C~X" char digit)
-                                       'base-string))
+            (let* ((slave-name (with-simple-output-to-string (str nil base-char)
+                                 (format str "/dev/tty~C~X" char digit)))
                    (slave-fd (sb-unix:unix-open slave-name
                                                 (logior sb-unix:o_rdwr
                                                         sb-unix:o_noctty)
@@ -477,22 +486,24 @@ status slot."
 #-win32
 (defun open-pty (pty cookie &key (external-format :default))
   (when pty
-    (multiple-value-bind
-          (master slave name)
-        (find-a-pty)
-      (push master *close-on-error*)
-      (push slave *close-in-parent*)
-      (when (streamp pty)
-        (multiple-value-bind (new-fd errno) (sb-unix:unix-dup master)
-          (unless new-fd
-            (error "couldn't SB-UNIX:UNIX-DUP ~W: ~A" master (strerror errno)))
-          (push new-fd *close-on-error*)
-          (copy-descriptor-to-stream new-fd pty cookie external-format)))
-      (values name
-              (make-fd-stream master :input t :output t
-                                     :external-format external-format
-                                     :element-type :default
-                                     :dual-channel-p t)))))
+    ;; ptsname is not thread-safe, ptsname_r is.
+    (with-active-processes-lock ()
+      (multiple-value-bind
+            (master slave name)
+          (find-a-pty)
+        (push master *close-on-error*)
+        (push slave *close-in-parent*)
+        (when (streamp pty)
+          (multiple-value-bind (new-fd errno) (sb-unix:unix-dup master)
+            (unless new-fd
+              (error "couldn't SB-UNIX:UNIX-DUP ~W: ~A" master (strerror errno)))
+            (push new-fd *close-on-error*)
+            (copy-descriptor-to-stream new-fd pty cookie external-format)))
+        (values name
+                (make-fd-stream master :input t :output t
+                                       :external-format external-format
+                                       :element-type :default
+                                       :dual-channel-p t))))))
 
 ;; Null terminate strings only C-side: otherwise we can run into
 ;; A-T-S-L even for simple encodings like ASCII.  Multibyte encodings
@@ -501,14 +512,14 @@ status slot."
 #-win32
 (defmacro round-null-terminated-bytes-to-words (n)
   `(logandc2 (the sb-vm:signed-word (+ (the fixnum ,n)
-                                       4 (1- sb-vm:n-word-bytes)))
-             (1- sb-vm:n-word-bytes)))
+                                       4 (1- sb-vm:n-machine-word-bytes)))
+             (1- sb-vm:n-machine-word-bytes)))
 
 #-win32
 (defun string-list-to-c-strvec (string-list)
   (let* (;; We need an extra for the null, and an extra 'cause exect
          ;; clobbers argv[-1].
-         (vec-bytes (* sb-vm:n-word-bytes (+ (length string-list) 2)))
+         (vec-bytes (* sb-vm:n-machine-word-bytes (+ (length string-list) 2)))
          (octet-vector-list (mapcar (lambda (s)
                                       (string-to-octets s))
                                     string-list))
@@ -521,7 +532,7 @@ status slot."
          (vec-sap (allocate-system-memory total-bytes))
          (string-sap (sap+ vec-sap vec-bytes))
          ;; Index starts from [1]!
-         (vec-index-offset sb-vm:n-word-bytes))
+         (vec-index-offset sb-vm:n-machine-word-bytes))
     (declare (sb-vm:signed-word vec-bytes)
              (sb-vm:word string-bytes total-bytes)
              (system-area-pointer vec-sap string-sap))
@@ -537,10 +548,10 @@ status slot."
         ;; Advance string-sap for the next string.
         (setf string-sap (sap+ string-sap
                                (round-null-terminated-bytes-to-words size)))
-        (incf vec-index-offset sb-vm:n-word-bytes)))
+        (incf vec-index-offset sb-vm:n-machine-word-bytes)))
     ;; Final null pointer.
     (setf (sap-ref-sap vec-sap vec-index-offset) (int-sap 0))
-    (values vec-sap (sap+ vec-sap sb-vm:n-word-bytes) total-bytes)))
+    (values vec-sap (sap+ vec-sap sb-vm:n-machine-word-bytes) total-bytes)))
 
 #-win32
 (defmacro with-args ((var str-list) &body body)
@@ -576,8 +587,14 @@ status slot."
   (search int)
   (envp (* c-string))
   (pty-name c-string)
-  (wait int)
+  (channel (array int 2))
   (dir c-string))
+
+#-win32
+(define-alien-routine wait-for-exec
+  int
+  (pid int)
+  (channel (array int 2)))
 
 #+win32
 (defun escape-arg (arg stream)
@@ -610,26 +627,26 @@ status slot."
               do (write-char #\\ stream)))
   (write-char #\" stream))
 
+#+win32
+(defun prepare-args (args escape)
+  (with-simple-output-to-string (str)
+    (loop for (arg . rest) on args
+          do
+          (cond ((and escape
+                      (find-if (lambda (c) (find c '(#\Space #\Tab #\")))
+                               arg))
+                 (escape-arg arg str))
+                (t
+                 (write-string arg str)))
+          (when rest
+            (write-char #\Space str)))))
+
+#-win32
 (defun prepare-args (args)
-  (cond #-win32
-        ((every #'simple-string-p args)
-         args)
-        #-win32
-        (t
-         (loop for arg in args
-               collect (coerce arg 'simple-string)))
-        #+win32
-        (t
-         (with-output-to-string (str)
-           (loop for (arg . rest) on args
-                 do
-                 (cond ((find-if (lambda (c) (find c '(#\Space #\Tab #\")))
-                                 arg)
-                        (escape-arg arg str))
-                       (t
-                        (princ arg str)))
-                 (when rest
-                   (write-char #\Space str)))))))
+  (if (every #'simple-string-p args)
+      args
+      (loop for arg in args
+            collect (coerce arg 'simple-string))))
 
 ;;; FIXME: There shouldn't be two semiredundant versions of the
 ;;; documentation. Since this is a public extension function, the
@@ -692,16 +709,10 @@ status slot."
                     (if-error-exists :error)
                     status-hook
                     (external-format :default)
-                    directory)
-  #+sb-doc
-  #.(concatenate
-     'string
-     ;; The Texinfoizer is sensitive to whitespace, so mind the
-     ;; placement of the #-win32 pseudosplicings.
-     "RUN-PROGRAM creates a new process specified by the PROGRAM
-argument. ARGS are the standard arguments that can be passed to a
-program. For no arguments, use NIL (which means that just the
-name of the program is passed as arg 0).
+                    directory
+                    #+win32 (escape-arguments t))
+  "RUN-PROGRAM creates a new process specified by PROGRAM.
+ARGS are passed as the arguments to the program.
 
 The program arguments and the environment are encoded using the
 default external format for streams.
@@ -713,13 +724,13 @@ Users Manual for details about the PROCESS structure.
 
    - The SBCL implementation of RUN-PROGRAM, like Perl and many other
      programs, but unlike the original CMU CL implementation, copies
-     the Unix environment by default."#-win32"
+     the Unix environment by default.
    - Running Unix programs from a setuid process, or in any other
      situation where the Unix environment is under the control of someone
      else, is a mother lode of security problems. If you are contemplating
      doing this, read about it first. (The Perl community has a lot of good
      documentation about this and other security issues in script-like
-     programs.)""
+     programs.)
 
    The &KEY arguments have the following meanings:
    :ENVIRONMENT
@@ -734,43 +745,50 @@ Users Manual for details about the PROCESS structure.
       environment variable.  Otherwise an absolute pathname is required.
    :WAIT
       If non-NIL (default), wait until the created process finishes.  If
-      NIL, continue running Lisp until the program finishes."#-win32"
-   :PTY
+      NIL, continue running Lisp until the program finishes.
+   :PTY (not supported on win32)
       Either T, NIL, or a stream.  Unless NIL, the subprocess is established
       under a PTY.  If :pty is a stream, all output to this pty is sent to
       this stream, otherwise the PROCESS-PTY slot is filled in with a stream
-      connected to pty that can read output and write input.""
+      connected to pty that can read output and write input.
    :INPUT
-      Either T, NIL, a pathname, a stream, or :STREAM.  If T, the standard
-      input for the current process is inherited.  If NIL, "
-      #-win32"/dev/null"#+win32"nul""
-      is used.  If a pathname, the file so specified is used.  If a stream,
-      all the input is read from that stream and sent to the subprocess.  If
-      :STREAM, the PROCESS-INPUT slot is filled in with a stream that sends
-      its output to the process. Defaults to NIL.
+      Either T, NIL, a pathname, a stream, or :STREAM.
+      T: the standard input for the current process is inherited.
+      NIL: /dev/null (nul on win32) is used.
+      pathname: the specified file is used.
+      stream: all the input is read from that stream and sent to the
+      subprocess.
+      :STREAM: the PROCESS-INPUT slot is filled in with a stream that sends
+      its output to the process.
+      Defaults to NIL.
    :IF-INPUT-DOES-NOT-EXIST (when :INPUT is the name of a file)
       can be one of:
          :ERROR to generate an error
          :CREATE to create an empty file
          NIL (the default) to return NIL from RUN-PROGRAM
    :OUTPUT
-      Either T, NIL, a pathname, a stream, or :STREAM.  If T, the standard
-      output for the current process is inherited.  If NIL, "
-      #-win32"/dev/null"#+win32"nul""
-      is used.  If a pathname, the file so specified is used.  If a stream,
-      all the output from the process is written to this stream. If
-      :STREAM, the PROCESS-OUTPUT slot is filled in with a stream that can
-      be read to get the output. Defaults to NIL.
+      Either T, NIL, a pathname, a stream, or :STREAM.
+      T: the standard output for the current process is inherited.
+      NIL: /dev/null (nul on win32) is used.
+      pathname: the specified file is used.
+      stream: all the output from the process is written to this stream.
+      :STREAM: the PROCESS-OUTPUT slot is filled in with a stream that can be
+      read to get the output.
+      Defaults to NIL.
+   :ERROR
+      Same as :OUTPUT, additionally accepts :OUTPUT, making all error
+      output routed to the same place as normal output.
+      Defaults to :OUTPUT.
    :IF-OUTPUT-EXISTS (when :OUTPUT is the name of a file)
       can be one of:
          :ERROR (the default) to generate an error
          :SUPERSEDE to supersede the file with output from the program
          :APPEND to append output from the program to the file
          NIL to return NIL from RUN-PROGRAM, without doing anything
-   :ERROR and :IF-ERROR-EXISTS
-      Same as :OUTPUT and :IF-OUTPUT-EXISTS, except that :ERROR can also be
-      specified as :OUTPUT in which case all error output is routed to the
-      same place as normal output.
+   :IF-ERROR-EXISTS
+      Same as :IF-OUTPUT-EXISTS, controlling :ERROR output to files.
+      Ignored when :ERROR :OUTPUT.
+      Defaults to :ERROR.
    :STATUS-HOOK
       This is a function the system calls whenever the status of the
       process changes.  The function takes the process as an argument.
@@ -778,20 +796,22 @@ Users Manual for details about the PROCESS structure.
       The external-format to use for :INPUT, :OUTPUT, and :ERROR :STREAMs.
    :DIRECTORY
       Specifies the directory in which the program should be run.
-      NIL (the default) means the directory is unchanged.")
+      NIL (the default) means the directory is unchanged.
+
+   Windows specific options:
+   :ESCAPE-ARGUMENTS (default T)
+      Controls escaping of the arguments passed to CreateProcess."
   (when (and env-p environment-p)
     (error "can't specify :ENV and :ENVIRONMENT simultaneously"))
   (let* (;; Clear various specials used by GET-DESCRIPTOR-FOR to
          ;; communicate cleanup info.
          *close-on-error*
          *close-in-parent*
-         ;; Some other binding used only on non-Win32.  FIXME:
-         ;; nothing seems to set this.
-         #-win32 *handlers-installed*
+         *handlers-installed*
          ;; Establish PROC at this level so that we can return it.
          proc
          (progname (native-namestring program))
-         (args (prepare-args (cons progname args)))
+         (args (prepare-args (cons progname args) #+win32 escape-arguments))
          (directory (and directory (native-namestring directory)))
          ;; Gag.
          (cookie (list 0)))
@@ -805,13 +825,13 @@ Users Manual for details about the PROCESS structure.
                       `(multiple-value-bind (,fd ,stream)
                            ,(ecase which
                               ((:input :output)
-                               `(get-descriptor-for ,@args))
+                               `(get-descriptor-for ,which ,@args))
                               (:error
                                `(if (eq ,(first args) :output)
                                     ;; kludge: we expand into
                                     ;; hard-coded symbols here.
                                     (values stdout output-stream)
-                                    (get-descriptor-for ,@args))))
+                                    (get-descriptor-for ,which ,@args))))
                          (unless ,fd
                            (return-from run-program))
                          ,@body))
@@ -840,59 +860,65 @@ Users Manual for details about the PROCESS structure.
                                         :direction :output
                                         :if-exists if-error-exists
                                         :external-format external-format)
-                 (with-open-pty ((pty-name pty-stream) (pty cookie))
-                   ;; Make sure we are not notified about the child
-                   ;; death before we have installed the PROCESS
-                   ;; structure in *ACTIVE-PROCESSES*.
-                   (let (child)
-                     (with-active-processes-lock ()
-                       (with-environment (environment-vec environment
-                                          :null (not (or environment environment-p)))
-                         (setq child
+                 ;; Make sure we are not notified about the child
+                 ;; death before we have installed the PROCESS
+                 ;; structure in *ACTIVE-PROCESSES*.
+                 (let (child #+win32 handle)
+                   (with-environment (environment-vec environment
+                                      :null (not (or environment environment-p)))
+                     (with-alien (#-win32 (channel (array int 2)))
+                       (with-open-pty ((pty-name pty-stream) (pty cookie))
+                         (setf (values child #+win32 handle)
                                #+win32
-                               (sb-win32::mswin-spawn
-                                progname
-                                args
-                                stdin stdout stderr
-                                search environment-vec wait directory)
+                               (sb-thread::with-system-mutex (*spawn-lock*)
+                                 (sb-win32::mswin-spawn
+                                  progname
+                                  args
+                                  stdin stdout stderr
+                                  search environment-vec directory))
                                #-win32
                                (with-args (args-vec args)
-                                 (without-gcing
+                                 (sb-thread::with-system-mutex (*spawn-lock*)
                                    (spawn progname args-vec
                                           stdin stdout stderr
                                           (if search 1 0)
                                           environment-vec pty-name
-                                          (if wait 1 0) directory))))
+                                          channel
+                                          directory))))
                          (unless (minusp child)
-                           (setf proc
-                                 (make-process
-                                  :input input-stream
-                                  :output output-stream
-                                  :error error-stream
-                                  :status-hook status-hook
-                                  :cookie cookie
-                                  #-win32 :pty #-win32 pty-stream
-                                  :%status #-win32 :running
-                                           #+win32 (if wait
-                                                       :exited
-                                                       :running)
-                                  :pid #-win32 child
-                                       #+win32 (if wait
-                                                   nil
-                                                   child)
-                                  #+win32 :%exit-code #+win32 (and wait child)))
-                           (push proc *active-processes*))))
-                     ;; Report the error outside the lock.
-                     (case child
-                       (-1
-                        (error "Couldn't fork child process: ~A"
-                               (strerror)))
-                       (-2
-                        (error "Couldn't execute ~S: ~A"
-                               progname (strerror)))
-                       (-3
-                        (error "Couldn't change directory to ~S: ~A"
-                               directory (strerror))))))))))
+                           #-win32
+                           (setf child (wait-for-exec child channel))
+                           (unless (minusp child)
+                             (setf proc
+                                   (make-process
+                                    :input input-stream
+                                    :output output-stream
+                                    :error error-stream
+                                    :status-hook status-hook
+                                    :cookie cookie
+                                    #-win32 :pty #-win32 pty-stream
+                                    :%status :running
+                                    :pid child
+                                    #+win32 :copiers #+win32 *handlers-installed*
+                                    #+win32 :handle #+win32 handle))
+                             (with-active-processes-lock ()
+                               (push proc *active-processes*))
+                             ;; In case a sigchld signal was missed
+                             ;; when the process wasn't on
+                             ;; *active-processes*
+                             (unless wait
+                               (get-processes-status-changes)))))))
+                   ;; Report the error outside the lock.
+                   (case child
+                     (-1
+                      (error "Couldn't fork child process: ~A"
+                             (strerror)))
+                     (-2
+                      (error "Couldn't execute ~S: ~A"
+                             progname (strerror)))
+                     (-3
+                      (error "Couldn't change directory to ~S: ~A"
+                             directory (strerror)))))))))
       (dolist (fd *close-in-parent*)
         (sb-unix:unix-close fd))
       (unless proc
@@ -901,10 +927,10 @@ Users Manual for details about the PROCESS structure.
         #-win32
         (dolist (handler *handlers-installed*)
           (remove-fd-handler handler)))
-      #-win32
       (when (and wait proc)
         (unwind-protect
              (process-wait proc)
+          #-win32
           (dolist (handler *handlers-installed*)
             (remove-fd-handler handler)))))
     proc))
@@ -912,6 +938,7 @@ Users Manual for details about the PROCESS structure.
 ;;; Install a handler for any input that shows up on the file
 ;;; descriptor. The handler reads the data and writes it to the
 ;;; stream.
+#-win32
 (defun copy-descriptor-to-stream (descriptor stream cookie external-format)
   (incf (car cookie))
   (let* ((handler nil)
@@ -983,10 +1010,9 @@ Users Manual for details about the PROCESS structure.
                                          (sap+ (vector-sap buf) read-end)
                                          (- (length buf) read-end)))
                   (cond
-                    ((and #-win32 (or (and (null count)
-                                           (eql errno sb-unix:eio))
-                                      (eql count 0))
-                          #+win32 (<= count 0))
+                    ((or (and (null count)
+                              (eql errno sb-unix:eio))
+                         (eql count 0))
                      (remove-fd-handler handler)
                      (setf handler nil)
                      (decf (car cookie))
@@ -1007,8 +1033,15 @@ Users Manual for details about the PROCESS structure.
                     (t
                      (incf read-end count)
                      (funcall copy-fun))))))))
-    #-win32
     (push handler *handlers-installed*)))
+
+#+win32
+(defun copy-descriptor-to-stream (descriptor stream cookie external-format)
+  (declare (ignore cookie))
+  (push (sb-win32::make-io-copier :pipe descriptor
+                                  :stream stream
+                                  :external-format external-format)
+        *handlers-installed*))
 
 ;;; FIXME: something very like this is done in SB-POSIX to treat
 ;;; streams as file descriptor designators; maybe we can combine these
@@ -1022,7 +1055,7 @@ Users Manual for details about the PROCESS structure.
      (values (fd-stream-fd stream) nil (stream-external-format stream)))
     (synonym-stream
      (get-stream-fd-and-external-format
-      (symbol-value (synonym-stream-symbol stream)) direction))
+      (resolve-synonym-stream stream) direction))
     (two-way-stream
      (ecase direction
        (:input
@@ -1042,8 +1075,7 @@ Users Manual for details about the PROCESS structure.
 ;;; Find a file descriptor to use for object given the direction.
 ;;; Returns the descriptor. If object is :STREAM, returns the created
 ;;; stream as the second value.
-(defun get-descriptor-for (object
-                           cookie
+(defun get-descriptor-for (argument object cookie
                            &rest keys
                            &key direction (external-format :default) wait
                            &allow-other-keys)
@@ -1054,21 +1086,25 @@ Users Manual for details about the PROCESS structure.
   ;; user-defined stream classes, we can end up trying to copy
   ;; arbitrarily much data into the temp file, and so are liable to
   ;; run afoul of disk quotas or to choke on small /tmp file systems.
-  (flet ((make-temp-fd ()
-           (multiple-value-bind (fd name/errno)
-               (sb-unix:sb-mkstemp (format nil "~a/.run-program-XXXXXX"
-                                           (get-temporary-directory))
-                                   #o0600)
-             (unless fd
-               (error "could not open a temporary file: ~A"
-                      (strerror name/errno)))
-             ;; Can't unlink an open file on Windows
-             #-win32
-             (unless (sb-unix:unix-unlink name/errno)
-               (sb-unix:unix-close fd)
-               (error "failed to unlink ~A" name/errno))
-             fd)))
-    (let ((dev-null #.(coerce #-win32 "/dev/null" #+win32 "nul" 'base-string)))
+  (labels ((fail (format &rest arguments)
+             (error "~s error processing ~s argument:~% ~?" 'run-program argument format arguments))
+           (make-temp-fd ()
+             (multiple-value-bind (fd name/errno)
+                 (sb-unix:sb-mkstemp (format nil "~a/.run-program-XXXXXX"
+                                             (get-temporary-directory))
+                                     #o0600)
+               (unless fd
+                 (fail "could not open a temporary file: ~A"
+                       (strerror name/errno)))
+               #+win32
+               (setf (sb-win32::inheritable-handle-p fd) t)
+               ;; Can't unlink an open file on Windows
+               #-win32
+               (unless (sb-unix:unix-unlink name/errno)
+                 (sb-unix:unix-close fd)
+                 (fail "failed to unlink ~A" name/errno))
+               fd)))
+    (let ((dev-null #-win32 "/dev/null" #+win32 "nul"))
       (cond ((eq object t)
              ;; No new descriptor is needed.
              (values -1 nil))
@@ -1083,10 +1119,11 @@ Users Manual for details about the PROCESS structure.
                                       (:input sb-unix:o_rdonly)
                                       (:output sb-unix:o_wronly)
                                       (t sb-unix:o_rdwr))
-                                    #o666)
+                                    #o666
+                                    #+win32 :overlapped #+win32 nil)
                (unless fd
-                 (error "~@<couldn't open ~S: ~2I~_~A~:>"
-                        dev-null (strerror errno)))
+                 (fail "~@<couldn't open ~S: ~2I~_~A~:>"
+                       dev-null (strerror errno)))
                #+win32
                (setf (sb-win32::inheritable-handle-p fd) t)
                (push fd *close-in-parent*)
@@ -1094,7 +1131,7 @@ Users Manual for details about the PROCESS structure.
             ((eq object :stream)
              (multiple-value-bind (read-fd write-fd) (sb-unix:unix-pipe)
                (unless read-fd
-                 (error "couldn't create pipe: ~A" (strerror write-fd)))
+                 (fail "couldn't create pipe: ~A" (strerror write-fd)))
                #+win32
                (setf (sb-win32::inheritable-handle-p read-fd)
                      (eq direction :input)
@@ -1120,24 +1157,28 @@ Users Manual for details about the PROCESS structure.
                  (t
                     (sb-unix:unix-close read-fd)
                     (sb-unix:unix-close write-fd)
-                    (error "Direction must be either :INPUT or :OUTPUT, not ~S."
+                    (fail "Direction must be either :INPUT or :OUTPUT, not ~S."
                            direction)))))
             ((or (pathnamep object) (stringp object))
              ;; GET-DESCRIPTOR-FOR uses &allow-other-keys, so rather
              ;; than munge the &rest list for OPEN, just disable keyword
              ;; validation there.
-             (with-open-stream (file (apply #'open object :allow-other-keys t
-                                            keys))
-               (when file
-                 (multiple-value-bind
-                       (fd errno)
-                     (sb-unix:unix-dup (fd-stream-fd file))
-                   (cond (fd
-                          (push fd *close-in-parent*)
-                          (values fd nil))
-                         (t
-                          (error "couldn't duplicate file descriptor: ~A"
-                                 (strerror errno))))))))
+             (with-open-stream (file (or (apply #'open object
+                                                :allow-other-keys t
+                                                #+win32 :overlapped #+win32 nil
+                                                keys)
+                                         ;; :if-input-does-not-exist nil
+                                         ;; can result in this
+                                         (return-from get-descriptor-for)))
+               (multiple-value-bind
+                     (fd errno)
+                   (sb-unix:unix-dup (fd-stream-fd file))
+                 (cond (fd
+                        (push fd *close-in-parent*)
+                        (values fd nil))
+                       (t
+                        (fail "couldn't duplicate file descriptor: ~A"
+                              (strerror errno)))))))
           ((streamp object)
            (ecase direction
              (:input
@@ -1223,13 +1264,27 @@ Users Manual for details about the PROCESS structure.
                   (when fd
                     (return (values fd stream))))
                 (multiple-value-bind (read-fd write-fd)
-                    (sb-unix:unix-pipe)
+                    #-win32 (sb-unix:unix-pipe)
+                    #+win32 (sb-win32::make-named-pipe)
                   (unless read-fd
-                    (error "couldn't create pipe: ~S" (strerror write-fd)))
+                    (fail "couldn't create pipe: ~S" (strerror write-fd)))
+                  #+win32
+                  (setf (sb-win32::inheritable-handle-p write-fd) t)
                   (copy-descriptor-to-stream read-fd object cookie
                                              external-format)
                   (push read-fd *close-on-error*)
                   (push write-fd *close-in-parent*)
-                  (return (values write-fd nil)))))
-             (t
-              (error "invalid option to RUN-PROGRAM: ~S" object))))))))
+                  (return (values write-fd nil)))))))
+          (t
+           (fail "invalid option: ~S" object))))))
+
+#+(or linux sunos hpux)
+(defun software-version ()
+  "Return a string describing version of the supporting software, or NIL
+  if not available."
+  (or sb-sys::*software-version*
+      (setf sb-sys::*software-version*
+            (string-trim '(#\newline)
+                         (sb-kernel:with-simple-output-to-string (stream)
+                           (run-program "/bin/uname" `("-r")
+                                        :output stream))))))

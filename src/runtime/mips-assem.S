@@ -13,15 +13,21 @@
  * files for more information.
  */
 
+#ifdef __ELF__
+// Mark the object as not requiring an executable stack.
+.section .note.GNU-stack,"",%progbits
+#endif
+
 #include "sbcl.h"
 #include "lispregs.h"
 #include "globals.h"
 #include "genesis/fdefn.h"
 #include "genesis/closure.h"
+#include "genesis/code.h"
 #include "genesis/funcallable-instance.h"
 #include "genesis/simple-fun.h"
 #include "genesis/static-symbols.h"
-		
+
 #define zero $0
 #define AT $1
 #define v0 $2
@@ -99,7 +105,7 @@ symbol:
 
 
 	.text
-	
+
 /*
  * Function to transfer control into lisp.
  */
@@ -150,7 +156,7 @@ symbol:
         .set    noreorder
 	bgez	reg_NL4, 1f
 	 subu	reg_ALLOC, 1
-	break	0x0, 0x10
+	break	0x0, trap_PendingInterrupt
 1:	.set	reorder
 
 	/* Pass in args */
@@ -170,7 +176,7 @@ symbol:
 	/* Indirect closure */
 	lw	reg_CODE, CLOSURE_FUN_OFFSET(reg_LEXENV)
 
-	addu	reg_LIP, reg_CODE, SIMPLE_FUN_CODE_OFFSET
+	addu	reg_LIP, reg_CODE, SIMPLE_FUN_INSTS_OFFSET
 
 	/* Mark us as in Lisp land. */
 	sw	zero, foreign_function_call_active
@@ -180,7 +186,7 @@ symbol:
 
 	.align	3
 	.set	noreorder
-lra:	.word	RETURN_PC_HEADER_WIDETAG
+lra:	.word	RETURN_PC_WIDETAG
 
 	/* Multiple value return spot, clear stack. */
 	move	reg_CSP, reg_OCFP
@@ -210,7 +216,7 @@ lra:	.word	RETURN_PC_HEADER_WIDETAG
 	.set	noreorder
 	bgez	reg_NL4, 1f
 	 subu	reg_ALLOC, 1
-	break	0x0, 0x10
+	break	0x0, trap_PendingInterrupt
 1:	.set	reorder
 
 	/* Pass one return value back to C land. For a 64bit value, we may
@@ -273,9 +279,10 @@ lra:	.word	RETURN_PC_HEADER_WIDETAG
 	/* Convert the return address to an offset and save it on the stack. */
 	subu	reg_NFP, reg_LIP, reg_CODE
 	addu	reg_NFP, OTHER_POINTER_LOWTAG
-	sw	reg_LRA, (reg_CFP)
-	sw	reg_CODE, 4(reg_CFP)
-	sw	gp, 8(reg_CFP)
+        sw      reg_OCFP, (reg_CFP)
+	sw	reg_NFP, 4(reg_CFP)
+	sw	reg_CODE, 8(reg_CFP)
+	sw	gp, 12(reg_CFP) // should this be saved? on the control stack?
 
 	/* Save LISP state. */
 	subu	reg_A0, reg_ALLOC, 1
@@ -287,17 +294,17 @@ lra:	.word	RETURN_PC_HEADER_WIDETAG
 	/* Check for interrupt */
 	.set	noreorder
 	bgez	reg_NL4, 1f
-	 subu	reg_ALLOC, 1
-	break	0x0, 0x10
+	subu	reg_ALLOC, 1
+	break	0x0, trap_PendingInterrupt
 1:	.set	reorder
 
 	/* Into C land we go. */
 	move    t9, reg_CFUNC		# reg_ALLOC
 	jalr	t9
 
-	lw	gp, 8(reg_CFP)
+	lw	gp, 12(reg_CFP)
 
-	/* Pass 64bit return value to lisp land. */ 
+	/* Pass 64bit return value to lisp land. */
 	move	reg_NL0, v0		# reg_CFUNC
 	move	reg_NL1, v1		# reg_NL4
 
@@ -336,9 +343,9 @@ lra:	.word	RETURN_PC_HEADER_WIDETAG
 
 	lw	reg_BSP, current_binding_stack_pointer
 
-	/* Restore LRA & CODE */
-	lw	reg_LRA, (reg_CFP)
-	lw	reg_CODE, 4(reg_CFP)
+	/* Restore CODE */
+	lw	reg_CODE, 8(reg_CFP)
+        /* Setup the return address */
 	subu	reg_LIP, reg_NFP, OTHER_POINTER_LOWTAG
 	addu	reg_LIP, reg_CODE
 
@@ -346,7 +353,7 @@ lra:	.word	RETURN_PC_HEADER_WIDETAG
 	.set	noreorder
 	bgez	reg_NL4, 1f
 	 subu	reg_ALLOC, 1
-	break	0x0, 0x10
+	break	0x0, trap_PendingInterrupt
 1:	.set	reorder
 
 	/* Reset the lisp stack. */
@@ -362,86 +369,6 @@ lra:	.word	RETURN_PC_HEADER_WIDETAG
 	END(call_into_c)
 
 /*
- * Trampolines follow the Lisp calling convention.
- *
- * The undefined-function trampoline.
- */
-	.align	3 /* minimum alignment for a lisp object */
-	.word	SIMPLE_FUN_HEADER_WIDETAG /* header */
-	.word	undefined_tramp - SIMPLE_FUN_CODE_OFFSET /* self */
-	.word	NIL /* next */
-	.word   NIL /* name */
-	.word	NIL /* arglist */
-	.word	NIL /* type */
-	.word	NIL /* xrefs */
-	LEAF(undefined_tramp)
-	/* Point reg_CODE to the header and tag it as function, since
-	   the debugger regards a function pointer in reg_CODE which
-	   doesn't point to a code object as undefined function.  */
-	lui	reg_CODE, %hi(undefined_tramp)
-	addiu	reg_CODE, %lo(undefined_tramp)
-	addiu	reg_CODE, -SIMPLE_FUN_CODE_OFFSET
-	.set	noreorder
-	b	1f
-	 break	0x0, trap_Cerror
-	/* Error data length. */
-	.byte	4
-	/* Error number. */
-	.byte	UNDEFINED_FUN_ERROR
-	/* Magic value 254 means a 16bit little endian value follows.
-	   See debug-var-io.lisp. */
-	.byte	254
-	/* reg_FDEFN is #14. */
-	.byte	((14 << 6) + sc_DescriptorReg) % 0x100
-	.byte	((14 << 6) + sc_DescriptorReg) / 0x100
-	.align	2
-	.set	reorder
-1:	lw	reg_CODE, FDEFN_FUN_OFFSET(reg_FDEFN)
-	lw	reg_LIP, SIMPLE_FUN_CODE_OFFSET(reg_CODE)
-	jr	reg_LIP
-	END(undefined_tramp)
-
-/*
- * The closure trampoline.
- */
- 	.align	5 /* common MIPS cacheline size */
-	.word	0 /* pad 1 */
-	.word	0 /* pad 2 */
-	.word	SIMPLE_FUN_HEADER_WIDETAG /* header */
-	.word	closure_tramp - SIMPLE_FUN_CODE_OFFSET /* self */
-	.word	NIL /* next */
-	.word   NIL /* name */
-	.word	NIL /* arglist */
-	.word	NIL /* type */
-	.word	NIL /* xrefs */
-	LEAF(closure_tramp)
-        lw	reg_LEXENV, FDEFN_FUN_OFFSET(reg_FDEFN)
-        lw	reg_CODE, CLOSURE_FUN_OFFSET(reg_LEXENV)
-        addu	reg_LIP, reg_CODE, SIMPLE_FUN_CODE_OFFSET
-        jr	reg_LIP
-	END(closure_tramp)
-
-/*
- * The trampoline for funcallable instances
- */
-	.globl funcallable_instance_tramp
-	.align	3
-	.word	SIMPLE_FUN_HEADER_WIDETAG
-funcallable_instance_tramp = . + 1
-	.word	funcallable_instance_tramp
-	.word	NIL
-	.word	NIL
-	.word	NIL
-	.word	NIL
-	.word	NIL
-
-	lw	reg_LEXENV, FUNCALLABLE_INSTANCE_FUNCTION_OFFSET(reg_LEXENV)
-	lw	reg_CODE, CLOSURE_FUN_OFFSET(reg_LEXENV)
-	addu	reg_LIP, reg_CODE, SIMPLE_FUN_CODE_OFFSET
-	jr	reg_LIP
-	nop
-
-/*
  * Function-end breakpoint magic. This is truely magic, the code is
  * copied and has to be relocatable. It also needs a properly aligned
  * header tag after the fun_end_breakpoint_guts symbol.
@@ -455,7 +382,7 @@ funcallable_instance_tramp = . + 1
 	.align  3 /* minimum alignment for a lisp object */
 	LEAF(fun_end_breakpoint_guts)
 	.set    noreorder
-	.word   RETURN_PC_HEADER_WIDETAG + 0x600
+	.word	(((CODE_SIZE+1)&~1)<<N_WIDETAG_BITS)|RETURN_PC_WIDETAG
 	b       multiple_value_return
 	 nop
 	.set    reorder

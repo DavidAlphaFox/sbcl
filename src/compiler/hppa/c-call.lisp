@@ -9,7 +9,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
+
+(defstruct arg-state
+  (stack-frame-size 0)
+  (float-args 0)
+  nargs)
 
 ;;; beware that we deal alot here with register-offsets directly
 ;;; instead of their symbol-name in vm.lisp
@@ -42,11 +47,6 @@
                    ((sap-stack signed-stack unsigned-stack)
                      (- (arg-state-nargs state) offset 8 1)))))
 
-(defstruct arg-state
-  (stack-frame-size 0)
-  (float-args 0)
-  nargs)
-
 (define-alien-type-method (integer :arg-tn) (type state)
   (let ((stack-frame-size (arg-state-stack-frame-size state)))
     (setf (arg-state-stack-frame-size state) (1+ stack-frame-size))
@@ -76,15 +76,15 @@
   (let ((stack-frame-size (logandc2 (1+ (arg-state-stack-frame-size state)) 1))
         (float-args (arg-state-float-args state)))
     (setf (arg-state-stack-frame-size state) (+ stack-frame-size 2))
-    (setf (arg-state-float-args state) (1+ float-args))
+    (setf (arg-state-float-args state) (+ 2 float-args))
     (cond ((>= stack-frame-size 4)
            (my-make-wired-tn 'double-float
                              'double-stack
                              stack-frame-size state))
           (t
             (my-make-wired-tn 'double-float
-                              'double-int-carg-reg
-                              (1+ (* float-args 2)) state)))))
+                              'double-reg
+                              (1+ float-args) state)))))
 
 (define-alien-type-method (single-float :arg-tn) (type state)
   (declare (ignore type))
@@ -97,9 +97,9 @@
                              'single-stack
                              stack-frame-size state))
           (t
-            (my-make-wired-tn 'double-float
-                              'single-int-carg-reg
-                              (* float-args 2) state)))))
+            (my-make-wired-tn 'single-float
+                              'single-reg
+                              float-args state)))))
 
 (defstruct result-state
   (num-results 0))
@@ -161,8 +161,8 @@
                                         (make-result-state))))))
 
 (deftransform %alien-funcall ((function type &rest args))
-  (aver (sb!c::constant-lvar-p type))
-  (let* ((type (sb!c::lvar-value type))
+  (aver (sb-c::constant-lvar-p type))
+  (let* ((type (sb-c::lvar-value type))
          (env (make-null-lexenv))
          (arg-types (alien-fun-type-arg-types type))
          (result-type (alien-fun-type-result-type type)))
@@ -171,16 +171,16 @@
     ;; and results.
     (if (or (some (lambda (type)
                     (and (alien-integer-type-p type)
-                         (> (sb!alien::alien-integer-type-bits type) 32)))
+                         (> (sb-alien::alien-integer-type-bits type) 32)))
                   arg-types)
             (and (alien-integer-type-p result-type)
-                 (> (sb!alien::alien-integer-type-bits result-type) 32)))
+                 (> (sb-alien::alien-integer-type-bits result-type) 32)))
         (collect ((new-args) (lambda-vars) (new-arg-types))
                  (dolist (type arg-types)
                    (let ((arg (gensym)))
                      (lambda-vars arg)
                      (cond ((and (alien-integer-type-p type)
-                                 (> (sb!alien::alien-integer-type-bits type) 32))
+                                 (> (sb-alien::alien-integer-type-bits type) 32))
                             ;; 64-bit long long types are stored in
                             ;; consecutive locations, endian word order,
                             ;; aligned to 8 bytes.
@@ -198,9 +198,9 @@
                             (new-args arg)
                             (new-arg-types type)))))
                  (cond ((and (alien-integer-type-p result-type)
-                             (> (sb!alien::alien-integer-type-bits result-type) 32))
+                             (> (sb-alien::alien-integer-type-bits result-type) 32))
                         (let ((new-result-type
-                               (let ((sb!alien::*values-type-okay* t))
+                               (let ((sb-alien::*values-type-okay* t))
                                  (parse-alien-type
                                   (if (alien-integer-type-signed result-type)
                                       '(values (signed 32) (unsigned 32))
@@ -224,7 +224,7 @@
                               :arg-types (new-arg-types)
                               :result-type result-type)
                            ,@(new-args))))))
-        (sb!c::give-up-ir1-transform))))
+        (sb-c::give-up-ir1-transform))))
 
 (define-vop (foreign-symbol-sap)
   (:translate foreign-symbol-sap)
@@ -237,7 +237,7 @@
   (:generator 2
     (inst li (make-fixup foreign-symbol :foreign) res)))
 
-#!+linkage-table
+#+linkage-table
 (define-vop (foreign-symbol-dataref-sap)
   (:translate foreign-symbol-dataref-sap)
   (:policy :fast-safe)
@@ -311,7 +311,7 @@
 (defun alien-callback-accessor-form (type sap offset)
   (let ((parsed-type type))
     (if (alien-integer-type-p parsed-type)
-        (let ((bits (sb!alien::alien-integer-type-bits parsed-type)))
+        (let ((bits (sb-alien::alien-integer-type-bits parsed-type)))
                (let ((byte-offset
                       (cond ((< bits n-word-bits)
                              (- n-word-bytes

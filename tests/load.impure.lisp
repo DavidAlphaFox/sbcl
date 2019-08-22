@@ -11,7 +11,57 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(defvar *tmp-filename* "load-test.tmp")
+(defvar *tmp-filename* (scratch-file-name "tmp"))
+
+;;; These tests are essentially the same as in compiler.pure.lisp
+;;; They have to be run before we mess up *DEFAULT-PATHNAME-DEFAULTS*
+(with-test (:name :load-as-source-error-position-reporting)
+  ;; These test errors that occur during READ
+  (dolist (input '("data/wonky1.lisp" "data/wonky2.lisp" "data/wonky3.lisp"))
+    (let ((expect (with-open-file (f input) (read f))))
+      (assert (stringp expect))
+      (let ((err-string
+             (block foo
+               ;; you can't query the stream position with HANDLER-CASE
+               ;; because it closes before the condition is formatted.
+               (handler-bind ((error (lambda (c)
+                                       (return-from foo
+                                         (write-to-string c :escape nil)))))
+                 (load input)))))
+        (assert (search expect err-string)))))
+
+  ;; This tests an error that occur during EVAL
+  (let ((s (with-output-to-string (*error-output*)
+             (handler-bind ((error #'abort)) (load "data/wonky4.lisp")))))
+    (assert (search "While evaluating the form starting at line 16, column 1"
+                    s))))
+
+;;; Save this because we're going to mess up the path in the following SETQ.
+(defvar *parallel-load-source-file* (truename "parallel-fasl-load-test.lisp"))
+
+;;; Tests in this file make assertions about behavior of LOAD or OPEN when given
+;;; partial pathnames. As such, fully qualifying the pathname arguments with the
+;;; temp dir would totally defeat the point of the tests. While we can't assume
+;;; that the current directory is writable, we can change the defaults to the temp
+;;; dir which doesn't affect the meaning of the tests, since they don't care where
+;;; their files are, with the one exception being "parallel-load".
+;;; I'm not doing this for win32 since I don't know what works there.
+#-win32 (setq *default-pathname-defaults*
+              (truename (make-pathname :directory
+                                       (pathname-directory (scratch-file-name)))))
+
+;;; Loading from Lisp should set the TOPLEVEL-FORM-NUMBER slot
+(with-test (:name :load-lisp-assigns-tlf-num)
+  (with-open-file (f *tmp-filename* :direction :output
+                     :if-exists :supersede :if-does-not-exist :create)
+    (write '(defvar *var0* 'this-is-form-0) :stream f)
+    (write '(defvar *var1* 'this-is-form-1) :stream f))
+  (load *tmp-filename*)
+  (assert (eql 0 (sb-c:definition-source-location-toplevel-form-number
+                     (sb-int:info :source-location :variable '*var0*))))
+  (assert (eql 1 (sb-c:definition-source-location-toplevel-form-number
+                     (sb-int:info :source-location :variable '*var1*))))
+  (delete-file *tmp-filename*))
 
 ;;; Bug reported by Sean Ross: FASL loader set fill pointer to loaded
 ;;; simple arrays.
@@ -111,21 +161,24 @@
 ;;; Loading from streams.
 
 ;; string-stream
-(with-input-from-string (s *test-program-string*)
-  (load-and-assert s nil nil))
+(with-test (:name :load-string-stream)
+  (with-input-from-string (s *test-program-string*)
+    (load-and-assert s nil nil)))
 
 ;; file-stream associated with a source file
-(let ((source (pathname "load-impure-test.lisp")))
-  (with-test-program source nil
-    (with-open-file (stream source)
-      (load-and-assert stream source source))))
+(with-test (:name :load-lisp-file-stream)
+  (let ((source (scratch-file-name "lisp")))
+    (with-test-program source nil
+      (with-open-file (stream source)
+        (load-and-assert stream source source)))))
 
 ;; file-stream associated with a fasl file
-(let* ((source (pathname "load-impure-test.lisp"))
-       (fasl (compile-file-pathname source)))
-  (with-test-program source fasl
-    (with-open-file (stream fasl :element-type 'unsigned-byte)
-      (load-and-assert fasl fasl fasl))))
+(with-test (:name :load-fasl-file-stream)
+  (let* ((source (scratch-file-name "lisp"))
+         (fasl (compile-file-pathname source)))
+    (with-test-program source fasl
+      (with-open-file (stream fasl :element-type 'unsigned-byte)
+        (load-and-assert fasl fasl fasl)))))
 
 ;; Develop a simple Gray stream to test loading from.
 (defclass load-impure-gray-stream (fundamental-character-input-stream)
@@ -146,132 +199,151 @@
         (decf pointer)))
   nil)
 
-(with-open-stream (stream (make-instance 'load-impure-gray-stream))
-  (load-and-assert stream nil nil))
+(with-test (:name :load-gray-stream)
+  (with-open-stream (stream (make-instance 'load-impure-gray-stream))
+    (load-and-assert stream nil nil)))
 
 ;;; Loading from things named by pathname designators.
 
+(defvar *tmp-lisp-filename* (scratch-file-name "lisp"))
+
 ;; Test loading a source file by supplying a complete pathname.
-(let ((source (pathname "load-impure-test.lisp")))
-  (with-test-program source nil
-    (load-and-assert source source source)))
+(with-test (:name :load-source-file-full-pathname)
+  (let ((source *tmp-lisp-filename*))
+    (with-test-program source nil
+      (load-and-assert source source source))))
 
 ;; Test loading a source file when supplying a partial pathname.
-(let ((source (pathname "load-impure-test.lisp"))
-      (partial (pathname "load-impure-test")))
-  (with-test-program source nil
-    (load-and-assert partial source source)))
+(with-test (:name :load-source-file-partial-pathname)
+  (let ((source *tmp-lisp-filename*)
+        (partial (make-pathname :defaults *tmp-lisp-filename*
+                                 :type nil)))
+    (with-test-program source nil
+      (load-and-assert partial source source))))
 
 ;; Test loading a source file whose name lacks a type when supplying a
 ;; partial pathname.
-(let ((source (make-pathname :type :unspecific
-                             :defaults (pathname "load-impure-test")))
-      (partial (pathname "load-impure-test")))
-  (with-test-program source nil
-    (load-and-assert partial partial partial)))
+(with-test (:name :load-source-file-default-type)
+  (let ((source (make-pathname :type :unspecific
+                               :defaults *tmp-lisp-filename*))
+        (partial (make-pathname :defaults *tmp-lisp-filename*
+                                :type nil)))
+    (with-test-program source nil
+      (load-and-assert partial partial partial))))
 
 ;; Test loading a fasl
-(let* ((source (pathname "load-impure-test.lisp"))
-       (fasl (compile-file-pathname source)))
-  (with-test-program source fasl
-    (load-and-assert fasl fasl fasl)))
+(with-test (:name :load-fasl-file)
+  (let* ((source *tmp-lisp-filename*)
+         (fasl (compile-file-pathname source)))
+    (with-test-program source fasl
+      (load-and-assert fasl fasl fasl))))
 
 ;; Test loading a fasl when supplying a partial pathname.
-(let* ((source  (pathname "load-impure-test.lisp"))
-       (fasl (compile-file-pathname source))
-       (partial (pathname "load-impure-test")))
-  (with-test-program source fasl
-    (load-and-assert partial fasl fasl)))
+(with-test (:name :load-fasl-file-partial-pathname)
+  (let* ((source *tmp-lisp-filename*)
+         (fasl (compile-file-pathname source))
+         (partial (make-pathname :defaults *tmp-lisp-filename*
+                                 :type nil)))
+    (with-test-program source fasl
+      (load-and-assert partial fasl fasl))))
 
 ;; Test loading a fasl whose name lacks a type when supplying a
 ;; partial pathname.
-(let* ((source  (pathname "load-impure-test.lisp"))
-       (fasl (make-pathname :type :unspecific
-                            :defaults (compile-file-pathname source)))
-       (partial (pathname "load-impure-test")))
-  (with-test-program source fasl
-    (load-and-assert partial partial partial)))
+(with-test (:name :load-fasl-file-defaut-type)
+  (let* ((source  *tmp-lisp-filename*)
+         (fasl (make-pathname :type :unspecific
+                              :defaults (compile-file-pathname source)))
+         (partial (make-pathname :defaults *tmp-lisp-filename*
+                                 :type nil)))
+    (with-test-program source fasl
+      (load-and-assert partial partial partial))))
 
 ;; Test loading a fasl with a strange type
-(let* ((source (pathname "load-impure-test.lisp"))
-       (fasl (make-pathname :defaults (compile-file-pathname source)
-                            :type "compiled-lisp")))
-  (with-test-program source fasl
-    (load-and-assert fasl fasl fasl)))
+(with-test (:name :load-fasl-file-strange-type)
+  (let* ((source *tmp-lisp-filename*)
+         (fasl (make-pathname :defaults (compile-file-pathname source)
+                              :type "compiled-lisp")))
+    (with-test-program source fasl
+      (load-and-assert fasl fasl fasl))))
 
 ;;; Errors
 
 ;; Ensure that loading a fasl specified with a type checks for the
 ;; header.
-(let* ((source (pathname "load-impure-test.lisp"))
-       (fasl (compile-file-pathname source)))
-  (with-test-program source fasl
-    (with-open-file (f fasl :direction :io :if-exists :overwrite
-                       :element-type '(unsigned-byte 8))
-      (write-byte 0 f))
-    (handler-case (load fasl)
-      (sb-fasl::fasl-header-missing () :ok))))
+(with-test (:name :load-fasl-header-missing-1)
+  (let* ((source *tmp-lisp-filename*)
+         (fasl (compile-file-pathname source)))
+    (with-test-program source fasl
+      (with-open-file (f fasl :direction :io :if-exists :overwrite
+                         :element-type '(unsigned-byte 8))
+        (write-byte 0 f))
+      (handler-case (load fasl)
+        (sb-fasl::fasl-header-missing () :ok)))))
 
 ;; Ensure that loading a fasl specified without a type checks for the
 ;; header.  Note: this wasn't the behavior in
 ;; src/code/target-load.lisp v1.40 and earlier (SBCL version 1.0.12.35
 ;; or so).  If target-load.lisp is reverted to that state eventually,
 ;; this test should be removed (or that definition of LOAD altered).
-(let* ((source (pathname "load-impure-test.lisp"))
-       (fasl (compile-file-pathname source))
-       (fasl-spec (make-pathname :type nil
-                                 :defaults (compile-file-pathname source))))
-  (with-test-program source fasl
-    (with-open-file (f fasl :direction :io :if-exists :overwrite
-                       :element-type '(unsigned-byte 8))
-      (write-byte 0 f))
-    (handler-case (load fasl-spec)
-      (sb-fasl::fasl-header-missing () :ok))))
+(with-test (:name :load-fasl-header-missing-2)
+  (let* ((source *tmp-lisp-filename*)
+         (fasl (compile-file-pathname source))
+         (fasl-spec (make-pathname :type nil
+                                   :defaults (compile-file-pathname source))))
+    (with-test-program source fasl
+      (with-open-file (f fasl :direction :io :if-exists :overwrite
+                         :element-type '(unsigned-byte 8))
+        (write-byte 0 f))
+      (handler-case (load fasl-spec)
+        (sb-fasl::fasl-header-missing () :ok)))))
 
 ;; Ensure that we get an error when the source file is newer than the
 ;; fasl and the supplied argument is an incomplete pathname.
-(let* ((source (pathname "load-impure-test.lisp"))
-       (fasl (compile-file-pathname source))
-       (spec (make-pathname :type nil :defaults source)))
-  (with-test-program source fasl
-    (sleep 1)
-    (with-open-file (*standard-output* source :direction :output
-                                       :if-exists :append)
-      (write-line ";;comment"))
-    (handler-case (load spec)
-      ;; IWBNI the error signalled here were more specific than
-      ;; SIMPLE-ERROR.
-      (error () :|well, we got an error!|))))
+(with-test (:name :load-default-obsolete-fasl)
+  (let* ((source *tmp-lisp-filename*)
+         (fasl (compile-file-pathname source))
+         (spec (make-pathname :type nil :defaults source)))
+    (with-test-program source fasl
+      (sleep 1)
+      (with-open-file (*standard-output* source :direction :output
+                                         :if-exists :append)
+        (write-line ";;comment"))
+      (handler-case (load spec)
+        ;; IWBNI the error signalled here were more specific than
+        ;; SIMPLE-ERROR.
+        (error () :|well, we got an error!|)))))
 
 ;; Ensure that we can invoke the restart SOURCE in the above case.
-(let* ((source (pathname "load-impure-test.lisp"))
-       (fasl (compile-file-pathname source))
-       (spec (make-pathname :type nil :defaults source)))
-  (with-test-program source fasl
-    (sleep 1)
-    (with-open-file (*standard-output* source :direction :output
-                                       :if-exists :append)
-      (write-line ";;comment"))
-    (handler-bind ((error (lambda (error)
-                            (declare (ignore error))
-                            (when (find-restart 'sb-fasl::source)
-                              (invoke-restart 'sb-fasl::source)))))
-      (load-and-assert spec source source))))
+(with-test (:name :load-default-obsolete-fasl-restart-source)
+  (let* ((source *tmp-lisp-filename*)
+         (fasl (compile-file-pathname source))
+         (spec (make-pathname :type nil :defaults source)))
+    (with-test-program source fasl
+      (sleep 1)
+      (with-open-file (*standard-output* source :direction :output
+                                         :if-exists :append)
+        (write-line ";;comment"))
+      (handler-bind ((error (lambda (error)
+                              (declare (ignore error))
+                              (when (find-restart 'sb-fasl::source)
+                                (invoke-restart 'sb-fasl::source)))))
+        (load-and-assert spec source source)))))
 
 ;; Ensure that we can invoke the restart OBJECT in the above case.
-(let* ((source (pathname "load-impure-test.lisp"))
-       (fasl (compile-file-pathname source))
-       (spec (make-pathname :type nil :defaults source)))
-  (with-test-program source fasl
-    (sleep 1)
-    (with-open-file (*standard-output* source :direction :output
-                                       :if-exists :append)
-      (write-line ";;comment"))
-    (handler-bind ((error (lambda (error)
-                            (declare (ignore error))
-                            (when (find-restart 'sb-fasl::object)
-                              (invoke-restart 'sb-fasl::object)))))
-      (load-and-assert spec fasl fasl))))
+(with-test (:name :load-defaulted-obsolete-fasl-restart-object)
+  (let* ((source *tmp-lisp-filename*)
+         (fasl (compile-file-pathname source))
+         (spec (make-pathname :type nil :defaults source)))
+    (with-test-program source fasl
+      (sleep 1)
+      (with-open-file (*standard-output* source :direction :output
+                                         :if-exists :append)
+        (write-line ";;comment"))
+      (handler-bind ((error (lambda (error)
+                              (declare (ignore error))
+                              (when (find-restart 'sb-fasl::object)
+                                (invoke-restart 'sb-fasl::object)))))
+        (load-and-assert spec fasl fasl)))))
 
 (with-test (:name :bug-332)
   (flet ((stimulate-sbcl ()
@@ -286,8 +358,7 @@
     (stimulate-sbcl)))
 
 (defun load-empty-file (type)
-  (let ((pathname (make-pathname :name "load-impure-lisp-empty-temp"
-                                 :type type)))
+  (let ((pathname (scratch-file-name type)))
       (unwind-protect
            (progn
              (with-open-file (f pathname
@@ -313,107 +384,40 @@
 (with-test (:name :parallel-fasl-load
             :skipped-on :sb-safepoint)
   #+sb-thread
-  (let ((lisp #p"parallel-fasl-load-test.lisp")
-        (fasl nil)
-        (ready nil))
-    (unwind-protect
-         (progn
-           (multiple-value-bind (compiled warned failed)
-               (compile-file lisp)
-             (setf fasl compiled)
-             (assert (not warned))
-             (assert (not failed))
-             (labels ((load-loop ()
-                        (let* ((*standard-output* (make-broadcast-stream))
-                               (*error-output* *standard-output*))
-                          (sb-ext:wait-for ready)
-                          (handler-case
-                              (progn
-                                (loop repeat 1000
-                                      do (load fasl)
-                                         (test-it))
-                                t)
-                            (error (e) e))))
-                      (test-it ()
-                        (assert (= 1 (one-fun)))
-                        (assert (= 2 (two-fun)))
-                        (assert (= 42 (symbol-value '*var*)))
-                        (assert (= 13 (symbol-value '*quux*)))))
-               (let ((t1 (sb-thread:make-thread #'load-loop))
-                     (t2 (sb-thread:make-thread #'load-loop))
-                     (t3 (sb-thread:make-thread #'load-loop)))
-                 (setf ready t)
-                 (let ((r1 (sb-thread:join-thread t1))
-                       (r2 (sb-thread:join-thread t2))
-                       (r3 (sb-thread:join-thread t3)))
-                   (unless (and (eq t r1) (eq t r2) (eq t r3))
-                     (error "R1: ~A~2%R2: ~A~2%R2: ~A" r1 r2 r3))
-                   ;; These ones cannot be tested while redefinitions are running:
-                   ;; adding a method implies REMOVE-METHOD, so a call would be racy.
-                   (assert (eq :ok (a-slot (make-instance 'a-class :slot :ok))))
-                   (assert (eq 'cons (gen-fun '(foo))))
-                   (assert (eq 'a-class (gen-fun (make-instance 'a-class)))))
-                 (test-it)))))
-      (when fasl
-        (ignore-errors (delete-file fasl))))))
-
-(defvar *pack*)
-#+sb-simd-pack
-(with-test (:name :load-simd-pack-int)
-  (with-open-file (s *tmp-filename*
-                     :direction :output
-                     :if-exists :supersede
-                     :if-does-not-exist :create)
-    (print '(setq *pack* (sb-kernel:%make-simd-pack-ub64 2 4)) s))
-  (let (tmp-fasl)
-    (unwind-protect
-         (progn
-           (setq tmp-fasl (compile-file *tmp-filename*))
-           (let ((*pack* nil))
-             (load tmp-fasl)
-             (assert (typep *pack* '(sb-kernel:simd-pack integer)))
-             (assert (= 2 (sb-kernel:%simd-pack-low *pack*)))
-             (assert (= 4 (sb-kernel:%simd-pack-high *pack*)))))
-      (when tmp-fasl (delete-file tmp-fasl))
-      (delete-file *tmp-filename*))))
-
-#+sb-simd-pack
-(with-test (:name :load-simd-pack-single)
-  (with-open-file (s *tmp-filename*
-                     :direction :output
-                     :if-exists :supersede
-                     :if-does-not-exist :create)
-    (print '(setq *pack* (sb-kernel:%make-simd-pack-single 1f0 2f0 3f0 4f0)) s))
-  (let (tmp-fasl)
-    (unwind-protect
-         (progn
-           (setq tmp-fasl (compile-file *tmp-filename*))
-           (let ((*pack* nil))
-             (load tmp-fasl)
-             (assert (typep *pack* '(sb-kernel:simd-pack single-float)))
-             (assert (equal (multiple-value-list (sb-kernel:%simd-pack-singles *pack*))
-                            '(1f0 2f0 3f0 4f0)))))
-      (when tmp-fasl (delete-file tmp-fasl))
-      (delete-file *tmp-filename*))))
-
-#+sb-simd-pack
-(with-test (:name :load-simd-pack-double)
-  (with-open-file (s *tmp-filename*
-                     :direction :output
-                     :if-exists :supersede
-                     :if-does-not-exist :create)
-    (print '(setq *pack* (sb-kernel:%make-simd-pack-double 1d0 2d0)) s))
-  (let (tmp-fasl)
-    (unwind-protect
-         (progn
-           (setq tmp-fasl (compile-file *tmp-filename*))
-           (let ((*pack* nil))
-             (load tmp-fasl)
-             (assert (typep *pack* '(sb-kernel:simd-pack double-float)))
-             (assert (equal (multiple-value-list (sb-kernel:%simd-pack-doubles *pack*))
-                            '(1d0 2d0)))))
-      (when tmp-fasl (delete-file tmp-fasl))
-      (delete-file *tmp-filename*))))
+  (with-scratch-file (fasl "fasl")
+    (let ((ready nil))
+      (multiple-value-bind (compiled warned failed)
+          (compile-file *parallel-load-source-file* :output-file fasl)
+        (assert (not warned))
+        (assert (not failed)))
+      (labels ((load-loop ()
+                 (let* ((*standard-output* (make-broadcast-stream))
+                        (*error-output* *standard-output*))
+                   (sb-ext:wait-for ready)
+                   (handler-case (dotimes (i 1000 t)
+                                   (load fasl)
+                                   (test-it))
+                     (error (e) e))))
+               (test-it ()
+                 (assert (= 1 (one-fun)))
+                 (assert (= 2 (two-fun)))
+                 (assert (= 42 (symbol-value '*var*)))
+                 (assert (= 13 (symbol-value '*quux*)))))
+        (let ((t1 (sb-thread:make-thread #'load-loop))
+              (t2 (sb-thread:make-thread #'load-loop))
+              (t3 (sb-thread:make-thread #'load-loop)))
+          (setf ready t)
+          (let ((r1 (sb-thread:join-thread t1))
+                (r2 (sb-thread:join-thread t2))
+                (r3 (sb-thread:join-thread t3)))
+            (unless (and (eq t r1) (eq t r2) (eq t r3))
+              (error "R1: ~A~2%R2: ~A~2%R2: ~A" r1 r2 r3))
+            ;; These ones cannot be tested while redefinitions are running:
+            ;; adding a method implies REMOVE-METHOD, so a call would be racy.
+            (assert (eq :ok (a-slot (make-instance 'a-class :slot :ok))))
+            (assert (eq 'cons (gen-fun '(foo))))
+            (assert (eq 'a-class (gen-fun (make-instance 'a-class)))))
+          (test-it))))))
 
 ;; Check that ':load print' on a fasl has some non-null effect
 (with-test (:name :fasloader-print)
@@ -434,7 +438,6 @@
 ";; SOME-FANCY-MACRO
 ;; *SOME-VAR*
 ;; MY-FAVORITE-TYPE
-;; NIL
 ;; FRED
 ;; (A)"))
      (delete-file *tmp-filename*)))
@@ -457,5 +460,5 @@
     (delete-file *tmp-filename*))
   ;; Not really a test of the bugfix, but a reminder that asdf-dependency-grovel
   ;; uses this internal macro and that we should endeavor not to break the syntax.
-  (macroexpand '(sb-c::do-forms-from-info
+  (macroexpand '(sb-c:do-forms-from-info
                  ((myform myindex) my-source-info) (something))))

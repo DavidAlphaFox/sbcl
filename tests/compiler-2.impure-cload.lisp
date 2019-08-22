@@ -16,6 +16,17 @@
 ;;;; recognize self-calls
 (declaim (optimize speed))
 
+;;; This is a fopcompilable form that caused FOP stack underflow
+;;; because the PROGN and SETQ each failed to push a NIL onto the stack.
+;;; >>> DO NOT ADD A (WITH-TEST) TO THIS. <<< It must stay fopcompilable.
+(let ((a (progn)) ; lp# 1427050
+      (b (setq))
+      (c (+ 1 2)))
+  (print c)
+  (defvar *aaa* a)
+  (defvar *bbb* b))
+
+
 ;;;; These three forms should be equivalent.
 
 ;;; This used to be a bug in the handling of null-lexenv vs toplevel
@@ -78,3 +89,61 @@
   (multiple-value-bind (val foundp)
       (sb-int:info :variable :macro-expansion '%trash%)
     (assert (and (not val) (not foundp)))))
+
+;; This must be one toplevel form.
+;; In practice you'd never do anything like this I suspect.
+(progn
+  (defvar *foofoo1* 1)
+  (eval-when (:compile-toplevel)
+    (setq sb-c::*source-plist* '(strange "Yes")))
+  (defvar *foofoo2* 2))
+
+(with-test (:name :source-location-plist-invalid-memoization)
+  (assert (null (sb-c:definition-source-location-plist
+                    (sb-int:info :source-location :variable '*foofoo1*))))
+  (assert (equal (sb-c:definition-source-location-plist
+                     (sb-int:info :source-location :variable '*foofoo2*))
+                 '(strange "Yes"))))
+
+(defstruct zombie-cast-struct
+  (value nil :type zombie-cast-struct-v))
+
+(defstruct zombie-cast-struct-v
+  (uses nil :type (or list zombie-cast-struct)))
+
+(with-test (:name :flush-zombie-casts)
+  (checked-compile `(lambda (x)
+                      (declare (optimize (debug 2) (speed 1)))
+                      (let ((value (zombie-cast-struct-value x)))
+                        (labels ((l (x)
+                                   (declare (ignore x))
+                                   (let ((uses (zombie-cast-struct-v-uses value)))
+                                     (when (zombie-cast-struct-p uses)
+                                       (list* uses (l uses)))))))))))
+
+(let ()
+  (define-condition non-top-level-condition (error) ()))
+
+(with-test (:name :non-top-level-condition)
+  (assert
+   (handler-case (signal 'non-top-level-condition)
+     (non-top-level-condition () t))))
+
+(defun somefun (x)
+  (declare (optimize (sb-c:store-source-form 3)))
+  (+ x 101))
+
+(locally
+    (declare (optimize (sb-c:store-source-form 3)))
+  (defun otherfun (y)
+    (/ y 3)))
+
+(locally
+    (declare (optimize (sb-c:store-source-form 2)))
+  (defun nosourcefun (y)
+    (/ y 3)))
+
+(with-test (:name :store-source-form)
+  (assert (function-lambda-expression #'somefun))
+  (assert (function-lambda-expression #'otherfun))
+  (assert (not (function-lambda-expression #'nosourcefun))))

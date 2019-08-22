@@ -24,11 +24,6 @@
 #include "breakpoint.h"
 #include "monitor.h"
 
-void arch_init(void)
-{
-    return;
-}
-
 os_vm_address_t arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *context)
 {
     return (os_vm_address_t)code->si_addr;
@@ -73,13 +68,12 @@ boolean arch_pseudo_atomic_atomic(os_context_t *context)
 
 void arch_set_pseudo_atomic_interrupted(os_context_t *context)
 {
-    /* 0x000f0001 is the syscall number for BREAK_POINT. */
-    SetSymbolValue(PSEUDO_ATOMIC_INTERRUPTED,MAKE_FIXNUM(0x000f0001),0);
+    SetSymbolValue(PSEUDO_ATOMIC_INTERRUPTED, (lispobj)do_pending_interrupt, 0);
 }
 
 void arch_clear_pseudo_atomic_interrupted(os_context_t *context)
 {
-    SetSymbolValue(PSEUDO_ATOMIC_INTERRUPTED,NIL,0);
+    SetSymbolValue(PSEUDO_ATOMIC_INTERRUPTED, 0, 0);
 }
 
 unsigned int arch_install_breakpoint(void *pc)
@@ -124,36 +118,6 @@ arch_handle_single_step_trap(os_context_t *context, int trap)
     arch_skip_instruction(context);
 }
 
-static void
-sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
-{
-    unsigned int code = *((unsigned char *)(4+*os_context_pc_addr(context)));
-    u32 trap_instruction = *((u32 *)*os_context_pc_addr(context));
-    int condition_bits = (trap_instruction >> 28) & 0x0f;
-
-    /* Make sure that we're looking at an SWI instruction or that one
-     * undefined instruction that the kernel recognizes as an explicit
-     * trap. */
-    if ((condition_bits == 15)
-        || (((trap_instruction & 0x0f000000) != 0x0f000000)
-            && (trap_instruction != 0xe7f001f0))) {
-        lose("Unrecognized trap instruction %08lx in sigtrap_handler()",
-             trap_instruction);
-    }
-
-    if (trap_instruction == 0xe7f001f0) {
-        handle_trap(context, code);
-    } else {
-        arch_clear_pseudo_atomic_interrupted(context);
-        arch_skip_instruction(context);
-        interrupt_handle_pending(context);
-    }
-}
-
-void arch_install_interrupt_handlers()
-{
-    undoably_install_low_level_interrupt_handler(SIGTRAP, sigtrap_handler);
-}
 
 
 #ifdef LISP_FEATURE_LINKAGE_TABLE
@@ -165,8 +129,12 @@ void arch_install_interrupt_handlers()
 
 #define LINKAGE_TEMP_REG        reg_NFP
 
-void arch_write_linkage_table_jmp(void* reloc_addr, void *target_addr)
+void arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
 {
+  if (datap) {
+    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
+    return;
+  }
   /*
     ldr reg, [pc, #4]
     bx  reg
@@ -195,15 +163,8 @@ void arch_write_linkage_table_jmp(void* reloc_addr, void *target_addr)
   *inst_ptr++ = inst;
 
   // address
-  *inst_ptr++ = target_addr;
+  *inst_ptr++ = (int)target_addr;
 
-  os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - (char*) reloc_addr);
+  os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
 }
-
-void
-arch_write_linkage_table_ref(void * reloc_addr, void *target_addr)
-{
-    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
-}
-
 #endif

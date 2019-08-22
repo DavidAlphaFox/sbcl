@@ -97,6 +97,10 @@
   (declare (ignore a))
   (xref/2))
 
+(defmethod xref/11 ((a (eql 'z)))
+  (declare (ignore a))
+  (xref/2))
+
 (defmethod xref/11 ((a float))
   (declare (ignore a))
   (xref/3))
@@ -122,6 +126,14 @@
 
 (defun xref/14 ()
   *a*)
+
+(sb-ext:defglobal **global** 31)
+
+(defun xref/15 ()
+  **global**)
+
+(defun xref/16 (x)
+  (setf **global** x))
 
 ;; calling a function in a macro body
 (defmacro macro/1 ()
@@ -178,6 +190,7 @@
 ;;; Inlining functions with non-trivial lambda-lists.
 (declaim (inline inline/3))
 (defun inline/3 (a &optional b &key c d)
+  (declare (sb-ext:muffle-conditions sb-kernel:&optional-and-&key-in-lambda-list))
   (list a b c d))
 (defun inline/3-user/1 (a)
   (inline/3 a))
@@ -224,3 +237,22 @@
 
 (defmethod a-gf-3 ((x (eql *an-instance-of-a-subclass*))))
 (defmethod a-gf-3 ((x (eql *an-instance-of-a-substructure*))))
+
+(defun called-by-traced-fun ())
+
+(defun traced-fun ()
+  (called-by-traced-fun))
+(trace traced-fun)
+
+#+sb-eval
+(progn
+  (defun called-by-interpreted-funs ())
+
+  (let ((sb-ext:*evaluator-mode* :interpret))
+    (eval '(defun interpreted-fun ()
+             (called-by-interpreted-funs))))
+
+  (let ((sb-ext:*evaluator-mode* :interpret))
+    (eval '(defun traced-interpreted-fun ()
+            (called-by-interpreted-funs))))
+  (trace traced-interpreted-fun))

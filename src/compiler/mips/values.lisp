@@ -9,32 +9,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-vop (reset-stack-pointer)
   (:args (ptr :scs (any-reg)))
   (:generator 1
     (move csp-tn ptr)))
-
-(define-vop (%%pop-dx)
-  (:args (ptr :scs (any-reg)))
-  (:ignore ptr)
-  (:generator 1
-    (bug "VOP %%POP-DX is not implemented.")))
-
-(define-vop (%%nip-dx)
-  (:args (last-nipped-ptr :scs (any-reg) :target dest)
-         (last-preserved-ptr :scs (any-reg) :target src)
-         (moved-ptrs :scs (any-reg) :more t))
-  (:results (r-moved-ptrs :scs (any-reg) :more t))
-  (:temporary (:sc any-reg) src)
-  (:temporary (:sc any-reg) dest)
-  (:temporary (:sc non-descriptor-reg) temp)
-  (:ignore r-moved-ptrs
-           last-nipped-ptr last-preserved-ptr moved-ptrs
-           src dest temp)
-  (:generator 1
-    (bug "VOP %%NIP-DX is not implemented.")))
 
 (define-vop (%%nip-values)
   (:args (last-nipped-ptr :scs (any-reg) :target dest)
@@ -43,33 +23,34 @@
   (:results (r-moved-ptrs :scs (any-reg) :more t))
   (:temporary (:sc any-reg) src)
   (:temporary (:sc any-reg) dest)
-  (:temporary (:sc non-descriptor-reg) temp)
+  (:temporary (:sc non-descriptor-reg) cmp-temp)
+  (:temporary (:sc descriptor-reg) temp)
   (:ignore r-moved-ptrs)
   (:generator 1
     (move src last-preserved-ptr)
     (move dest last-nipped-ptr)
-    (inst sltu temp src csp-tn)
-    (inst beq temp DONE)
+    (inst sltu cmp-temp src csp-tn)
+    (inst beq cmp-temp DONE)
     (inst nop) ; not strictly necessary
     LOOP
     (loadw temp src)
-    (inst add dest dest n-word-bytes)
-    (inst add src src n-word-bytes)
+    (inst addu dest dest n-word-bytes)
+    (inst addu src src n-word-bytes)
     (storew temp dest -1)
-    (inst sltu temp src csp-tn)
-    (inst bne temp LOOP)
+    (inst sltu cmp-temp src csp-tn)
+    (inst bne cmp-temp LOOP)
     (inst nop)
     DONE
     (move csp-tn dest)
-    (inst sub src src dest)
+    (inst subu src src dest)
     (loop for moved = moved-ptrs then (tn-ref-across moved)
           while moved
           do (sc-case (tn-ref-tn moved)
                ((descriptor-reg any-reg)
-                (inst sub (tn-ref-tn moved) (tn-ref-tn moved) src))
+                (inst subu (tn-ref-tn moved) (tn-ref-tn moved) src))
                ((control-stack)
                 (load-stack-tn temp (tn-ref-tn moved))
-                (inst sub temp temp src)
+                (inst subu temp temp src)
                 (store-stack-tn (tn-ref-tn moved) temp))))))
 
 ;;; Push some values onto the stack, returning the start and number of values
@@ -116,7 +97,7 @@
   (:policy :fast-safe)
   (:results (start :scs (any-reg))
             (count :scs (any-reg)))
-  (:temporary (:scs (descriptor-reg) :type list :from (:argument 0)) list)
+  (:temporary (:scs (descriptor-reg) :from (:argument 0)) list)
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:vop-var vop)
@@ -135,7 +116,7 @@
     (inst xor ndescr list-pointer-lowtag)
     (inst beq ndescr loop)
     (inst nop)
-    (error-call vop bogus-arg-to-values-list-error list)
+    (cerror-call vop 'bogus-arg-to-values-list-error list)
 
     DONE
     (inst subu count csp-tn start)))

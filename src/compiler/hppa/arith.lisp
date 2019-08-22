@@ -9,14 +9,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Unary operations.
 
 (define-vop (fast-safe-arith-op)
-  (:policy :fast-safe)
-  (:effects)
-  (:affected))
+  (:policy :fast-safe))
 
 (define-vop (fixnum-unop fast-safe-arith-op)
   (:args (x :scs (any-reg)))
@@ -44,7 +42,7 @@
 
 (define-vop (fast-lognot/fixnum fixnum-unop)
   (:translate lognot)
-  (:temporary (:scs (any-reg) :type fixnum :to (:result 0))
+  (:temporary (:scs (any-reg) :to (:result 0))
               temp)
   (:generator 1
     (inst li (fixnumize -1) temp)
@@ -200,22 +198,30 @@
         (:note "inline ASH")
         (:policy :fast-safe)
         (:args (number :scs (,reg) :to :save)
-               (count  :scs (signed-reg)
-                       ,@(if save
-                           '(:to :save))))
+               (count  :scs (signed-reg)))
         (:arg-types ,num ,tag)
         (:results (result :scs (,reg)))
         (:result-types ,num)
-        (:temporary (:scs (unsigned-reg) :to (:result 0)) temp)
+        (:temporary (:scs (unsigned-reg)
+                          ,@(unless save
+                              '(:to (:result 0)))) temp)
         (:generator 8
           (inst comb :>= count zero-tn positive :nullify t)
           (inst sub zero-tn count temp)
-          (inst comiclr 31 temp zero-tn :>=)
-          (inst li 31 temp)
-          (inst mtctl temp :sar)
-          (inst extrs number 0 1 temp)
-          (inst b done)
-          (inst shd temp number :variable result)
+          ,@(if save
+                '(;; Unsigned case
+                  (inst comiclr 31 temp result :>=)
+                  (inst b done :nullify t)
+                  (inst mtctl temp :sar)
+                  (inst b done)
+                  (inst shd zero-tn number :variable result))
+                '(;; Signed case
+                  (inst comiclr 31 temp zero-tn :>=)
+                  (inst li 31 temp)
+                  (inst mtctl temp :sar)
+                  (inst extrs number 0 1 temp)
+                  (inst b done)
+                  (inst shd temp number :variable result)))
           POSITIVE
           (inst subi 31 count temp)
           (inst mtctl temp :sar)
@@ -435,7 +441,7 @@
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 30
-    (let ((zero (generate-error-code vop division-by-zero-error x y)))
+    (let ((zero (generate-error-code vop 'division-by-zero-error x y)))
       (inst bc := nil y zero-tn zero))
     (move x x-pass)
     (move y y-pass)
@@ -447,6 +453,9 @@
     ;(move q-pass q)
     (move r-pass r)))
 
+#+(or) ;; This contains two largely-inexplicable hacks, and there's no
+       ;; equivalent VOP for either Alpha or ARM.  Why is this even
+       ;; here?  -- AB, 2015-11-19
 (define-vop (fast-truncate/unsigned fast-unsigned-binop)
   (:translate truncate)
   (:args (x :scs (unsigned-reg) :target x-pass)
@@ -465,7 +474,7 @@
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 35
-    (let ((zero (generate-error-code vop division-by-zero-error x y)))
+    (let ((zero (generate-error-code vop 'division-by-zero-error x y)))
       (inst bc := nil y zero-tn zero))
     (move x x-pass)
     (move y y-pass)
@@ -509,7 +518,7 @@
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 35
-    (let ((zero (generate-error-code vop division-by-zero-error x y)))
+    (let ((zero (generate-error-code vop 'division-by-zero-error x y)))
       (inst bc := nil y zero-tn zero))
     (move x x-pass)
     (move y y-pass)
@@ -526,8 +535,6 @@
 (define-vop (fast-conditional)
   (:conditional)
   (:info target not-p)
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-conditional/fixnum fast-conditional)
@@ -654,8 +661,8 @@
              fast-ash-left/unsigned=>unsigned))
 (deftransform ash-left-mod32 ((integer count)
                               ((unsigned-byte 32) (unsigned-byte 5)))
-  (when (sb!c::constant-lvar-p count)
-    (sb!c::give-up-ir1-transform))
+  (when (sb-c::constant-lvar-p count)
+    (sb-c::give-up-ir1-transform))
   '(%primitive fast-ash-left-mod32/unsigned=>unsigned integer count))
 
 ;;; logical operations
@@ -717,21 +724,21 @@
 ;;;; Bignum stuff.
 
 (define-vop (bignum-length get-header-data)
-  (:translate sb!bignum:%bignum-length)
+  (:translate sb-bignum:%bignum-length)
   (:policy :fast-safe))
 
 (define-vop (bignum-set-length set-header-data)
-  (:translate sb!bignum:%bignum-set-length)
+  (:translate sb-bignum:%bignum-set-length)
   (:policy :fast-safe))
 
 (define-full-reffer bignum-ref * bignum-digits-offset other-pointer-lowtag
-  (unsigned-reg) unsigned-num sb!bignum:%bignum-ref)
+  (unsigned-reg) unsigned-num sb-bignum:%bignum-ref)
 
 (define-full-setter bignum-set * bignum-digits-offset other-pointer-lowtag
-  (unsigned-reg) unsigned-num sb!bignum:%bignum-set)
+  (unsigned-reg) unsigned-num sb-bignum:%bignum-set)
 
 (define-vop (digit-0-or-plus)
-  (:translate sb!bignum:%digit-0-or-plusp)
+  (:translate sb-bignum:%digit-0-or-plusp)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg)))
   (:arg-types unsigned-num)
@@ -741,7 +748,7 @@
     (inst bc :>= not-p digit zero-tn target)))
 
 (define-vop (add-w/carry)
-  (:translate sb!bignum:%add-with-carry)
+  (:translate sb-bignum:%add-with-carry)
   (:policy :fast-safe)
   (:args (a :scs (unsigned-reg))
          (b :scs (unsigned-reg))
@@ -756,7 +763,7 @@
     (inst addc zero-tn zero-tn carry)))
 
 (define-vop (sub-w/borrow)
-  (:translate sb!bignum:%subtract-with-borrow)
+  (:translate sb-bignum:%subtract-with-borrow)
   (:policy :fast-safe)
   (:args (a :scs (unsigned-reg))
          (b :scs (unsigned-reg))
@@ -771,7 +778,7 @@
     (inst addc zero-tn zero-tn borrow)))
 
 (define-vop (bignum-mult)
-  (:translate sb!bignum:%multiply)
+  (:translate sb-bignum:%multiply)
   (:policy :fast-safe)
   (:args (x-arg :scs (unsigned-reg) :target x)
          (y-arg :scs (unsigned-reg) :target y))
@@ -807,35 +814,35 @@
 
     DONE))
 
-(define-source-transform sb!bignum:%multiply-and-add (x y carry &optional (extra 0))
+(define-source-transform sb-bignum:%multiply-and-add (x y carry &optional (extra 0))
   #+nil ;; This would be greate if it worked, but it doesn't.
   (if (eql extra 0)
-      `(multiple-value-call #'sb!bignum:%dual-word-add
-         (sb!bignum:%multiply ,x ,y)
+      `(multiple-value-call #'sb-bignum:%dual-word-add
+         (sb-bignum:%multiply ,x ,y)
          (values ,carry))
-      `(multiple-value-call #'sb!bignum:%dual-word-add
-         (multiple-value-call #'sb!bignum:%dual-word-add
-           (sb!bignum:%multiply ,x ,y)
+      `(multiple-value-call #'sb-bignum:%dual-word-add
+         (multiple-value-call #'sb-bignum:%dual-word-add
+           (sb-bignum:%multiply ,x ,y)
            (values ,carry))
          (values ,extra)))
   (with-unique-names (hi lo)
     (if (eql extra 0)
-        `(multiple-value-bind (,hi ,lo) (sb!bignum:%multiply ,x ,y)
-           (sb!bignum::%dual-word-add ,hi ,lo ,carry))
-        `(multiple-value-bind (,hi ,lo) (sb!bignum:%multiply ,x ,y)
+        `(multiple-value-bind (,hi ,lo) (sb-bignum:%multiply ,x ,y)
+           (sb-bignum::%dual-word-add ,hi ,lo ,carry))
+        `(multiple-value-bind (,hi ,lo) (sb-bignum:%multiply ,x ,y)
            (multiple-value-bind
                (,hi ,lo)
-               (sb!bignum::%dual-word-add ,hi ,lo ,carry)
-             (sb!bignum::%dual-word-add ,hi ,lo ,extra))))))
+               (sb-bignum::%dual-word-add ,hi ,lo ,carry)
+             (sb-bignum::%dual-word-add ,hi ,lo ,extra))))))
 
-(defknown sb!bignum::%dual-word-add
-          (sb!bignum:bignum-element-type sb!bignum:bignum-element-type sb!bignum:bignum-element-type)
-  (values sb!bignum:bignum-element-type sb!bignum:bignum-element-type)
+(defknown sb-bignum::%dual-word-add
+          (sb-bignum:bignum-element-type sb-bignum:bignum-element-type sb-bignum:bignum-element-type)
+  (values sb-bignum:bignum-element-type sb-bignum:bignum-element-type)
   (flushable movable))
 
 (define-vop (dual-word-add)
   (:policy :fast-safe)
-  (:translate sb!bignum::%dual-word-add)
+  (:translate sb-bignum::%dual-word-add)
   (:args (hi :scs (unsigned-reg) :to (:result 1))
          (lo :scs (unsigned-reg))
          (extra :scs (unsigned-reg)))
@@ -843,17 +850,15 @@
   (:results (hi-res :scs (unsigned-reg) :from (:result 1))
             (lo-res :scs (unsigned-reg) :from (:result 0)))
   (:result-types unsigned-num unsigned-num)
-  (:affected)
-  (:effects)
   (:generator 3
     (inst add lo extra lo-res)
     (inst addc hi zero-tn hi-res)))
 
 (define-vop (bignum-lognot lognot-mod32/unsigned=>unsigned)
-  (:translate sb!bignum:%lognot))
+  (:translate sb-bignum:%lognot))
 
 (define-vop (fixnum-to-digit)
-  (:translate sb!bignum:%fixnum-to-digit)
+  (:translate sb-bignum:%fixnum-to-digit)
   (:policy :fast-safe)
   (:args (fixnum :scs (any-reg)))
   (:arg-types tagged-num)
@@ -863,7 +868,7 @@
     (inst sra fixnum n-fixnum-tag-bits digit)))
 
 (define-vop (bignum-floor)
-  (:translate sb!bignum:%bigfloor)
+  (:translate sb-bignum:%bigfloor)
   (:policy :fast-safe)
   (:args (hi :scs (unsigned-reg) :to (:argument 1))
          (lo :scs (unsigned-reg) :to (:argument 0))
@@ -886,7 +891,7 @@
     (inst add divisor rem rem)))
 
 (define-vop (signify-digit)
-  (:translate sb!bignum:%fixnum-digit-with-correct-sign)
+  (:translate sb-bignum:%fixnum-digit-with-correct-sign)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg) :target res))
   (:arg-types unsigned-num)
@@ -900,7 +905,7 @@
         (move digit res)))))
 
 (define-vop (digit-lshr)
-  (:translate sb!bignum:%digit-logical-shift-right)
+  (:translate sb-bignum:%digit-logical-shift-right)
   (:policy :fast-safe)
   (:args (digit :scs (unsigned-reg))
          (count :scs (unsigned-reg)))
@@ -912,7 +917,7 @@
     (inst shd zero-tn digit :variable result)))
 
 (define-vop (digit-ashr digit-lshr)
-  (:translate sb!bignum:%ashr)
+  (:translate sb-bignum:%ashr)
   (:temporary (:scs (unsigned-reg) :to (:result 0)) temp)
   (:generator 1
     (inst extrs digit 0 1 temp)
@@ -920,33 +925,8 @@
     (inst shd temp digit :variable result)))
 
 (define-vop (digit-ashl digit-ashr)
-  (:translate sb!bignum:%ashl)
+  (:translate sb-bignum:%ashl)
   (:generator 1
     (inst subi 31 count temp)
     (inst mtctl temp :sar)
     (inst zdep digit :variable 32 result)))
-
-
-;;;; Static functions.
-
-(define-static-fun two-arg-gcd (x y) :translate gcd)
-(define-static-fun two-arg-lcm (x y) :translate lcm)
-
-(define-static-fun two-arg-+ (x y) :translate +)
-(define-static-fun two-arg-- (x y) :translate -)
-(define-static-fun two-arg-* (x y) :translate *)
-(define-static-fun two-arg-/ (x y) :translate /)
-
-(define-static-fun two-arg-< (x y) :translate <)
-(define-static-fun two-arg-<= (x y) :translate <=)
-(define-static-fun two-arg-> (x y) :translate >)
-(define-static-fun two-arg->= (x y) :translate >=)
-(define-static-fun two-arg-= (x y) :translate =)
-(define-static-fun two-arg-/= (x y) :translate /=)
-
-(define-static-fun %negate (x) :translate %negate)
-
-(define-static-fun two-arg-and (x y) :translate logand)
-(define-static-fun two-arg-ior (x y) :translate logior)
-(define-static-fun two-arg-xor (x y) :translate logxor)
-

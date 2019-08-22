@@ -15,19 +15,29 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
-
-;;; numeric types
-(/show0 "precomputing numeric types")
-(precompute-types '((mod 2) (mod 4) (mod 16) (mod #x100) (mod #x10000)
-                    (mod #x100000000)
-                    (unsigned-byte 1) (unsigned-byte 2) (unsigned-byte 4)
-                    (unsigned-byte 8) (unsigned-byte 16) (unsigned-byte 32)
-                    (signed-byte 8) (signed-byte 16) (signed-byte 32)))
+(in-package "SB-KERNEL")
 
 ;;; built-in symbol type specifiers
+
+;;; Predefined types that are of kind :INSTANCE can't have their
+;;; :BUILTIN property set, so we cull them out. This used to operate
+;;; on all *!STANDARD-TYPE-NAMES* because !PRECOMPUTE-TYPES was ok to
+;;; call on unknown types. This relied upon the knowledge that
+;;; VALUES-SPECIFIER-TYPE avoided signaling a PARSE-UNKNOWN-TYPE
+;;; condition while in cold-init. This is terrible! It means that
+;;; (a) we have to know that something wouldn't signal
+;;;     when it otherwise should, and
+;;; (b) we can call that thing when the very data that it depends on
+;;;     are actually wrong.
+;;; Well, in as much as we have to do this suspicious action,
+;;; at least let's not get into a state where we *know*
+;;; that it ought to signal.
+
 (/show0 "precomputing built-in symbol type specifiers")
-(precompute-types *!standard-type-names*)
+(!precompute-types
+ (remove-if (lambda (x)
+              (memq x '(hash-table package pathname random-state readtable)))
+            *!standard-type-names*))
 
 #+sb-xc-host (setf *type-system-initialized* t)
 

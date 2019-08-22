@@ -27,7 +27,9 @@
 ;;; 4) FIXMEs
 
 (defpackage :sb-introspect
-  (:use "CL")
+  (:use "CL" "SB-KERNEL" "SB-INT")
+  (:import-from "SB-VM" "PRIMITIVE-OBJECT-SIZE")
+  (:shadow "VALID-FUNCTION-NAME-P")
   (:export "ALLOCATION-INFORMATION"
            "FUNCTION-ARGLIST"
            "FUNCTION-LAMBDA-LIST"
@@ -39,6 +41,7 @@
            "DEFINITION-SOURCE"
            "DEFINITION-SOURCE-PATHNAME"
            "DEFINITION-SOURCE-FORM-PATH"
+           "DEFINITION-SOURCE-FORM-NUMBER"
            "DEFINITION-SOURCE-CHARACTER-OFFSET"
            "DEFINITION-SOURCE-FILE-WRITE-DATE"
            "DEFINITION-SOURCE-PLIST"
@@ -77,28 +80,66 @@ include the pathname of the file and the position of the definition."
   "Debug function represent static compile-time information about a function."
   'sb-c::compiled-debug-fun)
 
-(declaim (ftype (function (function) debug-info) function-debug-info))
+(declaim (ftype (sfunction (function) debug-info) function-debug-info))
 (defun function-debug-info (function)
-  (let* ((function-object (sb-kernel::%fun-fun function))
-         (function-header (sb-kernel:fun-code-header function-object)))
-    (sb-kernel:%code-debug-info function-header)))
+  (let* ((function-object (%fun-fun function))
+         (function-header (fun-code-header function-object)))
+    (%code-debug-info function-header)))
 
-(declaim (ftype (function (function) debug-source) function-debug-source))
+(declaim (ftype (sfunction (function) debug-source) function-debug-source))
 (defun function-debug-source (function)
   (debug-info-source (function-debug-info function)))
 
-(declaim (ftype (function (debug-info) debug-source) debug-info-source))
+(declaim (ftype (sfunction (debug-info) debug-source) debug-info-source))
 (defun debug-info-source (debug-info)
   (sb-c::debug-info-source debug-info))
 
-(declaim (ftype (function (debug-info) debug-function) debug-info-debug-function))
-(defun debug-info-debug-function (debug-info)
-  (elt (sb-c::compiled-debug-info-fun-map debug-info) 0))
+(declaim (ftype (sfunction (t debug-info) debug-function) debug-info-debug-function))
+(defun debug-info-debug-function (function debug-info)
+  (sb-di::compiled-debug-fun-from-pc debug-info
+                                     (sb-di::function-start-pc-offset function)))
 
 (defun valid-function-name-p (name)
   "True if NAME denotes a valid function name, ie. one that can be passed to
 FBOUNDP."
   (and (sb-int:valid-function-name-p name) t))
+
+;;;; Utilities for code
+
+(declaim (inline map-code-constants))
+(defun map-code-constants (code fn)
+  "Call FN for each constant in CODE's constant pool."
+  (check-type code code-component)
+  (loop for i from sb-vm:code-constants-offset below (code-header-words code)
+     do (funcall fn (code-header-ref code i))))
+
+(declaim (inline map-allocated-code-components))
+(defun map-allocated-code-components (spaces fn)
+  "Call FN for each allocated code component in one of SPACES.  FN
+receives the object and its size as arguments.  SPACES should be a
+list of the symbols :dynamic, :static, :read-only, or :immobile on
+#+immobile-space"
+  (apply #'sb-vm:map-allocated-objects
+     (lambda (obj header size)
+       (when (= sb-vm:code-header-widetag header)
+         (funcall fn obj size)))
+     spaces))
+
+(declaim (inline map-caller-code-components))
+(defun map-caller-code-components (function spaces fn)
+  "Call FN for each code component with a fdefn for FUNCTION in its
+constant pool."
+  (let ((function (coerce function 'function)))
+    (map-allocated-code-components
+     spaces
+     (lambda (obj size)
+       (declare (ignore size))
+       (map-code-constants
+        obj
+        (lambda (constant)
+          (when (and (fdefn-p constant)
+                     (eq (fdefn-fun constant) function))
+            (funcall fn obj))))))))
 
 ;;;; Finding definitions
 
@@ -110,12 +151,19 @@ FBOUNDP."
   ;; This may be incomplete depending on the debug level at which the
   ;; source was compiled.
   (form-path '() :type list)
+  ;; Depth first number of the form.
+  ;; FORM-PATH above usually contains just the top-level form number,
+  ;; ideally the proper form path could be dervied from the
+  ;; form-number and the tlf-number, but it's a bit complicated and
+  ;; Slime already knows how to deal with form numbers, so delegate
+  ;; that job to Slime.
+  (form-number nil :type (or null unsigned-byte))
   ;; Character offset of the top-level-form containing the definition.
   ;; This corresponds to the first element of form-path.
-  (character-offset nil :type (or null integer))
+  (character-offset nil :type (or null unsigned-byte))
   ;; File-write-date of the source file when compiled.
   ;; Null if not compiled from a file.
-  (file-write-date nil :type (or null integer))
+  (file-write-date nil :type (or null unsigned-byte))
   ;; plist from WITH-COMPILATION-UNIT
   (plist nil)
   ;; Any extra metadata that the caller might be interested in. For
@@ -123,29 +171,31 @@ FBOUNDP."
   ;; is.
   (description nil :type list))
 
-(defun vop-sources-from-fun-templates (name)
-  (let ((fun-info (sb-int:info :function :info name)))
+(defun vops-translating-fun (name)
+  (let ((fun-info (info :function :info name)))
     (when fun-info
-      (loop for vop in (sb-c::fun-info-templates fun-info)
-            for source = (find-definition-source
-                          (sb-c::vop-info-generator-function vop))
-            do (setf (definition-source-description source)
-                     (list (sb-c::template-name vop)
-                           (sb-c::template-note vop)))
-            collect source))))
+      (sb-c::fun-info-templates fun-info))))
 
 (defun find-vop-source (name)
-  (let* ((templates (vop-sources-from-fun-templates name))
-         (vop (gethash name sb-c::*backend-template-names*))
-         (source (and vop
-                      (find-definition-source
-                       (sb-c::vop-info-generator-function vop)))))
-    (when source
-      (setf (definition-source-description source)
-            (list name)))
-    (if source
-        (cons source templates)
-        templates)))
+  (let* ((vop (gethash name sb-c::*backend-parsed-vops*))
+         (translating (vops-translating-fun name))
+         (vops (if vop
+                   (cons vop (remove vop translating))
+                   translating)))
+    (loop for vop in vops
+          for vop-parse = (if (typep vop 'sb-c::vop-parse)
+                              vop
+                              (gethash (sb-c::vop-info-name vop)
+                                       sb-c::*backend-parsed-vops*))
+          for name = (sb-c::vop-parse-name vop-parse)
+          for loc = (sb-c::vop-parse-source-location vop-parse)
+          when loc
+          collect (let ((source (translate-source-location loc)))
+                    (setf (definition-source-description source)
+                          (if (sb-c::vop-parse-note vop-parse)
+                              (list name (sb-c::vop-parse-note vop-parse))
+                              (list name)))
+                    source))))
 
 (defun find-definition-sources-by-name (name type)
   "Returns a list of DEFINITION-SOURCEs for the objects of type TYPE
@@ -167,21 +217,20 @@ name. Type can currently be one of the following:
    :STRUCTURE
    :SYMBOL-MACRO
    :TYPE
+   :ALIEN-TYPE
    :VARIABLE
+   :DECLARATION
 
    (Internal)
    :OPTIMIZER
    :SOURCE-TRANSFORM
    :TRANSFORM
    :VOP
+   :IR1-CONVERT
 
 If an unsupported TYPE is requested, the function will return NIL.
 "
-  (flet ((listify (x)
-           (if (listp x)
-               x
-               (list x)))
-         (get-class (name)
+  (flet ((get-class (name)
            (and (symbolp name)
                 (find-class name nil)))
          (real-fdefinition (name)
@@ -191,21 +240,21 @@ If an unsupported TYPE is requested, the function will return NIL.
              (if profile-info
                  (sb-profile::profile-info-encapsulated-fun profile-info)
                  (fdefinition name)))))
-    (listify
+    (ensure-list
      (case type
        ((:variable)
         (when (and (symbolp name)
-                   (member (sb-int:info :variable :kind name)
-                           '(:global :special)))
-          (translate-source-location (sb-int:info :source-location type name))))
+                   (member (info :variable :kind name)
+                           '(:global :special :alien)))
+          (translate-source-location (info :source-location type name))))
        ((:constant)
         (when (and (symbolp name)
-                   (eq (sb-int:info :variable :kind name) :constant))
-          (translate-source-location (sb-int:info :source-location type name))))
+                   (eq (info :variable :kind name) :constant))
+          (translate-source-location (info :source-location type name))))
        ((:symbol-macro)
         (when (and (symbolp name)
-                   (eq (sb-int:info :variable :kind name) :macro))
-          (translate-source-location (sb-int:info :source-location type name))))
+                   (eq (info :variable :kind name) :macro))
+          (translate-source-location (info :source-location type name))))
        ((:macro)
         (when (and (symbolp name)
                    (macro-function name))
@@ -213,11 +262,16 @@ If an unsupported TYPE is requested, the function will return NIL.
        ((:compiler-macro)
         (when (compiler-macro-function name)
           (find-definition-source (compiler-macro-function name))))
+       (:ir1-convert
+        (let ((converter (info :function :ir1-convert name)))
+          (and converter
+           (find-definition-source converter))))
        ((:function :generic-function)
         (when (and (fboundp name)
-                   (or (not (symbolp name))
-                       (not (macro-function name))
-                       (special-operator-p name)))
+                   (or (consp name)
+                       (and
+                        (not (macro-function name))
+                        (not (special-operator-p name)))))
           (let ((fun (real-fdefinition name)))
             (when (eq (not (typep fun 'generic-function))
                       (not (eq type :generic-function)))
@@ -225,11 +279,11 @@ If an unsupported TYPE is requested, the function will return NIL.
        ((:type)
         ;; Source locations for types are saved separately when the expander
         ;; is a closure without a good source-location.
-        (let ((loc (sb-int:info :type :source-location name)))
+        (let ((loc (info :type :source-location name)))
           (if loc
               (translate-source-location loc)
-              (let ((expander-fun (sb-int:info :type :expander name)))
-                (when expander-fun
+              (let ((expander-fun (info :type :expander name)))
+                (when (functionp expander-fun)
                   (find-definition-source expander-fun))))))
        ((:method)
         (when (fboundp name)
@@ -243,20 +297,20 @@ If an unsupported TYPE is requested, the function will return NIL.
         (when (and (consp name)
                    (eq (car name) 'setf))
           (setf name (cadr name)))
-        (let ((expander (or (sb-int:info :setf :inverse name)
-                            (sb-int:info :setf :expander name))))
+        (let ((expander (info :setf :expander name)))
           (when expander
-            (find-definition-source (if (symbolp expander)
-                                        (symbol-function expander)
-                                        expander)))))
+            (find-definition-source
+             (cond ((symbolp expander) (symbol-function expander))
+                   ((listp expander) (cdr expander))
+                   (t expander))))))
        ((:structure)
         (let ((class (get-class name)))
           (if class
               (when (typep class 'sb-pcl::structure-class)
                 (find-definition-source class))
-              (when (sb-int:info :typed-structure :info name)
+              (when (info :typed-structure :info name)
                 (translate-source-location
-                 (sb-int:info :source-location :typed-structure name))))))
+                 (info :source-location :typed-structure name))))))
        ((:condition :class)
         (let ((class (get-class name)))
           (when (and class
@@ -265,15 +319,10 @@ If an unsupported TYPE is requested, the function will return NIL.
                       (not (eq type :condition)))
               (find-definition-source class)))))
        ((:method-combination)
-        (let ((combination-fun
-                (find-method #'sb-mop:find-method-combination
-                             nil
-                             (list (find-class 'generic-function)
-                                   (list 'eql name)
-                                   t)
-                             nil)))
-          (when combination-fun
-            (find-definition-source combination-fun))))
+        (let ((info (gethash name sb-pcl::**method-combinations**)))
+          (when info
+            (translate-source-location
+             (sb-pcl::method-combination-info-source-location info)))))
        ((:package)
         (when (symbolp name)
           (let ((package (find-package name)))
@@ -281,30 +330,35 @@ If an unsupported TYPE is requested, the function will return NIL.
               (find-definition-source package)))))
        ;; TRANSFORM and OPTIMIZER handling from swank-sbcl
        ((:transform)
-        (when (symbolp name)
-          (let ((fun-info (sb-int:info :function :info name)))
-            (when fun-info
-              (loop for xform in (sb-c::fun-info-transforms fun-info)
-                    for source = (find-definition-source
-                                  (sb-c::transform-function xform))
-                    for typespec = (sb-kernel:type-specifier
-                                    (sb-c::transform-type xform))
-                    for note = (sb-c::transform-note xform)
-                    do (setf (definition-source-description source)
-                             (if (consp typespec)
-                                 (list (second typespec) note)
-                                 (list note)))
-                    collect source)))))
+        (let ((fun-info (info :function :info name)))
+          (when fun-info
+            (loop for xform in (sb-c::fun-info-transforms fun-info)
+                  for source = (find-definition-source
+                                (sb-c::transform-function xform))
+                  for typespec = (type-specifier
+                                  (sb-c::transform-type xform))
+                  for note = (sb-c::transform-note xform)
+                  do (setf (definition-source-description source)
+                           (if (consp typespec)
+                               (list (second typespec) note)
+                               (list note)))
+                  collect source))))
        ((:optimizer)
         (let ((fun-info (and (symbolp name)
-                             (sb-int:info :function :info name))))
+                             (info :function :info name))))
           (when fun-info
             (let ((otypes '((sb-c:fun-info-derive-type . sb-c:derive-type)
                             (sb-c:fun-info-ltn-annotate . sb-c:ltn-annotate)
                             (sb-c:fun-info-optimizer . sb-c:optimizer)
                             (sb-c:fun-info-ir2-convert . sb-c:ir2-convert)
                             (sb-c::fun-info-stack-allocate-result
-                             . sb-c::stack-allocate-result))))
+                             . sb-c::stack-allocate-result)
+                            (sb-c::fun-info-constraint-propagate
+                             . sb-c::constraint-propagate)
+                            (sb-c::fun-info-constraint-propagate-if
+                             . sb-c::constraint-propagate-if)
+                            (sb-c::fun-info-call-type-deriver
+                             . sb-c::call-type-deriver))))
               (loop for (reader . name) in otypes
                     for fn = (funcall reader fun-info)
                     when fn collect
@@ -312,41 +366,54 @@ If an unsupported TYPE is requested, the function will return NIL.
                       (setf (definition-source-description source)
                             (list name))
                       source))))))
-       ((:vop)
-        (when (symbolp name)
-          (find-vop-source name)))
+       (:vop
+        (find-vop-source name))
+       (:alien-type
+        (let ((loc (info :source-location type name)))
+          (and loc
+               (translate-source-location loc))))
        ((:source-transform)
-        (let ((transform-fun (sb-int:info :function :source-transform name))
-              (accessor (sb-int:info :function :structure-accessor
-                                     (if (typep name '(cons (eql setf)
-                                                       (cons symbol null)))
-                                         (second name)
-                                         name))))
+        (let* ((transform-fun
+                (or (info :function :source-transform name)
+                    (and (typep name '(cons (eql setf) (cons symbol null)))
+                         (info :function :source-transform
+                                      (second name)))))
+               ;; A cons for the :source-transform is essentially the same
+               ;; info that was formerly in :structure-accessor.
+               (accessor (and (consp transform-fun) (cdr transform-fun))))
           ;; Structure accessors have source transforms, but the
           ;; returned locations will neither show the actual place
           ;; where it's defined, nor is really interesting.
           (when (and transform-fun
                      (not accessor))
             (find-definition-source transform-fun))))
+       (:declaration
+        (let ((locations (info :source-location :declaration name)))
+          (loop for (kind loc) on locations by #'cddr
+                when loc
+                collect (let ((loc (translate-source-location loc)))
+                          (setf (definition-source-description loc)
+                                ;; Copy list to ensure that user code
+                                ;; cannot mutate the original.
+                                (copy-list (ensure-list kind)))
+                          loc))))
        (t
         nil)))))
 
 (defun find-definition-source (object)
   (typecase object
     ((or sb-pcl::condition-class sb-pcl::structure-class)
-     (let ((classoid (sb-impl::find-classoid (class-name object))))
+     (let ((classoid (sb-pcl::class-classoid object)))
        (when classoid
-         (let ((layout (sb-impl::classoid-layout classoid)))
-           (when layout
-             (translate-source-location
-              (sb-kernel::layout-source-location layout)))))))
+         (translate-source-location
+          (sb-kernel::classoid-source-location classoid)))))
     (method-combination
      (car
       (find-definition-sources-by-name
        (sb-pcl::method-combination-type-name object) :method-combination)))
     (package
      (translate-source-location (sb-impl::package-source-location object)))
-    (class
+    ((or class sb-mop:slot-definition)
      (translate-source-location (sb-pcl::definition-source object)))
     ;; Use the PCL definition location information instead of the function
     ;; debug-info for methods and generic functions. Sometimes the
@@ -371,11 +438,13 @@ If an unsupported TYPE is requested, the function will return NIL.
                             (sb-mop:method-specializers object))
                            (sb-mop:method-specializers object)))))
        source))
-    #+sb-eval
-    (sb-eval:interpreted-function
+    (interpreted-function
+     #+sb-eval
      (let ((source (translate-source-location
                     (sb-eval:interpreted-function-source-location object))))
-       source))
+       source)
+     #+sb-fasteval
+     (translate-source-location (sb-interpreter:fun-source-location object)))
     (function
      (find-function-definition-source object))
     ((or condition standard-object structure-object)
@@ -387,25 +456,17 @@ If an unsupported TYPE is requested, the function will return NIL.
 (defun find-function-definition-source (function)
   (let* ((debug-info (function-debug-info function))
          (debug-source (debug-info-source debug-info))
-         (debug-fun (debug-info-debug-function debug-info))
-         (tlf (if debug-fun (sb-c::compiled-debug-fun-tlf-number debug-fun))))
+         (debug-fun (debug-info-debug-function function debug-info))
+         (tlf (sb-c::compiled-debug-info-tlf-number debug-info)))
     (make-definition-source
      :pathname
-     ;; KLUDGE: at the moment, we don't record the correct toplevel
-     ;; form number for forms processed by EVAL (including EVAL-WHEN
-     ;; :COMPILE-TOPLEVEL).  Until that's fixed, don't return a
-     ;; DEFINITION-SOURCE with a pathname.  (When that's fixed, take
-     ;; out the (not (debug-source-form ...)) test.
-     (when (stringp (sb-c::debug-source-namestring debug-source))
-       (parse-namestring (sb-c::debug-source-namestring debug-source)))
+     (when (stringp (debug-source-namestring debug-source))
+       (parse-namestring (debug-source-namestring debug-source)))
      :character-offset
-     (if tlf
-         (elt (sb-c::debug-source-start-positions debug-source) tlf))
-     ;; Unfortunately there is no proper source path available in the
-     ;; debug-source. FIXME: We could use sb-di:code-locations to get
-     ;; a full source path. -luke (12/Mar/2005)
+     (sb-c::compiled-debug-info-char-offset debug-info)
      :form-path (if tlf (list tlf))
-     :file-write-date (sb-c::debug-source-created debug-source)
+     :form-number (sb-c::compiled-debug-fun-form-number debug-fun)
+     :file-write-date (debug-source-created debug-source)
      :plist (sb-c::debug-source-plist debug-source))))
 
 (defun translate-source-location (location)
@@ -419,10 +480,12 @@ If an unsupported TYPE is requested, the function will return NIL.
                          location)))
          (when number
            (list number)))
+       :form-number (sb-c:definition-source-location-form-number
+                     location)
        :plist (sb-c:definition-source-location-plist location))
       (make-definition-source)))
 
-(sb-int:define-deprecated-function :late "1.0.24.5" function-arglist function-lambda-list
+(define-deprecated-function :late "1.0.24.5" function-arglist function-lambda-list
     (function)
   (function-lambda-list function))
 
@@ -431,41 +494,36 @@ If an unsupported TYPE is requested, the function will return NIL.
 Works for special-operators, macros, simple functions, interpreted functions,
 and generic functions. Signals an error if FUNCTION is not a valid extended
 function designator."
-  (cond ((valid-function-name-p function)
+  ;; FIXME: sink this logic into SB-KERNEL:%FUN-LAMBDA-LIST and just call that?
+  (cond ((and (symbolp function) (special-operator-p function))
+         (function-lambda-list (info :function :ir1-convert function)))
+        ((valid-function-name-p function)
          (function-lambda-list (or (and (symbolp function)
                                         (macro-function function))
                                    (fdefinition function))))
         ((typep function 'generic-function)
          (sb-pcl::generic-function-pretty-arglist function))
-        #+sb-eval
-        ((typep function 'sb-eval:interpreted-function)
-         (sb-eval:interpreted-function-lambda-list function))
         (t
-         (sb-kernel:%simple-fun-arglist (sb-kernel:%fun-fun function)))))
+         (%fun-lambda-list function))))
 
 (defun deftype-lambda-list (typespec-operator)
   "Returns the lambda list of TYPESPEC-OPERATOR as first return
 value, and a flag whether the arglist could be found as second
 value."
   (check-type typespec-operator symbol)
-  (case (sb-int:info :type :kind typespec-operator)
-    (:defined
-     (sb-int:info :type :lambda-list typespec-operator))
-    (:primitive
-     (let ((translator-fun (sb-int:info :type :translator typespec-operator)))
-       (if translator-fun
-           (values (sb-kernel:%fun-lambda-list translator-fun) t)
-           ;; Some builtin types (e.g. STRING) do not have a
-           ;; translator, but they were actually defined via DEFTYPE
-           ;; in src/code/deftypes-for-target.lisp.
-           (sb-int:info :type :lambda-list typespec-operator))))
-    (t (values nil nil))))
+  ;; Don't return a lambda-list for combinators AND,OR,NOT.
+  (let* ((f (and (info :type :kind typespec-operator)
+                 (info :type :expander typespec-operator)))
+         (f (if (listp f) (car f) f)))
+    (if (functionp f)
+        (values (%fun-lambda-list f) t)
+        (values nil nil))))
 
 (defun function-type (function-designator)
   "Returns the ftype of FUNCTION-DESIGNATOR, or NIL."
   (flet ((ftype-of (function-designator)
-           (sb-kernel:type-specifier
-            (sb-int:info :function :type function-designator))))
+           (type-specifier
+            (global-ftype function-designator))))
     (etypecase function-designator
       (symbol
        (when (and (fboundp function-designator)
@@ -473,7 +531,7 @@ value."
                   (not (special-operator-p function-designator)))
          (ftype-of function-designator)))
       (cons
-       (when (and (sb-int:legal-fun-name-p function-designator)
+       (when (and (legal-fun-name-p function-designator)
                   (fboundp function-designator))
          (ftype-of function-designator)))
       (generic-function
@@ -482,15 +540,14 @@ value."
        ;; Give declared type in globaldb priority over derived type
        ;; because it contains more accurate information e.g. for
        ;; struct-accessors.
-       (let ((type (function-type (sb-kernel:%fun-name
-                                   (sb-impl::%fun-fun function-designator)))))
+       (let ((type (function-type (%fun-name (%fun-fun function-designator)))))
          (if type
              type
              (sb-impl::%fun-type function-designator)))))))
 
 ;;;; find callers/callees, liberated from Helmut Eller's code in SLIME
 
-;;; This interface is trmendously experimental.
+;;; This interface is tremendously experimental.
 
 ;;; For the moment I'm taking the view that FDEFN is an internal
 ;;; object (one out of one CMUCL developer surveyed didn't know what
@@ -504,151 +561,77 @@ value."
 
 (defun find-function-callees (function)
   "Return functions called by FUNCTION."
-  (declare (sb-kernel:simple-fun function))
+  (declare (simple-fun function))
   (let ((callees '()))
     (map-code-constants
-     (sb-kernel:fun-code-header function)
+     (fun-code-header function)
      (lambda (obj)
-       (when (sb-kernel:fdefn-p obj)
-         (push (sb-kernel:fdefn-fun obj)
-               callees))))
+       (when (fdefn-p obj)
+         (push (fdefn-fun obj) callees))))
     callees))
 
-
 (defun find-function-callers (function &optional (spaces '(:read-only :static
-                                                           :dynamic)))
+                                                           :dynamic
+                                                           #+immobile-code :immobile)))
   "Return functions which call FUNCTION, by searching SPACES for code objects"
   (let ((referrers '()))
     (map-caller-code-components
      function
      spaces
      (lambda (code)
-       (let ((entry (sb-kernel:%code-entry-points  code)))
-         (cond ((not entry)
-                (push (princ-to-string code) referrers))
-               (t
-                (loop for e = entry then (sb-kernel::%simple-fun-next e)
-                      while e
-                      do (pushnew e referrers)))))))
+       (dotimes (i (code-n-entries code))
+         (pushnew (%code-entry-point code i) referrers))))
     referrers))
-
-(declaim (inline map-code-constants)) ; FIXME: out-of-order
-(defun map-code-constants (code fn)
-  "Call FN for each constant in CODE's constant pool."
-  (check-type code sb-kernel:code-component)
-  (loop for i from sb-vm:code-constants-offset below
-        (sb-kernel:get-header-data code)
-        do (funcall fn (sb-kernel:code-header-ref code i))))
-
-(declaim (inline map-allocated-code-components))
-(defun map-allocated-code-components (spaces fn)
-  "Call FN for each allocated code component in one of SPACES.  FN
-receives the object and its size as arguments.  SPACES should be a
-list of the symbols :dynamic, :static, or :read-only."
-  (dolist (space spaces)
-    (sb-vm::map-allocated-objects
-     (lambda (obj header size)
-       (when (= sb-vm:code-header-widetag header)
-         (funcall fn obj size)))
-     space)))
-
-(declaim (inline map-caller-code-components)) ; FIXME: out-of-order
-(defun map-caller-code-components (function spaces fn)
-  "Call FN for each code component with a fdefn for FUNCTION in its
-constant pool."
-  (let ((function (coerce function 'function)))
-    (map-allocated-code-components
-     spaces
-     (lambda (obj size)
-       (declare (ignore size))
-       (map-code-constants
-        obj
-        (lambda (constant)
-          (when (and (sb-kernel:fdefn-p constant)
-                     (eq (sb-kernel:fdefn-fun constant)
-                         function))
-            (funcall fn obj))))))))
 
 ;;; XREF facility
 
-(defun get-simple-fun (functoid)
-  (etypecase functoid
-    (sb-kernel::fdefn
-     (get-simple-fun (sb-vm::fdefn-fun functoid)))
-    ((or null sb-impl::funcallable-instance)
-     nil)
-    (function
-     (sb-kernel::%fun-fun functoid))))
-
-;; Call FUNCTION with two args, NAME and VALUE, for each value that is
-;; either the FDEFINITION or MACRO-FUNCTION of some global name.
-;;
-(defun call-with-each-global-functoid (function)
-  (sb-c::call-with-each-globaldb-name
-   (lambda (name)
-     ;; In general it might be unsafe to call INFO with a NAME that is not
-     ;; valid for the kind of info being retrieved, as when the defaulting
-     ;; function tries to perform a sanity-check. But here it's safe.
-     (let ((functoid (or (sb-int:info :function :macro-function name)
-                         (sb-int:info :function :definition name))))
-             (if functoid
-                 (funcall function name functoid))))))
-
-(defun collect-xref (kind-index wanted-name)
-  (let ((ret nil))
-    (call-with-each-global-functoid
-     (lambda (info-name value)
-          ;; Get a simple-fun for the definition, and an xref array
-          ;; from the table if available.
-          (let* ((simple-fun (get-simple-fun value))
-                 (xrefs (when simple-fun
-                          (sb-kernel:%simple-fun-xrefs simple-fun)))
-                 (array (when xrefs
-                          (aref xrefs kind-index))))
-            ;; Loop through the name/path xref entries in the table
-            (loop for i from 0 below (length array) by 2
-                  for xref-name = (aref array i)
-                  for xref-path = (aref array (1+ i))
-                  do (when (equal xref-name wanted-name)
-                       (let ((source-location
-                              (find-function-definition-source simple-fun)))
-                         ;; Use the more accurate source path from
-                         ;; the xref entry.
-                         (setf (definition-source-form-path source-location)
-                               xref-path)
-                         (push (cons info-name source-location)
-                               ret)))))))
-    ret))
+(defun collect-xref (wanted-kind wanted-name)
+  (let ((result '()))
+    (sb-c:map-simple-funs
+     (lambda (name fun)
+       (binding* ((xrefs (%simple-fun-xrefs fun) :exit-if-null))
+         (sb-c:map-packed-xref-data
+          (lambda (xref-kind xref-name xref-form-number)
+            (when (and (eq xref-kind wanted-kind)
+                       (equal xref-name wanted-name))
+              (let ((source-location (find-function-definition-source fun)))
+                ;; Use the more accurate source path from the xref
+                ;; entry.
+                (setf (definition-source-form-number source-location)
+                      xref-form-number)
+                (push (cons name source-location) result))))
+          xrefs))))
+    result))
 
 (defun who-calls (function-name)
   "Use the xref facility to search for source locations where the
 global function named FUNCTION-NAME is called. Returns a list of
 function name, definition-source pairs."
-  (collect-xref #.(position :calls sb-c::*xref-kinds*) function-name))
+  (collect-xref :calls function-name))
 
 (defun who-binds (symbol)
   "Use the xref facility to search for source locations where the
 special variable SYMBOL is rebound. Returns a list of function name,
 definition-source pairs."
-  (collect-xref #.(position :binds sb-c::*xref-kinds*) symbol))
+  (collect-xref :binds symbol))
 
 (defun who-references (symbol)
   "Use the xref facility to search for source locations where the
 special variable or constant SYMBOL is read. Returns a list of function
 name, definition-source pairs."
-  (collect-xref #.(position :references sb-c::*xref-kinds*) symbol))
+  (collect-xref :references symbol))
 
 (defun who-sets (symbol)
   "Use the xref facility to search for source locations where the
 special variable SYMBOL is written to. Returns a list of function name,
 definition-source pairs."
-  (collect-xref #.(position :sets sb-c::*xref-kinds*) symbol))
+  (collect-xref :sets symbol))
 
 (defun who-macroexpands (macro-name)
   "Use the xref facility to search for source locations where the
 macro MACRO-NAME is expanded. Returns a list of function name,
 definition-source pairs."
-  (collect-xref #.(position :macroexpands sb-c::*xref-kinds*) macro-name))
+  (collect-xref :macroexpands macro-name))
 
 (defun who-specializes-directly (class-designator)
   "Search for source locations of methods directly specializing on
@@ -791,71 +774,58 @@ Experimental: interface subject to change."
   ;; for mapping over parts of arbitrary objects so users can get "deep sizes"
   ;; as well if they want to.
   ;;
-  ;; FIXME: For the memoization use-case possibly we should also provide a
-  ;; simpler HEAP-ALLOCATED-P, since that doesn't require disabling the GC
-  ;; scanning threads for negative answers? Similarly, STACK-ALLOCATED-P for
-  ;; checking if an object has been stack-allocated by a given thread for
-  ;; testing purposes might not come amiss.
-  (if (typep object '(or fixnum character
-                      #.(if (= sb-vm:n-word-bits 64) 'single-float (values))))
+  (if (not (sb-vm:is-lisp-pointer (get-lisp-obj-address object)))
       (values :immediate nil)
       (let ((plist
-             (sb-sys:without-gcing
-               ;; Disable GC so the object cannot move to another page while
-               ;; we have the address.
-               (let* ((addr (sb-kernel:get-lisp-obj-address object))
-                      (space
-                       (cond ((< sb-vm:read-only-space-start addr
-                                 (ash sb-vm:*read-only-space-free-pointer*
-                                      sb-vm:n-fixnum-tag-bits))
-                              :read-only)
-                             ((< sb-vm:static-space-start addr
-                                 (ash sb-vm:*static-space-free-pointer*
-                                      sb-vm:n-fixnum-tag-bits))
-                              :static)
-                             ((< (sb-kernel:current-dynamic-space-start) addr
-                                 (sb-sys:sap-int (sb-kernel:dynamic-space-free-pointer)))
-                              :dynamic))))
+             (sb-sys:with-pinned-objects (object)
+               (let ((space (sb-ext:heap-allocated-p object)))
                  (when space
                    #+gencgc
                    (if (eq :dynamic space)
-                       (let ((index (sb-vm::find-page-index addr)))
-                         (symbol-macrolet ((page (sb-alien:deref sb-vm::page-table index)))
-                           (let ((flags (sb-alien:slot page 'sb-vm::flags)))
-                             (list :space space
-                                   :generation (sb-alien:slot page 'sb-vm::gen)
-                                   :write-protected (logbitp 0 flags)
-                                   :boxed (logbitp 2 flags)
-                                   :pinned (logbitp 5 flags)
-                                   :large (logbitp 6 flags)
-                                   :page index))))
+                       (symbol-macrolet ((page (sb-alien:deref sb-vm::page-table index)))
+                         ;; No wonder #+big-endian failed introspection tests-
+                         ;; bits are packed in the opposite order. And thankfully,
+                         ;; this fix seems not to depend on whether the numbering
+                         ;; scheme is MSB 0 or LSB 0, afaict.
+                         (let* ((index (sb-vm:find-page-index
+                                        (get-lisp-obj-address object)))
+                                (flags (sb-alien:slot page 'sb-vm::flags))
+                                .
+                                ;; The unused WP-CLR is for ease of counting
+                                #+big-endian
+                                ((type      (ldb (byte 5 3) flags))
+                                 (wp        (logbitp 2 flags))
+                                 (wp-clr    (logbitp 1 flags))
+                                 (dontmove  (logbitp 0 flags)))
+                                #+little-endian
+                                ((type      (ldb (byte 5 0) flags))
+                                 (wp        (logbitp 5 flags))
+                                 (wp-clr    (logbitp 6 flags))
+                                 (dontmove  (logbitp 7 flags))))
+                           (declare (ignore wp-clr))
+                           (list :space space
+                                 :generation (sb-alien:slot page 'sb-vm::gen)
+                                 :write-protected wp
+                                 :boxed (logbitp 0 type)
+                                 :pinned dontmove
+                                 :large (logbitp 4 type)
+                                 :page index)))
                        (list :space space))
                    #-gencgc
                    (list :space space))))))
         (cond (plist
                (values :heap plist))
               (t
-               (let ((sap (sb-sys:int-sap (sb-kernel:get-lisp-obj-address object))))
-                 ;; FIXME: Check other stacks as well.
-                 #+sb-thread
-                 (dolist (thread (sb-thread:list-all-threads))
-                   (let ((c-start (sb-di::descriptor-sap
-                                   (sb-thread::%symbol-value-in-thread
-                                    'sb-vm:*control-stack-start*
-                                    thread)))
-                         (c-end (sb-di::descriptor-sap
-                                 (sb-thread::%symbol-value-in-thread
-                                  'sb-vm:*control-stack-end*
-                                  thread))))
-                     (when (and c-start c-end)
-                       (when (and (sb-sys:sap<= c-start sap)
-                                  (sb-sys:sap< sap c-end))
-                         (return-from allocation-information
-                           (values :stack thread))))))
-                 #-sb-thread
-                 (when (sb-vm:control-stack-pointer-valid-p sap nil)
+               #+sb-thread
+               (let ((thread (sb-ext:stack-allocated-p object t)))
+                 (when thread
                    (return-from allocation-information
-                     (values :stack sb-thread::*current-thread*))))
+                     (values :stack thread))))
+               #-sb-thread
+               (when (sb-vm:control-stack-pointer-valid-p
+                      (sb-sys:int-sap (get-lisp-obj-address object)) nil)
+                 (return-from allocation-information
+                   (values :stack sb-thread::*current-thread*)))
                :foreign)))))
 
 (defun map-root (function object &key simple (ext t))
@@ -876,42 +846,28 @@ NOTE: calling MAP-ROOT with a THREAD does not currently map over
 conservative roots from the thread registers and interrupt contexts.
 
 Experimental: interface subject to change."
+  (when (typep object '(or bignum float sb-sys:system-area-pointer
+                           fixnum character))
+    (return-from map-root object))
   (let ((fun (coerce function 'function))
-        (seen (sb-int:alloc-xset)))
+        (seen (alloc-xset)))
     (flet ((call (part)
-             (when (and (member (sb-kernel:lowtag-of part)
-                                `(,sb-vm:instance-pointer-lowtag
-                                  ,sb-vm:list-pointer-lowtag
-                                  ,sb-vm:fun-pointer-lowtag
-                                  ,sb-vm:other-pointer-lowtag))
-                        (not (sb-int:xset-member-p part seen)))
-               (sb-int:add-to-xset part seen)
-               (funcall fun part))))
+             (when (and (sb-vm:is-lisp-pointer (get-lisp-obj-address part))
+                        (not (xset-member-p part seen)))
+                 (add-to-xset part seen)
+                 (funcall fun part))))
       (when ext
         (let ((table sb-pcl::*eql-specializer-table*))
-          (call (sb-int:with-locked-system-table (table)
-                  (gethash object table)))))
-      (etypecase object
-        ((or bignum float sb-sys:system-area-pointer fixnum))
-        (sb-ext:weak-pointer
-         (call (sb-ext:weak-pointer-value object)))
+          (multiple-value-bind (value foundp)
+              (with-locked-system-table (table) (gethash object table))
+            (when foundp (call value)))))
+      (sb-vm:do-referenced-object (object call)
         (cons
-         (call (car object))
-         (call (cdr object))
+         :extend
          (when (and ext (ignore-errors (fboundp object)))
            (call (fdefinition object))))
-        (ratio
-         (call (numerator object))
-         (call (denominator object)))
-        (complex
-         (call (realpart object))
-         (call (realpart object)))
-        (sb-vm::instance
-         (if (typep object 'structure-object)
-             (sb-kernel:do-instance-tagged-slot (i object)
-               (call (sb-kernel:%instance-ref object i)))
-             (dotimes (i (sb-kernel:%instance-length object))
-               (call (sb-kernel:%instance-ref object i))))
+        (instance
+         :extend
          #+sb-thread
          (when (typep object 'sb-thread:thread)
            (cond ((eq object sb-thread:*current-thread*)
@@ -921,7 +877,6 @@ Experimental: interface subject to change."
                  (t
                   ;; KLUDGE: INTERRUPT-THREAD is Not Nice (tm), but
                   ;; the alternative would be stopping the world...
-                  #+sb-thread
                   (let ((sem (sb-thread:make-semaphore))
                         (refs nil))
                     (handler-case
@@ -934,50 +889,46 @@ Experimental: interface subject to change."
                              (sb-thread:signal-semaphore sem)))
                           (sb-thread:wait-on-semaphore sem))
                       (sb-thread:interrupt-thread-error ()))
+                    ;; This is whacky - the other thread signals our condition var,
+                    ;; *then* we call the funarg on objects that may no longer
+                    ;; satisfy VALID-LISP-POINTER-P.
+                    ;; And incidentally, we miss any references from TLS indices
+                    ;; that map onto the 'struct thread', which is just as well
+                    ;; since they're either fixnums or dynamic-extent objects.
                     (mapc #'call refs))))))
-        (array
-         (if (simple-vector-p object)
-             (dotimes (i (length object))
-               (call (aref object i)))
-             (when (sb-kernel:array-header-p object)
-               (call (sb-kernel::%array-data-vector object))
-               (call (sb-kernel::%array-displaced-p object))
-               (unless simple
-                 (call (sb-kernel::%array-displaced-from object))))))
-        (sb-kernel:code-component
-         (call (sb-kernel:%code-entry-points object))
-         (call (sb-kernel:%code-debug-info object))
-         (loop for i from sb-vm:code-constants-offset
-               below (sb-kernel:get-header-data object)
-               do (call (sb-kernel:code-header-ref object i))))
-        (sb-kernel:fdefn
-         (call (sb-kernel:fdefn-name object))
-         (call (sb-kernel:fdefn-fun object)))
-        (sb-kernel:simple-fun
+        ((satisfies array-header-p)
+         :override
+         ;; The default implementation always scans %array-displaced-from
+         (call (%array-data object))
+         (call (%array-displaced-p object))
          (unless simple
-           (call (sb-kernel:%simple-fun-next object)))
-         (call (sb-kernel:fun-code-header object))
-         (call (sb-kernel:%simple-fun-name object))
-         (call (sb-kernel:%simple-fun-arglist object))
-         (call (sb-kernel:%simple-fun-type object))
-         (call (sb-kernel:%simple-fun-info object)))
-        (sb-kernel:closure
-         (call (sb-kernel:%closure-fun object))
-         (sb-kernel:do-closure-values (x object)
-           (call x)))
-        (sb-kernel:funcallable-instance
-         (call (sb-kernel:%funcallable-instance-function object))
-         (loop for i from 1 below (- (1+ (sb-kernel:get-closure-length object))
-                                     sb-vm::funcallable-instance-info-offset)
-               do (call (sb-kernel:%funcallable-instance-info object i))))
+           (call (%array-displaced-from object))))
+        (code-component
+         :extend
+         (loop for i below (code-n-entries object)
+               do (call (%code-entry-point object i))))
+        (function ; excluding CLOSURE and FUNCALLABLE-INSTANCE
+         :override
+         (unless simple
+           (call (fun-code-header object)))
+         (call (%simple-fun-name object))
+         (call (%simple-fun-arglist object))
+         (call (%simple-fun-source object))
+         (call (%simple-fun-info object)))
         (symbol
+         ;; We use :override here because (apparently) the intent is
+         ;; to avoid calling FUNCTION on the SYMBOL-PACKAGE
+         ;; when SIMPLE is NIL (the default). And we skip SYMBOL-EXTRA for
+         ;; the same reason that we don't call FUNCTION on SYMBOL-INFO
+         ;; (logically it's "system" data, not for user consumption).
+         ;; Frankly this entire function is a confusing mishmash that is not
+         ;; accurate for computing a true graph of objects starting from a
+         ;; certain point, given all the special cases that it implements.
+         :override
          (when ext
            (dolist (thread (sb-thread:list-all-threads))
              (call (sb-thread:symbol-value-in-thread object thread nil))))
-         (handler-case
-             ;; We don't have GLOBAL-BOUNDP, and there's no ERRORP arg.
-             (call (sb-ext:symbol-global-value object))
-           (unbound-variable ()))
+         (call (sb-sys:%primitive sb-c:fast-symbol-global-value object))
          ;; These first two are probably unnecessary.
          ;; The functoid values, if present, are in SYMBOL-INFO
          ;; which is traversed whether or not EXT was true.
@@ -992,11 +943,108 @@ Experimental: interface subject to change."
          (call (symbol-name object))
          (unless simple
            (call (symbol-package object))))
-        (sb-kernel::random-class
-         (case (sb-kernel:widetag-of object)
-           (#.sb-vm::value-cell-header-widetag
-            (call (sb-kernel::value-cell-ref object)))
+        (t
+         :extend
+         (case (widetag-of object)
+           (#.sb-vm:value-cell-widetag
+            (call (value-cell-ref object)))
            (t
             (warn "~&MAP-ROOT: Unknown widetag ~S: ~S~%"
-                  (sb-kernel:widetag-of object) object)))))))
+                  (widetag-of object) object)))))))
   object)
+
+(defun object-size (object)
+  (+ (primitive-object-size object)
+     (typecase object
+       (sb-mop:funcallable-standard-object
+        (primitive-object-size (sb-pcl::fsc-instance-slots object)))
+       (standard-object
+        (primitive-object-size (sb-pcl::std-instance-slots object)))
+       (t 0))))
+
+;;; Print a distribution of object sizes in SPACE.
+;;; There are two bins for cons-sized objects: conses and anything else,
+;;; the latter including SAPs, value cells, 0-length simple-vectors,
+;;; and a bunch of other things.
+(defun object-size-histogram (&optional
+                              (space :dynamic)
+                              (size-bins ; objects whose size in words is <= this
+                               `#(2 4 6 8 10 16 20 24 32 64 128 256 512 1024
+                                  2048 4096 8192 16384 32768 131072 524288
+                                  ,(ash 1 20) ,(ash 1 21) ,(ash 1 23))))
+  (declare (simple-vector size-bins))
+  (let* ((n-bins (+ (length size-bins) 2))
+         (counts (make-array n-bins :initial-element 0))
+         (size-totals (make-array n-bins :initial-element 0)))
+    (sb-vm:map-allocated-objects
+     (lambda (obj type size)
+       (declare (ignore type))
+       (cond ((consp obj)
+              (incf (aref counts 0)))
+             (t
+              (let* ((words (ash size (- sb-vm:word-shift)))
+                     (bin
+                      (let ((i (position words size-bins :test #'<=)))
+                        (if i (1+ i) (1- n-bins)))))
+                (incf (aref counts bin))
+                (incf (aref size-totals bin) words)))))
+     space)
+    (format t "     Freq     Tot Words~% =========    =========~%")
+    (dotimes (i n-bins)
+      (format t " ~9d  ~11d  ~a~%"
+              (aref counts i)
+              (if (eql i 0) ; cons bin
+                  (* 2 (aref counts i))
+                  (aref size-totals i))
+              (cond ((zerop i) "cons")
+                    ((eql i (1- n-bins))
+                     (format nil " > ~D" (aref size-bins (- n-bins 3))))
+                    (t
+                     (let ((this-bin-size (aref size-bins (1- i)))
+                           (prev-bin-size (when (>= i 2) (aref size-bins (- i 2)))))
+                       (format nil "~:[<=~;=~] ~D"
+                               (or (not prev-bin-size)
+                                   (= this-bin-size (+ prev-bin-size 2)))
+                               this-bin-size))))))))
+
+(defun largest-objects (&key (threshold #+gencgc sb-vm:gencgc-card-bytes
+                                        #-gencgc sb-c:+backend-page-bytes+)
+                             (sort :size))
+  (declare (type (member :address :size) sort))
+  (flet ((show-obj (obj)
+           #-gencgc
+           (format t "~10x ~7x ~s~%"
+                     (get-lisp-obj-address obj)
+                     (primitive-object-size obj)
+                     (type-of obj))
+           #+gencgc
+           (let* ((gen (generation-of obj))
+                  (page (sb-vm::find-page-index (sb-kernel:get-lisp-obj-address obj)))
+                  (flags (if (>= page 0)
+                             (sb-alien:slot (sb-alien:deref sb-vm:page-table page)
+                                            'sb-vm::flags))))
+             (format t "~10x ~7x ~a ~:[        ~;~:*~8b~] ~s~%"
+                     (get-lisp-obj-address obj)
+                     (primitive-object-size obj)
+                     (if gen gen #\?)
+                     flags
+                     (type-of obj)))))
+    (case sort
+     (:address
+      (sb-vm:map-allocated-objects
+       (lambda (obj widetag size)
+         (declare (ignore widetag))
+         (when (>= size threshold)
+           (show-obj obj)))
+       :all))
+     (:size
+      (let (list)
+         (sb-vm:map-allocated-objects
+          (lambda (obj widetag size)
+            (declare (ignore widetag))
+            (when (>= size threshold)
+              (push obj list)))
+          :all)
+         (mapc #'show-obj
+               (stable-sort list #'> :key #'primitive-object-size))
+         nil)))))

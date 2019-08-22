@@ -9,18 +9,18 @@
 # provided with absolutely no warranty. See the COPYING and CREDITS
 # files for more information.
 
-CFLAGS = -g -m32
-LINKFLAGS += -v -rdynamic -m32
+CFLAGS += -m32
+LINKFLAGS += -rdynamic -m32
 NM = ./linux-nm
 
 ASSEM_SRC = ppc-assem.S ldso-stubs.S
 ARCH_SRC = ppc-arch.c
 
-OS_SRC = linux-os.c ppc-linux-os.c
+OS_SRC = linux-os.c linux-mman.c ppc-linux-os.c
 OS_LIBS = -ldl
 
 ifdef LISP_FEATURE_GENCGC
-  GC_SRC = gencgc.c
+  GC_SRC = fullcgc.c gencgc.c traceroot.c
 else
   GC_SRC = cheneygc.c
 endif

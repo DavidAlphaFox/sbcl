@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; Registers
@@ -20,7 +20,7 @@
 (macrolet ((defreg (name offset)
                (let ((offset-sym (symbolicate name "-OFFSET")))
                  `(eval-when (:compile-toplevel :load-toplevel :execute)
-                   (def!constant ,offset-sym ,offset)
+                   (defconstant ,offset-sym ,offset)
                    (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
 
            (defregset (name &rest regs)
@@ -63,6 +63,7 @@
   ;; 26 and 27 are used by the system kernel.
   ;; 28 is the global pointer of our C runtime, and used for
   ;; jump/branch relaxation in Lisp.
+  (defreg gp 28)
   (defreg nsp 29) ; number (native) stack pointer
   ;; C frame pointer, or additional saved register.
   (defreg code 30) ; current function object
@@ -78,6 +79,11 @@
   (defregset *register-arg-offsets*
       a0 a1 a2 a3 a4 a5)
 
+  ;; OAOOM: Same as runtime/mips-lispregs.h
+  (defregset boxed-regs
+      a0 a1 a2 a3 a4 a5 fdefn lexenv
+      nfp ocfp lra l0 l1 code)
+
   (defregset reserve-descriptor-regs
       fdefn lexenv)
 
@@ -87,32 +93,14 @@
 
 ;;;; SB and SC definition:
 
+(!define-storage-bases
 (define-storage-base registers :finite :size 32)
 (define-storage-base float-registers :finite :size 32)
 (define-storage-base control-stack :unbounded :size 8)
 (define-storage-base non-descriptor-stack :unbounded :size 0)
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
-
-;;;
-;;; Handy macro so we don't have to keep changing all the numbers whenever
-;;; we insert a new storage class.
-;;;
-(defmacro !define-storage-classes (&rest classes)
-  (do ((forms (list 'progn)
-              (let* ((class (car classes))
-                     (sc-name (car class))
-                     (constant-name (intern (concatenate 'simple-string
-                                                         (string sc-name)
-                                                         "-SC-NUMBER"))))
-                (list* `(define-storage-class ,sc-name ,index
-                          ,@(cdr class))
-                       `(def!constant ,constant-name ,index)
-                       forms)))
-       (index 0 (1+ index))
-       (classes classes (cdr classes)))
-      ((null classes)
-       (nreverse forms))))
+)
 
 (!define-storage-classes
 
@@ -244,8 +232,8 @@
    :save-p t
    :alternate-scs (complex-double-stack))
 
-  ;; A catch or unwind block.
   (catch-block control-stack :element-size catch-block-size)
+  (unwind-block control-stack :element-size unwind-block-size)
 
   ;; floating point numbers temporarily stuck in integer registers for c-call
   (single-int-carg-reg registers
@@ -296,44 +284,44 @@
 (defun immediate-constant-sc (value)
   (typecase value
     ((integer 0 0)
-     (sc-number-or-lose 'zero))
+     zero-sc-number)
     (null
-     (sc-number-or-lose 'null))
+     null-sc-number)
     (symbol
      (if (static-symbol-p value)
-         (sc-number-or-lose 'immediate)
+         immediate-sc-number
          nil))
-    ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
+    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
          character)
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
+    #-sb-xc-host ; There is no such object type in the host
     (system-area-pointer
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
     (character
-     (sc-number-or-lose 'immediate))))
+     immediate-sc-number)))
 
 (defun boxed-immediate-sc-p (sc)
-  (or (eql sc (sc-number-or-lose 'zero))
-      (eql sc (sc-number-or-lose 'null))
-      (eql sc (sc-number-or-lose 'immediate))))
+  (or (eql sc zero-sc-number)
+      (eql sc null-sc-number)
+      (eql sc immediate-sc-number)))
 
 ;;;; Function Call Parameters
 
 ;;; The SC numbers for register and stack arguments/return values.
 ;;;
-(def!constant register-arg-scn (sc-number-or-lose 'descriptor-reg))
-(def!constant immediate-arg-scn (sc-number-or-lose 'any-reg))
-(def!constant control-stack-arg-scn (sc-number-or-lose 'control-stack))
+(defconstant immediate-arg-scn any-reg-sc-number)
+(defconstant control-stack-arg-scn control-stack-sc-number)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
 ;;; Offsets of special stack frame locations
-(def!constant ocfp-save-offset 0)
-(def!constant lra-save-offset 1)
-(def!constant nfp-save-offset 2)
+(defconstant ocfp-save-offset 0)
+(defconstant lra-save-offset 1)
+(defconstant nfp-save-offset 2)
 
 ;;; The number of arguments/return values passed in registers.
 ;;;
-(def!constant register-arg-count 6)
+(defconstant register-arg-count 6)
 
 ;;; The offsets within the register-arg SC that we pass values in, first
 ;;; value first.
@@ -356,7 +344,7 @@
           *register-arg-offsets*))
 
 ;;; This is used by the debugger.
-(def!constant single-value-return-byte-offset 8)
+(defconstant single-value-return-byte-offset 8)
 
 ;;; This function is called by debug output routines that want a pretty name
 ;;; for a TN's location.  It returns a thing that can be printed with PRINC.
@@ -374,7 +362,7 @@
       (immediate-constant "Immed"))))
 
 (defun combination-implementation-style (node)
-  (declare (type sb!c::combination node) (ignore node))
+  (declare (type sb-c::combination node) (ignore node))
   (values :default nil))
 
 (defun primitive-type-indirect-cell-type (ptype)

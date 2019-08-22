@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; Moves and coercions:
@@ -47,8 +47,6 @@
   (:results (y :scs (sap-reg)
                :load-if (not (location= x y))))
   (:note "SAP move")
-  (:effects)
-  (:affected)
   (:generator 0
     (move y x)))
 
@@ -69,7 +67,7 @@
       (sap-reg
        (move y x))
       (sap-stack
-       (storew x fp (tn-offset y))))))
+       (store-stack-offset x fp y)))))
 
 (define-move-vop move-sap-arg :move-arg
   (descriptor-reg sap-reg) (sap-reg))
@@ -155,6 +153,7 @@
                (ref-name set-name sc type size &key signed use-lip)
                (let ((ref-name-c (symbolicate ref-name "-C"))
                      (set-name-c (symbolicate set-name "-C")))
+                 (declare (ignorable ref-name-c set-name-c))
                  `(progn
                    (define-vop (,ref-name)
                        (:translate ,ref-name)

@@ -11,7 +11,40 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
+
+(defconstant sb-assem:assem-scheduler-p nil)
+(defconstant sb-assem:+inst-alignment-bytes+ 1)
+
+(defconstant +backend-fasl-file-implementation+ :x86-64)
+(defconstant-eqx +fixup-kinds+ #(:absolute :relative :absolute64)
+  #'equalp)
+
+;;; KLUDGE: It would seem natural to set this by asking our C runtime
+;;; code for it, but mostly we need it for GENESIS, which doesn't in
+;;; general have our C runtime code running to ask, so instead we set
+;;; it by hand. -- WHN 2001-04-15
+;;;
+;;; Actually any information that we can retrieve C-side would be
+;;; useless in SBCL, since it's possible for otherwise binary
+;;; compatible systems to return different values for getpagesize().
+;;; -- JES, 2007-01-06
+(defconstant +backend-page-bytes+ #+win32 65536 #-win32 32768)
+
+;;; The size in bytes of GENCGC cards, i.e. the granularity at which
+;;; writes to old generations are logged.  With mprotect-based write
+;;; barriers, this must be a multiple of the OS page size.
+(defconstant gencgc-card-bytes +backend-page-bytes+)
+;;; The minimum size of new allocation regions.  While it doesn't
+;;; currently make a lot of sense to have a card size lower than
+;;; the alloc granularity, it will, once we are smarter about finding
+;;; the start of objects.
+(defconstant gencgc-alloc-granularity 0)
+;;; The minimum size at which we release address ranges to the OS.
+;;; This must be a multiple of the OS page size.
+(defconstant gencgc-release-granularity +backend-page-bytes+)
+;;; The card size for immobile/low space
+(defconstant immobile-card-bytes 4096)
 
 ;;; ### Note: we simultaneously use ``word'' to mean a 32 bit quantity
 ;;; and a 16 bit quantity depending on context. This is because Intel
@@ -25,71 +58,59 @@
 ;;;; machine architecture parameters
 
 ;;; the number of bits per word, where a word holds one lisp descriptor
-(def!constant n-word-bits 64)
+(defconstant n-word-bits 64)
 
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
-(def!constant n-machine-word-bits 64)
+(defconstant n-machine-word-bits 64)
 
-;;; the number of bits per byte, where a byte is the smallest
-;;; addressable object
-(def!constant n-byte-bits 8)
-
-;;; The minimum immediate offset in a memory-referencing instruction.
-(def!constant minimum-immediate-offset (- (expt 2 31)))
-
-;;; The maximum immediate offset in a memory-referencing instruction.
-(def!constant maximum-immediate-offset (1- (expt 2 31)))
-
-(def!constant float-sign-shift 31)
+(defconstant float-sign-shift 31)
 
 ;;; comment from CMU CL:
 ;;;   These values were taken from the alpha code. The values for
 ;;;   bias and exponent min/max are not the same as shown in the 486 book.
 ;;;   They may be correct for how Python uses them.
-(def!constant single-float-bias 126)    ; Intel says 127.
+(defconstant single-float-bias 126)    ; Intel says 127.
 (defconstant-eqx single-float-exponent-byte    (byte 8 23) #'equalp)
 (defconstant-eqx single-float-significand-byte (byte 23 0) #'equalp)
 ;;; comment from CMU CL:
 ;;;   The 486 book shows the exponent range -126 to +127. The Lisp
 ;;;   code that uses these values seems to want already biased numbers.
-(def!constant single-float-normal-exponent-min 1)
-(def!constant single-float-normal-exponent-max 254)
-(def!constant single-float-hidden-bit (ash 1 23))
-(def!constant single-float-trapping-nan-bit (ash 1 22))
+(defconstant single-float-normal-exponent-min 1)
+(defconstant single-float-normal-exponent-max 254)
+(defconstant single-float-hidden-bit (ash 1 23))
 
-(def!constant double-float-bias 1022)
+(defconstant double-float-bias 1022)
 (defconstant-eqx double-float-exponent-byte    (byte 11 20) #'equalp)
 (defconstant-eqx double-float-significand-byte (byte 20 0)  #'equalp)
-(def!constant double-float-normal-exponent-min 1)
-(def!constant double-float-normal-exponent-max #x7FE)
-(def!constant double-float-hidden-bit (ash 1 20))
-(def!constant double-float-trapping-nan-bit (ash 1 19))
+(defconstant double-float-normal-exponent-min 1)
+(defconstant double-float-normal-exponent-max #x7FE)
+(defconstant double-float-hidden-bit (ash 1 20))
 
-(def!constant single-float-digits
+(defconstant single-float-digits
   (+ (byte-size single-float-significand-byte) 1))
 
-(def!constant double-float-digits
+(defconstant double-float-digits
   (+ (byte-size double-float-significand-byte) 32 1))
 
 ;;; from AMD64 Architecture manual
-(def!constant float-invalid-trap-bit       (ash 1 0))
-(def!constant float-denormal-trap-bit       (ash 1 1))
-(def!constant float-divide-by-zero-trap-bit (ash 1 2))
-(def!constant float-overflow-trap-bit       (ash 1 3))
-(def!constant float-underflow-trap-bit      (ash 1 4))
-(def!constant float-inexact-trap-bit       (ash 1 5))
+(defconstant float-invalid-trap-bit       (ash 1 0))
+(defconstant float-denormal-trap-bit       (ash 1 1))
+(defconstant float-divide-by-zero-trap-bit (ash 1 2))
+(defconstant float-overflow-trap-bit       (ash 1 3))
+(defconstant float-underflow-trap-bit      (ash 1 4))
+(defconstant float-inexact-trap-bit       (ash 1 5))
 
-(def!constant float-round-to-nearest  0)
-(def!constant float-round-to-negative 1)
-(def!constant float-round-to-positive 2)
-(def!constant float-round-to-zero     3)
+(defconstant float-round-to-nearest  0)
+(defconstant float-round-to-negative 1)
+(defconstant float-round-to-positive 2)
+(defconstant float-round-to-zero     3)
 
 (defconstant-eqx float-rounding-mode     (byte 2 13) #'equalp)
 (defconstant-eqx float-sticky-bits       (byte 6  0) #'equalp)
 (defconstant-eqx float-traps-byte        (byte 6  7) #'equalp)
 (defconstant-eqx float-exceptions-byte   (byte 6  0) #'equalp)
-(def!constant float-fast-bit 0) ; no fast mode on x86-64
+(defconstant float-fast-bit 0) ; no fast mode on x86-64
 
 ;;;; description of the target address space
 
@@ -103,38 +124,37 @@
 ;;; would be possible, but probably not worth the time and code bloat
 ;;; it would cause. -- JES, 2005-12-11
 
+#+linux
+(!gencgc-space-setup #x50000000
+                     :fixedobj-space-size #.(* 30 1024 1024)
+                     :varyobj-space-size #.(* 130 1024 1024)
+                     :dynamic-space-start #x1000000000)
+
 ;;; The default dynamic space size is lower on OpenBSD to allow SBCL to
 ;;; run under the default 512M data size limit.
 
+#-linux
 (!gencgc-space-setup #x20000000
-                     #x1000000000
+                     :dynamic-space-start #x1000000000
+                     #+openbsd :dynamic-space-size #+openbsd #x1bcf0000)
 
-                     ;; :default-dynamic-space-size
-                     #!+openbsd #x1bcf0000
-
-                     ;; :alignment
-                     #!+win32 #!+win32 nil #x10000)
-
-(def!constant linkage-table-entry-size 16)
+(defconstant linkage-table-entry-size 16)
 
 
-;;;; other miscellaneous constants
-
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
-  error-trap
   cerror-trap
   breakpoint-trap
   fun-end-breakpoint-trap
   single-step-around-trap
-  single-step-before-trap)
-
-(defenum (:start 24)
-  object-not-list-trap
-  object-not-instance-trap
-  #!+sb-safepoint global-safepoint-trap
-  #!+sb-safepoint csp-safepoint-trap)
+  single-step-before-trap
+  undefined-function-trap
+  invalid-arg-count-trap
+  memory-fault-emulation-trap
+  #+sb-safepoint global-safepoint-trap
+  #+sb-safepoint csp-safepoint-trap
+  error-trap)
 
 ;;;; static symbols
 
@@ -149,47 +169,22 @@
 ;;; we could profitably keep these in registers on x86-64 now we have
 ;;; r8-r15 as well
 ;;;     Note these spaces grow from low to high addresses.
-(defvar *allocation-pointer*)
 (defvar *binding-stack-pointer*)
 
-(defparameter *static-symbols*
-  (append
-   *common-static-symbols*
-   *c-callable-static-symbols*
-   '(*alien-stack-pointer*
-
+(defconstant-eqx +static-symbols+
+ `#(,@+common-static-symbols+
+    #+(and immobile-space (not sb-thread)) function-layout
+    #-sb-thread *alien-stack-pointer*    ; a thread slot if #+sb-thread
      ;; interrupt handling
-     *pseudo-atomic-bits*
+    #-sb-thread *pseudo-atomic-bits*     ; ditto
+    #-sb-thread *binding-stack-pointer* ; ditto
+    *cpuid-fn1-ecx*)
+  #'equalp)
 
-     *allocation-pointer*
-     *binding-stack-pointer*
-
-     ;; the floating point constants
-     *fp-constant-0d0*
-     *fp-constant-1d0*
-     *fp-constant-0f0*
-     *fp-constant-1f0*
-
-     ;; For GC-AND-SAVE
-     *restart-lisp-function*
-
-     ;; Needed for callbacks to work across saving cores. see
-     ;; ALIEN-CALLBACK-ASSEMBLER-WRAPPER in c-call.lisp for gory
-     ;; details.
-     sb!alien::*enter-alien-callback*
-
-     ;; The ..SLOT-UNBOUND.. symbol is static in order to optimise the
-     ;; common slot unbound check.
-     ;;
-     ;; FIXME: In SBCL, the CLOS code has become sufficiently tightly
-     ;; integrated into the system that it'd probably make sense to
-     ;; use the ordinary unbound marker for this.
-     ;;
-     ;; FIXME II: if it doesn't make sense, why is this X86-ish only?
-     sb!pcl::..slot-unbound..)))
-
-(defparameter *static-funs*
-  '(length
+;;; FIXME: with #+immobile-space, this should be the empty list,
+;;; because *all* fdefns are permanently placed.
+(defconstant-eqx +static-fdefns+
+  #(length
     two-arg-+
     two-arg--
     two-arg-*
@@ -204,7 +199,18 @@
     two-arg-xor
     two-arg-gcd
     two-arg-lcm
-    %coerce-callable-to-fun))
+    %coerce-callable-to-fun)
+  #'equalp)
 
-#!+sb-simd-pack
-(defvar *simd-pack-element-types* '(integer single-float double-float))
+#+sb-simd-pack
+(defglobal *simd-pack-element-types* '(integer single-float double-float))
+
+(defconstant undefined-fdefn-header
+  ;; This constant is constructed as follows: Take the INT 0xCC opcode
+  ;; plus the undefined-fun trap byte, then the bytes of the 'disp' field
+  ;; of the JMP instruction that would overwrite the INT instruction.
+  ;;   INT3 <trap-code> = CC **
+  ;;   JMP [RIP+16]     = FF 25 10 00 00 00 00
+  ;; When assigning a function we'll change the first two bytes to 0xFF 0x25.
+  ;; The 'disp' field will aready be correct.
+  (logior (ash undefined-function-trap 8) #x1000CC))

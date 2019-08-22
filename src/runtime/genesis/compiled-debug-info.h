@@ -11,18 +11,18 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_COMPILED_DEBUG_INFO
-#define SBCL_GENESIS_COMPILED_DEBUG_INFO 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_COMPILED_DEBUG_INFO
+#ifndef __ASSEMBLER__
 
 struct compiled_debug_info {
-    lispobj header;
-    lispobj _layout;
+    lispobj header; // = word_0_
     lispobj name;
     lispobj source;
     lispobj fun_map;
-    lispobj end_padding;
+    lispobj contexts;
+    lispobj tlf_numoffset;
 };
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_COMPILED-DEBUG-INFO */
+#endif

@@ -11,8 +11,8 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_SIMD_PACK
-#define SBCL_GENESIS_SIMD_PACK 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_SIMD_PACK
+#ifndef __ASSEMBLER__
 
 struct simd_pack {
     lispobj header;
@@ -21,7 +21,7 @@ struct simd_pack {
     long hi_value;
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
@@ -29,7 +29,8 @@ struct simd_pack {
 #define SIMD_PACK_TAG_OFFSET -7
 #define SIMD_PACK_LO_VALUE_OFFSET 1
 #define SIMD_PACK_HI_VALUE_OFFSET 9
+#define SIMD_PACK_SIZE 4
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_SIMD-PACK */
+#endif

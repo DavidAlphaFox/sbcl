@@ -9,32 +9,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-vop (reset-stack-pointer)
   (:args (ptr :scs (any-reg)))
   (:generator 1
     (move csp-tn ptr)))
-
-(define-vop (%%pop-dx)
-  (:args (ptr :scs (any-reg)))
-  (:ignore ptr)
-  (:generator 1
-    (bug "VOP %%POP-DX is not implemented.")))
-
-(define-vop (%%nip-dx)
-  (:args (last-nipped-ptr :scs (any-reg) :target dest)
-         (last-preserved-ptr :scs (any-reg) :target src)
-         (moved-ptrs :scs (any-reg) :more t))
-  (:results (r-moved-ptrs :scs (any-reg) :more t))
-  (:temporary (:sc any-reg) src)
-  (:temporary (:sc any-reg) dest)
-  (:temporary (:sc non-descriptor-reg) temp)
-  (:ignore r-moved-ptrs
-           last-nipped-ptr last-preserved-ptr moved-ptrs
-           src dest temp)
-  (:generator 1
-    (bug "VOP %%NIP-DX is not implemented.")))
 
 (define-vop (%%nip-values)
   (:args (last-nipped-ptr :scs (any-reg) :target dest)
@@ -43,7 +23,7 @@
   (:results (r-moved-ptrs :scs (any-reg) :more t))
   (:temporary (:sc any-reg) src)
   (:temporary (:sc any-reg) dest)
-  (:temporary (:sc non-descriptor-reg) temp)
+  (:temporary (:sc descriptor-reg) temp)
   (:ignore r-moved-ptrs)
   (:generator 1
     (inst move dest last-nipped-ptr)
@@ -110,7 +90,7 @@
   (:policy :fast-safe)
   (:results (start :scs (any-reg))
             (count :scs (any-reg)))
-  (:temporary (:scs (descriptor-reg) :type list :from (:argument 0)) list)
+  (:temporary (:scs (descriptor-reg) :from (:argument 0)) list)
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:vop-var vop)
@@ -129,8 +109,8 @@
       (loadw list list cons-cdr-slot list-pointer-lowtag)
       (inst add csp-tn csp-tn n-word-bytes)
       (storew temp csp-tn -1)
-      (test-type list loop nil (list-pointer-lowtag) :temp ndescr)
-      (error-call vop 'bogus-arg-to-values-list-error list)
+      (test-type list ndescr loop nil (list-pointer-lowtag))
+      (cerror-call vop 'bogus-arg-to-values-list-error list)
 
       (emit-label done)
       (inst sub count csp-tn start))))

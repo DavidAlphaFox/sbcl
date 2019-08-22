@@ -11,22 +11,23 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_BINDING
-#define SBCL_GENESIS_BINDING 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_BINDING
+#ifndef __ASSEMBLER__
 
 struct binding {
     lispobj value;
     lispobj symbol;
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
 #define BINDING_VALUE_OFFSET 0
 #define BINDING_SYMBOL_OFFSET 8
+#define BINDING_SIZE 2
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_BINDING */
+#endif

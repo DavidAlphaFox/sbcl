@@ -9,9 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(defun generate-call-sequence (name style vop)
+(defun generate-call-sequence (name style vop options)
+  (declare (ignore options))
   (ecase style
     ((:none :raw)
      (let ((fixup-address (make-symbol "FIXUP-ADDRESS")))
@@ -21,7 +22,7 @@
                   `((inst load-from-label pc-tn lr-tn ,fixup-address))
                   `((inst load-from-label lr-tn lr-tn ,fixup-address)
                     (inst blx lr-tn)))
-            (assemble (*elsewhere* ,vop)
+            (assemble (:elsewhere ,vop)
               (emit-label ,fixup-address)
               (inst word (make-fixup ',name :assembly-routine)))))
         nil)))
@@ -75,5 +76,6 @@
                     :offset 2)))
     (:none)))
 
+#-sb-xc-host ; CONTEXT-REGISTER is not defined at xc-time
 (defun return-machine-address (scp)
   (context-register scp lr-offset))

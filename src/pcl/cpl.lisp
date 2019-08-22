@@ -79,9 +79,6 @@
 
 (defstruct (class-precedence-description
             (:conc-name nil)
-            (:print-object (lambda (obj str)
-                             (print-unreadable-object (obj str :type t)
-                               (format str "~D" (cpd-count obj)))))
             (:constructor make-cpd ())
             (:copier nil))
   (cpd-class  nil)
@@ -117,8 +114,7 @@
                                 :test #'eq)))
     (declare (fixnum nclasses))
     (labels ((get-cpd (c)
-               (or (gethash c table)
-                   (setf (gethash c table) (make-cpd))))
+               (ensure-gethash c table (make-cpd)))
              (walk (c supers)
                (declare (special *allow-forward-referenced-classes-in-cpl-p*))
                (if (and (forward-referenced-class-p c)
@@ -200,7 +196,7 @@
 (defun cpl-error (class format-string &rest format-args)
   (error "While computing the class precedence list of the class ~A.~%~A"
           (if (class-name class)
-              (format nil "named ~/sb-impl::print-symbol-with-prefix/"
+              (format nil "named ~/sb-ext:print-symbol-with-prefix/"
                       (class-name class))
               class)
           (apply #'format nil format-string format-args)))
@@ -208,7 +204,7 @@
 (defun cpl-forward-referenced-class-error (class forward-class)
   (flet ((class-or-name (class)
            (if (class-name class)
-               (format nil "named ~/sb-impl::print-symbol-with-prefix/"
+               (format nil "named ~/sb-ext:print-symbol-with-prefix/"
                        (class-name class))
                class)))
     (if (eq class forward-class)
@@ -258,7 +254,7 @@
   (flet ((class-or-name (cpd)
            (let ((class (cpd-class cpd)))
              (if (class-name class)
-                 (format nil "named ~/sb-impl::print-symbol-with-prefix/"
+                 (format nil "named ~/sb-ext:print-symbol-with-prefix/"
                          (class-name class))
                  class))))
     (mapcar
@@ -310,4 +306,3 @@
           (chase (list cpd))))
 
       cycle-reasons)))
-

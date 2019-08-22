@@ -28,13 +28,22 @@
 
 (defmacro wrapper-class (wrapper)
   `(classoid-pcl-class (layout-classoid ,wrapper)))
-(defmacro wrapper-no-of-instance-slots (wrapper)
-  `(layout-length ,wrapper))
 
 (declaim (inline make-wrapper-internal))
-(defun make-wrapper-internal (&key length classoid)
-  (make-layout :length length :classoid classoid :invalid nil
-               :%for-std-class-b 1))
+(defun make-wrapper-internal (&key (bitmap -1) length classoid)
+  (make-layout classoid :length length :invalid nil
+               :flags +pcl-object-layout-flag+ :bitmap bitmap))
+
+;;; With compact-instance-header and immobile-code, the primitive object has
+;;; 2 descriptor slots (fin-fun and CLOS slot vector) and 2 non-desriptor slots
+;;; containing machine instructions, after the self-pointer (trampoline) slot.
+;;; Scavenging the self-pointer is unnecessary though harmless.
+;;; This intricate calculation of #b110 makes it insensitive to the
+;;; index of the trampoline slot.
+#+(and immobile-code compact-instance-header)
+(defconstant +fsc-layout-bitmap+
+  (logxor (1- (ash 1 sb-vm:funcallable-instance-info-offset))
+          (ash 1 (1- sb-vm:funcallable-instance-trampoline-slot))))
 
 ;;; This is called in BRAID when we are making wrappers for classes
 ;;; whose slots are not initialized yet, and which may be built-in
@@ -51,25 +60,31 @@
         layout))
      (t
       (make-wrapper-internal
+       :bitmap (cond #+(and immobile-code compact-instance-header)
+                     ((member name '(generic-function
+                                     standard-generic-function))
+                      +fsc-layout-bitmap+)
+                     (t -1))
        :length length
        :classoid (make-standard-classoid
                   :name name :pcl-class class))))))
-
-;;; The following variable may be set to a STANDARD-CLASS that has
-;;; already been created by the lisp code and which is to be redefined
-;;; by PCL. This allows STANDARD-CLASSes to be defined and used for
-;;; type testing and dispatch before PCL is loaded.
-(defvar *pcl-class-boot* nil)
 
 ;;; In SBCL, as in CMU CL, the layouts (a.k.a wrappers) for built-in
 ;;; and structure classes already exist when PCL is initialized, so we
 ;;; don't necessarily always make a wrapper. Also, we help maintain
 ;;; the mapping between CL:CLASS and SB-KERNEL:CLASSOID objects.
 (defun make-wrapper (length class)
+  ;; SLOT-VALUE can't be inlined because we don't have the machinery
+  ;; to perform ENSURE-ACCESSOR as yet.
+  (declare (notinline slot-value))
   (cond
     ((or (typep class 'std-class)
          (typep class 'forward-referenced-class))
      (make-wrapper-internal
+      :bitmap (cond #+(and immobile-code compact-instance-header)
+                    ((eq (class-of class) *the-class-funcallable-standard-class*)
+                     +fsc-layout-bitmap+)
+                    (t -1))
       :length length
       :classoid
       (let ((owrap (class-wrapper class)))
@@ -78,18 +93,9 @@
               ((or (*subtypep (class-of class) *the-class-standard-class*)
                    (*subtypep (class-of class) *the-class-funcallable-standard-class*)
                    (typep class 'forward-referenced-class))
-               (cond ((and *pcl-class-boot*
-                           (eq (slot-value class 'name) *pcl-class-boot*))
-                      (let ((found (find-classoid
-                                    (slot-value class 'name))))
-                        (unless (classoid-pcl-class found)
-                          (setf (classoid-pcl-class found) class))
-                        (aver (eq (classoid-pcl-class found) class))
-                        found))
-                     (t
-                      (let ((name (slot-value class 'name)))
-                        (make-standard-classoid :pcl-class class
-                                                :name (and (symbolp name) name))))))
+               (let ((name (slot-value class 'name)))
+                 (make-standard-classoid :pcl-class class
+                                         :name (and (symbolp name) name))))
               (t
                (bug "Got to T branch in ~S" 'make-wrapper))))))
     (t
@@ -135,12 +141,59 @@
 (defun invalid-wrapper-p (wrapper)
   (not (null (layout-invalid wrapper))))
 
-;;; We only use this inside INVALIDATE-WRAPPER.
-(defvar *previous-nwrappers* (make-hash-table))
-
+;;; The portable code inherited from the ancient PCL sources used an extremely
+;;; clever mechanism to store a mapping from new layouts ("wrappers") to old.
+;;; Old layouts point to new in a straighforward way - via the INVALID slot -
+;;; but the invalidation logic wants backpointers from new to old as well.
+;;; It arranges so that if the following state exists:
+;;;   layout_A -> (:flush layout_B)
+;;; and then we want to change layout_B from valid to invalid:
+;;;   layout_B -> (:flush layout_C)
+;;; the state of layout_A should be changed to (:flush layout_C)
+;;; at the same time that the state of layout_B is changed.
+;;;
+;;; In general, alterating layout_B might might have to perform more than one
+;;; update to older versions of the layout, so it's a one-to-many relation.
+;;; The same "transitivity" could have been implemented at the time of flushing
+;;; layout_A by chasing an extra pointer (the B -> C pointer) and recording that
+;;; new state back into A. So I don't see how this "clever" code actually
+;;; improves anything, as it merely performs work eagerly that could have
+;;; been performed lazily. (PCL generally prefers lazy updates.)
+;;;
+;;; Anyway the extreme cleverness (and premature optimization, imho), was almost,
+;;; but not quite, clever enough - it leaked three conses per redefinition,
+;;; which it pretty much had to in order to remain portable.
+;;; We can at least replicate it in a way that doesn't leak conses,
+;;; or at least theoretically doesn't. A likely scenario is that old caches may
+;;; never get adquately flushed to drop all references to obsolete layouts.
+;;; If you call a GF once and not again, it won't flush; thus causing a retained
+;;; old layout no matter what else is done.
+;;;
+;;; So the non-leaky thing to do is use weak pointers, which makes the object
+;;; representation more transparent, because you can examine a classoid to get
+;;; the mapping rather than having to guess at what layouts are pointed to
+;;; by the variable formerly known as *previous-nwrappers*.
+;;;
+;;; And the code no longer relies on such spooky action at a distance - smashing
+;;; the CAR and CDR of the cons cells that are shared across layouts - but instead
+;;; performs a slot update on old layouts which, while still being a mutating
+;;; operation, is far more obvious as to intent.
+;;; This might even fix a data race, though I can't be certain.
+;;; The bug is that it was possible for an observer to see (:FLUSH new-thing)
+;;; in an older layout when it should actually have seen (:OBSOLETE newer-thing).
+;;; On the other hand, it's still possible for an observer to see the
+;;; wrong value in the INVALID slot itself. i.e. if it reads the slot
+;;; before %invalidate-wrapper performs the transitivity operation,
+;;; hence the possibility that this optimization is not only premature,
+;;; but also pretty much not correct.
 (defun %invalidate-wrapper (owrapper state nwrapper)
-  (aver (member state '(:flush :obsolete) :test #'eq))
-  (let ((new-previous ()))
+  (aver (member state '(:flush :obsolete)))
+  #+sb-thread (aver (eq (sb-thread:mutex-owner sb-c::**world-lock**)
+                        sb-thread:*current-thread*))
+  (let ((classoid (layout-classoid nwrapper))
+        (new-previous ())
+        (new-state (cons state nwrapper)))
+    (aver (eq (layout-classoid owrapper) classoid))
     ;; First off, a previous call to INVALIDATE-WRAPPER may have
     ;; recorded OWRAPPER as an NWRAPPER to update to. Since OWRAPPER
     ;; is about to be invalid, it no longer makes sense to update to
@@ -149,23 +202,30 @@
     ;; We go back and change the previously invalidated wrappers so
     ;; that they will now update directly to NWRAPPER. This
     ;; corresponds to a kind of transitivity of wrapper updates.
-    (dolist (previous (gethash owrapper *previous-nwrappers*))
-      (when (eq state :obsolete)
-        (setf (car previous) :obsolete))
-      (setf (cadr previous) nwrapper)
-      (push previous new-previous))
+    (dolist (weak-pointer (sb-kernel::standard-classoid-old-layouts classoid))
+      (let ((previous (weak-pointer-value weak-pointer)))
+        (when previous
+          (setf (layout-invalid previous)
+                (cond ((and (eq (car (layout-invalid previous)) :obsolete)
+                            (eq state :flush))
+                       ;; :obsolete must stay :obsolete,
+                       ;; requiring the protocol for obsolete instances.
+                       (cons :obsolete nwrapper))
+                      (t
+                       ;; flush->{obsolete|flush} or {flush|obsolete}->obsolete
+                       new-state)))
+          (push weak-pointer new-previous))))
 
     ;; FIXME: We are here inside PCL lock, but might someone be
     ;; accessing the wrapper at the same time from outside the lock?
     (setf (layout-clos-hash owrapper) 0)
-
-    ;; FIXME: We could save a whopping cons by using (STATE . WRAPPER)
-    ;; instead
-    (push (setf (layout-invalid owrapper) (list state nwrapper))
-          new-previous)
-
-    (remhash owrapper *previous-nwrappers*)
-    (setf (gethash nwrapper *previous-nwrappers*) new-previous)))
+    ;; And shouldn't these assignments be flipped, so that if an observer
+    ;; sees a 0 hash in owrapper, it can find the new layout?
+    (setf (layout-invalid owrapper) new-state)
+    (push (make-weak-pointer owrapper) new-previous)
+    ;; This function is called for effect; return value is arbitrary.
+    (setf  (sb-kernel::standard-classoid-old-layouts classoid)
+           new-previous)))
 
 ;;; FIXME: This is not a good name: part of the contract here is that
 ;;; we return the valid wrapper, which is not obvious from the name
@@ -217,17 +277,15 @@
             ((consp state)
              (ecase (car state)
                (:flush
-                (let ((new (cadr state)))
+                (let ((new (cdr state)))
                   (cond ((std-instance-p instance)
-                         (setf (std-instance-wrapper instance) new))
+                         (setf (%instance-layout instance) new))
                         ((fsc-instance-p instance)
-                         (setf (fsc-instance-wrapper instance) new))
+                         (setf (%funcallable-instance-layout instance) new))
                         (t
                          (bug "unrecognized instance type")))))
                (:obsolete
-                (%obsolete-instance-trap owrapper (cadr state) instance))))
-            (t
-             (bug "Invalid LAYOUT-INVALID: ~S" state))))))
+                (%obsolete-instance-trap owrapper (cdr state) instance))))))))
 
 (declaim (inline check-obsolete-instance))
 (defun check-obsolete-instance (instance)

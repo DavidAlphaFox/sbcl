@@ -9,35 +9,32 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; register specs
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defvar *byte-register-names* (make-array 8 :initial-element nil))
-  (defvar *word-register-names* (make-array 16 :initial-element nil))
-  (defvar *dword-register-names* (make-array 16 :initial-element nil))
-  (defvar *float-register-names* (make-array 8 :initial-element nil)))
+(defconstant-eqx +byte-register-names+
+    #("AL" "AH" "CL" "CH" "DL" "DH" "BL" "BH")
+  #'equalp)
+(defconstant-eqx +word-register-names+
+    #("AX" NIL "CX" NIL "DX" NIL "BX" NIL "SP" NIL "BP" NIL "SI" NIL "DI" NIL)
+  #'equalp)
+(defconstant-eqx +dword-register-names+
+    #("EAX" NIL "ECX" NIL "EDX" NIL "EBX" NIL "ESP" NIL "EBP" NIL "ESI" NIL "EDI" NIL)
+  #'equalp)
 
 (macrolet ((defreg (name offset size)
-             (let ((offset-sym (symbolicate name "-OFFSET"))
-                   (names-vector (symbolicate "*" size "-REGISTER-NAMES*")))
-               `(progn
-                  (eval-when (:compile-toplevel :load-toplevel :execute)
+             (declare (ignore size))
+             `(eval-when (:compile-toplevel :load-toplevel :execute)
                     ;; EVAL-WHEN is necessary because stuff like #.EAX-OFFSET
                     ;; (in the same file) depends on compile-time evaluation
                     ;; of the DEFCONSTANT. -- AL 20010224
-                    (def!constant ,offset-sym ,offset))
-                  (setf (svref ,names-vector ,offset-sym)
-                        ,(symbol-name name)))))
-           ;; FIXME: It looks to me as though DEFREGSET should also
-           ;; define the related *FOO-REGISTER-NAMES* variable.
+                (defconstant ,(symbolicate name "-OFFSET") ,offset)))
            (defregset (name &rest regs)
-             `(eval-when (:compile-toplevel :load-toplevel :execute)
-                (defparameter ,name
+             `(defglobal ,name
                   (list ,@(mapcar (lambda (name)
                                     (symbolicate name "-OFFSET"))
-                                  regs))))))
+                                  regs)))))
 
   ;; byte registers
   ;;
@@ -90,7 +87,7 @@
   ;; registers used to pass arguments
   ;;
   ;; the number of arguments/return values passed in registers
-  (def!constant  register-arg-count 3)
+  (defconstant  register-arg-count 3)
   ;; names and offsets for registers used to pass arguments
   (eval-when (:compile-toplevel :load-toplevel :execute)
     (defparameter *register-arg-names* '(edx edi esi)))
@@ -98,6 +95,7 @@
 
 ;;;; SB definitions
 
+(!define-storage-bases
 ;;; Despite the fact that there are only 8 different registers, we consider
 ;;; them 16 in order to describe the overlap of byte registers. The only
 ;;; thing we need to represent is what registers overlap. Therefore, we
@@ -118,26 +116,12 @@
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
 (define-storage-base noise :unbounded :size 2)
+)
 
 ;;;; SC definitions
 
-;;; a handy macro so we don't have to keep changing all the numbers whenever
-;;; we insert a new storage class
-;;;
-(defmacro !define-storage-classes (&rest classes)
-  (collect ((forms))
-    (let ((index 0))
-      (dolist (class classes)
-        (let* ((sc-name (car class))
-               (constant-name (symbolicate sc-name "-SC-NUMBER")))
-          (forms `(define-storage-class ,sc-name ,index
-                    ,@(cdr class)))
-          (forms `(def!constant ,constant-name ,index))
-          (incf index))))
-    `(progn
-       ,@(forms))))
-
-(!define-storage-classes
+(eval-when (:compile-toplevel :execute)
+(defparameter *storage-class-defs* '(
 
   ;; non-immediate constants in the constant pool
   (constant constant)
@@ -162,11 +146,11 @@
   (sap-stack stack)                     ; System area pointers.
   (single-stack stack)                  ; single-floats
   (double-stack stack :element-size 2)  ; double-floats.
-  #!+long-float
+  #+long-float
   (long-stack stack :element-size 3)    ; long-floats.
   (complex-single-stack stack :element-size 2)  ; complex-single-floats
   (complex-double-stack stack :element-size 4)  ; complex-double-floats
-  #!+long-float
+  #+long-float
   (complex-long-stack stack :element-size 6)    ; complex-long-floats
 
   ;;
@@ -205,11 +189,11 @@
 
   ;; non-descriptor characters
   (character-reg registers
-                 :locations #!-sb-unicode #.*byte-regs*
-                            #!+sb-unicode #.*dword-regs*
-                 #!+sb-unicode #!+sb-unicode
+                 :locations #-sb-unicode #.*byte-regs*
+                            #+sb-unicode #.*dword-regs*
+                 #+sb-unicode #+sb-unicode
                  :element-size 2
-                 #!-sb-unicode #!-sb-unicode
+                 #-sb-unicode #-sb-unicode
                  :reserve-locations (#.ah-offset #.al-offset)
                  :constant-scs (immediate)
                  :save-p t
@@ -269,7 +253,7 @@
               :alternate-scs (double-stack))
 
   ;; non-descriptor LONG-FLOATs
-  #!+long-float
+  #+long-float
   (long-reg float-registers
             :locations (0 1 2 3 4 5 6 7)
             :constant-scs (fp-constant)
@@ -290,7 +274,7 @@
                       :save-p t
                       :alternate-scs (complex-double-stack))
 
-  #!+long-float
+  #+long-float
   (complex-long-reg float-registers
                     :locations (0 2 4 6)
                     :element-size 2
@@ -298,17 +282,16 @@
                     :save-p t
                     :alternate-scs (complex-long-stack))
 
-  ;; a catch or unwind block
-  (catch-block stack :element-size catch-block-size))
+  (catch-block stack :element-size catch-block-size)
+  (unwind-block stack :element-size unwind-block-size)))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
 (defparameter *byte-sc-names*
-  '(#!-sb-unicode character-reg byte-reg #!-sb-unicode character-stack))
+  '(#-sb-unicode character-reg byte-reg #-sb-unicode character-stack))
 (defparameter *word-sc-names* '(word-reg))
 (defparameter *dword-sc-names*
   '(any-reg descriptor-reg sap-reg signed-reg unsigned-reg control-stack
     signed-stack unsigned-stack sap-stack single-stack
-    #!+sb-unicode character-reg #!+sb-unicode character-stack constant))
+    #+sb-unicode character-reg #+sb-unicode character-stack constant))
 ;;; added by jrd. I guess the right thing to do is to treat floats
 ;;; as a separate size...
 ;;;
@@ -316,23 +299,29 @@
 (defparameter *float-sc-names* '(single-reg))
 (defparameter *double-sc-names* '(double-reg double-stack))
 ) ; EVAL-WHEN
+(!define-storage-classes
+  . #.(mapcar (lambda (class-spec)
+                (let ((size
+                       (case (car class-spec)
+                         (#.*dword-sc-names*   :dword)
+                         (#.*word-sc-names*    :word)
+                         (#.*byte-sc-names*    :byte)
+                         (#.*float-sc-names*   :float)
+                         (#.*double-sc-names*  :double))))
+                  (append class-spec (if size (list :operand-size size)))))
+              *storage-class-defs*))
 
 ;;;; miscellaneous TNs for the various registers
 
 (macrolet ((def-misc-reg-tns (sc-name &rest reg-names)
              (collect ((forms))
-                      (dolist (reg-name reg-names)
-                        (let ((tn-name (symbolicate reg-name "-TN"))
-                              (offset-name (symbolicate reg-name "-OFFSET")))
-                          ;; FIXME: It'd be good to have the special
-                          ;; variables here be named with the *FOO*
-                          ;; convention.
-                          (forms `(defparameter ,tn-name
-                                    (make-random-tn :kind :normal
-                                                    :sc (sc-or-lose ',sc-name)
-                                                    :offset
-                                                    ,offset-name)))))
-                      `(progn ,@(forms)))))
+               (dolist (reg-name reg-names `(progn ,@(forms)))
+                 (let ((tn-name (symbolicate reg-name "-TN"))
+                       (offset-name (symbolicate reg-name "-OFFSET")))
+                   (forms `(defglobal ,tn-name
+                             (make-random-tn :kind :normal
+                                             :sc (sc-or-lose ',sc-name)
+                                             :offset ,offset-name))))))))
 
   (def-misc-reg-tns unsigned-reg eax ebx ecx edx ebp esp edi esi)
   (def-misc-reg-tns word-reg ax bx cx dx bp sp di si)
@@ -358,21 +347,21 @@
 ;;; the appropriate SC number, otherwise return NIL.
 (defun immediate-constant-sc (value)
   (typecase value
-    ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
+    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
          character)
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
     (symbol
      (when (static-symbol-p value)
-       (sc-number-or-lose 'immediate)))
+       immediate-sc-number))
     (single-float
        (case value
-         ((0f0 1f0) (sc-number-or-lose 'fp-constant))
-         (t (sc-number-or-lose 'fp-single-immediate))))
+         (($0f0 $1f0) fp-constant-sc-number)
+         (t fp-single-immediate-sc-number)))
     (double-float
        (case value
-         ((0d0 1d0) (sc-number-or-lose 'fp-constant))
-         (t (sc-number-or-lose 'fp-double-immediate))))
-    #!+long-float
+         (($0d0 $1d0) fp-constant-sc-number)
+         (t fp-double-immediate-sc-number)))
+    #+long-float
     (long-float
        (when (or (eql value 0l0) (eql value 1l0)
                  (eql value pi)
@@ -380,10 +369,10 @@
                  (eql value (log 2.718281828459045235360287471352662L0 2l0))
                  (eql value (log 2l0 10l0))
                  (eql value (log 2l0 2.718281828459045235360287471352662L0)))
-         (sc-number-or-lose 'fp-constant)))))
+         fp-constant-sc-number))))
 
 (defun boxed-immediate-sc-p (sc)
-  (eql sc (sc-number-or-lose 'immediate)))
+  (eql sc immediate-sc-number))
 
 ;; For an immediate TN, return its value encoded for use as a literal.
 ;; For any other TN, return the TN.  Only works for FIXNUMs,
@@ -407,12 +396,12 @@
 ;;; address is at EBP+4, the old control stack frame pointer is at
 ;;; EBP, the magic 3rd slot is at EBP-4. Then come the locals from
 ;;; EBP-8 on.
-(def!constant return-pc-save-offset 0)
-(def!constant ocfp-save-offset 1)
+(defconstant return-pc-save-offset 0)
+(defconstant ocfp-save-offset 1)
 ;;; Let SP be the stack pointer before CALLing, and FP is the frame
 ;;; pointer after the standard prologue. SP +
 ;;; FRAME-WORD-OFFSET(SP->FP-OFFSET + I) = FP + FRAME-WORD-OFFSET(I).
-(def!constant sp->fp-offset 2)
+(defconstant sp->fp-offset 2)
 
 (declaim (inline frame-word-offset))
 (defun frame-word-offset (index)
@@ -427,13 +416,13 @@
 ;;; them or flagging them with KLUDGE might be better than nothing.
 ;;;
 ;;; names of these things seem to have changed. these aliases by jrd
-(def!constant lra-save-offset return-pc-save-offset)
 
-(def!constant cfp-offset ebp-offset)    ; pfw - needed by stuff in /code
+(defconstant nargs-offset ecx-offset)
+(defconstant cfp-offset ebp-offset)    ; pfw - needed by stuff in /code
                                         ; related to signal context stuff
 
 ;;; This is used by the debugger.
-(def!constant single-value-return-byte-offset 2)
+(defconstant single-value-return-byte-offset 2)
 
 ;;; This function is called by debug output routines that want a pretty name
 ;;; for a TN's location. It returns a thing that can be printed with PRINC.
@@ -444,32 +433,28 @@
          (offset (tn-offset tn)))
     (ecase sb
       (registers
-       (let* ((sc-name (sc-name sc))
-              (name-vec (cond ((member sc-name *byte-sc-names*)
-                               *byte-register-names*)
-                              ((member sc-name *word-sc-names*)
-                               *word-register-names*)
-                              ((member sc-name *dword-sc-names*)
-                               *dword-register-names*))))
+       (let ((name-vec (case (sb-c:sc-operand-size sc)
+                         (:byte  +byte-register-names+)
+                         (:word  +word-register-names+)
+                         (:dword +dword-register-names+))))
          (or (and name-vec
                   (< -1 offset (length name-vec))
                   (svref name-vec offset))
              ;; FIXME: Shouldn't this be an ERROR?
-             (format nil "<unknown reg: off=~W, sc=~A>" offset sc-name))))
+             (format nil "<unknown reg: off=~W, sc=~A>" offset (sc-name sc)))))
       (float-registers (format nil "FR~D" offset))
       (stack (format nil "S~D" offset))
       (constant (format nil "Const~D" offset))
       (immediate-constant "Immed")
       (noise (symbol-name (sc-name sc))))))
-;;; FIXME: Could this, and everything that uses it, be made #!+SB-SHOW?
 
 (defun combination-implementation-style (node)
-  (declare (type sb!c::combination node))
+  (declare (type sb-c::combination node))
   (flet ((valid-funtype (args result)
-           (sb!c::valid-fun-use node
-                                (sb!c::specifier-type
+           (sb-c::valid-fun-use node
+                                (sb-c::specifier-type
                                  `(function ,args ,result)))))
-    (case (sb!c::combination-fun-source-name node)
+    (case (sb-c::combination-fun-source-name node)
       (logtest
        (cond
          ((valid-funtype '(fixnum fixnum) '*)
@@ -482,7 +467,7 @@
       (logbitp
        (cond
          ((and (valid-funtype '((integer 0 29) fixnum) '*)
-               (sb!c::constant-lvar-p (first (sb!c::basic-combination-args node))))
+               (sb-c::constant-lvar-p (first (sb-c::basic-combination-args node))))
           (values :transform '(lambda (index integer)
                                (%logbitp integer index))))
          ((valid-funtype '((integer 0 31) (signed-byte 32)) '*)

@@ -3,6 +3,8 @@ set -e
 
 # Install SBCL files into the usual places.
 
+umask 022
+
 ensure_dirs ()
 {
     for j in "$@"; do
@@ -20,10 +22,10 @@ else
     RUNTIME=sbcl
     OLD_RUNTIME=sbcl.old
 fi
-INSTALL_ROOT=${INSTALL_ROOT-$DEFAULT_INSTALL_ROOT}
-MAN_DIR=${MAN_DIR-"$INSTALL_ROOT"/share/man}
-INFO_DIR=${INFO_DIR-"$INSTALL_ROOT"/share/info}
-DOC_DIR=${DOC_DIR-"$INSTALL_ROOT"/share/doc/sbcl}
+INSTALL_ROOT=${INSTALL_ROOT:-$DEFAULT_INSTALL_ROOT}
+MAN_DIR=${MAN_DIR:-"$INSTALL_ROOT"/share/man}
+INFO_DIR=${INFO_DIR:-"$INSTALL_ROOT"/share/info}
+DOC_DIR=${DOC_DIR:-"$INSTALL_ROOT"/share/doc/sbcl}
 
 # Does the environment look sane?
 if [ -n "$SBCL_HOME" -a "$INSTALL_ROOT/lib/sbcl" != "$SBCL_HOME" ];then
@@ -54,8 +56,7 @@ ensure_dirs "$BUILD_ROOT$INSTALL_ROOT" "$BUILD_ROOT$INSTALL_ROOT"/bin \
     "$BUILD_ROOT$MAN_DIR" "$BUILD_ROOT$MAN_DIR"/man1 \
     "$BUILD_ROOT$INFO_DIR" "$BUILD_ROOT$DOC_DIR" \
     "$BUILD_ROOT$DOC_DIR"/html \
-    "$BUILD_ROOT$SBCL_HOME" \
-    "$BUILD_ROOT$SBCL_HOME"/site-systems
+    "$BUILD_ROOT$SBCL_HOME"
 
 # move old versions out of the way.  Safer than copying: don't want to
 # break any running instances that have these files mapped
@@ -67,6 +68,10 @@ test -f "$BUILD_ROOT$SBCL_HOME"/sbcl.core && \
 
 cp src/runtime/$RUNTIME "$BUILD_ROOT$INSTALL_ROOT"/bin/
 cp output/sbcl.core "$BUILD_ROOT$SBCL_HOME"/sbcl.core
+cp src/runtime/sbcl.mk "$BUILD_ROOT$SBCL_HOME"/sbcl.mk
+for i in $(grep '^LIBSBCL=' src/runtime/sbcl.mk | cut -d= -f2-) ; do
+    cp "src/runtime/$i" "$BUILD_ROOT$SBCL_HOME/$i"
+done
 
 # installing contrib
 
@@ -104,14 +109,15 @@ echo " core and contribs in $BUILD_ROOT$INSTALL_ROOT/lib/sbcl/"
 
 echo
 echo "Documentation:"
+CP="cp -f"
 
 # man
-cp doc/sbcl.1 "$BUILD_ROOT$MAN_DIR"/man1/ && echo " man $BUILD_ROOT$MAN_DIR/man1/sbcl.1"
+$CP doc/sbcl.1 "$BUILD_ROOT$MAN_DIR"/man1/ && echo " man $BUILD_ROOT$MAN_DIR/man1/sbcl.1"
 
 # info
 for info in doc/manual/*.info
 do
-  cp $info "$BUILD_ROOT$INFO_DIR"/ \
+  test -e $info && $CP $info "$BUILD_ROOT$INFO_DIR"/ \
       && BN=`basename $info` \
       && DIRFAIL=`install-info --info-dir="$BUILD_ROOT$INFO_DIR" \
         "$BUILD_ROOT$INFO_DIR"/$BN > /dev/null 2>&1 \
@@ -121,31 +127,31 @@ done
 
 for info in doc/manual/*.info-*
 do
-  cp $info "$BUILD_ROOT$INFO_DIR"/ \
+  test -e $info && $CP $info "$BUILD_ROOT$INFO_DIR"/ \
       && echo " info $BUILD_ROOT$INFO_DIR/`basename $info`"
 done
 
 # pdf
 for pdf in doc/manual/*.pdf
 do
-  cp $pdf "$BUILD_ROOT$DOC_DIR"/ \
+  test -e $pdf && $CP $pdf "$BUILD_ROOT$DOC_DIR"/ \
       && echo " pdf $BUILD_ROOT$DOC_DIR/`basename $pdf`"
 done
 
 # html
 for html in doc/manual/sbcl doc/manual/asdf
 do
-  test -d $html && cp -R -L $html "$BUILD_ROOT$DOC_DIR"/html \
+  test -d $html && $CP -R -L $html "$BUILD_ROOT$DOC_DIR"/html \
       && echo " html $BUILD_ROOT$DOC_DIR/html/`basename $html`/index.html"
 done
 
 for html in doc/manual/sbcl.html doc/manual/asdf.html
 do
-  cp $html "$BUILD_ROOT$DOC_DIR"/ \
+  test -e $html && $CP $html "$BUILD_ROOT$DOC_DIR"/ \
       && echo " html $BUILD_ROOT$DOC_DIR/`basename $html`"
 done
 
 for f in BUGS CREDITS COPYING NEWS
 do
-  cp $f "$BUILD_ROOT$DOC_DIR"/
+  test -e $f && $CP $f "$BUILD_ROOT$DOC_DIR"/
 done

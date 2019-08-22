@@ -11,21 +11,22 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_COMPLEX_SINGLE_FLOAT
-#define SBCL_GENESIS_COMPLEX_SINGLE_FLOAT 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_COMPLEX_SINGLE_FLOAT
+#ifndef __ASSEMBLER__
 
 struct complex_single_float {
     lispobj header;
     struct { float data[2]; }  data;
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
 #define COMPLEX_SINGLE_FLOAT_DATA_OFFSET -7
+#define COMPLEX_SINGLE_FLOAT_SIZE 2
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_COMPLEX-SINGLE-FLOAT */
+#endif

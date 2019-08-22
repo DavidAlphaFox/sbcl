@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-move-fun (load-immediate 1) (vop x y)
   ((immediate)
@@ -63,8 +63,6 @@
                (not (or (location= x y)
                         (and (sc-is x any-reg descriptor-reg immediate)
                              (sc-is y control-stack))))))
-  (:effects)
-  (:affected)
   (:generator 0
     (if (and (sc-is x immediate)
              (sc-is y any-reg descriptor-reg control-stack))
@@ -77,11 +75,6 @@
 (define-move-vop move :move
   (any-reg descriptor-reg immediate)
   (any-reg descriptor-reg))
-
-;;; Make MOVE the check VOP for T so that type check generation
-;;; doesn't think it is a hairy type. This also allows checking of a
-;;; few of the values in a continuation to fall out.
-(primitive-type-vop move (:check) t)
 
 ;;; The MOVE-ARG VOP is used for moving descriptor values into
 ;;; another frame for argument or known value passing.
@@ -117,21 +110,6 @@
   (any-reg descriptor-reg)
   (any-reg descriptor-reg))
 
-;;;; ILLEGAL-MOVE
-
-;;; This VOP exists just to begin the lifetime of a TN that couldn't
-;;; be written legally due to a type error. An error is signalled
-;;; before this VOP is so we don't need to do anything (not that there
-;;; would be anything sensible to do anyway.)
-(define-vop (illegal-move)
-  (:args (x) (type))
-  (:results (y))
-  (:ignore y)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 666
-    (error-call vop 'object-not-type-error x type)))
-
 ;;;; moves and coercions
 
 ;;; These MOVE-TO-WORD VOPs move a tagged integer to a raw full-word
@@ -160,7 +138,7 @@
   (:results (y :scs (signed-reg unsigned-reg)))
   (:note "constant load")
   (:generator 1
-    (cond ((sb!c::tn-leaf x)
+    (cond ((sb-c::tn-leaf x)
            (inst mov y (tn-value x)))
           (t
            (inst mov y x)
@@ -238,6 +216,22 @@
 (define-move-vop move-from-signed :move
   (signed-reg) (descriptor-reg))
 
+(define-vop (move-from-fixnum+1)
+  (:args (x :scs (signed-reg unsigned-reg)))
+  (:results (y :scs (any-reg descriptor-reg)))
+  (:generator 4
+    (inst imul y x (ash 1 n-fixnum-tag-bits))
+    (inst jmp :no done)
+    (inst mov y (emit-constant (1+ sb-xc:most-positive-fixnum)))
+    done))
+
+(define-vop (move-from-fixnum-1 move-from-fixnum+1)
+  (:generator 4
+    (inst imul y x (ash 1 n-fixnum-tag-bits))
+    (inst jmp :no done)
+    (inst mov y (emit-constant (1- sb-xc:most-negative-fixnum)))
+    done))
+
 ;;; Convert an untagged unsigned word to a lispobj -- fixnum or bignum
 ;;; as the case may be. Fixnum case inline, bignum case in an assembly
 ;;; routine.
@@ -279,8 +273,6 @@
                (not (or (location= x y)
                         (and (sc-is x signed-reg unsigned-reg)
                              (sc-is y signed-stack unsigned-stack))))))
-  (:effects)
-  (:affected)
   (:note "word integer move")
   (:generator 0
     (move y x)))
@@ -290,7 +282,8 @@
 ;;; Move untagged number arguments/return-values.
 (define-vop (move-word-arg)
   (:args (x :scs (signed-reg unsigned-reg) :target y)
-         (fp :scs (any-reg) :load-if (not (sc-is y sap-reg))))
+         (fp :scs (any-reg)
+             :load-if (not (sc-is y signed-reg unsigned-reg))))
   (:results (y))
   (:note "word integer argument move")
   (:generator 0

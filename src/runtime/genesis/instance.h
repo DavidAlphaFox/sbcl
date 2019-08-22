@@ -11,21 +11,22 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_INSTANCE
-#define SBCL_GENESIS_INSTANCE 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_INSTANCE
+#ifndef __ASSEMBLER__
 
 struct instance {
     lispobj header;
     lispobj slots[1];
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
 #define INSTANCE_SLOTS_OFFSET 5
+#define INSTANCE_SIZE 1
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_INSTANCE */
+#endif

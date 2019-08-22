@@ -9,33 +9,21 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!SYS")
+(in-package "SB-SYS")
 
 ;;; Check that target machine features are set up consistently with
 ;;; this file.
-#!-hpux (error "missing :HPUX feature")
+#-hpux (error "missing :HPUX feature")
 
 (defun software-type ()
-  #!+sb-doc
   "Return a string describing the supporting software."
   (values "HPUX"))
-
-(defun software-version ()
-  #!+sb-doc
-  "Return a string describing version of the supporting software, or NIL
-  if not available."
-  (or *software-version*
-      (setf *software-version*
-            (string-trim '(#\newline)
-                         (with-output-to-string (stream)
-                           (run-program "/bin/uname" `("-r")
-                                        :output stream))))))
 
 ;;; Return system time, user time and number of page faults.
 (defun get-system-info ()
   (multiple-value-bind
       (err? utime stime maxrss ixrss idrss isrss minflt majflt)
-      (sb!unix:unix-getrusage sb!unix:rusage_self)
+      (sb-unix:unix-getrusage sb-unix:rusage_self)
     (declare (ignore maxrss ixrss idrss isrss minflt))
     (unless err? ; FIXME: nonmnemonic (reversed) name for ERR?
       (error "Unix system call getrusage failed: ~A." (strerror utime)))

@@ -9,66 +9,97 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
+;;; A DEFINITION-SOURCE-LOCATION contains two packed fixnums in the INDICES slot,
+;;; and unless there is a non-nil plist, does not store the plist.
+;;; Packed representation is: header + layout, namestring, indices, (padding)
 (def!struct (definition-source-location
-             (:make-load-form-fun just-dump-it-normally))
+             (:constructor %make-basic-definition-source-location
+                           (namestring indices))
+             (:copier nil))
   ;; Namestring of the source file that the definition was compiled from.
   ;; This is null if the definition was not compiled from a file.
-  (namestring
-   (or *source-namestring*
-       (when (and (boundp '*source-info*)
-                  *source-info*)
-         (make-file-info-namestring *compile-file-pathname*
-                                    (sb!c:get-toplevelish-file-info *source-info*))))
-   :type (or string null))
-  ;; Toplevel form index
-  (toplevel-form-number
-   (when (boundp '*current-path*)
-     (source-path-tlf-number *current-path*))
-   :type (or fixnum null))
-  ;; plist from WITH-COMPILATION-UNIT
-  (plist *source-plist*))
+  (namestring nil :type (or string null) :read-only t)
+  (indices 0 :type integer :read-only t))
+(!set-load-form-method definition-source-location  (:xc :target))
+(def!struct (definition-source-location+plist
+             (:include definition-source-location)
+             (:constructor %make-full-definition-source-location
+                           (namestring indices plist))
+             (:copier nil))
+  (plist nil :read-only t))
+
+(declaim (inline definition-source-location-toplevel-form-number
+                 definition-source-location-form-number
+                 definition-source-location-plist))
+;;; Toplevel form index
+(defun definition-source-location-toplevel-form-number (source-loc)
+  (let ((val (ash (definition-source-location-indices source-loc) -15)))
+    (cond ((plusp val) (1- val))
+          ((minusp val) val))))
+;; DFO form number within the top-level form
+(defun definition-source-location-form-number (source-loc)
+  (let ((val (ldb (byte 15 0) (definition-source-location-indices source-loc))))
+    (if (plusp val) (1- val))))
+;; plist from WITH-COMPILATION-UNIT
+(defun definition-source-location-plist (source-loc)
+  (when (typep (the definition-source-location source-loc)
+               'definition-source-location+plist)
+    (definition-source-location+plist-plist source-loc)))
+
+(defun %make-definition-source-location (namestring tlf-num subform-num)
+  (declare (type (or null (integer -1 *)) tlf-num)
+           (type (or null unsigned-byte) subform-num))
+  (let* ((plist *source-plist*)
+         ;; Use 15 bits for subform#, and all other bits (including sign) for TLF#.
+         ;; Map 0 to NIL, 1 to 0, 2 to 1, etc; but -1 remains itself.
+         (indices
+          (logior (ash (cond ((eql tlf-num -1) -1)
+                             (tlf-num (1+ tlf-num))
+                             (t 0))
+                       15)
+                  ;; If subform-num exceeds 32766 just drop it.
+                  (if (and subform-num (< subform-num 32767))
+                      (1+ subform-num)
+                      0)))
+         (source-info (and (boundp '*source-info*) *source-info*))
+         (last (and source-info
+                    (source-info-last-defn-source-loc source-info))))
+    (if (and last
+             (eql (definition-source-location-indices last) indices)
+             (string= (definition-source-location-namestring last) namestring)
+             (equal (definition-source-location-plist last) plist))
+        last
+        (let ((new (if plist
+                       (%make-full-definition-source-location namestring indices plist)
+                       (%make-basic-definition-source-location namestring indices))))
+          (when source-info
+            (setf (source-info-last-defn-source-loc source-info) new))
+          new))))
+
+(defun make-definition-source-location ()
+  (let* ((source-info (and (boundp '*source-info*) *source-info*))
+         (namestring
+          (or *source-namestring*
+              (when source-info
+                (make-file-info-namestring
+                 *compile-file-pathname*
+                 (get-toplevelish-file-info source-info)))))
+         tlf-number
+         form-number)
+    (acond ((boundp '*current-path*)
+            (setf tlf-number (source-path-tlf-number *current-path*)
+                  form-number (source-path-form-number *current-path*)))
+           ((and source-info (source-info-file-info source-info))
+            (setf tlf-number (1- (fill-pointer (file-info-forms it))))))
+    (%make-definition-source-location namestring tlf-number form-number)))
 
 (defun make-file-info-namestring (name file-info)
-  #+sb-xc-host (declare (ignore name))
   (let* ((untruename (file-info-untruename file-info))
          (dir (and untruename (pathname-directory untruename))))
-    #+sb-xc-host
-    (let ((src (position "src" dir :test #'string=
-                         :from-end t)))
-      (cond
-        ((and src (not (string= (car (last dir)) "output")))
-         (format nil "SYS:~{~:@(~A~);~}~:@(~A~).LISP"
-                 (subseq dir src) (pathname-name untruename)))
-        (t (aver (string-equal (car (last dir)) "output"))
-           (aver (string-equal (pathname-name untruename) "stuff-groveled-from-headers"))
-           (aver (string-equal (pathname-type untruename) "lisp"))
-           "SYS:OUTPUT;STUFF-GROVELED-FROM-HEADERS.LISP")))
-    #-sb-xc-host
     (if (and dir (eq (first dir) :absolute))
         (namestring untruename)
         (if name
             (namestring name)
             nil))))
-
-#!+sb-source-locations
-(define-compiler-macro source-location (&environment env)
-  (declare (ignore env))
-  #-sb-xc-host (make-definition-source-location))
-
-;; We need a regular definition of SOURCE-LOCATION for calls processed
-;; during LOAD on a source file while *EVALUATOR-MODE* is :INTERPRET.
-#!+sb-source-locations
-(setf (symbol-function 'source-location)
-      (lambda () (make-definition-source-location)))
-
-(/show0 "/Processing source location thunks")
-#!+sb-source-locations
-(dolist (fun *source-location-thunks*)
-  (/show0 ".")
-  (funcall fun))
-;; Unbind the symbol to ensure that we detect any attempts to add new
-;; thunks after this.
-(makunbound '*source-location-thunks*)
-(/show0 "/Done with source location thunks")

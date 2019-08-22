@@ -11,28 +11,31 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_CATCH_BLOCK
-#define SBCL_GENESIS_CATCH_BLOCK 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_CATCH_BLOCK
+#ifndef __ASSEMBLER__
 
 struct catch_block {
-    struct unwind_block * current_uwp;
-    lispobj * current_cont;
+    struct unwind_block * uwp;
+    lispobj * cfp;
     lispobj entry_pc;
-    lispobj tag;
+    lispobj bsp;
     struct catch_block * previous_catch;
+    lispobj tag;
 };
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
 
-#define CATCH_BLOCK_CURRENT_UWP_OFFSET 0
-#define CATCH_BLOCK_CURRENT_CONT_OFFSET 8
+#define CATCH_BLOCK_UWP_OFFSET 0
+#define CATCH_BLOCK_CFP_OFFSET 8
 #define CATCH_BLOCK_ENTRY_PC_OFFSET 16
-#define CATCH_BLOCK_TAG_OFFSET 24
+#define CATCH_BLOCK_BSP_OFFSET 24
 #define CATCH_BLOCK_PREVIOUS_CATCH_OFFSET 32
+#define CATCH_BLOCK_TAG_OFFSET 40
+#define CATCH_BLOCK_SIZE 6
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_CATCH-BLOCK */
+#endif

@@ -9,10 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Test generation utilities.
-(defun %test-fixnum (value target not-p &key temp)
+(defun %test-fixnum (value temp target not-p)
   (assemble ()
     (inst and temp value fixnum-tag-mask)
     (if not-p
@@ -20,15 +20,16 @@
         (inst beq temp target))
     (inst nop)))
 
-(defun %test-fixnum-and-headers (value target not-p headers &key temp)
+(defun %test-fixnum-and-headers (value temp target not-p headers &key value-tn-ref)
   (let ((drop-through (gen-label)))
     (assemble ()
       (inst and temp value fixnum-tag-mask)
       (inst beq temp (if not-p drop-through target)))
-    (%test-headers value target not-p nil headers
-                   :drop-through drop-through :temp temp)))
+    (%test-headers value temp target not-p nil headers
+                   :drop-through drop-through
+                   :value-tn-ref value-tn-ref)))
 
-(defun %test-immediate (value target not-p immediate &key temp)
+(defun %test-immediate (value temp target not-p immediate)
   (assemble ()
     (inst and temp value widetag-mask)
     (inst xor temp immediate)
@@ -37,7 +38,7 @@
         (inst beq temp target))
     (inst nop)))
 
-(defun %test-lowtag (value target not-p lowtag &key temp)
+(defun %test-lowtag (value temp target not-p lowtag)
   (assemble ()
     (inst and temp value lowtag-mask)
     (inst xor temp lowtag)
@@ -46,8 +47,9 @@
         (inst beq temp target))
     (inst nop)))
 
-(defun %test-headers (value target not-p function-p headers
-                      &key (drop-through (gen-label)) temp)
+(defun %test-headers (value temp target not-p function-p headers
+                      &key (drop-through (gen-label)) value-tn-ref)
+  (declare (ignore value-tn-ref))
   (let ((lowtag (if function-p fun-pointer-lowtag other-pointer-lowtag)))
     (multiple-value-bind
         (when-true when-false)
@@ -57,7 +59,7 @@
             (values drop-through target)
             (values target drop-through))
       (assemble ()
-        (%test-lowtag value when-false t lowtag :temp temp)
+        (%test-lowtag value temp when-false t lowtag)
         (load-type temp value (- lowtag))
         (inst nop)
         (let ((delta 0))
@@ -90,53 +92,6 @@
                       (inst blez temp when-true))))))))
         (inst nop)
         (emit-label drop-through)))))
-
-
-
-;;; Type checking and testing (see also the use of !DEFINE-TYPE-VOPS
-;;; in src/compiler/generic/late-type-vops.lisp):
-;;;
-;;; [FIXME: Like some of the other comments in this file, this one
-;;; really belongs somewhere else]
-(define-vop (check-type)
-  (:args (value :target result :scs (any-reg descriptor-reg)))
-  (:results (result :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg) :to (:result 0)) temp)
-  (:vop-var vop)
-  (:save-p :compute-only))
-
-(define-vop (type-predicate)
-  (:args (value :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:conditional)
-  (:info target not-p)
-  (:policy :fast-safe))
-
-(defun cost-to-test-types (type-codes)
-  (+ (* 2 (length type-codes))
-     (if (> (apply #'max type-codes) lowtag-limit) 7 2)))
-
-(defmacro !define-type-vops (pred-name check-name ptype error-code
-                             (&rest type-codes)
-                             &key &allow-other-keys)
-  (let ((cost (cost-to-test-types (mapcar #'eval type-codes))))
-    `(progn
-       ,@(when pred-name
-           `((define-vop (,pred-name type-predicate)
-               (:translate ,pred-name)
-               (:generator ,cost
-                 (test-type value target not-p (,@type-codes)
-                            :temp temp)))))
-       ,@(when check-name
-           `((define-vop (,check-name check-type)
-               (:generator ,cost
-                 (let ((err-lab
-                        (generate-error-code vop ,error-code value)))
-                   (test-type value err-lab t (,@type-codes)
-                              :temp temp)
-                   (move result value))))))
-       ,@(when ptype
-           `((primitive-type-vop ,check-name (:check) ,ptype))))))
 
 ;;;; TYPE-VOPs for types that are more complex to test for than simple
 ;;;; LOWTAG and WIDETAG tests, but that are nevertheless important:
@@ -169,14 +124,6 @@
   (:generator 45
     (signed-byte-32-test value temp not-p target not-target)
     NOT-TARGET))
-
-(define-vop (check-signed-byte-32 check-type)
-  (:generator 45
-    (let ((loose (generate-error-code vop object-not-signed-byte-32-error
-                                      value)))
-      (signed-byte-32-test value temp t loose okay))
-    OKAY
-    (move result value)))
 
 ;;; An (UNSIGNED-BYTE 32) can be represented with either a positive
 ;;; fixnum, a bignum with exactly one positive digit, or a bignum with
@@ -231,18 +178,10 @@
     (unsigned-byte-32-test value temp not-p target not-target)
     NOT-TARGET))
 
-(define-vop (check-unsigned-byte-32 check-type)
-  (:generator 45
-    (let ((loose (generate-error-code vop object-not-unsigned-byte-32-error
-                                      value)))
-      (unsigned-byte-32-test value temp t loose okay))
-    OKAY
-    (move result value)))
-
 ;;; Because of our LOWTAG representation, SYMBOLP and CONSP are
 ;;; slightly more complex:
 ;;;
-;;; * SYMBOLP is true if the object has SYMBOL-HEADER-WIDETAG or is EQ
+;;; * SYMBOLP is true if the object has SYMBOL-WIDETAG or is EQ
 ;;; to NIL;
 ;;;
 ;;; * CONSP is true if the object has LIST-POINTER-LOWTAG and is not
@@ -254,27 +193,12 @@
   (:translate symbolp)
   (:generator 12
     (inst beq value null-tn (if not-p drop-thru target))
-    (test-type value target not-p (symbol-header-widetag) :temp temp)
+    (test-type value temp target not-p (symbol-widetag))
     DROP-THRU))
-
-(define-vop (check-symbol check-type)
-  (:generator 12
-    (inst beq value null-tn drop-thru)
-    (let ((error (generate-error-code vop object-not-symbol-error value)))
-      (test-type value error t (symbol-header-widetag) :temp temp))
-    DROP-THRU
-    (move result value)))
 
 (define-vop (consp type-predicate)
   (:translate consp)
   (:generator 8
     (inst beq value null-tn (if not-p target drop-thru))
-    (test-type value target not-p (list-pointer-lowtag) :temp temp)
+    (test-type value temp target not-p (list-pointer-lowtag))
     DROP-THRU))
-
-(define-vop (check-cons check-type)
-  (:generator 8
-    (let ((error (generate-error-code vop object-not-cons-error value)))
-      (inst beq value null-tn error)
-      (test-type value error t (list-pointer-lowtag) :temp temp))
-    (move result value)))

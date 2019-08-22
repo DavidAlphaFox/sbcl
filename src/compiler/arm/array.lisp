@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; Allocator for the array header.
@@ -24,9 +24,9 @@
   (:temporary (:sc non-descriptor-reg :offset ocfp-offset) pa-flag)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:results (result :scs (descriptor-reg)))
-  (:generator 0
+  (:generator 5
     ;; Compute the allocation size.
-    (inst add ndescr rank (+ (* (1+ array-dimensions-offset) n-word-bytes)
+    (inst add ndescr rank (+ (* array-dimensions-offset n-word-bytes)
                              lowtag-mask))
     (inst bic ndescr ndescr lowtag-mask)
     (pseudo-atomic (pa-flag)
@@ -39,18 +39,41 @@
       ;; And store the header value.
       (storew ndescr header 0 other-pointer-lowtag))
     (move result header)))
+
+(define-vop (make-array-header/c)
+  (:translate make-array-header)
+  (:policy :fast-safe)
+  (:arg-types (:constant t) (:constant t))
+  (:info type rank)
+  (:temporary (:scs (descriptor-reg) :to (:result 0) :target result) header)
+  (:temporary (:sc non-descriptor-reg :offset ocfp-offset) pa-flag)
+  (:results (result :scs (descriptor-reg)))
+  (:generator 4
+    (let* ((header-size (+ rank
+                           (1- array-dimensions-offset)))
+           (bytes (logandc2 (+ (* (1+ header-size) n-word-bytes)
+                               lowtag-mask)
+                            lowtag-mask))
+           (header-bits (logior (ash header-size
+                                     n-widetag-bits)
+                                type)))
+      (pseudo-atomic (pa-flag)
+        (allocation header bytes other-pointer-lowtag :flag-tn pa-flag)
+        (load-immediate-word pa-flag header-bits)
+        (storew pa-flag header 0 other-pointer-lowtag)))
+    (move result header)))
 
 ;;;; Additional accessors and setters for the array header.
 (define-full-reffer %array-dimension *
   array-dimensions-offset other-pointer-lowtag
-  (any-reg) positive-fixnum sb!kernel:%array-dimension)
+  (any-reg) positive-fixnum sb-kernel:%array-dimension)
 
 (define-full-setter %set-array-dimension *
   array-dimensions-offset other-pointer-lowtag
-  (any-reg) positive-fixnum sb!kernel:%set-array-dimension)
+  (any-reg) positive-fixnum sb-kernel:%set-array-dimension)
 
 (define-vop (array-rank-vop)
-  (:translate sb!kernel:%array-rank)
+  (:translate sb-kernel:%array-rank)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) temp)
@@ -60,21 +83,21 @@
     (inst mov temp (asr temp n-widetag-bits))
     (inst sub temp temp (1- array-dimensions-offset))
     (inst mov res (lsl temp n-fixnum-tag-bits))))
+
 ;;;; Bounds checking routine.
 (define-vop (check-bound)
   (:translate %check-bound)
   (:policy :fast-safe)
   (:args (array :scs (descriptor-reg))
          (bound :scs (any-reg descriptor-reg))
-         (index :scs (any-reg descriptor-reg) :target result))
-  (:results (result :scs (any-reg descriptor-reg)))
+         (index :scs (any-reg descriptor-reg)))
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 5
     (let ((error (generate-error-code vop 'invalid-array-index-error array bound index)))
+      (%test-fixnum index nil error t)
       (inst cmp index bound)
-      (inst b :hs error)
-      (move result index))))
+      (inst b :hs error))))
 
 ;;;; Accessors/Setters
 
@@ -106,7 +129,7 @@
 
   (def-partial-data-vector-frobs simple-base-string character
     :byte nil character-reg)
-  #!+sb-unicode
+  #+sb-unicode
   (def-full-data-vector-frobs simple-character-string character character-reg)
 
   (def-partial-data-vector-frobs simple-array-unsigned-byte-7 positive-fixnum

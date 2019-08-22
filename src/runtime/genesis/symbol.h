@@ -11,8 +11,8 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_SYMBOL
-#define SBCL_GENESIS_SYMBOL 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_SYMBOL
+#ifndef __ASSEMBLER__
 
 struct symbol {
     lispobj header;
@@ -22,8 +22,11 @@ struct symbol {
     lispobj name;
     lispobj package;
 };
+static inline struct symbol* SYMBOL(lispobj obj) {
+  return (struct symbol*)(obj - 15);
+}
 
-#else /* LANGUAGE_ASSEMBLY */
+#else /* __ASSEMBLER__ */
 
 /* These offsets are SLOT-OFFSET * N-WORD-BYTES - LOWTAG
  * so they work directly on tagged addresses. */
@@ -33,7 +36,8 @@ struct symbol {
 #define SYMBOL_INFO_OFFSET 9
 #define SYMBOL_NAME_OFFSET 17
 #define SYMBOL_PACKAGE_OFFSET 25
+#define SYMBOL_SIZE 6
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_SYMBOL */
+#endif

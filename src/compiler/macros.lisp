@@ -9,9 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
-
-(declaim (special *compiler-error-context*))
+(in-package "SB-C")
 
 ;;;; source-hacking defining forms
 
@@ -23,51 +21,43 @@
 ;;; list. START-VAR, NEXT-VAR and RESULT-VAR are bound to the start and
 ;;; result continuations for the resulting IR1. KIND is the function
 ;;; kind to associate with NAME.
+;;; FIXME - Translators which accept implicit PROGNs fail on improper
+;;; input, e.g. (LAMBDA (X) (CATCH X (BAZ) . 3))
+;;; This is because &REST is defined to allow a dotted tail in macros,
+;;; and we have no implementation-specific workaround to disallow it.
 (defmacro def-ir1-translator (name (lambda-list start-var next-var result-var)
                               &body body)
-  (let ((fn-name (symbolicate "IR1-CONVERT-" name)))
-    (with-unique-names (whole-var n-env)
-      (multiple-value-bind (body decls #-sb-xc-host doc)
-          (parse-defmacro lambda-list whole-var body name "special form"
-                          :environment n-env
-                          :error-fun 'compiler-error
-                          :wrap-block nil)
-        `(progn
-           (declaim (ftype (function (ctran ctran (or lvar null) t) (values))
-                           ,fn-name))
-           (defun ,fn-name (,start-var ,next-var ,result-var ,whole-var
-                            &aux (,n-env *lexenv*))
-             (declare (ignorable ,start-var ,next-var ,result-var))
-             ,@decls
-             ,body
-             (values))
-           #-sb-xc-host
-           ;; It's nice to do this for error checking in the target
-           ;; SBCL, but it's not nice to do this when we're running in
-           ;; the cross-compilation host Lisp, which owns the
-           ;; SYMBOL-FUNCTION of its COMMON-LISP symbols. These guard
-           ;; functions also provide the documentation for special forms.
-           ;; FIXME: should be disallowed after bootstrap. Package-lock
-           ;; prevents it, but the protection could be stronger than that.
-           ;; The lambda name has significance to COERCE-SYMBOL-TO-FUN.
-           (let ((fun (named-lambda (sb!impl::special-operator ,name)
-                          (&rest args)
-                        ,@(when doc (list doc))
-                        (declare (ignore args))
-                        (error 'special-form-function :name ',name)) ))
-             ;; Set up a macro lambda list to a function.
-             (setf (%simple-fun-arglist fun)
-                   ',(if (eq (first lambda-list) '&whole)
-                         (cddr lambda-list)
-                         lambda-list)
-                   (symbol-function ',name) fun))
+  (binding* ((fn-name (symbolicate "IR1-CONVERT-" name))
+             (whole-var (make-symbol "FORM"))
+             ((lambda-expr doc)
+              (make-macro-lambda nil lambda-list body :special-form name
+                                 :doc-string-allowed :external
+                                 :wrap-block nil)))
+    (declare (ignorable doc)) ; unused on host
+    ;; Maybe kill docstring, but only under the cross-compiler.
+    #+(and (not sb-doc) sb-xc-host) (setq doc nil)
+    `(progn
+      (declaim (ftype (function (ctran ctran (or lvar null) t) (values))
+                      ,fn-name))
+      (defun ,fn-name (,start-var ,next-var ,result-var ,whole-var)
+        (declare (ignorable ,start-var ,next-var ,result-var))
+           ;; The guard function is a closure, which can't have its lambda-list
+           ;; changed independently of other closures based on the same
+           ;; simple-fun. So change it in the ir1-translator since the actual
+           ;; lambda-list is not terribly useful.
+        (declare (lambda-list ,lambda-list))
+        (,lambda-expr ,whole-var *lexenv*)
+        (values))
+      #-sb-xc-host
+      (progn (install-guard-function ',name '(:special ,name))
+             (setf (documentation (symbol-function ',name) t) ',doc))
            ;; FIXME: Evidently "there can only be one!" -- we overwrite any
            ;; other :IR1-CONVERT value. This deserves a warning, I think.
-           (setf (info :function :ir1-convert ',name) #',fn-name)
+      (setf (info :function :ir1-convert ',name) #',fn-name)
            ;; FIXME: rename this to SPECIAL-OPERATOR, to update it to
            ;; the 1990s?
-           (setf (info :function :kind ',name) :special-form)
-           ',name)))))
+      (setf (info :function :kind ',name) :special-form)
+      ',name)))
 
 ;;; (This is similar to DEF-IR1-TRANSLATOR, except that we pass if the
 ;;; syntax is invalid.)
@@ -82,176 +72,72 @@
 ;;; Source transforms may only be defined for functions. Source
 ;;; transformation is not attempted if the function is declared
 ;;; NOTINLINE. Source transforms should not examine their arguments.
+;;; A macro lambda list which destructures more than one level would
+;;; be legal but suspicious, as inner list parsing "examines" arguments.
 ;;; If it matters how the function is used, then DEFTRANSFORM should
 ;;; be used to define an IR1 transformation.
 ;;;
 ;;; If the desirability of the transformation depends on the current
 ;;; OPTIMIZE parameters, then the POLICY macro should be used to
 ;;; determine when to pass.
-(defmacro source-transform-lambda (lambda-list &body body)
-  (with-unique-names (whole-var n-env name)
-    (multiple-value-bind (body decls)
-        (parse-defmacro lambda-list whole-var body "source transform" "form"
-                        :environment n-env
-                        :error-fun `(lambda (&rest stuff)
-                                      (declare (ignore stuff))
-                                      (return-from ,name
-                                        (values nil t)))
-                        :wrap-block nil)
-      `(lambda (,whole-var &aux (,n-env *lexenv*))
-         ,@decls
-         (block ,name
-           ,body)))))
-(defmacro define-source-transform (name lambda-list &body body)
-  `(setf (info :function :source-transform ',name)
-         (source-transform-lambda ,lambda-list ,@body)))
-
-;;;; boolean attribute utilities
-;;;;
-;;;; We need to maintain various sets of boolean attributes for known
-;;;; functions and VOPs. To save space and allow for quick set
-;;;; operations, we represent the attributes as bits in a fixnum.
-
-(deftype attributes () 'fixnum)
-
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-
-;;; Given a list of attribute names and an alist that translates them
-;;; to masks, return the OR of the masks.
-(defun compute-attribute-mask (names alist)
-  (collect ((res 0 logior))
-    (dolist (name names)
-      (let ((mask (cdr (assoc name alist))))
-        (unless mask
-          (error "unknown attribute name: ~S" name))
-        (res mask)))
-    (res)))
-
-) ; EVAL-WHEN
-
-;;; Define a new class of boolean attributes, with the attributes
-;;; having the specified ATTRIBUTE-NAMES. NAME is the name of the
-;;; class, which is used to generate some macros to manipulate sets of
-;;; the attributes:
 ;;;
-;;;    NAME-attributep attributes attribute-name*
-;;;      Return true if one of the named attributes is present, false
-;;;      otherwise. When set with SETF, updates the place Attributes
-;;;      setting or clearing the specified attributes.
+;;; Note that while a compiler-macro must deal with being invoked when its
+;;; whole form matches (FUNCALL <f> ...) so that it must skip over <f> to find
+;;; the arguments, a source-transform need not worry about that situation.
+;;; Any FUNCALL which is eligible for a source-transform calls the expander
+;;; with the form's head replaced by a compiler representation of the function.
+;;; Internalizing the name avoids semantic problems resulting from syntactic
+;;; substitution. One problem would be that a source-transform can exist for
+;;; a function named (SETF X), but ((SETF X) arg ...) would be bad syntax.
+;;; Even if we decided that it is ok within the compiler - just not in code
+;;; given to the compiler - the problem remains that changing (FUNCALL 'F x)
+;;; to (F x) is wrong when F also names a local functionoid.
+;;; Hence, either a #<GLOBAL-VAR> or #<DEFINED-FUN> appears in the form head.
 ;;;
-;;;    NAME-attributes attribute-name*
-;;;      Return a set of the named attributes.
-#-sb-xc
-(progn
-  (def!macro !def-boolean-attribute (name &rest attribute-names)
-
-    (let ((translations-name (symbolicate "*" name "-ATTRIBUTE-TRANSLATIONS*"))
-          (test-name (symbolicate name "-ATTRIBUTEP"))
-          (decoder-name (symbolicate "DECODE-" name "-ATTRIBUTES")))
-      (collect ((alist))
-        (do ((mask 1 (ash mask 1))
-             (names attribute-names (cdr names)))
-            ((null names))
-          (alist (cons (car names) mask)))
-        `(progn
-           (eval-when (:compile-toplevel :load-toplevel :execute)
-             (defparameter ,translations-name ',(alist)))
-           (defmacro ,(symbolicate name "-ATTRIBUTES") (&rest attribute-names)
-             #!+sb-doc
-             "Automagically generated boolean attribute creation function.
-  See !DEF-BOOLEAN-ATTRIBUTE."
-             (compute-attribute-mask attribute-names ,translations-name))
-           (defmacro ,test-name (attributes &rest attribute-names)
-             #!+sb-doc
-             "Automagically generated boolean attribute test function.
-  See !DEF-BOOLEAN-ATTRIBUTE."
-             `(logtest ,(compute-attribute-mask attribute-names
-                                                ,translations-name)
-                       (the attributes ,attributes)))
-           ;; This definition transforms strangely under UNCROSS, in a
-           ;; way that DEF!MACRO doesn't understand, so we delegate it
-           ;; to a submacro then define the submacro differently when
-           ;; building the xc and when building the target compiler.
-           (!def-boolean-attribute-setter ,test-name
-                                          ,translations-name
-                                          ,@attribute-names)
-           (defun ,decoder-name (attributes)
-             (loop for (name . mask) in ,translations-name
-                   when (logtest mask attributes)
-                     collect name))))))
-
-  ;; It seems to be difficult to express in DEF!MACRO machinery what
-  ;; to do with target-vs-host GET-SETF-EXPANSION in here, so we just
-  ;; hack it by hand, passing a different GET-SETF-EXPANSION-FUN-NAME
-  ;; in the host DEFMACRO and target DEFMACRO-MUNDANELY cases.
-  (defun guts-of-!def-boolean-attribute-setter (test-name
-                                                translations-name
-                                                attribute-names
-                                                get-setf-expansion-fun-name)
-    (declare (ignore attribute-names))
-    `(define-setf-expander ,test-name (place &rest attributes
-                                             &environment env)
-       #!+sb-doc
-       "Automagically generated boolean attribute setter. See
- !DEF-BOOLEAN-ATTRIBUTE."
-       #-sb-xc-host (declare (type lexenv env))
-       ;; FIXME: It would be better if &ENVIRONMENT arguments were
-       ;; automatically declared to have type LEXENV by the
-       ;; hairy-argument-handling code.
-       (multiple-value-bind (temps values stores set get)
-           (,get-setf-expansion-fun-name place env)
-         (when (cdr stores)
-           (error "multiple store variables for ~S" place))
-         (let ((newval (sb!xc:gensym))
-               (n-place (sb!xc:gensym))
-               (mask (compute-attribute-mask attributes ,translations-name)))
-           (values `(,@temps ,n-place)
-                   `(,@values ,get)
-                   `(,newval)
-                   `(let ((,(first stores)
-                           (if ,newval
-                               (logior ,n-place ,mask)
-                               (logand ,n-place ,(lognot mask)))))
-                      ,set
-                      ,newval)
-                   `(,',test-name ,n-place ,@attributes))))))
-  ;; We define the host version here, and the just-like-it-but-different
-  ;; target version later, after DEFMACRO-MUNDANELY has been defined.
-  (defmacro !def-boolean-attribute-setter (test-name
-                                           translations-name
-                                           &rest attribute-names)
-    (guts-of-!def-boolean-attribute-setter test-name
-                                           translations-name
-                                           attribute-names
-                                           'get-setf-expansion)))
-
-;;; Otherwise the source locations for DEFTRANSFORM, DEFKNOWN, &c
-;;; would be off by one toplevel form as their source locations are
-;;; determined before cross-compiling where the above PROGN is not
-;;; seen.
-#+sb-xc (progn)
-
-;;; And now for some gratuitous pseudo-abstraction...
-;;;
-;;; ATTRIBUTES-UNION
-;;;   Return the union of all the sets of boolean attributes which are its
-;;;   arguments.
-;;; ATTRIBUTES-INTERSECTION
-;;;   Return the intersection of all the sets of boolean attributes which
-;;;   are its arguments.
-;;; ATTRIBUTES
-;;;   True if the attributes present in ATTR1 are identical to
-;;;   those in ATTR2.
-(defmacro attributes-union (&rest attributes)
-  `(the attributes
-        (logior ,@(mapcar (lambda (x) `(the attributes ,x)) attributes))))
-(defmacro attributes-intersection (&rest attributes)
-  `(the attributes
-        (logand ,@(mapcar (lambda (x) `(the attributes ,x)) attributes))))
-(declaim (ftype (function (attributes attributes) boolean) attributes=))
-#!-sb-fluid (declaim (inline attributes=))
-(defun attributes= (attr1 attr2)
-  (eql attr1 attr2))
+(defmacro define-source-transform (fun-name lambda-list &body body)
+  ;; FIXME: this is redundant with what will become MAKE-MACRO-LAMBDA
+  ;; except that it needs a "silently do nothing" mode, which may or may not
+  ;; be a generally exposed feature.
+  (binding*
+      (((forms decls) (parse-body body nil))
+       ((llks req opt rest keys aux env whole)
+        (parse-lambda-list
+         lambda-list
+         :accept
+         (logandc2 (logior (lambda-list-keyword-mask '&environment)
+                           (lambda-list-keyword-mask 'destructuring-bind))
+                   ;; Function lambda lists shouldn't take &BODY.
+                   (lambda-list-keyword-mask '&body))
+         :context "a source transform"))
+       ((outer-decl inner-decls) (extract-var-decls decls (append env whole)))
+       ;; With general macros, the user can declare (&WHOLE W &ENVIRONMENT E ..)
+       ;; and then (DECLARE (IGNORE W E)) which is a problem if system code
+       ;; touches user variables. But this is all system code, so it's fine.
+       (lambda-whole (if whole (car whole) (make-symbol "FORM")))
+       (lambda-env (if env (car env) (make-symbol "ENV")))
+       (new-ll (if (or whole env) ; strip them out if present
+                   (make-lambda-list llks nil req opt rest keys aux)
+                   lambda-list)) ; otherwise use the original list
+       (args (make-symbol "ARGS")))
+    `(%define-source-transform ',fun-name
+           (named-lambda (:source-transform ,fun-name)
+               (,lambda-whole ,lambda-env &aux (,args (cdr ,lambda-whole)))
+             ,@(if (not env) `((declare (ignore ,lambda-env))))
+             ,@outer-decl ; SPECIALs or something? I hope not.
+             (if (not ,(emit-ds-lambda-list-match args new-ll))
+                 (values nil t)
+                 ;; The body can return 1 or 2 values, but consistently
+                 ;; returning 2 values from the XEP is stylistically
+                 ;; preferable, and produces shorter assembly code too.
+                 (multiple-value-bind (call pass)
+                     (binding* ,(expand-ds-bind new-ll args nil 'truly-the)
+                       ,@inner-decls
+                       (block ,(fun-name-block-name fun-name) ,@forms))
+                   (values call pass)))))))
+(defun %define-source-transform (fun-name lambda)
+  (when (info :function :source-transform fun-name)
+    (warn "Redefining source-transform for ~S" fun-name))
+  (setf (info :function :source-transform fun-name) lambda))
 
 ;;;; lambda-list parsing utilities
 ;;;;
@@ -270,19 +156,17 @@
 ;;; is a list of all the arguments bound, which the caller should make
 ;;; IGNORABLE if their only purpose is to make the syntax work.
 (defun parse-deftransform (lambda-list node-var error-form)
-  (multiple-value-bind (req opt restp rest keyp keys allowp)
-      (parse-lambda-list lambda-list)
+  (multiple-value-bind (llks req opt rest keys) (parse-lambda-list lambda-list)
     (let* ((tail (make-symbol "ARGS"))
            (dummies (make-gensym-list 2))
            (all-dummies (cons tail dummies))
+           (keyp (ll-kwds-keyp llks))
+           ;; FIXME: the logic for keywordicating a keyword arg specifier
+           ;; is repeated in a as many places as there are calls to
+           ;; parse-lambda-just, and more.
            (keys (mapcar (lambda (spec)
                            (multiple-value-bind (key var)
-                               (if (atom spec)
-                                   (values (keywordicate spec) spec)
-                                   (let ((head (car spec)))
-                                     (if (atom head)
-                                         (values (keywordicate head) head)
-                                         (values (car head) (cadr head)))))
+                               (parse-key-arg-spec spec)
                              (cons var key)))
                          keys))
            final-mandatory-arg)
@@ -305,19 +189,19 @@
           (binds `(,(if (atom arg) arg (car arg)) (pop ,tail))))
         ;; Now if min or max # of args is incorrect,
         ;; or there are unacceptable keywords, bail out
-        (when (or req keyp (not restp))
+        (when (or req keyp (not rest))
           (binds `(,(pop dummies) ; binding is for effect, not value
                    (unless (and ,@(if req `(,final-mandatory-arg))
-                                ,@(if (and (not restp) (not keyp))
+                                ,@(if (and (not rest) (not keyp))
                                       `((endp ,tail)))
                                 ,@(if keyp
-                                      (if allowp
+                                      (if (ll-kwds-allowp llks)
                                           `((check-key-args-constant ,tail))
                                           `((check-transform-keys
                                              ,tail ',(mapcar #'cdr keys))))))
                       ,error-form))))
-        (when restp
-          (binds `(,rest ,tail)))
+        (when rest
+          (binds `(,(car rest) ,tail)))
         ;; Return list of bindings, the list of user-specified symbols,
         ;; and the list of gensyms to be declared ignorable.
         (values (append (binds)
@@ -389,8 +273,8 @@
 ;;;   :IMPORTANT
 ;;;           - If the transform fails and :IMPORTANT is
 ;;;               NIL,       then never print an efficiency note.
-;;;               :SLIGHTLY, then print a note if SPEED>=INHIBIT-WARNINGS.
-;;;               T,         then print a note if SPEED>INHIBIT-WARNINGS.
+;;;               :SLIGHTLY, then print a note if SPEED>INHIBIT-WARNINGS.
+;;;               T,         then print a note if SPEED>=INHIBIT-WARNINGS.
 ;;;             :SLIGHTLY is the default.
 (defmacro deftransform (name (lambda-list &optional (arg-types '*)
                                           (result-type '*)
@@ -400,87 +284,75 @@
   (declare (type (member nil :slightly t) important))
   (when (and eval-name defun-only)
     (error "can't specify both DEFUN-ONLY and EVAL-NAME"))
-  (multiple-value-bind (body decls doc) (parse-body body-decls-doc)
-    (let ((n-node (or node (sb!xc:gensym)))
-          (n-decls (sb!xc:gensym))
-          (n-lambda (sb!xc:gensym)))
+  (multiple-value-bind (body decls doc) (parse-body body-decls-doc t)
+    (let ((n-node (or node (make-symbol "NODE")))
+          (n-decls (sb-xc:gensym))
+          (n-lambda (sb-xc:gensym)))
       (multiple-value-bind (bindings vars)
           (parse-deftransform lambda-list n-node
                               '(give-up-ir1-transform))
         (let ((stuff
-               `((,n-node &aux ,@bindings
-                               ,@(when result
-                                   `((,result (node-lvar ,n-node)))))
-                 (declare (ignorable ,@(mapcar #'car bindings)))
-                 ,@decls
-                 ,@(if policy
-                      `((unless (policy ,n-node ,policy)
-                          (give-up-ir1-transform))))
-                 ;; What purpose does it serve to allow the transform's body
-                 ;; to return decls as a second value? They would go in the
-                 ;; right place if simply returned as part of the expression.
-                 (multiple-value-bind (,n-lambda ,n-decls)
-                       (progn ,@body)
-                     (if (and (consp ,n-lambda) (eq (car ,n-lambda) 'lambda))
-                         ,n-lambda
-                       `(lambda ,',lambda-list
-                          (declare (ignorable ,@',vars))
-                          ,@,n-decls
-                          ,,n-lambda))))))
+                `((,n-node &aux ,@bindings
+                           ,@(when result
+                               `((,result (node-lvar ,n-node)))))
+                  (declare (ignorable ,@(mapcar #'car bindings)))
+                  (declare (lambda-list (node)))
+                  ,@decls
+                  ,@(and defun-only
+                         doc
+                         `(,doc))
+                  ;; What purpose does it serve to allow the transform's body
+                  ;; to return decls as a second value? They would go in the
+                  ;; right place if simply returned as part of the expression.
+                  (block ,(fun-name-block-name name)
+                   (multiple-value-bind (,n-lambda ,n-decls)
+                      (progn ,@body)
+                    (if (and (consp ,n-lambda) (eq (car ,n-lambda) 'lambda))
+                        ,n-lambda
+                        `(lambda ,',lambda-list
+                           (declare (ignorable ,@',vars))
+                           ,@,n-decls
+                           ,,n-lambda)))))))
           (if defun-only
-              `(defun ,name ,@(when doc `(,doc)) ,@stuff)
+              `(defun ,name ,@stuff)
               `(%deftransform
                 ,(if eval-name name `',name)
                 ,(if eval-name
                      ``(function ,,arg-types ,,result-type)
                      `'(function ,arg-types ,result-type))
-                (lambda ,@stuff)
+                (named-lambda ,(if eval-name "xform" `(deftransform ,name))
+                  ,@stuff)
                 ,doc
-                ,important)))))))
+                ,important
+                ,(and policy
+                      `(lambda (,n-node)
+                         (policy ,n-node ,policy))))))))))
+
+(defmacro deftransforms (names (lambda-list &optional (arg-types '*)
+                                                      (result-type '*)
+                                &key result policy node (important :slightly))
+                         &body body-decls-doc)
+
+  (let ((transform-name (symbolicate (car names) '-transform))
+        (type (list 'function arg-types result-type))
+        (doc (nth-value 2 (parse-body body-decls-doc t))))
+    `(progn
+       (deftransform ,transform-name
+           (,lambda-list ,arg-types ,result-type
+            :defun-only t
+            :result ,result :policy ,policy :node ,node)
+         ,@body-decls-doc)
+       ,@(loop for name in names
+               collect
+               `(let ((policy ,(and policy
+                                    (let ((node-sym (gensym "NODE")))
+                                      `(lambda (,node-sym)
+                                         (policy ,node-sym ,policy))))))
+                  (%deftransform ',name ',type #',transform-name
+                                 ,doc
+                                 ,important
+                                 policy))))))
 
-;;;; DEFKNOWN and DEFOPTIMIZER
-
-;;; This macro should be the way that all implementation independent
-;;; information about functions is made known to the compiler.
-;;;
-;;; FIXME: The comment above suggests that perhaps some of my added
-;;; FTYPE declarations are in poor taste. Should I change my
-;;; declarations, or change the comment, or what?
-;;;
-;;; FIXME: DEFKNOWN is needed only at build-the-system time. Figure
-;;; out some way to keep it from appearing in the target system.
-;;;
-;;; Declare the function NAME to be a known function. We construct a
-;;; type specifier for the function by wrapping (FUNCTION ...) around
-;;; the ARG-TYPES and RESULT-TYPE. ATTRIBUTES is an unevaluated list
-;;; of boolean attributes of the function. See their description in
-;;; (!DEF-BOOLEAN-ATTRIBUTE IR1). NAME may also be a list of names, in
-;;; which case the same information is given to all the names. The
-;;; keywords specify the initial values for various optimizers that
-;;; the function might have.
-(defmacro defknown (name arg-types result-type &optional (attributes '(any))
-                    &body keys)
-  #-sb-xc-host
-  (when (member 'unsafe attributes)
-    (style-warn "Ignoring legacy attribute UNSAFE. Replaced by its inverse: DX-SAFE.")
-    (setf attributes (remove 'unsafe attributes)))
-  (when (and (intersection attributes '(any call unwind))
-             (intersection attributes '(movable)))
-    (error "function cannot have both good and bad attributes: ~S" attributes))
-
-  (when (member 'any attributes)
-    (setq attributes (union '(call unwind) attributes)))
-  (when (member 'flushable attributes)
-    (pushnew 'unsafely-flushable attributes))
-
-  `(%defknown ',(if (and (consp name)
-                         (not (legal-fun-name-p name)))
-                    name
-                    (list name))
-              '(sfunction ,arg-types ,result-type)
-              (ir1-attributes ,@attributes)
-              ,@keys))
-
 ;;; Create a function which parses combination args according to WHAT
 ;;; and LAMBDA-LIST, where WHAT is either a function name or a list
 ;;; (FUN-NAME KIND) and does some KIND of optimization.
@@ -503,7 +375,7 @@
 ;;; methods are passed an additional POLICY argument, and IR2-CONVERT
 ;;; methods are passed an additional IR2-BLOCK argument.
 (defmacro defoptimizer (what (lambda-list
-                              &optional (node (sb!xc:gensym) node-p)
+                              &optional (node (sb-xc:gensym) node-p)
                               &rest vars)
                         &body body)
   (binding* ((name
@@ -516,7 +388,7 @@
                     what
                     (symbolicate (function-name (first what))
                                  "-" (second what) "-OPTIMIZER"))))
-             ((forms decls) (parse-body body :doc-string-allowed nil))
+             ((forms decls) (parse-body body nil))
              ((var-decls more-decls) (extract-var-decls decls vars))
              ;; In case the BODY declares IGNORE of the formal NODE var,
              ;; we rebind it from N-NODE and never reference it from BINDS.
@@ -537,7 +409,7 @@
                                ,@gensyms))
            ,@more-decls ,@forms))
        ,@(when (consp what)
-           `((setf (,(let ((*package* (symbol-package 'fun-info)))
+           `((setf (,(let ((*package* (sb-xc:symbol-package 'fun-info)))
                           (symbolicate "FUN-INFO-" (second what)))
                        (fun-info-or-lose ',(first what)))
                       #',name))))))
@@ -680,6 +552,12 @@
            while ,node-var
            do (progn ,@body))))
 
+(defmacro do-nested-cleanups ((cleanup-var lexenv &optional return-value)
+                              &body body)
+  `(block nil
+     (map-nested-cleanups
+      (lambda (,cleanup-var) ,@body) ,lexenv ,return-value)))
+
 ;;; Bind the IR1 context variables to the values associated with NODE,
 ;;; so that new, extra IR1 conversion related to NODE can be done
 ;;; after the original conversion pass has finished.
@@ -689,13 +567,20 @@
      (%with-ir1-environment-from-node
       ,node
       #'closure-needing-ir1-environment-from-node)))
-(defun %with-ir1-environment-from-node (node fun)
-  (declare (type node node) (type function fun))
-  (let ((*current-component* (node-component node))
-        (*lexenv* (node-lexenv node))
-        (*current-path* (node-source-path node)))
-    (aver-live-component *current-component*)
-    (funcall fun)))
+
+;;; *SOURCE-PATHS* is a hashtable from source code forms to the path
+;;; taken through the source to reach the form. This provides a way to
+;;; keep track of the location of original source forms, even when
+;;; macroexpansions and other arbitary permutations of the code
+;;; happen. This table is initialized by calling FIND-SOURCE-PATHS on
+;;; the original source.
+;;;
+;;; It is fairly useless to store symbols, characters, or fixnums in
+;;; this table, as 42 is EQ to 42 no matter where in the source it
+;;; appears. GET-SOURCE-PATH and NOTE-SOURCE-PATH functions should be
+;;; always used to access this table.
+(declaim (hash-table *source-paths*))
+(defvar *source-paths*)
 
 (defmacro with-source-paths (&body forms)
   (with-unique-names (source-paths)
@@ -722,7 +607,7 @@
 ;;; :TEST keyword may be used to determine the name equality
 ;;; predicate.
 (defmacro lexenv-find (name slot &key test)
-  (once-only ((n-res `(assoc ,name (,(let ((*package* (symbol-package 'lexenv-funs)))
+  (once-only ((n-res `(assoc ,name (,(let ((*package* (sb-xc:symbol-package 'lexenv-funs)))
                                           (symbolicate "LEXENV-" slot))
                                      *lexenv*)
                              :test ,(or test '#'eq))))
@@ -749,8 +634,6 @@
 ;;; experimentation, not for ordinary use, so it should probably
 ;;; become conditional on SB-SHOW.
 
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-
 (defstruct (event-info (:copier nil))
   ;; The name of this event.
   (name (missing-arg) :type symbol)
@@ -767,7 +650,7 @@
   (action nil :type (or function null)))
 
 ;;; A hashtable from event names to event-info structures.
-(defvar *event-info* (make-hash-table :test 'eq))
+(define-load-time-global *event-info* (make-hash-table :test 'eq))
 
 ;;; Return the event info for Name or die trying.
 (declaim (ftype (function (t) event-info) event-info-or-lose))
@@ -776,8 +659,6 @@
     (unless res
       (error "~S is not the name of an event." name))
     res))
-
-) ; EVAL-WHEN
 
 ;;; Return the number of times that EVENT has happened.
 (declaim (ftype (function (symbol) fixnum) event-count))
@@ -818,13 +699,14 @@
 ;;; event happens.
 (defmacro defevent (name description &optional (level 0))
   (let ((var-name (symbolicate "*" name "-EVENT-INFO*")))
-    `(eval-when (:compile-toplevel :load-toplevel :execute)
-       (defvar ,var-name
+    `(progn
+       (defglobal ,var-name
          (make-event-info :name ',name
                           :description ',description
                           :var ',var-name
                           :level ,level))
-       (setf (gethash ',name *event-info*) ,var-name)
+       (eval-when (:compile-toplevel :load-toplevel :execute)
+         (setf (gethash ',name *event-info*) ,var-name))
        ',name)))
 
 ;;; the lowest level of event that will print a note when it occurs
@@ -866,7 +748,7 @@
 ;;;; functions on directly-linked lists (linked through specialized
 ;;;; NEXT operations)
 
-#!-sb-fluid (declaim (inline find-in position-in))
+#-sb-fluid (declaim (inline find-in position-in))
 
 ;;; Find ELEMENT in a null-terminated LIST linked by the accessor
 ;;; function NEXT. KEY and TEST are the same as for generic sequence functions.
@@ -877,6 +759,7 @@
                 (key #'identity)
                 (test #'eql))
   (declare (type function next key test))
+  ;; #-sb-xc-host (declare (dynamic-extent next key test)) ; emits "unable" note
   (do ((current list (funcall next current)))
       ((null current) nil)
     (when (funcall test (funcall key current) element)
@@ -892,27 +775,16 @@
                     (key #'identity)
                     (test #'eql))
   (declare (type function next key test))
+  ;; #-sb-xc-host (declare (dynamic-extent next key test)) ; emits "unable" note
   (do ((current list (funcall next current))
        (i 0 (1+ i)))
       ((null current) nil)
     (when (funcall test (funcall key current) element)
       (return i))))
 
-
-;;; KLUDGE: This is expanded out twice, by cut-and-paste, in a
-;;;   (DEF!MACRO FOO (..) .. CL:GET-SETF-EXPANSION ..)
-;;;   #+SB-XC-HOST
-;;;   (SB!XC:DEFMACRO FOO (..) .. SB!XC:GET-SETF-EXPANSION ..)
-;;; arrangement, in order to get it to work in cross-compilation. This
-;;; duplication should be removed, perhaps by rewriting the macro in a more
-;;; cross-compiler-friendly way, or perhaps just by using some (MACROLET ((FROB
-;;; ..)) .. FROB .. FROB) form, or perhaps by completely eliminating this macro
-;;; and its partner PUSH-IN, but I don't want to do it now, because the system
-;;; isn't running yet, so it'd be too hard to check that my changes were
-;;; correct -- WHN 19990806
-(def!macro deletef-in (next place item &environment env)
+(defmacro deletef-in (next place item &environment env)
   (multiple-value-bind (temps vals stores store access)
-      (get-setf-expansion place env)
+      (#+sb-xc sb-xc:get-setf-expansion #-sb-xc get-setf-expansion place env)
     (when (cdr stores)
       (error "multiple store variables for ~S" place))
     (let ((n-item (gensym))
@@ -932,25 +804,13 @@
                   (setf (,next ,n-prev)
                         (,next ,n-current)))))
          (values)))))
-;;; #+SB-XC-HOST SB!XC:DEFMACRO version is in late-macros.lisp. -- WHN 19990806
 
 ;;; Push ITEM onto a list linked by the accessor function NEXT that is
 ;;; stored in PLACE.
 ;;;
-;;; KLUDGE: This is expanded out twice, by cut-and-paste, in a
-;;;   (DEF!MACRO FOO (..) .. CL:GET-SETF-EXPANSION ..)
-;;;   #+SB-XC-HOST
-;;;   (SB!XC:DEFMACRO FOO (..) .. SB!XC:GET-SETF-EXPANSION ..)
-;;; arrangement, in order to get it to work in cross-compilation. This
-;;; duplication should be removed, perhaps by rewriting the macro in a more
-;;; cross-compiler-friendly way, or perhaps just by using some (MACROLET ((FROB
-;;; ..)) .. FROB .. FROB) form, or perhaps by completely eliminating this macro
-;;; and its partner DELETEF-IN, but I don't want to do it now, because the
-;;; system isn't running yet, so it'd be too hard to check that my changes were
-;;; correct -- WHN 19990806
-(def!macro push-in (next item place &environment env)
+(defmacro push-in (next item place &environment env)
   (multiple-value-bind (temps vals stores store access)
-      (get-setf-expansion place env)
+      (#+sb-xc sb-xc:get-setf-expansion #-sb-xc get-setf-expansion place env)
     (when (cdr stores)
       (error "multiple store variables for ~S" place))
     `(let (,@(mapcar #'list temps vals)
@@ -958,7 +818,6 @@
        (setf (,next ,(first stores)) ,access)
        ,store
        (values))))
-;;; #+SB-XC-HOST SB!XC:DEFMACRO version is in late-macros.lisp. -- WHN 19990806
 
 (defmacro position-or-lose (&rest args)
   `(or (position ,@args)
@@ -969,7 +828,6 @@
 ;;; We use WITH-SANE-IO-SYNTAX to provide safe defaults, and provide
 ;;; *COMPILER-PRINT-VARIABLE-ALIST* for user customization.
 (defvar *compiler-print-variable-alist* nil
-  #!+sb-doc
   "an association list describing new bindings for special variables
 to be used by the compiler for error-reporting, etc. Eg.
 
@@ -989,19 +847,3 @@ specify bindings for printer control variables.")
         (nreverse (mapcar #'car *compiler-print-variable-alist*))
         (nreverse (mapcar #'cdr *compiler-print-variable-alist*))
       ,@forms)))
-
-;;; Like DESTRUCTURING-BIND, but generates a COMPILER-ERROR on failure
-(defmacro compiler-destructuring-bind (lambda-list thing context
-                                       &body body)
-  (let ((whole-name (gensym "WHOLE")))
-    (multiple-value-bind (body local-decls)
-        (parse-defmacro lambda-list whole-name body nil
-                        context
-                        :anonymousp t
-                        :doc-string-allowed nil
-                        :wrap-block nil
-                        :error-fun 'compiler-error)
-      `(let ((,whole-name ,thing))
-         (declare (type list ,whole-name))
-         ,@local-decls
-         ,body))))

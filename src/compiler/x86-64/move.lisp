@@ -9,33 +9,15 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defun zeroize (tn)
-  (let ((offset (tn-offset tn)))
-    ;; Using the 32-bit instruction accomplishes the same thing and is
-    ;; one byte shorter.
-    (if (<= offset edi-offset)
-        (let ((tn (make-random-tn :kind :normal
-                                  :sc (sc-or-lose 'dword-reg)
-                                  :offset offset)))
-          (inst xor tn tn))
-        (inst xor tn tn))))
+  (inst xor :dword tn tn))
 
 (define-move-fun (load-immediate 1) (vop x y)
   ((immediate)
    (any-reg descriptor-reg))
-  (let ((val (tn-value x)))
-    (etypecase val
-      (integer
-       (if (zerop val)
-           (zeroize y)
-         (inst mov y (fixnumize val))))
-      (symbol
-       (load-symbol y val))
-      (character
-       (inst mov y (logior (ash (char-code val) n-widetag-bits)
-                           character-widetag))))))
+  (move-immediate y (encode-value-if-immediate x)))
 
 (define-move-fun (load-number 1) (vop x y)
   ((immediate) (signed-reg unsigned-reg))
@@ -81,43 +63,45 @@
                (not (or (location= x y)
                         (and (sc-is x any-reg descriptor-reg immediate)
                              (sc-is y control-stack))))))
-  (:temporary (:sc unsigned-reg) temp)
-  (:effects)
-  (:affected)
   (:generator 0
     (if (and (sc-is x immediate)
              (sc-is y any-reg descriptor-reg control-stack))
-        (let ((val (tn-value x)))
-          (etypecase val
-            (integer
-             (move-immediate y (fixnumize val) temp))
-            (symbol
-             (inst mov y (+ nil-value (static-symbol-offset val))))
-            (character
-             (inst mov y (logior (ash (char-code val) n-widetag-bits)
-                                 character-widetag)))))
+        (move-immediate y (encode-value-if-immediate x) temp-reg-tn)
         (move y x))))
 
 (define-move-vop move :move
   (any-reg descriptor-reg immediate)
   (any-reg descriptor-reg))
 
-;;; Make MOVE the check VOP for T so that type check generation
-;;; doesn't think it is a hairy type. This also allows checking of a
-;;; few of the values in a continuation to fall out.
-(primitive-type-vop move (:check) t)
-
-(defun move-immediate (target val &optional tmp-tn)
+(defun move-immediate (target val &optional tmp-tn zeroed)
+  ;; Try to emit the smallest immediate operand if the destination word
+  ;; is already zeroed. Otherwise a :qword.
   (cond
     ;; If target is a register, we can just mov it there directly
-    ((and (tn-p target)
-          (sc-is target signed-reg unsigned-reg descriptor-reg any-reg))
-     (if (zerop val)
-         (zeroize target)
-         (inst mov target val)))
+    ((gpr-tn-p target)
+     ;; val can be a fixup for an immobile-space symbol, i.e. not a number,
+     ;; hence not acceptable to ZEROP.
+     (cond ((and (numberp val) (zerop val)) (zeroize target))
+           (t (inst mov target val))))
     ;; Likewise if the value is small enough.
-    ((typep val '(signed-byte 32))
-     (inst mov target val))
+    ((typep val '(or (signed-byte 32) #+immobile-space fixup))
+     ;; This logic is similar to that of STOREW*.
+     ;; It would be nice to pull it all together in one place.
+     ;; The basic idea is that storing any byte-aligned 8-bit value
+     ;; should be a single byte write, etc.
+     (let ((operand-size
+            (or (and zeroed
+                     (ea-p target)
+                     (typecase val
+                       ((unsigned-byte 8) :byte)
+                       ((unsigned-byte 16) :word)
+                       ;; fixups can be :dword size because we don't reference
+                       ;; objects that require a 64-bit address as immediate operands.
+                       ;; signed-32 is no good, as it needs sign-extension.
+                       ((or (unsigned-byte 32) fixup)
+                        :dword)))
+                :qword)))
+       (inst mov operand-size target val)))
     ;; Otherwise go through the temporary register
     (tmp-tn
      (inst mov tmp-tn val)
@@ -142,68 +126,20 @@
     (sc-case y
       ((any-reg descriptor-reg)
        (if (sc-is x immediate)
-           (let ((val (tn-value x)))
-             (etypecase val
-               ((integer 0 0)
-                (zeroize y))
-               (integer
-                (inst mov y (fixnumize val)))
-               (symbol
-                (load-symbol y val))
-               (character
-                (inst mov y (logior (ash (char-code val) n-widetag-bits)
-                                    character-widetag)))))
+           (let ((val (encode-value-if-immediate x)))
+             (if (eql val 0) (zeroize y) (inst mov y val)))
            (move y x)))
       ((control-stack)
-       (if (sc-is x immediate)
-           (let ((val (tn-value x)))
-             (if (= (tn-offset fp) esp-offset)
-                 ;; C-call
-                 (etypecase val
-                   (integer
-                    (storew (fixnumize val) fp (tn-offset y)))
-                   (symbol
-                    (storew (+ nil-value (static-symbol-offset val))
-                            fp (tn-offset y)))
-                   (character
-                    (storew (logior (ash (char-code val) n-widetag-bits)
-                                    character-widetag)
-                            fp (tn-offset y))))
-               ;; Lisp stack
-               (etypecase val
-                 (integer
-                  (storew (fixnumize val) fp (frame-word-offset (tn-offset y))))
-                 (symbol
-                  (storew (+ nil-value (static-symbol-offset val))
-                          fp (frame-word-offset (tn-offset y))))
-                 (character
-                  (storew (logior (ash (char-code val) n-widetag-bits)
-                                  character-widetag)
-                          fp (frame-word-offset (tn-offset y)))))))
-         (if (= (tn-offset fp) esp-offset)
-             ;; C-call
-             (storew x fp (tn-offset y))
+       (if (= (tn-offset fp) esp-offset)
+           ;; C-call
+           (storew (encode-value-if-immediate x) fp (tn-offset y))
            ;; Lisp stack
-           (storew x fp (frame-word-offset (tn-offset y)))))))))
+           (storew (encode-value-if-immediate x) fp
+               (frame-word-offset (tn-offset y))))))))
 
 (define-move-vop move-arg :move-arg
   (any-reg descriptor-reg)
   (any-reg descriptor-reg))
-
-;;;; ILLEGAL-MOVE
-
-;;; This VOP exists just to begin the lifetime of a TN that couldn't
-;;; be written legally due to a type error. An error is signalled
-;;; before this VOP is so we don't need to do anything (not that there
-;;; would be anything sensible to do anyway.)
-(define-vop (illegal-move)
-  (:args (x) (type))
-  (:results (y))
-  (:ignore y)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 666
-    (error-call vop 'object-not-type-error x type)))
 
 ;;;; moves and coercions
 
@@ -233,7 +169,7 @@
   (:results (y :scs (signed-reg unsigned-reg)))
   (:note "constant load")
   (:generator 1
-    (cond ((sb!c::tn-leaf x)
+    (cond ((sb-c::tn-leaf x)
            (inst mov y (tn-value x)))
           (t
            (inst mov y x)
@@ -243,7 +179,7 @@
 
 
 ;;; Arg is a fixnum or bignum, figure out which and load if necessary.
-#-#.(cl:if (cl:= sb!vm:n-fixnum-tag-bits 1) '(:and) '(:or))
+#-#.(cl:if (cl:= sb-vm:n-fixnum-tag-bits 1) '(:and) '(:or))
 (define-vop (move-to-word/integer)
   (:args (x :scs (descriptor-reg) :target rax))
   (:results (y :scs (signed-reg unsigned-reg)))
@@ -255,7 +191,7 @@
                :from (:argument 0) :to (:result 0) :target y) rax)
   (:generator 4
     (move rax x)
-    (inst test al-tn fixnum-tag-mask)
+    (inst test :byte rax fixnum-tag-mask)
     (inst jmp :z FIXNUM)
     (loadw y rax bignum-digits-offset other-pointer-lowtag)
     (inst jmp DONE)
@@ -264,7 +200,7 @@
     (move y rax)
     DONE))
 
-#+#.(cl:if (cl:= sb!vm:n-fixnum-tag-bits 1) '(:and) '(:or))
+#+#.(cl:if (cl:= sb-vm:n-fixnum-tag-bits 1) '(:and) '(:or))
 (define-vop (move-to-word/integer)
   (:args (x :scs (descriptor-reg) :target y))
   (:results (y :scs (signed-reg unsigned-reg)))
@@ -300,15 +236,26 @@
     (cond ((and (sc-is x signed-reg unsigned-reg)
                 (not (location= x y)))
            (if (= n-fixnum-tag-bits 1)
-               (inst lea y (make-ea :qword :base x :index x))
-               (inst lea y (make-ea :qword :index x
-                                    :scale (ash 1 n-fixnum-tag-bits)))))
+               (inst lea y (ea x x))
+               (inst lea y (ea nil x (ash 1 n-fixnum-tag-bits)))))
           (t
            ;; Uses: If x is a reg 2 + 3; if x = y uses only 3 bytes
            (move y x)
            (inst shl y n-fixnum-tag-bits)))))
 (define-move-vop move-from-word/fixnum :move
   (signed-reg unsigned-reg) (any-reg descriptor-reg))
+
+(eval-when (:compile-toplevel :execute)
+  ;; Don't use a macro for this, because define-vop is weird.
+  (defun bignum-from-reg (tn signedp)
+    `(aref ',(map 'vector
+                  (lambda (x)
+                    ;; At present R11 can not occur here,
+                    ;; but let's be future-proof and allow for it.
+                    (unless (member x '(rsp rbp) :test 'string=)
+                      (symbolicate "ALLOC-" signedp "-BIGNUM-IN-" x)))
+                  +qword-register-names+)
+           (tn-offset ,tn))))
 
 ;;; Convert an untagged signed word to a lispobj -- fixnum or bignum
 ;;; as the case may be. Fixnum case inline, bignum case in an assembly
@@ -319,6 +266,7 @@
   (:results (y :scs (any-reg descriptor-reg) . #.(and (> n-fixnum-tag-bits 1)
                                                       '(:from :argument))))
   (:note "signed word to integer coercion")
+  (:vop-var vop)
   ;; Worst case cost to make sure people know they may be number consing.
   (:generator 20
      (cond ((= 1 n-fixnum-tag-bits)
@@ -333,72 +281,53 @@
             (inst imul y x #.(ash 1 n-fixnum-tag-bits))
             (inst jmp :no DONE)
             (inst mov y x)))
-     (inst mov temp-reg-tn
-           (make-fixup (ecase (tn-offset y)
-                         (#.rax-offset 'alloc-signed-bignum-in-rax)
-                         (#.rcx-offset 'alloc-signed-bignum-in-rcx)
-                         (#.rdx-offset 'alloc-signed-bignum-in-rdx)
-                         (#.rbx-offset 'alloc-signed-bignum-in-rbx)
-                         (#.rsi-offset 'alloc-signed-bignum-in-rsi)
-                         (#.rdi-offset 'alloc-signed-bignum-in-rdi)
-                         (#.r8-offset  'alloc-signed-bignum-in-r8)
-                         (#.r9-offset  'alloc-signed-bignum-in-r9)
-                         (#.r10-offset 'alloc-signed-bignum-in-r10)
-                         (#.r12-offset 'alloc-signed-bignum-in-r12)
-                         (#.r13-offset 'alloc-signed-bignum-in-r13)
-                         (#.r14-offset 'alloc-signed-bignum-in-r14)
-                         (#.r15-offset 'alloc-signed-bignum-in-r15))
-                       :assembly-routine))
-     (inst call temp-reg-tn)
+     (invoke-asm-routine 'call #.(bignum-from-reg 'y "SIGNED") vop)
      DONE))
 (define-move-vop move-from-signed :move
   (signed-reg) (descriptor-reg))
+
+(define-vop (move-from-fixnum+1)
+  (:args (x :scs (signed-reg unsigned-reg)))
+  (:results (y :scs (any-reg descriptor-reg)))
+  (:generator 4
+    #.(aver (= n-fixnum-tag-bits 1))
+    (move y x)
+    (inst shl y 1)
+    (inst cmov :o y (emit-constant (1+ sb-xc:most-positive-fixnum)))))
+
+(define-vop (move-from-fixnum-1 move-from-fixnum+1)
+  (:generator 4
+    #.(aver (= n-fixnum-tag-bits 1))
+    (move y x)
+    (inst shl y 1)
+    (inst cmov :o y (emit-constant (1- sb-xc:most-negative-fixnum)))))
 
 ;;; Convert an untagged unsigned word to a lispobj -- fixnum or bignum
 ;;; as the case may be. Fixnum case inline, bignum case in an assembly
 ;;; routine.
 (define-vop (move-from-unsigned)
-  (:args (x :scs (signed-reg unsigned-reg) :to :result))
-  (:results (y :scs (any-reg descriptor-reg) :from :argument))
+  ;; This sure seems wonky - how would this be selected for a signed arg?
+  (:args (arg :scs (signed-reg unsigned-reg signed-stack unsigned-stack)))
+  (:results (res :scs (any-reg descriptor-reg)))
   (:note "unsigned word to integer coercion")
+  (:vop-var vop)
   ;; Worst case cost to make sure people know they may be number consing.
   (:generator 20
-    (aver (not (location= x y)))
-    (let ((done (gen-label)))
-      (inst mov y #.(ash (1- (ash 1 (1+ n-fixnum-tag-bits)))
-                         n-positive-fixnum-bits))
-      ;; The assembly routines test the sign flag from this one, so if
-      ;; you change stuff here, make sure the sign flag doesn't get
-      ;; overwritten before the CALL!
-      (inst test x y)
-      ;; Using LEA is faster but bigger than MOV+SHL; it also doesn't
-      ;; twiddle the sign flag.  The cost of doing this speculatively
-      ;; should be noise compared to bignum consing if that is needed
-      ;; and saves one branch.
-      (if (= n-fixnum-tag-bits 1)
-          (inst lea y (make-ea :qword :base x :index x))
-          (inst lea y (make-ea :qword :index x
-                               :scale (ash 1 n-fixnum-tag-bits))))
-      (inst jmp :z done)
-      (inst mov y x)
-      (inst mov temp-reg-tn
-            (make-fixup (ecase (tn-offset y)
-                          (#.rax-offset 'alloc-unsigned-bignum-in-rax)
-                          (#.rcx-offset 'alloc-unsigned-bignum-in-rcx)
-                          (#.rdx-offset 'alloc-unsigned-bignum-in-rdx)
-                          (#.rbx-offset 'alloc-unsigned-bignum-in-rbx)
-                          (#.rsi-offset 'alloc-unsigned-bignum-in-rsi)
-                          (#.rdi-offset 'alloc-unsigned-bignum-in-rdi)
-                          (#.r8-offset  'alloc-unsigned-bignum-in-r8)
-                          (#.r9-offset  'alloc-unsigned-bignum-in-r9)
-                          (#.r10-offset 'alloc-unsigned-bignum-in-r10)
-                          (#.r12-offset 'alloc-unsigned-bignum-in-r12)
-                          (#.r13-offset 'alloc-unsigned-bignum-in-r13)
-                          (#.r14-offset 'alloc-unsigned-bignum-in-r14)
-                          (#.r15-offset 'alloc-unsigned-bignum-in-r15))
-                        :assembly-routine))
-      (inst call temp-reg-tn)
-      (emit-label done))))
+    (move res arg)
+    ;; the number of high bits that need to be zero is the number of bits of
+    ;; precision lost due to fixnum tag, plus the sign bit.
+    ;; rotate those into the least significant bits.
+    (inst rol res (1+ n-fixnum-tag-bits))
+    (inst test :byte res (1- (ash 1 (1+ n-fixnum-tag-bits))))
+    ;; this could make use of the SHRX instruction which is only available with BMI2
+    ;; support- speculatively restore the fixnum value, test previous flags and jump,
+    ;; which would eliminate the 'jmp done' that jumps over the following SHR.
+    (inst jmp :z fixnum)
+    (invoke-asm-routine 'call #.(bignum-from-reg 'res "UNSIGNED") vop)
+    (inst jmp done)
+    FIXNUM
+    (inst shr res 1)
+    DONE))
 (define-move-vop move-from-unsigned :move
   (unsigned-reg) (descriptor-reg))
 
@@ -411,8 +340,6 @@
                (not (or (location= x y)
                         (and (sc-is x signed-reg unsigned-reg)
                              (sc-is y signed-stack unsigned-stack))))))
-  (:effects)
-  (:affected)
   (:note "word integer move")
   (:generator 0
     (move y x)))
@@ -422,7 +349,8 @@
 ;;; Move untagged number arguments/return-values.
 (define-vop (move-word-arg)
   (:args (x :scs (signed-reg unsigned-reg) :target y)
-         (fp :scs (any-reg) :load-if (not (sc-is y sap-reg))))
+         (fp :scs (any-reg)
+             :load-if (not (sc-is y signed-reg unsigned-reg))))
   (:results (y))
   (:note "word integer argument move")
   (:generator 0

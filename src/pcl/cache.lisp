@@ -152,7 +152,7 @@
 ;;; Compute the starting index of the next cache line in the cache vector.
 (declaim (inline next-cache-index))
 (defun next-cache-index (mask index line-size)
-  (declare (type (unsigned-byte #.sb-vm:n-word-bits) index line-size mask))
+  (declare (type word index line-size mask))
   (logand mask (+ index line-size)))
 
 ;;; Returns the hash-value for layout, or executes ELSE if the layout
@@ -184,6 +184,7 @@
 ;;; number of keys and presence of values in the cache is known
 ;;; beforehand.
 (defun emit-cache-lookup (cache-var layout-vars miss-tag value-var)
+  (declare (muffle-conditions code-deletion-note))
   (with-unique-names (probe n-vector n-depth n-mask
                       MATCH-WRAPPERS EXIT-WITH-HIT)
     (let* ((num-keys (length layout-vars))
@@ -239,8 +240,6 @@
 ;;; value that is the value that was stored in the cache if any.
 (defun probe-cache (cache layouts)
   (declare (optimize speed))
-  (unless (consp layouts)
-    (setf layouts (list layouts)))
   (let ((vector (cache-vector cache))
         (key-count (cache-key-count cache))
         (line-size (cache-line-size cache))
@@ -248,20 +247,27 @@
     (flet ((probe-line (base)
              (declare (optimize (sb-c::type-check 0)))
              (tagbody
+              ;; LAYOUTS can't be the empty list, because COMPUTE-CACHE-INDEX
+              ;; takes its CAR, and would have borked if that weren't a LAYOUT.
+              ;; But perhaps we should figure out when LAYOUTS get passed
+              ;; as an atom, and make it so that doesn't happen?
                 (loop for offset of-type index from 0 below key-count
-                      for layout in layouts do
-                      (unless (eq layout (svref vector (+ base offset)))
-                        ;; missed
-                        (go :miss)))
+                      for layout = (if (listp layouts) (pop layouts) (shiftf layouts nil))
+                      then (pop layouts)
+                      unless (eq layout (svref vector (truly-the index (+ base offset))))
+                      do (go :miss))
                 ;; all layouts match!
                 (let ((value (when (cache-value cache)
-                               (non-empty-or (svref vector (+ base key-count))
+                               (non-empty-or (svref vector (truly-the index (+ base key-count)))
                                              (go :miss)))))
                   (return-from probe-cache (values t value)))
               :miss
                 (return-from probe-line (next-cache-index mask base line-size)))))
-      (declare (ftype (function (index) (values index &optional)) probe-line))
-      (let ((index (compute-cache-index cache layouts)))
+      (declare (ftype (sfunction (index) index) probe-line))
+      (let ((index (if (not (listp layouts))
+                       (let ((hash (layout-clos-hash layouts)))
+                         (unless (zerop hash) (logand hash mask)))
+                       (compute-cache-index cache layouts))))
         (when index
           (loop repeat (1+ (cache-depth cache))
                 do (setf index (probe-line index)))))))
@@ -282,7 +288,7 @@
             ;; The place was already taken, and doesn't match our key.
             (return-from try-update-cache-line nil))
           (unless layouts
-            ;; All keys match or succesfully saved, save our value --
+            ;; All keys match or successfully saved, save our value --
             ;; just smash it in. Until the first time it is written
             ;; there is ..EMPTY.. here, which probes look for, so we
             ;; don't get bogus hits. This is necessary because we want
@@ -362,7 +368,7 @@
                       ;; doing real work. 50% because if we drop too
                       ;; few we need to do this almost right away
                       ;; again, and if we drop too many, we need to
-                      ;; recompute more then we'd like.
+                      ;; recompute more than we'd like.
                       ;; _Experimentally_ 50% seems to perform the
                       ;; best, but it would be nice to have a proper
                       ;; analysis...
@@ -426,9 +432,7 @@
                 (%fill-cache (copy-cache cache) layouts value t))
                (t
                 (copy-and-expand-cache cache layouts value)))))
-    (if (listp layouts)
-        (%fill-cache cache layouts value nil)
-        (%fill-cache cache (list layouts) value nil))))
+    (%fill-cache cache (ensure-list layouts) value nil)))
 
 ;;; Calls FUNCTION with all layouts and values in cache.
 (defun map-cache (function cache)

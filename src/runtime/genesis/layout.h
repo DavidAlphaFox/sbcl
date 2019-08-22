@@ -11,28 +11,29 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_LAYOUT
-#define SBCL_GENESIS_LAYOUT 1
-#ifndef LANGUAGE_ASSEMBLY
+#define SBCL_GENESIS_LAYOUT
+#ifndef __ASSEMBLER__
 
 struct layout {
-    lispobj header;
-    lispobj _layout;
+    lispobj header; // = word_0_
+    lispobj word_1_; // _bits
     lispobj clos_hash;
     lispobj classoid;
     lispobj invalid;
     lispobj inherits;
-    lispobj depthoid;
-    lispobj length;
     lispobj info;
-    lispobj pure;
-    lispobj untagged_bitmap;
+    lispobj bitmap;
     lispobj equalp_tests;
-    lispobj source_location;
     lispobj slot_list;
     lispobj slot_table;
-    lispobj _for_std_class_b;
+    lispobj depth2_ancestor;
+    lispobj depth3_ancestor;
+    lispobj depth4_ancestor;
 };
+static inline struct layout* LAYOUT(lispobj obj) {
+  return (struct layout*)(obj - 3);
+}
 
-#endif /* LANGUAGE_ASSEMBLY */
+#endif /* __ASSEMBLER__ */
 
-#endif /* SBCL_GENESIS_LAYOUT */
+#endif

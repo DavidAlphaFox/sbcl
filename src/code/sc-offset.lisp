@@ -7,25 +7,64 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-;;; SC-OFFSETs are needed by sparc-vm.lisp
-
-(in-package "SB!C")
+(in-package "SB-C")
 
-;;;; SC-OFFSETs
+;;;; SC+OFFSET
 ;;;;
-;;;; We represent the place where some value is stored with a SC-OFFSET,
-;;;; which is the SC number and offset encoded as an integer.
+;;;; We represent the place where some value is stored with an
+;;;; SC+OFFSET value, which is the storage class number and an offset
+;;;; within that storage class encoded as an integer.
+;;;;
+;;;; The concrete encoding is described by +SC+OFFSET-SCN-BYTES+ and
+;;;; +SC+OFFSET-OFFSET-BYTES+ and exported to sc-offset.h during
+;;;; genesis for use by the runtime.
 
-;;;; FIXME: this layout is hardcoded in some .S files,
-;;;; undefined_tramp in at least mips/ppc/sparc-assem.S uses it.
-;;;; Ideally, it shouldn't be hardcoded.
-(defconstant-eqx sc-offset-scn-byte (byte 6 0) #'equalp)
-(defconstant-eqx sc-offset-offset-byte (byte 21 6) #'equalp)
-(def!type sc-offset () '(unsigned-byte 27))
+(def!type sc+offset ()
+  `(unsigned-byte ,(+ sb-vm:sc-number-bits sb-vm:sc-offset-bits)))
 
-(defmacro make-sc-offset (scn offset)
-  `(dpb ,scn sc-offset-scn-byte
-        (dpb ,offset sc-offset-offset-byte 0)))
+(defconstant-eqx +sc+offset-scn-bytes+
+    `(,(byte 2 0) ,(byte 4 23))
+  #'equalp)
+(assert (= (reduce #'+ +sc+offset-scn-bytes+ :key #'byte-size)
+           sb-vm:sc-number-bits))
 
-(defmacro sc-offset-scn (sco) `(ldb sc-offset-scn-byte ,sco))
-(defmacro sc-offset-offset (sco) `(ldb sc-offset-offset-byte ,sco))
+(defconstant-eqx +sc+offset-offset-bytes+
+    `(,(byte 21 2))
+  #'equalp)
+(assert (= (reduce #'+ +sc+offset-offset-bytes+ :key #'byte-size)
+           sb-vm:sc-offset-bits))
+
+(declaim (ftype (sfunction (sc-number sb-vm:sc-offset) sc+offset)
+                make-sc+offset))
+(defun make-sc+offset (sc-number offset)
+  (let ((result 0))
+    (flet ((add-bits (bytes source)
+             (loop for byte in bytes
+                for size = (byte-size byte)
+                with i = 0
+                do
+                  (setf result (dpb (ldb (byte size i) source) byte result))
+                  (incf i size))))
+      (add-bits +sc+offset-scn-bytes+ sc-number)
+      (add-bits +sc+offset-offset-bytes+ offset))
+    result))
+
+(declaim (ftype (sfunction (sc+offset) sc-number)
+                sc+offset-scn)
+         (ftype (sfunction (sc+offset) sb-vm:sc-offset)
+                sc+offset-offset))
+(flet ((extract-bits (bytes source)
+         (loop with result = 0
+            for byte in bytes
+            for size = (byte-size byte)
+            with i = 0
+            do
+              (setf result (dpb (ldb byte source) (byte size i) result))
+              (incf i size)
+            finally (return result))))
+
+  (defun sc+offset-scn (sc+offset)
+    (extract-bits +sc+offset-scn-bytes+ sc+offset))
+
+  (defun sc+offset-offset (sc+offset)
+    (extract-bits +sc+offset-offset-bytes+ sc+offset)))

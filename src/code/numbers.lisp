@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 ;;;; the NUMBER-DISPATCH macro
 
@@ -20,41 +20,47 @@
 ;;; alists representing the dispatching off each arg (in order). The
 ;;; leaf is the body to be executed in that case.
 (defun parse-number-dispatch (vars result types var-types body)
-  (cond ((null vars)
-         (unless (null types) (error "More types than vars."))
-         (when (cdr result)
-           (error "Duplicate case: ~S." body))
-         (setf (cdr result)
-               (sublis var-types body :test #'equal)))
-        ((null types)
-         (error "More vars than types."))
-        (t
-         (flet ((frob (var type)
-                  (parse-number-dispatch
-                   (rest vars)
-                   (or (assoc type (cdr result) :test #'equal)
-                       (car (setf (cdr result)
-                                  (acons type nil (cdr result)))))
-                   (rest types)
-                   (acons `(dispatch-type ,var) type var-types)
-                   body)))
-           (let ((type (first types))
-                 (var (first vars)))
-             (if (and (consp type) (eq (first type) 'foreach))
-                 (dolist (type (rest type))
-                   (frob var type))
-                 (frob var type)))))))
+  ;; Shouldn't be necessary, but avoids a warning in certain lisps that
+  ;; seem to like to warn about self-calls in :COMPILE-TOPLEVEL situation.
+  (named-let parse-number-dispatch ((vars vars) (result result) (types types)
+                                    (var-types var-types) (body body))
+    (cond ((null vars)
+           (unless (null types) (error "More types than vars."))
+           (when (cdr result)
+             (error "Duplicate case: ~S." body))
+           (setf (cdr result)
+                 (sublis var-types body :test #'equal)))
+          ((null types)
+           (error "More vars than types."))
+          (t
+           (flet ((frob (var type)
+                    (parse-number-dispatch
+                     (rest vars)
+                     (or (assoc type (cdr result) :test #'equal)
+                         (car (setf (cdr result)
+                                    (acons type nil (cdr result)))))
+                     (rest types)
+                     (acons `(dispatch-type ,var) type var-types)
+                     body)))
+             (let ((type (first types))
+                   (var (first vars)))
+               (if (and (consp type) (eq (first type) 'foreach))
+                   (dolist (type (rest type))
+                     (frob var type))
+                   (frob var type))))))))
 
 ;;; our guess for the preferred order in which to do type tests
 ;;; (cheaper and/or more probable first.)
-(defparameter *type-test-ordering*
-  '(fixnum single-float double-float integer #!+long-float long-float bignum
-    complex ratio))
+(defconstant-eqx +type-test-ordering+
+  '(fixnum single-float double-float integer #+long-float long-float
+    sb-vm:signed-word word bignum
+    complex ratio)
+  #'equal)
 
 ;;; Should TYPE1 be tested before TYPE2?
 (defun type-test-order (type1 type2)
-  (let ((o1 (position type1 *type-test-ordering*))
-        (o2 (position type2 *type-test-ordering*)))
+  (let ((o1 (position type1 +type-test-ordering+))
+        (o2 (position type2 +type-test-ordering+)))
     (cond ((not o1) nil)
           ((not o2) t)
           (t
@@ -81,41 +87,44 @@
 ;;; even though the second clause matches this signature. To catch
 ;;; this earlier than runtime we throw an error already here.
 (defun generate-number-dispatch (vars error-tags cases)
-  (if vars
-      (let ((var (first vars))
-            (cases (sort cases #'type-test-order :key #'car)))
-        (flet ((error-if-sub-or-supertype (type1 type2)
-                 (when (or (subtypep type1 type2)
-                           (subtypep type2 type1))
-                   (error "Types not disjoint: ~S ~S." type1 type2)))
-               (error-if-supertype (type1 type2)
-                 (when (subtypep type2 type1)
-                   (error "Type ~S ordered before subtype ~S."
-                          type1 type2)))
-               (test-type-pairs (fun)
-                 ;; Apply FUN to all (ordered) pairs of types from the
-                 ;; cases.
-                 (mapl (lambda (cases)
-                         (when (cdr cases)
-                           (let ((type1 (caar cases)))
-                             (dolist (case (cdr cases))
-                               (funcall fun type1 (car case))))))
-                       cases)))
-          ;; For the last variable throw an error if a type is followed
-          ;; by a subtype, for all other variables additionally if a
-          ;; type is followed by a supertype.
-          (test-type-pairs (if (cdr vars)
-                               #'error-if-sub-or-supertype
-                               #'error-if-supertype)))
-        `((typecase ,var
-            ,@(mapcar (lambda (case)
-                        `(,(first case)
-                          ,@(generate-number-dispatch (rest vars)
-                                                      (rest error-tags)
-                                                      (cdr case))))
-                      cases)
-            (t (go ,(first error-tags))))))
-      cases))
+  ;; Shouldn't be necessary, but avoids a warning in certain lisps that
+  ;; seem to like to warn about self-calls in :COMPILE-TOPLEVEL situation.
+  (named-let generate-number-dispatch ((vars vars) (error-tags error-tags) (cases cases))
+    (if vars
+        (let ((var (first vars))
+              (cases (sort cases #'type-test-order :key #'car)))
+          (flet ((error-if-sub-or-supertype (type1 type2)
+                   (when (or (sb-xc:subtypep type1 type2)
+                             (sb-xc:subtypep type2 type1))
+                     (error "Types not disjoint: ~S ~S." type1 type2)))
+                 (error-if-supertype (type1 type2)
+                   (when (sb-xc:subtypep type2 type1)
+                     (error "Type ~S ordered before subtype ~S."
+                            type1 type2)))
+                 (test-type-pairs (fun)
+                   ;; Apply FUN to all (ordered) pairs of types from the
+                   ;; cases.
+                   (mapl (lambda (cases)
+                           (when (cdr cases)
+                             (let ((type1 (caar cases)))
+                               (dolist (case (cdr cases))
+                                 (funcall fun type1 (car case))))))
+                         cases)))
+            ;; For the last variable throw an error if a type is followed
+            ;; by a subtype, for all other variables additionally if a
+            ;; type is followed by a supertype.
+            (test-type-pairs (if (cdr vars)
+                                 #'error-if-sub-or-supertype
+                                 #'error-if-supertype)))
+          `((typecase ,var
+              ,@(mapcar (lambda (case)
+                          `(,(first case)
+                            ,@(generate-number-dispatch (rest vars)
+                                                        (rest error-tags)
+                                                        (cdr case))))
+                        cases)
+              (t (go ,(first error-tags))))))
+        cases)))
 
 ) ; EVAL-WHEN
 
@@ -128,6 +137,20 @@
 ;;; instantiated for every Each-Type. In the body of each case, any
 ;;; list of the form (DISPATCH-TYPE Var-Name) is substituted with the
 ;;; type of that var in that instance of the case.
+;;;
+;;; [Though it says "_any_ list", it's still an example of how not to perform
+;;; incomplete lexical analysis within a macro imho. Let's say that the body
+;;; code passes a lambda that happens name its args DISPATCH-TYPE and X.
+;;; What happens?
+;;; (macroexpand-1 '(number-dispatch ((x number))
+;;;                  ((float) (f x (lambda (dispatch-type x) (wat))))))
+;;; -> [stuff elided]
+;;;      (TYPECASE X (FLOAT (F X (LAMBDA FLOAT (WAT))))
+;;;
+;;; So the NUMBER-DISPATCH macro indeed substituted for *any* appearance
+;;; just like it says. I wonder if we could define DISPATCH-TYPE as macrolet
+;;; that expands to the type for the current branch, so that it _must_
+;;; be in a for-evaluation position; but maybe I'm missing something?]
 ;;;
 ;;; As an alternate to a case spec, there may be a form whose CAR is a
 ;;; symbol. In this case, we apply the CAR of the form to the CDR and
@@ -159,21 +182,15 @@
               (tag (gensym)))
           (error-tags tag)
           (errors tag)
-          (errors `(return-from
-                    ,block
-                    (error 'simple-type-error :datum ,var
-                           :expected-type ',type
-                           :format-control
-                           "~@<Argument ~A is not a ~S: ~2I~_~S~:>"
-                           :format-arguments
-                           (list ',var ',type ,var))))))
+          (errors
+           (sb-c::internal-type-error-call var type))))
 
       `(block ,block
          (tagbody
-           (return-from ,block
-                        ,@(generate-number-dispatch vars (error-tags)
-                                                    (cdr res)))
-           ,@(errors))))))
+            (return-from ,block
+              ,@(generate-number-dispatch vars (error-tags)
+                                          (cdr res)))
+            ,@(errors))))))
 
 ;;;; binary operation dispatching utilities
 
@@ -183,15 +200,15 @@
 (defun float-contagion (op x y &optional (rat-types '(fixnum bignum ratio)))
   `(((single-float single-float) (,op ,x ,y))
     (((foreach ,@rat-types)
-      (foreach single-float double-float #!+long-float long-float))
+      (foreach single-float double-float #+long-float long-float))
      (,op (coerce ,x '(dispatch-type ,y)) ,y))
-    (((foreach single-float double-float #!+long-float long-float)
+    (((foreach single-float double-float #+long-float long-float)
       (foreach ,@rat-types))
      (,op ,x (coerce ,y '(dispatch-type ,x))))
-    #!+long-float
+    #+long-float
     (((foreach single-float double-float long-float) long-float)
      (,op (coerce ,x 'long-float) ,y))
-    #!+long-float
+    #+long-float
     ((long-float (foreach single-float double-float))
      (,op ,x (coerce ,y 'long-float)))
     (((foreach single-float double-float) double-float)
@@ -216,11 +233,11 @@
 ;;; If IMAGPART is 0, return REALPART, otherwise make a complex. This is
 ;;; used when we know that REALPART and IMAGPART are the same type, but
 ;;; rational canonicalization might still need to be done.
-#!-sb-fluid (declaim (inline canonical-complex))
+#-sb-fluid (declaim (inline canonical-complex))
 (defun canonical-complex (realpart imagpart)
   (if (eql imagpart 0)
       realpart
-      (cond #!+long-float
+      (cond #+long-float
             ((and (typep realpart 'long-float)
                   (typep imagpart 'long-float))
              (truly-the (complex long-float) (complex realpart imagpart)))
@@ -236,7 +253,7 @@
 ;;; Given a numerator and denominator with the GCD already divided
 ;;; out, make a canonical rational. We make the denominator positive,
 ;;; and check whether it is 1.
-#!-sb-fluid (declaim (inline build-ratio))
+#-sb-fluid (declaim (inline build-ratio))
 (defun build-ratio (num den)
   (multiple-value-bind (num den)
       (if (minusp den)
@@ -246,12 +263,12 @@
       ((eql den 0)
        (error 'division-by-zero
               :operands (list num den)
-              :operation 'build-ratio))
+              :operation '/))
       ((eql den 1) num)
       (t (%make-ratio num den)))))
 
 ;;; Truncate X and Y, but bum the case where Y is 1.
-#!-sb-fluid (declaim (inline maybe-truncate))
+#-sb-fluid (declaim (inline maybe-truncate))
 (defun maybe-truncate (x y)
   (if (eql y 1)
       x
@@ -260,10 +277,10 @@
 ;;;; COMPLEXes
 
 (defun complex (realpart &optional (imagpart 0))
-  #!+sb-doc
   "Return a complex number with the specified real and imaginary components."
+  (declare (explicit-check))
   (flet ((%%make-complex (realpart imagpart)
-           (cond #!+long-float
+           (cond #+long-float
                  ((and (typep realpart 'long-float)
                        (typep imagpart 'long-float))
                   (truly-the (complex long-float)
@@ -284,10 +301,9 @@
     (float-contagion %%make-complex realpart imagpart (rational)))))
 
 (defun realpart (number)
-  #!+sb-doc
   "Extract the real part of a number."
   (etypecase number
-    #!+long-float
+    #+long-float
     ((complex long-float)
      (truly-the long-float (realpart number)))
     ((complex double-float)
@@ -300,10 +316,9 @@
      number)))
 
 (defun imagpart (number)
-  #!+sb-doc
   "Extract the imaginary part of a number."
   (etypecase number
-    #!+long-float
+    #+long-float
     ((complex long-float)
      (truly-the long-float (imagpart number)))
     ((complex double-float)
@@ -318,32 +333,33 @@
      0)))
 
 (defun conjugate (number)
-  #!+sb-doc
   "Return the complex conjugate of NUMBER. For non-complex numbers, this is
   an identity."
-  (declare (type number number))
+  (declare (type number number) (explicit-check))
   (if (complexp number)
       (complex (realpart number) (- (imagpart number)))
       number))
 
 (defun signum (number)
-  #!+sb-doc
   "If NUMBER is zero, return NUMBER, else return (/ NUMBER (ABS NUMBER))."
+  (declare (explicit-check))
   (if (zerop number)
       number
-      (if (rationalp number)
-          (if (plusp number) 1 -1)
-          (/ number (abs number)))))
+      (number-dispatch ((number number))
+        (((foreach fixnum rational single-float double-float))
+         (if (plusp number)
+             (coerce 1 '(dispatch-type number))
+             (coerce -1 '(dispatch-type number))))
+        ((complex)
+         (/ number (abs number))))))
 
 ;;;; ratios
 
 (defun numerator (number)
-  #!+sb-doc
   "Return the numerator of NUMBER, which must be rational."
   (numerator number))
 
 (defun denominator (number)
-  #!+sb-doc
   "Return the denominator of NUMBER, which must be rational."
   (denominator number))
 
@@ -358,20 +374,13 @@
 ;;;; can sometimes be sliced exceedingly thing...)
 
 (macrolet ((define-arith (op init doc)
-             #!-sb-doc (declare (ignore doc))
              `(defun ,op (&rest numbers)
-                #!+sb-doc
+                (declare (explicit-check))
                 ,doc
                 (if numbers
-                    ;; FIXME: using NTH here produces
-                    ;; "caught STYLE-WARNING:
-                    ;;  The binding of RESULT is not a NUMBER"
-                    ;; Same warning occurs in -, /, =, /=, etc
-                    (do ((result (nth 0 numbers) (,op result (nth i numbers)))
-                         (i 1 (1+ i)))
-                        ((>= i (length numbers))
-                         result)
-                      (declare (number result)))
+                    (let ((result (the number (fast-&rest-nth 0 numbers))))
+                      (do-rest-arg ((n) numbers 1 result)
+                        (setq result (,op result n))))
                     ,init))))
   (define-arith + 0
     "Return the sum of its arguments. With no args, returns 0.")
@@ -379,9 +388,9 @@
     "Return the product of its arguments. With no args, returns 1."))
 
 (defun - (number &rest more-numbers)
-  #!+sb-doc
   "Subtract the second and all subsequent arguments from the first;
   or with one argument, negate the first argument."
+  (declare (explicit-check))
   (if more-numbers
       (let ((result number))
         (do-rest-arg ((n) more-numbers 0 result)
@@ -389,9 +398,9 @@
       (- number)))
 
 (defun / (number &rest more-numbers)
-  #!+sb-doc
   "Divide the first argument by each of the following arguments, in turn.
   With one argument, return reciprocal."
+  (declare (explicit-check))
   (if more-numbers
       (let ((result number))
         (do-rest-arg ((n) more-numbers 0 result)
@@ -399,18 +408,16 @@
       (/ number)))
 
 (defun 1+ (number)
-  #!+sb-doc
   "Return NUMBER + 1."
+  (declare (explicit-check))
   (1+ number))
 
 (defun 1- (number)
-  #!+sb-doc
   "Return NUMBER - 1."
+  (declare (explicit-check))
   (1- number))
 
-(eval-when (:compile-toplevel)
-
-(sb!xc:defmacro two-arg-+/- (name op big-op)
+(defmacro two-arg-+/- (name op big-op)
   `(defun ,name (x y)
      (number-dispatch ((x number) (y number))
        (bignum-cross-fixnum ,op ,big-op)
@@ -420,7 +427,7 @@
         (canonical-complex (,op (realpart x) (realpart y))
                            (,op (imagpart x) (imagpart y))))
        (((foreach bignum fixnum ratio single-float double-float
-                  #!+long-float long-float) complex)
+                  #+long-float long-float) complex)
         (complex (,op x (realpart y)) (,op 0 (imagpart y))))
        ((complex (or rational float))
         (complex (,op (realpart x) y) (,op (imagpart x) 0)))
@@ -441,9 +448,9 @@
                (g1 (gcd dx dy)))
           (if (eql g1 1)
               (%make-ratio (,op (* nx dy) (* dx ny)) (* dx dy))
-              (let* ((t1 (,op (* nx (truncate dy g1)) (* (truncate dx g1) ny)))
-                     (g2 (gcd t1 g1))
-                     (t2 (truncate dx g1)))
+              (let* ((t2 (truncate dx g1))
+                     (t1 (,op (* nx (truncate dy g1)) (* t2 ny)))
+                     (g2 (gcd t1 g1)))
                 (cond ((eql t1 0) 0)
                       ((eql g2 1)
                        (%make-ratio t1 (* t2 dy)))
@@ -451,8 +458,6 @@
                                 (t3 (truncate dy g2))
                                 (nd (if (eql t2 1) t3 (* t2 t3))))
                            (if (eql nd 1) nn (%make-ratio nn nd))))))))))))
-
-) ; EVAL-WHEN
 
 (two-arg-+/- two-arg-+ + add-bignums)
 (two-arg-+/- two-arg-- - subtract-bignum)
@@ -487,7 +492,7 @@
               (iy (imagpart y)))
          (canonical-complex (- (* rx ry) (* ix iy)) (+ (* rx iy) (* ix ry)))))
       (((foreach bignum fixnum ratio single-float double-float
-                 #!+long-float long-float)
+                 #+long-float long-float)
         complex)
        (complex*real y x))
       ((complex (or rational float))
@@ -589,8 +594,9 @@
                     (* (maybe-truncate y gcd) (denominator x)))))))
 
 (defun %negate (n)
+  (declare (explicit-check))
   (number-dispatch ((n number))
-    (((foreach fixnum single-float double-float #!+long-float long-float))
+    (((foreach fixnum single-float double-float #+long-float long-float))
      (%negate n))
     ((bignum)
      (negate-bignum n))
@@ -602,9 +608,9 @@
 ;;;; TRUNCATE and friends
 
 (defun truncate (number &optional (divisor 1))
-  #!+sb-doc
   "Return number (or number/divisor) as an integer, rounded toward 0.
   The second returned value is the remainder."
+  (declare (explicit-check))
   (macrolet ((truncate-float (rtype)
                `(let* ((float-div (coerce divisor ',rtype))
                        (res (%unary-truncate (/ number float-div))))
@@ -614,9 +620,12 @@
     (number-dispatch ((number real) (divisor real))
       ((fixnum fixnum) (truncate number divisor))
       (((foreach fixnum bignum) ratio)
-       (let ((q (truncate (* number (denominator divisor))
-                          (numerator divisor))))
-         (values q (- number (* q divisor)))))
+       (if (= (numerator divisor) 1)
+           (values (* number (denominator divisor)) 0)
+           (multiple-value-bind (quot rem)
+               (truncate (* number (denominator divisor))
+                         (numerator divisor))
+             (values quot (/ rem (denominator divisor))))))
       ((fixnum bignum)
        (bignum-truncate (make-small-bignum number) divisor))
       ((ratio (or float rational))
@@ -628,16 +637,16 @@
       ((bignum bignum)
        (bignum-truncate number divisor))
 
-      (((foreach single-float double-float #!+long-float long-float)
+      (((foreach single-float double-float #+long-float long-float)
         (or rational single-float))
        (if (eql divisor 1)
            (let ((res (%unary-truncate number)))
              (values res (- number (coerce res '(dispatch-type number)))))
            (truncate-float (dispatch-type number))))
-      #!+long-float
+      #+long-float
       ((long-float (or single-float double-float long-float))
        (truncate-float long-float))
-      #!+long-float
+      #+long-float
       (((foreach double-float single-float) long-float)
        (truncate-float long-float))
       ((double-float (or single-float double-float))
@@ -645,44 +654,39 @@
       ((single-float double-float)
        (truncate-float double-float))
       (((foreach fixnum bignum ratio)
-        (foreach single-float double-float #!+long-float long-float))
+        (foreach single-float double-float #+long-float long-float))
        (truncate-float (dispatch-type divisor))))))
 
-;; Only inline when no VOP exists
-#!-multiply-high-vops (declaim (inline %multiply-high))
 (defun %multiply-high (x y)
   (declare (type word x y))
-  #!-multiply-high-vops
-  (values (sb!bignum:%multiply x y))
-  #!+multiply-high-vops
   (%multiply-high x y))
 
 (defun floor (number &optional (divisor 1))
-  #!+sb-doc
   "Return the greatest integer not greater than number, or number/divisor.
   The second returned value is (mod number divisor)."
+  (declare (explicit-check))
   (floor number divisor))
 
 (defun ceiling (number &optional (divisor 1))
-  #!+sb-doc
   "Return the smallest integer not less than number, or number/divisor.
   The second returned value is the remainder."
+  (declare (explicit-check))
   (ceiling number divisor))
 
 (defun rem (number divisor)
-  #!+sb-doc
   "Return second result of TRUNCATE."
+  (declare (explicit-check))
   (rem number divisor))
 
 (defun mod (number divisor)
-  #!+sb-doc
   "Return second result of FLOOR."
+  (declare (explicit-check))
   (mod number divisor))
 
 (defun round (number &optional (divisor 1))
-  #!+sb-doc
   "Rounds number (or number/divisor) to nearest integer.
   The second returned value is the remainder."
+  (declare (explicit-check))
   (if (eql divisor 1)
       (round number)
       (multiple-value-bind (tru rem) (truncate number divisor)
@@ -706,16 +710,16 @@
   `(defun ,name (number &optional (divisor 1))
     ,doc
     (multiple-value-bind (res rem) (,op number divisor)
-      (values (float res (if (floatp rem) rem 1.0)) rem))))
+      (values (float res (if (floatp rem) rem $1.0)) rem))))
 
 ;;; Declare these guys inline to let them get optimized a little.
 ;;; ROUND and FROUND are not declared inline since they seem too
 ;;; obscure and too big to inline-expand by default. Also, this gives
 ;;; the compiler a chance to pick off the unary float case.
-#!-sb-fluid (declaim (inline fceiling ffloor ftruncate))
+#-sb-fluid (declaim (inline fceiling ffloor ftruncate))
 (defun ftruncate (number &optional (divisor 1))
-  #!+sb-doc
   "Same as TRUNCATE, but returns first value as a float."
+  (declare (explicit-check))
   (macrolet ((ftruncate-float (rtype)
                `(let* ((float-div (coerce divisor ',rtype))
                        (res (%unary-ftruncate (/ number float-div))))
@@ -727,16 +731,16 @@
        (multiple-value-bind (q r)
            (truncate number divisor)
          (values (float q) r)))
-      (((foreach single-float double-float #!+long-float long-float)
+      (((foreach single-float double-float #+long-float long-float)
         (or rational single-float))
        (if (eql divisor 1)
            (let ((res (%unary-ftruncate number)))
              (values res (- number (coerce res '(dispatch-type number)))))
            (ftruncate-float (dispatch-type number))))
-      #!+long-float
+      #+long-float
       ((long-float (or single-float double-float long-float))
        (ftruncate-float long-float))
-      #!+long-float
+      #+long-float
       (((foreach double-float single-float) long-float)
        (ftruncate-float long-float))
       ((double-float (or single-float double-float))
@@ -744,12 +748,12 @@
       ((single-float double-float)
        (ftruncate-float double-float))
       (((foreach fixnum bignum ratio)
-        (foreach single-float double-float #!+long-float long-float))
+        (foreach single-float double-float #+long-float long-float))
        (ftruncate-float (dispatch-type divisor))))))
 
 (defun ffloor (number &optional (divisor 1))
-  #!+sb-doc
   "Same as FLOOR, but returns first value as a float."
+  (declare (explicit-check))
   (multiple-value-bind (tru rem) (ftruncate number divisor)
     (if (and (not (zerop rem))
              (if (minusp divisor)
@@ -759,8 +763,8 @@
         (values tru rem))))
 
 (defun fceiling (number &optional (divisor 1))
-  #!+sb-doc
   "Same as CEILING, but returns first value as a float."
+  (declare (explicit-check))
   (multiple-value-bind (tru rem) (ftruncate number divisor)
     (if (and (not (zerop rem))
              (if (minusp divisor)
@@ -772,27 +776,25 @@
 ;;; FIXME: this probably needs treatment similar to the use of
 ;;; %UNARY-FTRUNCATE for FTRUNCATE.
 (defun fround (number &optional (divisor 1))
-  #!+sb-doc
   "Same as ROUND, but returns first value as a float."
+  (declare (explicit-check))
   (multiple-value-bind (res rem)
       (round number divisor)
-    (values (float res (if (floatp rem) rem 1.0)) rem)))
+    (values (float res (if (floatp rem) rem $1.0)) rem)))
 
 ;;;; comparisons
 
 (defun = (number &rest more-numbers)
-  #!+sb-doc
   "Return T if all of its arguments are numerically equal, NIL otherwise."
-  (declare (number number))
+  (declare (number number) (explicit-check))
   (do-rest-arg ((n i) more-numbers 0 t)
     (unless (= number n)
       (return (do-rest-arg ((n) more-numbers (1+ i))
                 (the number n)))))) ; for effect
 
 (defun /= (number &rest more-numbers)
-  #!+sb-doc
   "Return T if no two of its arguments are numerically equal, NIL otherwise."
-  (declare (number number))
+  (declare (number number) (explicit-check))
   (if more-numbers
       (do ((n number (nth i more-numbers))
             (i 0 (1+ i)))
@@ -804,9 +806,9 @@
       t))
 
 (macrolet ((def (op doc)
-             (declare (ignorable doc))
              `(defun ,op (number &rest more-numbers)
-                #!+sb-doc ,doc
+                ,doc
+                (declare (explicit-check))
                 (let ((n1 number))
                   (declare (real n1))
                   (do-rest-arg ((n2 i) more-numbers 0 t)
@@ -820,9 +822,9 @@
   (def >= "Return T if arguments are in strictly non-increasing order, NIL otherwise."))
 
 (defun max (number &rest more-numbers)
-  #!+sb-doc
   "Return the greatest of its arguments; among EQUALP greatest, return
 the first."
+  (declare (explicit-check))
   (let ((n number))
     (declare (real n))
     (do-rest-arg ((arg) more-numbers 0 n)
@@ -830,17 +832,50 @@ the first."
         (setf n arg)))))
 
 (defun min (number &rest more-numbers)
-  #!+sb-doc
   "Return the least of its arguments; among EQUALP least, return
 the first."
+  (declare (explicit-check))
   (let ((n number))
     (declare (real n))
     (do-rest-arg ((arg) more-numbers 0 n)
       (when (< arg n)
         (setf n arg)))))
 
-(eval-when (:compile-toplevel :execute)
+(defmacro make-fixnum-float-comparer (operation integer float float-type)
+  (multiple-value-bind (min max)
+      (ecase float-type
+        (single-float
+         (values most-negative-fixnum-single-float most-positive-fixnum-single-float))
+        (double-float
+         (values most-negative-fixnum-double-float most-positive-fixnum-double-float)))
+    ` (cond ((> ,float ,max)
+             ,(ecase operation
+                ((= >) nil)
+                (< t)))
+            ((< ,float ,min)
+             ,(ecase operation
+                ((= <) nil)
+                (> t)))
+            (t
+             (let ((quot (%unary-truncate ,float)))
+               ,(ecase operation
+                  (=
+                   `(and (= quot ,integer)
+                         (= (float quot ,float) ,float)))
+                  (>
+                   `(cond ((> ,integer quot))
+                          ((< ,integer quot)
+                           nil)
+                          ((<= ,integer 0)
+                           (> (float quot ,float) ,float))))
+                  (<
+                   `(cond ((< ,integer quot))
+                          ((> ,integer quot)
+                           nil)
+                          ((>= ,integer 0)
+                           (< (float quot ,float) ,float))))))))))
 
+(eval-when (:compile-toplevel :execute)
 ;;; The INFINITE-X-FINITE-Y and INFINITE-Y-FINITE-X args tell us how
 ;;; to handle the case when X or Y is a floating-point infinity and
 ;;; the other arg is a rational. (Section 12.1.4.1 of the ANSI spec
@@ -848,65 +883,46 @@ the first."
 ;;; rational when comparing with a rational, but infinities can't be
 ;;; converted to a rational, so we show some initiative and do it this
 ;;; way instead.)
-(defun basic-compare (op &key infinite-x-finite-y infinite-y-finite-x)
-  `(((fixnum fixnum) (,op x y))
+  (defun basic-compare (op &key infinite-x-finite-y infinite-y-finite-x)
+    `(((fixnum fixnum) (,op x y))
+      ((single-float single-float) (,op x y))
+      #+long-float
+      (((foreach single-float double-float long-float) long-float)
+       (,op (coerce x 'long-float) y))
+      #+long-float
+      ((long-float (foreach single-float double-float))
+       (,op x (coerce y 'long-float)))
+      ((fixnum (foreach single-float double-float))
+       (if (float-infinity-p y)
+           ,infinite-y-finite-x
+           (make-fixnum-float-comparer ,op x y (dispatch-type y))))
+      (((foreach single-float double-float) fixnum)
+       (if (eql y 0)
+           (,op x (coerce 0 '(dispatch-type x)))
+           (if (float-infinity-p x)
+               ,infinite-x-finite-y
+               ;; Likewise
+               (make-fixnum-float-comparer ,(case op
+                                              (> '<)
+                                              (< '>)
+                                              (= '=))
+                                           y x (dispatch-type x)))))
+      (((foreach single-float double-float) double-float)
+       (,op (coerce x 'double-float) y))
+      ((double-float single-float)
+       (,op x (coerce y 'double-float)))
+      (((foreach single-float double-float #+long-float long-float) rational)
+       (if (eql y 0)
+           (,op x (coerce 0 '(dispatch-type x)))
+           (if (float-infinity-p x)
+               ,infinite-x-finite-y
+               (,op (rational x) y))))
+      (((foreach bignum fixnum ratio) float)
+       (if (float-infinity-p y)
+           ,infinite-y-finite-x
+           (,op x (rational y))))))
+  )                                     ; EVAL-WHEN
 
-    ((single-float single-float) (,op x y))
-    #!+long-float
-    (((foreach single-float double-float long-float) long-float)
-     (,op (coerce x 'long-float) y))
-    #!+long-float
-    ((long-float (foreach single-float double-float))
-     (,op x (coerce y 'long-float)))
-    ((fixnum (foreach single-float double-float))
-     (if (float-infinity-p y)
-         ,infinite-y-finite-x
-         ;; If the fixnum has an exact float representation, do a
-         ;; float comparison. Otherwise do the slow float -> ratio
-         ;; conversion.
-         (multiple-value-bind (lo hi)
-             (case '(dispatch-type y)
-               (single-float
-                (values most-negative-exactly-single-float-fixnum
-                        most-positive-exactly-single-float-fixnum))
-               (double-float
-                (values most-negative-exactly-double-float-fixnum
-                        most-positive-exactly-double-float-fixnum)))
-           (if (<= lo y hi)
-               (,op (coerce x '(dispatch-type y)) y)
-               (,op x (rational y))))))
-    (((foreach single-float double-float) fixnum)
-     (if (eql y 0)
-         (,op x (coerce 0 '(dispatch-type x)))
-         (if (float-infinity-p x)
-             ,infinite-x-finite-y
-             ;; Likewise
-             (multiple-value-bind (lo hi)
-                 (case '(dispatch-type x)
-                   (single-float
-                    (values most-negative-exactly-single-float-fixnum
-                            most-positive-exactly-single-float-fixnum))
-                   (double-float
-                    (values most-negative-exactly-double-float-fixnum
-                            most-positive-exactly-double-float-fixnum)))
-               (if (<= lo y hi)
-                   (,op x (coerce y '(dispatch-type x)))
-                   (,op (rational x) y))))))
-    (((foreach single-float double-float) double-float)
-     (,op (coerce x 'double-float) y))
-    ((double-float single-float)
-     (,op x (coerce y 'double-float)))
-    (((foreach single-float double-float #!+long-float long-float) rational)
-     (if (eql y 0)
-         (,op x (coerce 0 '(dispatch-type x)))
-         (if (float-infinity-p x)
-             ,infinite-x-finite-y
-             (,op (rational x) y))))
-    (((foreach bignum fixnum ratio) float)
-     (if (float-infinity-p y)
-         ,infinite-y-finite-x
-         (,op x (rational y))))))
-) ; EVAL-WHEN
 
 (macrolet ((def-two-arg-</> (name op ratio-arg1 ratio-arg2 &rest cases)
              `(defun ,name (x y)
@@ -966,7 +982,7 @@ the first."
      (and (= (realpart x) (realpart y))
           (= (imagpart x) (imagpart y))))
     (((foreach fixnum bignum ratio single-float double-float
-               #!+long-float long-float) complex)
+               #+long-float long-float) complex)
      (and (= x (realpart y))
           (zerop (imagpart y))))
     ((complex (or float rational))
@@ -976,11 +992,12 @@ the first."
 ;;;; logicals
 
 (macrolet ((def (op init doc)
-             #!-sb-doc (declare (ignore doc))
              `(defun ,op (&rest integers)
-                #!+sb-doc ,doc
+                ,doc
+                (declare (explicit-check))
                 (if integers
-                    (do ((result (nth 0 integers) (,op result (nth i integers)))
+                    (do ((result (fast-&rest-nth 0 integers)
+                                 (,op result (fast-&rest-nth i integers)))
                          (i 1 (1+ i)))
                         ((>= i (length integers))
                          result)
@@ -992,80 +1009,80 @@ the first."
   (def logeqv -1 "Return the bit-wise equivalence of its arguments. Args must be integers."))
 
 (defun lognot (number)
-  #!+sb-doc
   "Return the bit-wise logical not of integer."
+  (declare (explicit-check))
   (etypecase number
     (fixnum (lognot (truly-the fixnum number)))
     (bignum (bignum-logical-not number))))
 
-(macrolet ((def (name op big-op &optional doc)
+(macrolet ((def (name explicit-check op big-op &optional doc)
              `(defun ,name (integer1 integer2)
-                ,@(when doc
-                    (list doc))
+                ,@(when doc (list doc))
+                ,@(when explicit-check `((declare (explicit-check))))
                 (let ((x integer1)
                       (y integer2))
                   (number-dispatch ((x integer) (y integer))
                     (bignum-cross-fixnum ,op ,big-op))))))
-  (def two-arg-and logand bignum-logical-and)
-  (def two-arg-ior logior bignum-logical-ior)
-  (def two-arg-xor logxor bignum-logical-xor)
+  (def two-arg-and nil logand bignum-logical-and)
+  (def two-arg-ior nil logior bignum-logical-ior)
+  (def two-arg-xor nil logxor bignum-logical-xor)
   ;; BIGNUM-LOGICAL-{AND,IOR,XOR} need not return a bignum, so must
   ;; call the generic LOGNOT...
-  (def two-arg-eqv logeqv (lambda (x y) (lognot (bignum-logical-xor x y))))
-  (def lognand lognand
+  (def two-arg-eqv nil logeqv (lambda (x y) (lognot (bignum-logical-xor x y))))
+  (def lognand t lognand
        (lambda (x y) (lognot (bignum-logical-and x y)))
-       #!+sb-doc "Complement the logical AND of INTEGER1 and INTEGER2.")
-  (def lognor lognor
+       "Complement the logical AND of INTEGER1 and INTEGER2.")
+  (def lognor t lognor
        (lambda (x y) (lognot (bignum-logical-ior x y)))
-       #!+sb-doc "Complement the logical AND of INTEGER1 and INTEGER2.")
+       "Complement the logical OR of INTEGER1 and INTEGER2.")
   ;; ... but BIGNUM-LOGICAL-NOT on a bignum will always return a bignum
-  (def logandc1 logandc1
+  (def logandc1 t logandc1
        (lambda (x y) (bignum-logical-and (bignum-logical-not x) y))
-       #!+sb-doc "Bitwise AND (LOGNOT INTEGER1) with INTEGER2.")
-  (def logandc2 logandc2
+       "Bitwise AND (LOGNOT INTEGER1) with INTEGER2.")
+  (def logandc2 t logandc2
        (lambda (x y) (bignum-logical-and x (bignum-logical-not y)))
-       #!+sb-doc "Bitwise AND INTEGER1 with (LOGNOT INTEGER2).")
-  (def logorc1 logorc1
+       "Bitwise AND INTEGER1 with (LOGNOT INTEGER2).")
+  (def logorc1 t logorc1
        (lambda (x y) (bignum-logical-ior (bignum-logical-not x) y))
-       #!+sb-doc "Bitwise OR (LOGNOT INTEGER1) with INTEGER2.")
-  (def logorc2 logorc2
+       "Bitwise OR (LOGNOT INTEGER1) with INTEGER2.")
+  (def logorc2 t logorc2
        (lambda (x y) (bignum-logical-ior x (bignum-logical-not y)))
-       #!+sb-doc "Bitwise OR INTEGER1 with (LOGNOT INTEGER2)."))
+       "Bitwise OR INTEGER1 with (LOGNOT INTEGER2)."))
 
 (defun logcount (integer)
-  #!+sb-doc
   "Count the number of 1 bits if INTEGER is non-negative,
 and the number of 0 bits if INTEGER is negative."
+  (declare (explicit-check))
   (etypecase integer
     (fixnum
-     (logcount (truly-the (integer 0
-                                   #.(max sb!xc:most-positive-fixnum
-                                          (lognot sb!xc:most-negative-fixnum)))
+     (logcount #-x86-64
+               (truly-the (integer 0
+                                   #.(max sb-xc:most-positive-fixnum
+                                          (lognot sb-xc:most-negative-fixnum)))
                           (if (minusp (truly-the fixnum integer))
                               (lognot (truly-the fixnum integer))
-                              integer))))
+                              integer))
+               ;; The VOP handles that case better
+               #+x86-64 integer))
     (bignum
      (bignum-logcount integer))))
 
 (defun logtest (integer1 integer2)
-  #!+sb-doc
   "Predicate which returns T if logand of integer1 and integer2 is not zero."
   (logtest integer1 integer2))
 
 (defun logbitp (index integer)
-  #!+sb-doc
   "Predicate returns T if bit index of integer is a 1."
   (number-dispatch ((index integer) (integer integer))
-    ((fixnum fixnum) (if (< index sb!vm:n-positive-fixnum-bits)
+    ((fixnum fixnum) (if (< index sb-vm:n-positive-fixnum-bits)
                          (not (zerop (logand integer (ash 1 index))))
                          (minusp integer)))
     ((fixnum bignum) (bignum-logbitp index integer))
     ((bignum (foreach fixnum bignum)) (minusp integer))))
 
 (defun ash (integer count)
-  #!+sb-doc
   "Shifts integer left by count places preserving sign. - count shifts right."
-  (declare (integer integer count))
+  (declare (explicit-check))
   (etypecase integer
     (fixnum
      (cond ((zerop integer)
@@ -1075,11 +1092,11 @@ and the number of 0 bits if INTEGER is negative."
                   (count (truly-the fixnum count)))
               (declare (fixnum length count))
               (cond ((and (plusp count)
-                          (> (+ length count)
-                             (integer-length most-positive-fixnum)))
-                     (bignum-ashift-left (make-small-bignum integer) count))
+                          (>= (+ length count)
+                              sb-vm:n-word-bits))
+                     (bignum-ashift-left-fixnum integer count))
                     (t
-                     (truly-the fixnum
+                     (truly-the sb-vm:signed-word
                                 (ash (truly-the fixnum integer) count))))))
            ((minusp count)
             (if (minusp integer) -1 0))
@@ -1091,9 +1108,9 @@ and the number of 0 bits if INTEGER is negative."
          (bignum-ashift-right integer (- count))))))
 
 (defun integer-length (integer)
-  #!+sb-doc
   "Return the number of non-sign bits in the twos-complement representation
   of INTEGER."
+  (declare (explicit-check))
   (etypecase integer
     (fixnum
      (integer-length (truly-the fixnum integer)))
@@ -1103,152 +1120,93 @@ and the number of 0 bits if INTEGER is negative."
 ;;;; BYTE, bytespecs, and related operations
 
 (defun byte (size position)
-  #!+sb-doc
   "Return a byte specifier which may be used by other byte functions
   (e.g. LDB)."
   (byte size position))
 
 (defun byte-size (bytespec)
-  #!+sb-doc
   "Return the size part of the byte specifier bytespec."
   (byte-size bytespec))
 
 (defun byte-position (bytespec)
-  #!+sb-doc
   "Return the position part of the byte specifier bytespec."
   (byte-position bytespec))
 
 (defun ldb (bytespec integer)
-  #!+sb-doc
   "Extract the specified byte from integer, and right justify result."
   (ldb bytespec integer))
 
 (defun ldb-test (bytespec integer)
-  #!+sb-doc
   "Return T if any of the specified bits in integer are 1's."
   (ldb-test bytespec integer))
 
 (defun mask-field (bytespec integer)
-  #!+sb-doc
   "Extract the specified byte from integer,  but do not right justify result."
   (mask-field bytespec integer))
 
 (defun dpb (newbyte bytespec integer)
-  #!+sb-doc
   "Return new integer with newbyte in specified position, newbyte is right justified."
   (dpb newbyte bytespec integer))
 
 (defun deposit-field (newbyte bytespec integer)
-  #!+sb-doc
   "Return new integer with newbyte in specified position, newbyte is not right justified."
   (deposit-field newbyte bytespec integer))
 
 (defun %ldb (size posn integer)
-  (declare (type bit-index size posn))
-  (logand (ash integer (- posn))
-          (1- (ash 1 size))))
+  (declare (type bit-index size posn) (explicit-check))
+  ;; The naive algorithm is horrible in the general case.
+  ;; Consider (LDB (BYTE 1 2) (SOME-GIANT-BIGNUM)) which has to shift the
+  ;; input rightward 2 bits, consing a new bignum just to read 1 bit.
+  (if (and (<= 0 size sb-vm:n-positive-fixnum-bits)
+           (typep integer 'bignum))
+      (sb-bignum::ldb-bignum=>fixnum size posn integer)
+      (logand (ash integer (- posn))
+              (1- (ash 1 size)))))
 
 (defun %mask-field (size posn integer)
-  (declare (type bit-index size posn))
+  (declare (type bit-index size posn) (explicit-check))
   (logand integer (ash (1- (ash 1 size)) posn)))
 
 (defun %dpb (newbyte size posn integer)
-  (declare (type bit-index size posn))
+  (declare (type bit-index size posn) (explicit-check))
   (let ((mask (1- (ash 1 size))))
     (logior (logand integer (lognot (ash mask posn)))
             (ash (logand newbyte mask) posn))))
 
 (defun %deposit-field (newbyte size posn integer)
-  (declare (type bit-index size posn))
+  (declare (type bit-index size posn) (explicit-check))
   (let ((mask (ash (ldb (byte size 0) -1) posn)))
     (logior (logand newbyte mask)
             (logand integer (lognot mask)))))
 
-(defun sb!c::mask-signed-field (size integer)
-  #!+sb-doc
+(defun sb-c::mask-signed-field (size integer)
   "Extract SIZE lower bits from INTEGER, considering them as a
 2-complement SIZE-bits representation of a signed integer."
-  (cond ((zerop size)
-         0)
-        ((logbitp (1- size) integer)
-         (dpb integer (byte size 0) -1))
-        (t
-         (ldb (byte size 0) integer))))
-
+  (macrolet ((msf (size integer)
+               `(if (logbitp (1- ,size) ,integer)
+                    (dpb ,integer (byte (1- ,size) 0) -1)
+                    (ldb (byte (1- ,size) 0) ,integer))))
+    (typecase size
+      ((eql 0) 0)
+      ((integer 1 #.sb-vm:n-fixnum-bits)
+       (number-dispatch ((integer integer))
+         ((fixnum) (msf size integer))
+         ((bignum) (let ((fix (sb-c::mask-signed-field #.sb-vm:n-fixnum-bits (%bignum-ref integer 0))))
+                     (if (= size #.sb-vm:n-fixnum-bits)
+                         fix
+                         (msf size fix))))))
+      ((integer (#.sb-vm:n-fixnum-bits) #.sb-vm:n-word-bits)
+       (number-dispatch ((integer integer))
+         ((fixnum) integer)
+         ((bignum) (let ((word (sb-c::mask-signed-field #.sb-vm:n-word-bits (%bignum-ref integer 0))))
+                     (if (= size #.sb-vm:n-word-bits)
+                         word
+                         (msf size word))))))
+      ((unsigned-byte) (msf size integer)))))
 
 ;;;; BOOLE
 
-;;; The boole function dispaches to any logic operation depending on
-;;;     the value of a variable. Presently, legal selector values are [0..15].
-;;;     boole is open coded for calls with a constant selector. or with calls
-;;;     using any of the constants declared below.
-
-(defconstant boole-clr 0
-  #!+sb-doc
-  "Boole function op, makes BOOLE return 0.")
-
-(defconstant boole-set 1
-  #!+sb-doc
-  "Boole function op, makes BOOLE return -1.")
-
-(defconstant boole-1   2
-  #!+sb-doc
-  "Boole function op, makes BOOLE return integer1.")
-
-(defconstant boole-2   3
-  #!+sb-doc
-  "Boole function op, makes BOOLE return integer2.")
-
-(defconstant boole-c1  4
-  #!+sb-doc
-  "Boole function op, makes BOOLE return complement of integer1.")
-
-(defconstant boole-c2  5
-  #!+sb-doc
-  "Boole function op, makes BOOLE return complement of integer2.")
-
-(defconstant boole-and 6
-  #!+sb-doc
-  "Boole function op, makes BOOLE return logand of integer1 and integer2.")
-
-(defconstant boole-ior 7
-  #!+sb-doc
-  "Boole function op, makes BOOLE return logior of integer1 and integer2.")
-
-(defconstant boole-xor 8
-  #!+sb-doc
-  "Boole function op, makes BOOLE return logxor of integer1 and integer2.")
-
-(defconstant boole-eqv 9
-  #!+sb-doc
-  "Boole function op, makes BOOLE return logeqv of integer1 and integer2.")
-
-(defconstant boole-nand  10
-  #!+sb-doc
-  "Boole function op, makes BOOLE return log nand of integer1 and integer2.")
-
-(defconstant boole-nor   11
-  #!+sb-doc
-  "Boole function op, makes BOOLE return lognor of integer1 and integer2.")
-
-(defconstant boole-andc1 12
-  #!+sb-doc
-  "Boole function op, makes BOOLE return logandc1 of integer1 and integer2.")
-
-(defconstant boole-andc2 13
-  #!+sb-doc
-  "Boole function op, makes BOOLE return logandc2 of integer1 and integer2.")
-
-(defconstant boole-orc1  14
-  #!+sb-doc
-  "Boole function op, makes BOOLE return logorc1 of integer1 and integer2.")
-
-(defconstant boole-orc2  15
-  #!+sb-doc
-  "Boole function op, makes BOOLE return logorc2 of integer1 and integer2.")
-
 (defun boole (op integer1 integer2)
-  #!+sb-doc
   "Bit-wise boolean function on two integers. Function chosen by OP:
         0       BOOLE-CLR
         1       BOOLE-SET
@@ -1288,30 +1246,34 @@ and the number of 0 bits if INTEGER is negative."
 ;;;; GCD and LCM
 
 (defun gcd (&rest integers)
-  #!+sb-doc
   "Return the greatest common divisor of the arguments, which must be
   integers. GCD with no arguments is defined to be 0."
+  (declare (explicit-check))
   (case (length integers)
     (0 0)
-    (1 (abs (the integer (nth 0 integers))))
+    (1 (abs (the integer (fast-&rest-nth 0 integers))))
     (otherwise
-     (do ((result (nth 0 integers)
-                  (gcd result (the integer (nth i integers))))
+     (do ((result (fast-&rest-nth 0 integers)
+                  ;; Call TWO-ARG-GCD directly, because self calls are
+                  ;; recognized before REWRITE-FULL-CALL can act,
+                  ;; because GCD has no templates to prevent self
+                  ;; call optimization.
+                  (two-arg-gcd result (the integer (fast-&rest-nth i integers))))
           (i 1 (1+ i)))
          ((>= i (length integers))
           result)
        (declare (integer result))))))
 
 (defun lcm (&rest integers)
-  #!+sb-doc
   "Return the least common multiple of one or more integers. LCM of no
   arguments is defined to be 1."
+  (declare (explicit-check))
   (case (length integers)
     (0 1)
-    (1 (abs (the integer (nth 0 integers))))
+    (1 (abs (the integer (fast-&rest-nth 0 integers))))
     (otherwise
-     (do ((result (nth 0 integers)
-                  (lcm result (the integer (nth i integers))))
+     (do ((result (fast-&rest-nth 0 integers)
+                  (two-arg-lcm result (the integer (fast-&rest-nth i integers))))
           (i 1 (1+ i)))
          ((>= i (length integers))
           result)
@@ -1344,6 +1306,7 @@ and the number of 0 bits if INTEGER is negative."
 ;;; of 0 before the dispatch so that the bignum code doesn't have to worry
 ;;; about "small bignum" zeros.
 (defun two-arg-gcd (u v)
+  (declare (muffle-conditions compiler-note))
   (cond ((eql u 0) (abs v))
         ((eql v 0) (abs u))
         (t
@@ -1366,11 +1329,12 @@ and the number of 0 bits if INTEGER is negative."
                        (setq temp (- u v))
                        (when (zerop temp)
                          (let ((res (ash u k)))
-                           (declare (type sb!vm:signed-word res)
-                                    (optimize (inhibit-warnings 3)))
+                           (declare (type sb-vm:signed-word res))
+                           ;; signed word to integer coercion -> return value
+                           (declare (muffle-conditions compiler-note))
                            (return res))))))
-                (declare (type (mod #.sb!vm:n-word-bits) k)
-                         (type sb!vm:signed-word u v)))))
+                (declare (type (mod #.sb-vm:n-word-bits) k)
+                         (type sb-vm:signed-word u v)))))
            ((bignum bignum)
             (bignum-gcd u v))
            ((bignum fixnum)
@@ -1386,9 +1350,8 @@ and the number of 0 bits if INTEGER is negative."
 ;;; type dispatching. This pattern is not supported by NUMBER-DISPATCH
 ;;; thus some special-purpose macrology is needed.
 (defun isqrt (n)
-  #!+sb-doc
   "Return the greatest integer less than or equal to the square root of N."
-  (declare (type unsigned-byte n))
+  (declare (type unsigned-byte n) (explicit-check))
   (macrolet
       ((isqrt-recursion (arg recurse fixnum-p)
          ;; Expands into code for the recursive step of the ISQRT
@@ -1410,7 +1373,7 @@ and the number of 0 bits if INTEGER is negative."
                    (significant-half (ash ,arg (- (ash fourth-size 1))))
                    (significant-half-isqrt
                     (if-fixnum-p-truly-the
-                     (integer 1 #.(isqrt sb!xc:most-positive-fixnum))
+                     (integer 1 #.(isqrt sb-xc:most-positive-fixnum))
                      (,recurse significant-half)))
                    (zeroth-iteration (ash significant-half-isqrt
                                           fourth-size)))
@@ -1442,8 +1405,9 @@ and the number of 0 bits if INTEGER is negative."
 ;;;; miscellaneous number predicates
 
 (macrolet ((def (name doc)
-             (declare (ignorable doc))
-             `(defun ,name (number) #!+sb-doc ,doc (,name number))))
+             `(defun ,name (number) ,doc
+                (declare (explicit-check))
+                (,name number))))
   (def zerop "Is this number zero?")
   (def plusp "Is this real number strictly positive?")
   (def minusp "Is this real number strictly negative?")
@@ -1455,7 +1419,7 @@ and the number of 0 bits if INTEGER is negative."
 (collect ((forms))
   (flet ((unsigned-definition (name lambda-list width)
            (let ((pattern (1- (ash 1 width))))
-             `(defun ,name ,lambda-list
+             `(defun ,name ,(copy-list lambda-list)
                (flet ((prepare-argument (x)
                         (declare (integer x))
                         (etypecase x
@@ -1465,54 +1429,54 @@ and the number of 0 bits if INTEGER is negative."
                  (,name ,@(loop for arg in lambda-list
                                 collect `(prepare-argument ,arg)))))))
          (signed-definition (name lambda-list width)
-           `(defun ,name ,lambda-list
+           `(defun ,name ,(copy-list lambda-list)
               (flet ((prepare-argument (x)
                        (declare (integer x))
                        (etypecase x
                          ((signed-byte ,width) x)
-                         (fixnum (sb!c::mask-signed-field ,width x))
-                         (bignum (sb!c::mask-signed-field ,width x)))))
+                         (fixnum (sb-c::mask-signed-field ,width x))
+                         (bignum (sb-c::mask-signed-field ,width x)))))
                 (,name ,@(loop for arg in lambda-list
                                collect `(prepare-argument ,arg)))))))
     (flet ((do-mfuns (class)
-             (loop for infos being each hash-value of (sb!c::modular-class-funs class)
+             (loop for infos being each hash-value of (sb-c::modular-class-funs class)
                    ;; FIXME: We need to process only "toplevel" functions
                    when (listp infos)
                    do (loop for info in infos
-                            for name = (sb!c::modular-fun-info-name info)
-                            and width = (sb!c::modular-fun-info-width info)
-                            and signedp = (sb!c::modular-fun-info-signedp info)
-                            and lambda-list = (sb!c::modular-fun-info-lambda-list info)
+                            for name = (sb-c::modular-fun-info-name info)
+                            and width = (sb-c::modular-fun-info-width info)
+                            and signedp = (sb-c::modular-fun-info-signedp info)
+                            and lambda-list = (sb-c::modular-fun-info-lambda-list info)
                             if signedp
                             do (forms (signed-definition name lambda-list width))
                             else
                             do (forms (unsigned-definition name lambda-list width))))))
-      (do-mfuns sb!c::*untagged-unsigned-modular-class*)
-      (do-mfuns sb!c::*untagged-signed-modular-class*)
-      (do-mfuns sb!c::*tagged-modular-class*)))
+      (do-mfuns sb-c::*untagged-unsigned-modular-class*)
+      (do-mfuns sb-c::*untagged-signed-modular-class*)
+      (do-mfuns sb-c::*tagged-modular-class*)))
   `(progn ,@(sort (forms) #'string< :key #'cadr)))
 
 ;;; KLUDGE: these out-of-line definitions can't use the modular
 ;;; arithmetic, as that is only (currently) defined for constant
 ;;; shifts.  See also the comment in (LOGAND OPTIMIZER) for more
 ;;; discussion of this hack.  -- CSR, 2003-10-09
-#!+#.(cl:if (cl:= sb!vm:n-machine-word-bits 32) '(and) '(or))
-(defun sb!vm::ash-left-mod32 (integer amount)
+#-64-bit-registers
+(defun sb-vm::ash-left-mod32 (integer amount)
   (etypecase integer
     ((unsigned-byte 32) (ldb (byte 32 0) (ash integer amount)))
     (fixnum (ldb (byte 32 0) (ash (logand integer #xffffffff) amount)))
     (bignum (ldb (byte 32 0) (ash (logand integer #xffffffff) amount)))))
-#!+#.(cl:if (cl:= sb!vm:n-machine-word-bits 64) '(and) '(or))
-(defun sb!vm::ash-left-mod64 (integer amount)
+#+64-bit-registers
+(defun sb-vm::ash-left-mod64 (integer amount)
   (etypecase integer
     ((unsigned-byte 64) (ldb (byte 64 0) (ash integer amount)))
     (fixnum (ldb (byte 64 0) (ash (logand integer #xffffffffffffffff) amount)))
     (bignum (ldb (byte 64 0)
                  (ash (logand integer #xffffffffffffffff) amount)))))
 
-#!+(or x86 x86-64 arm)
-(defun sb!vm::ash-left-modfx (integer amount)
-  (let ((fixnum-width (- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits)))
+#+(or x86 x86-64 arm arm64)
+(defun sb-vm::ash-left-modfx (integer amount)
+  (let ((fixnum-width (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits)))
     (etypecase integer
-      (fixnum (sb!c::mask-signed-field fixnum-width (ash integer amount)))
-      (integer (sb!c::mask-signed-field fixnum-width (ash (sb!c::mask-signed-field fixnum-width integer) amount))))))
+      (fixnum (sb-c::mask-signed-field fixnum-width (ash integer amount)))
+      (integer (sb-c::mask-signed-field fixnum-width (ash (sb-c::mask-signed-field fixnum-width integer) amount))))))

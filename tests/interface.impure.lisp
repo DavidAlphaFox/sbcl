@@ -11,40 +11,40 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(load "assertoid.lisp")
-(load "test-util.lisp")
-(use-package "ASSERTOID")
-(use-package "TEST-UTIL")
-
+(defmacro silently (&rest things)
+  `(let ((*standard-output* (make-broadcast-stream))) ,@things))
 
-(with-test (:name :disassemble)
-;;; DISASSEMBLE shouldn't fail on closures or unpurified functions
+;; Interpreted closure is a problem for COMPILE
+(with-test (:name (disassemble function) :skipped-on :interpreter)
+  ;; DISASSEMBLE shouldn't fail on closures or unpurified functions
   (defun disassemble-fun (x) x)
-  (disassemble 'disassemble-fun))
+  (silently (disassemble 'disassemble-fun)))
 
-(with-test (:name :disassemble-closure)
+(with-test (:name (disassemble :closure) :skipped-on :interpreter)
   (let ((x 1)) (defun disassemble-closure (y) (if y (setq x y) x)))
-  (disassemble 'disassemble-closure))
+  (silently (disassemble 'disassemble-closure)))
 
-#+sb-eval
-(with-test (:name :disassemble-interpreted)
+(defun interpreted-function-p (x) (typep x 'sb-kernel:interpreted-function))
+
+#+(or sb-eval sb-fasteval)
+(with-test (:name (disassemble :interpreted))
     ;; Nor should it fail on interpreted functions
     (let ((sb-ext:*evaluator-mode* :interpret))
       (eval `(defun disassemble-eval (x) x))
-      (disassemble 'disassemble-eval))
+      (silently (disassemble 'disassemble-eval)))
 
     ;; disassemble-eval should still be an interpreted function.
     ;; clhs disassemble: "(If that function is an interpreted function,
     ;; it is first compiled but the result of this implicit compilation
     ;; is not installed.)"
-    (assert (sb-eval:interpreted-function-p #'disassemble-eval)))
+    (assert (interpreted-function-p (symbol-function 'disassemble-eval))))
 
-(with-test (:name :disassemble-generic)
+(with-test (:name (disassemble generic-function))
   ;; nor should it fail on generic functions or other funcallable instances
   (defgeneric disassemble-generic (x))
-  (disassemble 'disassemble-generic)
+  (silently (disassemble 'disassemble-generic))
   (let ((fin (make-instance 'sb-mop:funcallable-standard-object)))
-    (disassemble fin)))
+    (silently (disassemble fin))))
 
 ;;; while we're at it, much the same applies to
 ;;; FUNCTION-LAMBDA-EXPRESSION:
@@ -52,7 +52,12 @@
 
 (let ((x 1)) (defun fle-closure (y) (if y (setq x y) x)))
 
-(with-test (:name :function-lambda-expression)
+(defclass non-standard-generic-function (generic-function) ()
+  (:metaclass sb-mop:funcallable-standard-class))
+(defmethod sb-mop:generic-function-name ((generic-function non-standard-generic-function))
+  'name)
+
+(with-test (:name function-lambda-expression)
   (flet ((fle-name (x)
            (nth-value 2 (function-lambda-expression x))))
     (assert (eql (fle-name #'fle-fun) 'fle-fun))
@@ -61,73 +66,33 @@
     (function-lambda-expression
      (make-instance 'sb-mop:funcallable-standard-object))
     (function-lambda-expression
-     (make-instance 'generic-function))
+     (make-instance 'non-standard-generic-function))
     (function-lambda-expression
      (make-instance 'standard-generic-function))
-    #+sb-eval
+    #+(or sb-eval sb-fasteval)
     (progn
       (let ((sb-ext:*evaluator-mode* :interpret))
         (eval `(defun fle-eval (x) x))
-        (assert (eql (fle-name #'fle-eval) 'fle-eval)))
+        (assert (eql (fle-name (symbol-function 'fle-eval)) 'fle-eval)))
 
       ;; fle-eval should still be an interpreted function.
-      (assert (sb-eval:interpreted-function-p #'fle-eval)))))
+      (assert (interpreted-function-p (symbol-function 'fle-eval))))))
 
-
-;;; support for DESCRIBE tests
-(defstruct to-be-described a b)
-(defclass forward-describe-class (forward-describe-ref) (a))
-(let ((sb-ext:*evaluator-mode* :compile))
-  (eval `(let (x) (defun closure-to-describe () (incf x)))))
-
-(with-test (:name :describe-empty-gf)
-  (describe (make-instance 'generic-function))
-  (describe (make-instance 'standard-generic-function)))
-
-;;; DESCRIBE should run without signalling an error.
-(with-test (:name (describe :no-error))
-  (describe (make-to-be-described))
-  (describe 12)
-  (describe "a string")
-  (describe 'symbolism)
-  (describe (find-package :cl))
-  (describe '(a list))
-  (describe #(a vector))
-;; bug 824974
-  (describe 'closure-to-describe))
-
-;;; The DESCRIBE-OBJECT methods for built-in CL stuff should do
-;;; FRESH-LINE and TERPRI neatly.
-(dolist (i (list (make-to-be-described :a 14) 12 "a string"
-                 #0a0 #(1 2 3) #2a((1 2) (3 4)) 'sym :keyword
-                 (find-package :keyword) (list 1 2 3)
-                 nil (cons 1 2) (make-hash-table)
-                 (let ((h (make-hash-table)))
-                   (setf (gethash 10 h) 100
-                         (gethash 11 h) 121)
-                   h)
-                 (make-condition 'simple-error)
-                 (make-condition 'simple-error :format-control "fc")
-                 #'car #'make-to-be-described (lambda (x) (+ x 11))
-                 (constantly 'foo) #'(setf to-be-described-a)
-                 #'describe-object (find-class 'to-be-described)
-                 (find-class 'forward-describe-class)
-                 (find-class 'forward-describe-ref) (find-class 'cons)))
-  (let ((s (with-output-to-string (s)
-             (write-char #\x s)
-             (describe i s))))
-    (macrolet ((check (form)
-                 `(or ,form
-                      (error "misbehavior in DESCRIBE of ~S:~%   ~S" i ',form))))
-      (check (char= #\x (char s 0)))
-      ;; one leading #\NEWLINE from FRESH-LINE or the like, no more
-      (check (char= #\newline (char s 1)))
-      (check (char/= #\newline (char s 2)))
-      ;; one trailing #\NEWLINE from TERPRI or the like, no more
-      (let ((n (length s)))
-        (check (char= #\newline (char s (- n 1))))
-        (check (char/= #\newline (char s (- n 2))))))))
-
+(with-test (:name :nested-function-lambda-expression)
+  (let* ((lexpr
+          '(lambda ()
+            (labels ((f1 (z &rest r &key (b (eval 'foo)) (a 3) w)
+                       (- a w (length r) (f2 (/  z b))))
+                     (f2 (w) (* w .3)))
+              (values #'f1 #'f2))))
+         (f (compile nil lexpr)))
+    (assert (equal (function-lambda-expression f) lexpr))
+    (assert (equal (function-lambda-expression (funcall f))
+                   '(lambda (z &rest r &key (b (eval 'foo)) (a 3) w)
+                     (block f1 (- a w (length r) (f2 (/ z b)))))))
+    (assert (equal (function-lambda-expression
+                    (nth-value 1 (funcall f)))
+                   '(lambda (w) (block f2 (* w 0.3)))))))
 
 ;;; Tests of documentation on types and classes
 
@@ -199,6 +164,50 @@
 
   (with-test (:name (documentation condition))
     (do-class baz "BAZ")))
+
+(defclass documentation-metaclass (standard-class)
+  ()
+  (:documentation "metaclass with methods on DOCUMENTATION."))
+
+(defmethod documentation ((thing documentation-metaclass)
+                          (doc-type (eql 't)))
+  (sb-int:awhen (call-next-method)
+    (concatenate 'string ":" sb-int:it)))
+
+(defmethod (setf documentation) (new-value
+                                 (thing documentation-metaclass)
+                                 (doc-type (eql 't)))
+  (call-next-method (when new-value
+                      (substitute #\! #\. new-value))
+                    thing doc-type))
+
+(defmethod sb-mop:validate-superclass ((class documentation-metaclass)
+                                       (superclass standard-class))
+  t)
+
+(defclass documentation-class ()
+  ()
+  (:metaclass documentation-metaclass)
+  (:documentation "normal"))
+
+(with-test (:name (documentation :non-stanadard :metaclass))
+  (flet ((check (expected class-name)
+           (let ((class (find-class class-name)))
+             (assert-documentation class-name 'type expected)
+             (assert-documentation class 'type expected)
+             (assert-documentation class t expected))))
+    ;; Make sure methods specialized on the metaclass are not bypassed
+    ;; when retrieving and modifying class documentation.
+    (check ":normal" 'documentation-class)
+    (setf (documentation 'documentation-class 'type) "2.")
+    (check ":2!" 'documentation-class)
+    (setf (documentation 'documentation-class 'type) nil)
+    (check nil 'documentation-class)
+
+    ;; Sanity check: make sure the metaclass has its own documentation
+    ;; and is not affected by the above modifications.
+    (check "metaclass with methods on DOCUMENTATION."
+           'documentation-metaclass)))
 
 (defstruct (frob (:type vector)) "FROB")
 
@@ -306,10 +315,10 @@
   (assert (not (setf (documentation 'docfoo 'function) nil)))
   (assert-documentation 'docfoo 'function nil))
 
-(with-test (:name (documentation :built-in-macro) :skipped-on '(not :sb-doc))
+(with-test (:name (documentation :built-in-macro) :skipped-on (not :sb-doc))
   (assert (documentation 'trace 'function)))
 
-(with-test (:name (documentation :built-in-function) :skipped-on '(not :sb-doc))
+(with-test (:name (documentation :built-in-function) :skipped-on (not :sb-doc))
   (assert (documentation 'cons 'function)))
 
 (defvar documentation.variable nil
@@ -345,11 +354,15 @@
        (declare (ignore x))
        nil))))
 
-(with-test (:name :describe-generic-function-with-assumed-type)
+(with-test (:name (describe generic-function :assumed-type))
   ;; Signalled an error at one point
-  (flet ((zoo () (gogo)))
-    (defmethod gogo () nil)
-    (describe 'gogo)))
+  (let ((fun (checked-compile '(lambda ()
+                                 (flet ((zoo () (gogo)))
+                                   (defmethod gogo () nil)
+                                   (describe 'gogo)))
+                              :allow-style-warnings t)))
+    (handler-bind ((warning #'muffle-warning)) ; implicit gf
+      (silently (funcall fun)))))
 
 (defmacro bug-643958-test ()
   "foo"
@@ -360,52 +373,10 @@
   (setf (documentation 'bug-643958-test 'function) "bar")
   (assert (equal "bar" (documentation 'bug-643958-test 'function))))
 
-(defclass cannot-print-this ()
-  ())
-(defmethod print-object ((oops cannot-print-this) stream)
-  (error "No go!"))
-(with-test (:name :describe-suppresses-print-errors)
-  (handler-bind ((error #'continue))
-    (with-output-to-string (s)
-      (describe (make-instance 'cannot-print-this) s))))
-(with-test (:name :backtrace-suppresses-print-errors)
-  (handler-bind ((error #'continue))
-    (with-output-to-string (s)
-      (labels ((foo (n x)
-                 (when (plusp n)
-                   (foo (1- n) x))
-                 (when (zerop n)
-                   (sb-debug:backtrace 100 s))))
-        (foo 100 (make-instance 'cannot-print-this))))))
-(with-test (:name :backtrace-and-circles)
-  (handler-bind ((error #'continue))
-    (with-output-to-string (s)
-      (labels ((foo (n x)
-                 (when (plusp n)
-                   (foo (1- n) x))
-                 (when (zerop n)
-                   (sb-debug:backtrace 100 s))))
-        (foo 100 (let ((list (list t)))
-                   (nconc list list)))))))
-
-(with-test (:name :endianness-in-features)
+(with-test (:name (:endianness :in *features*))
   (assert
    (or (member :big-endian *features*)
        (member :little-endian *features*))))
-
-(with-test (:name (trace generic-function))
-  (defgeneric traced-gf (x))
-  (defmethod traced-gf (x) (1+ x))
-  (assert (= (traced-gf 3) 4))
-  (trace traced-gf)
-  (let ((output (with-output-to-string (*trace-output*)
-                  (assert (= (traced-gf 3) 4)))))
-    (assert (> (length output) 0)))
-  (assert (typep #'traced-gf 'standard-generic-function))
-  (untrace traced-gf)
-  (let ((output (with-output-to-string (*trace-output*)
-                  (assert (= (traced-gf 3) 4)))))
-    (assert (= (length output) 0))))
 
 (with-test (:name (apropos :inherited :bug-1364413))
   (let* ((package (make-package "BUGGALO" :use nil))
@@ -429,4 +400,124 @@
 
 (with-test (:name (apropos :once-only))
   (assert (= (length (apropos-list "UPDATE-INSTANCE-FOR-REDEFINED-CLASS")) 1)))
+
+(defgeneric gf-arglist-1 (x &key y))
+(defmethod gf-arglist-1 (x &key (y nil) (z nil z-p))
+  (list x y z z-p))
+
+(defgeneric gf-arglist-2 (x &key y))
+(defmethod gf-arglist-2 ((x integer) &key (y nil) ((z f) nil z-p)) (list x y f z-p))
+(defmethod gf-arglist-2 ((x string) &key (y nil) ((z w) nil z-p)) (list x y w z-p))
+
+(defgeneric gf-arglist-3 (x &key ((:y y))))
+
+(defgeneric gf-arglist-4 (x &key ((:y z))))
+
+(defgeneric gf-arglist-5 (x &key y))
+(defmethod gf-arglist-5 ((x integer) &key z &allow-other-keys) (list x z))
+
+(with-test (:name (:generic-function-pretty-arglist 1))
+  (assert (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-1)
+                 '(x &key y z))))
+(with-test (:name (:generic-function-pretty-arglist 2))
+  (assert (or (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-2)
+                     '(x &key y ((z w))))
+              (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-2)
+                     '(x &key y ((z f)))))))
+(with-test (:name (:generic-function-pretty-arglist 3))
+  (assert (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-3)
+                 '(x &key y))))
+(with-test (:name (:generic-function-pretty-arglist 4))
+  (assert (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-4)
+                 '(x &key ((:y z))))))
+(with-test (:name (:generic-function-pretty-arglist 5))
+  (assert (equal (sb-pcl::generic-function-pretty-arglist #'gf-arglist-5)
+                 '(x &key y z &allow-other-keys))))
+
+(defgeneric traced-gf (x))
+(defmethod traced-gf (x) (1+ x))
+
+(with-test (:name (trace generic-function))
+  (assert (= (traced-gf 3) 4))
+  (trace traced-gf)
+  (let ((output (with-output-to-string (*trace-output*)
+                  (assert (= (traced-gf 3) 4)))))
+    (assert (> (length output) 0))
+    (assert (search "0: (TRACED-GF 3)" output))
+    (assert (search "0: TRACED-GF returned 4" output)))
+  (assert (typep #'traced-gf 'standard-generic-function))
+  (untrace traced-gf)
+  (let ((output (with-output-to-string (*trace-output*)
+                  (assert (= (traced-gf 3) 4)))))
+    (assert (= (length output) 0))))
+
+(untrace traced-gf)
+(with-test (:name (trace generic-function :methods t))
+  (trace :methods t traced-gf)
+  (let ((output (with-output-to-string (*trace-output*)
+                  (assert (= (traced-gf 4) 5)))))
+    (assert (> (length output) 0))
+    (assert (search "0: (TRACED-GF 4)" output))
+    (assert (search "0: TRACED-GF returned 5" output))
+    (assert (search "1: ((METHOD TRACED-GF (T)) 4)" output))
+    (assert (search "1: (METHOD TRACED-GF (T)) returned 5" output)))
+  (untrace traced-gf)
+  (let ((output (with-output-to-string (*trace-output*)
+                  (assert (= (traced-gf 3) 4)))))
+    (assert (= (length output) 0))))
+
+(defmethod traced-gf :before (x) :before)
+(defmethod traced-gf :after ((x integer)) :after)
+
+(untrace traced-gf)
+(with-test (:name (trace generic-function :methods :combined))
+  (trace :methods t traced-gf)
+  (let ((output (with-output-to-string (*trace-output*)
+                  (assert (= (traced-gf 5) 6)))))
+    (assert (> (length output) 0))
+    (assert (search "0: (TRACED-GF 5)" output))
+    (assert (search "0: TRACED-GF returned 6" output))
+    (assert (search "1: ((SB-PCL::COMBINED-METHOD TRACED-GF) 5)" output))
+    (assert (search "1: (SB-PCL::COMBINED-METHOD TRACED-GF) returned 6" output))
+    (assert (search "2: ((METHOD TRACED-GF :BEFORE (T)) 5)" output))
+    (assert (search "2: (METHOD TRACED-GF :BEFORE (T)) returned :BEFORE" output))
+    (assert (search "2: ((METHOD TRACED-GF :AFTER (INTEGER)) 5)" output))
+    (assert (search "2: (METHOD TRACED-GF :AFTER (INTEGER)) returned :AFTER" output))
+    (assert (search "2: ((METHOD TRACED-GF (T)) 5)" output))
+    (assert (search "2: (METHOD TRACED-GF (T)) returned 6" output)))
+  (untrace traced-gf)
+  (let ((output (with-output-to-string (*trace-output*)
+                  (assert (= (traced-gf 3) 4)))))
+    (assert (= (length output) 0))))
+
+(let* ((mf (lambda (args nms)
+             (* 2 (car args))))
+       (m (make-instance 'standard-method
+                         :specializers (list (find-class 'integer))
+                         :qualifiers nil
+                         :lambda-list '(x)
+                         :function mf)))
+  (add-method #'traced-gf m))
+
+(untrace traced-gf)
+(with-test (:name (trace generic-function :methods :method-function))
+  (trace :methods t traced-gf)
+  (let ((output (with-output-to-string (*trace-output*)
+                  (assert (= (traced-gf 5) 10)))))
+    (assert (> (length output) 0))
+    (assert (search "0: (TRACED-GF 5)" output))
+    (assert (search "0: TRACED-GF returned 10" output))
+    (assert (search "1: ((SB-PCL::COMBINED-METHOD TRACED-GF) 5)" output))
+    (assert (search "1: (SB-PCL::COMBINED-METHOD TRACED-GF) returned 10" output))
+    (assert (search "2: ((METHOD TRACED-GF :BEFORE (T)) 5)" output))
+    (assert (search "2: (METHOD TRACED-GF :BEFORE (T)) returned :BEFORE" output))
+    (assert (search "2: ((METHOD TRACED-GF :AFTER (INTEGER)) 5)" output))
+    (assert (search "2: (METHOD TRACED-GF :AFTER (INTEGER)) returned :AFTER" output))
+    (assert (search "2: ((METHOD TRACED-GF (INTEGER)) 5)" output))
+    (assert (search "2: (METHOD TRACED-GF (INTEGER)) returned 10" output)))
+  (untrace traced-gf)
+  (let ((output (with-output-to-string (*trace-output*)
+                  (assert (= (traced-gf 5) 10)))))
+    (assert (= (length output) 0))))
+
 ;;;; success

@@ -9,13 +9,14 @@
 # provided with absolutely no warranty. See the COPYING and CREDITS
 # files for more information.
 
-CFLAGS = -g -Wall -O2 -fdollars-in-identifiers
-ifdef LISP_FEATURE_DARWIN9_OR_BETTER
-CFLAGS += -mmacosx-version-min=10.5
-LINKFLAGS += -mmacosx-version-min=10.5
+CFLAGS += -g -Wall -O2 -fdollars-in-identifiers
+
+ifdef SBCL_MACOSX_VERSION_MIN
+  CFLAGS += -mmacosx-version-min=$(SBCL_MACOSX_VERSION_MIN)
+  LINKFLAGS += -mmacosx-version-min=$(SBCL_MACOSX_VERSION_MIN)
 else
-CFLAGS += -mmacosx-version-min=10.4
-LINKFLAGS += -mmacosx-version-min=10.4
+  CFLAGS += -mmacosx-version-min=10.6
+  LINKFLAGS += -mmacosx-version-min=10.6
 endif
 ifdef LISP_FEATURE_INODE64
 CFLAGS += -D_DARWIN_USE_64_BIT_INODE
@@ -30,17 +31,26 @@ endif
 ifdef LISP_FEATURE_SB_CORE_COMPRESSION
   OS_LIBS += -lz
 endif
-
-CC = gcc
+ifndef LISP_FEATURE_SB_DYNAMIC_CORE
+  LINKFLAGS +=-Wl,-no_pie
+endif
+ifdef LISP_FEATURE_SB_LINKABLE_RUNTIME
+  LIBSBCL = libsbcl.a
+  USE_LIBSBCL = -Wl,-force_load libsbcl.a
+endif
 
 ASSEM_SRC = x86-64-assem.S ldso-stubs.S
 ARCH_SRC = x86-64-arch.c
 
 LINKFLAGS += -arch x86_64 -dynamic -twolevel_namespace -bind_at_load -pagezero_size 0x100000
 
-CFLAGS += -arch x86_64 -fno-omit-frame-pointer -pagezero_size 0x100000
+CFLAGS += -arch x86_64 -fno-omit-frame-pointer
 
-GC_SRC = gencgc.c
+ifdef LISP_FEATURE_IMMOBILE_SPACE
+  GC_SRC = fullcgc.c gencgc.c traceroot.c immobile-space.c
+else
+  GC_SRC = fullcgc.c gencgc.c traceroot.c
+endif
 
 # Nothing to do for after-grovel-headers.
 .PHONY: after-grovel-headers

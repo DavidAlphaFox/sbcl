@@ -11,7 +11,6 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(load "test-util.lisp")
 (load "compiler-test-util.lisp")
 
 (defpackage "CTOR-TEST"
@@ -25,6 +24,20 @@
   (make-instance 'no-slots))
 (compile 'make-no-slots)
 
+;; Note: this test may no longer be relevant. It asserted laziness of
+;; the hash computation, since it was slow at some point, and it was
+;; the root cause of slow instance creation. But that was fixed,
+;; and we really don't care per se that hashing is lazy.
+#-compact-instance-header ; can't create symbols in SB-PCL
+(with-test (:name :instance-hash-starts-as-zero :fails-on :interpreter)
+  ;; These first two tests look the same but they aren't:
+  ;; the second one uses a CTOR function.
+  (locally
+      (declare (optimize (sb-c::type-check 0))) ; Same as STD-INSTANCE-HASH
+    (assert (zerop (sb-pcl::standard-instance-hash-code (make-instance 'no-slots))))
+    (assert (zerop (sb-pcl::standard-instance-hash-code (make-no-slots)))))
+  (assert (not (zerop (sxhash (make-no-slots))))))
+
 (defmethod update-instance-for-redefined-class
     ((object no-slots) added discarded plist &rest initargs)
   (declare (ignore initargs))
@@ -35,7 +48,7 @@
 (make-instances-obsolete 'no-slots)
 
 (assert (typep (make-no-slots) 'no-slots))
-(assert (typep (funcall #'(sb-pcl::ctor no-slots nil)) 'no-slots))
+(assert (typep (funcall (gethash '(sb-pcl::ctor no-slots nil) sb-pcl::*all-ctors*)) 'no-slots))
 
 (defclass one-slot ()
   ((a :initarg :a)))
@@ -58,9 +71,10 @@
 (make-instances-obsolete 'one-slot)
 
 (assert (= (slot-value (make-one-slot-a 3) 'a) 3))
-(assert (= (slot-value (funcall #'(sb-pcl::ctor one-slot nil :a sb-pcl::\.p0.) 4) 'a) 4))
+(assert (= (slot-value (funcall (gethash '(sb-pcl::ctor one-slot nil :a sb-pcl::\.p0.) sb-pcl::*all-ctors*)
+                                4) 'a) 4))
 (assert (not (slot-boundp (make-one-slot-noa) 'a)))
-(assert (not (slot-boundp (funcall #'(sb-pcl::ctor one-slot nil)) 'a)))
+(assert (not (slot-boundp (funcall (gethash '(sb-pcl::ctor one-slot nil) sb-pcl::*all-ctors*)) 'a)))
 
 (defclass one-slot-superclass ()
   ((b :initarg :b)))
@@ -81,58 +95,60 @@
 (make-instances-obsolete 'one-slot-subclass)
 
 (assert (= (slot-value (make-one-slot-subclass 2) 'b) 2))
-(assert (= (slot-value (funcall #'(sb-pcl::ctor one-slot-subclass nil :b sb-pcl::\.p0.) 3) 'b) 3))
+(assert (= (slot-value (funcall (gethash '(sb-pcl::ctor one-slot-subclass nil :b sb-pcl::\.p0.) sb-pcl::*all-ctors*)
+                                3) 'b) 3))
 (make-instances-obsolete 'one-slot-superclass)
 
 (assert (= (slot-value (make-one-slot-subclass 2) 'b) 2))
-(assert (= (slot-value (funcall #'(sb-pcl::ctor one-slot-subclass nil :b sb-pcl::\.p0.) 4) 'b) 4))
+(assert (= (slot-value (funcall (gethash '(sb-pcl::ctor one-slot-subclass nil :b sb-pcl::\.p0.) sb-pcl::*all-ctors*)
+                                4) 'b) 4))
 
 ;;; Tests for CTOR optimization of non-constant class args and constant class object args
 (defun find-ctor-caches (fun)
   (remove-if-not (lambda (value)
                    (and (consp value) (eq 'sb-pcl::ctor-cache (car value))))
-                 (find-value-cell-values fun)))
+                 (find-code-constants fun)))
 
-(let* ((cmacro (compiler-macro-function 'make-instance))
+(let* ((transform (sb-int:info :function :source-transform 'make-instance))
         (opt 0)
         (wrapper (lambda (form env)
-                   (let ((res (funcall cmacro form env)))
+                   (let ((res (funcall transform form env)))
                      (unless (eq form res)
                        (incf opt))
                      res))))
    (sb-ext:without-package-locks
      (unwind-protect
           (progn
-            (setf (compiler-macro-function 'make-instance) wrapper)
+            (setf (sb-int:info :function :source-transform 'make-instance) wrapper)
             (with-test (:name (make-instance :non-constant-class))
               (assert (= 0 opt))
-              (let ((f (compile nil `(lambda (class)
-                                       (make-instance class :b t)))))
+              (let ((f (checked-compile `(lambda (class)
+                                           (make-instance class :b t)))))
                 (assert (= 1 (length (find-ctor-caches f))))
                 (assert (= 1 opt))
                 (assert (typep (funcall f 'one-slot-subclass) 'one-slot-subclass))))
             (with-test (:name (make-instance :constant-class-object))
-              (let ((f (compile nil `(lambda ()
-                                       (make-instance ,(find-class 'one-slot-subclass) :b t)))))
+              (let ((f (checked-compile `(lambda ()
+                                           (make-instance ,(find-class 'one-slot-subclass) :b t)))))
                 (assert (not (find-ctor-caches f)))
                 (assert (= 2 opt))
                 (assert (typep (funcall f) 'one-slot-subclass))))
             (with-test (:name (make-instance :constant-non-std-class-object))
-              (let ((f (compile nil `(lambda ()
-                                       (make-instance ,(find-class 'structure-object))))))
+              (let ((f (checked-compile `(lambda ()
+                                           (make-instance ,(find-class 'structure-object))))))
                 (assert (not (find-ctor-caches f)))
                 (assert (= 3 opt))
                 (assert (typep (funcall f) 'structure-object))))
             (with-test (:name (make-instance :constant-non-std-class-name))
-              (let ((f (compile nil `(lambda ()
-                                       (make-instance 'structure-object)))))
+              (let ((f (checked-compile `(lambda ()
+                                           (make-instance 'structure-object)))))
                 (assert (not (find-ctor-caches f)))
                 (assert (= 4 opt))
                 (assert (typep (funcall f) 'structure-object)))))
-       (setf (compiler-macro-function 'make-instance) cmacro))))
+       (setf (sb-int:info :function :source-transform 'make-instance) transform))))
 
 (with-test (:name (make-instance :ctor-inline-cache-resize))
-  (let* ((f (compile nil `(lambda (name) (make-instance name))))
+  (let* ((f (checked-compile `(lambda (name) (make-instance name))))
          (classes (loop repeat (* 2 sb-pcl::+ctor-table-max-size+)
                         collect (class-name (eval `(defclass ,(gentemp) () ())))))
          (count 0)
@@ -169,10 +185,10 @@
 
 (with-test (:name (make-instance :ctor-default-initargs-1))
   (assert (aroundp (eval `(make-instance 'some-class))))
-  (let ((fun (compile nil `(lambda () (make-instance 'some-class)))))
+  (let ((fun (checked-compile `(lambda () (make-instance 'some-class)))))
     (assert (aroundp (funcall fun)))
     ;; make sure we tested what we think we tested...
-    (let ((ctors (find-named-callees fun :type 'sb-pcl::ctor)))
+    (let ((ctors (find-anonymous-callees fun :type 'sb-pcl::ctor)))
       (assert ctors)
       (assert (not (cdr ctors)))
       (assert (find-named-callees (car ctors) :name 'sb-pcl::fast-make-instance)))))
@@ -196,12 +212,12 @@
   (assert (= 0 *some-counter*))
   (assert (aroundp (eval `(make-instance 'some-class2))))
   (assert (= 1 *some-counter*))
-  (let ((fun (compile nil `(lambda () (make-instance 'some-class2)))))
+  (let ((fun (checked-compile `(lambda () (make-instance 'some-class2)))))
     (assert (= 1 *some-counter*))
     (assert (aroundp (funcall fun)))
     (assert (= 2 *some-counter*))
     ;; make sure we tested what we think we tested...
-    (let ((ctors (find-named-callees fun :type 'sb-pcl::ctor)))
+    (let ((ctors (find-anonymous-callees fun :type 'sb-pcl::ctor)))
       (assert ctors)
       (assert (not (cdr ctors)))
       (assert (find-named-callees (car ctors) :name 'sb-pcl::fast-make-instance)))))
@@ -211,9 +227,9 @@
   (defclass type-check-thing ()
     ((slot :type (integer 0) :initarg :slot))))
 (with-test (:name (make-instance :no-compile-note-at-runtime))
-  (let ((fun (compile nil `(lambda (x)
-                             (declare (optimize safety))
-                             (make-instance 'type-check-thing :slot x)))))
+  (let ((fun (checked-compile `(lambda (x)
+                                 (declare (optimize safety))
+                                 (make-instance 'type-check-thing :slot x)))))
     (handler-bind ((sb-ext:compiler-note #'error))
       (funcall fun 41)
       (funcall fun 13))))
@@ -222,21 +238,20 @@
 (defmethod no-applicable-method ((gf (eql #'make-instance)) &rest args)
   (cons :no-applicable-method args))
 (with-test (:name :constant-invalid-class-arg)
-  (assert (equal
-           '(:no-applicable-method "FOO" :quux 14)
-           (funcall (compile nil `(lambda (x) (make-instance "FOO" :quux x))) 14)))
-  (assert (equal
-           '(:no-applicable-method 'abc zot 1 bar 2)
-           (funcall (compile nil `(lambda (x y) (make-instance ''abc 'zot x 'bar y)))
-                    1 2))))
+  (checked-compile-and-assert ()
+      `(lambda (x) (make-instance "FOO" :quux x))
+    ((14) '(:no-applicable-method "FOO" :quux 14)))
+  (checked-compile-and-assert ()
+      `(lambda (x y) (make-instance ''abc 'zot x 'bar y))
+    ((1 2) '(:no-applicable-method 'abc zot 1 bar 2))))
+
 (with-test (:name :variable-invalid-class-arg)
-  (assert (equal
-           '(:no-applicable-method "FOO" :quux 14)
-           (funcall (compile nil `(lambda (c x) (make-instance c :quux x))) "FOO" 14)))
-  (assert (equal
-           '(:no-applicable-method 'abc zot 1 bar 2)
-           (funcall (compile nil `(lambda (c x y) (make-instance c 'zot x 'bar y)))
-                    ''abc 1 2))))
+  (checked-compile-and-assert ()
+      `(lambda (c x) (make-instance c :quux x))
+    (("FOO" 14) '(:no-applicable-method "FOO" :quux 14)))
+  (checked-compile-and-assert ()
+      `(lambda (c x y) (make-instance c 'zot x 'bar y))
+    ((''abc 1 2) '(:no-applicable-method 'abc zot 1 bar 2))))
 
 (defclass sneaky-class (standard-class)
   ())
@@ -262,10 +277,10 @@
         (pushnew name (dirty-slots instance))))))
 
 (with-test (:name (make-instance :setf-slot-value-using-class-hits-other-slots))
-  (let ((fun (compile nil `(lambda (a c)
-                             (let ((i (make-instance 'sneaky :a a)))
-                               (setf (sneaky-c i) c)
-                               i)))))
+  (let ((fun (checked-compile `(lambda (a c)
+                                 (let ((i (make-instance 'sneaky :a a)))
+                                   (setf (sneaky-c i) c)
+                                   i)))))
     (loop repeat 3
           do (let ((i (funcall fun "a" "c")))
                (assert (equal '(c b a) (dirty-slots i)))
@@ -313,5 +328,71 @@
 (with-test (:name :bug-1397454)
   (assert (equal (slot-value (fancy-cnm-in-ii-test 'hi) 'a)
                  '(expect-this hi))))
-
-;;;; success
+
+(with-test (:name (make-instance :ctor
+                   :constant-initarg :constant-redefinition
+                   :bug-1644944))
+  (let ((class-name (gensym))
+        (slot-name (gensym))
+        (all-specs '()))
+    (eval `(defclass ,class-name () ((,slot-name :initarg :s
+                                                 :reader ,slot-name))))
+    (flet ((define-constant (name value)
+             (handler-bind ((sb-ext:defconstant-uneql #'continue))
+               (eval `(defconstant ,name ',value))))
+           (make (value)
+             (checked-compile
+              `(lambda ()
+                 (make-instance ',class-name :s ,value))))
+           (check (&rest specs)
+             (setf all-specs (append all-specs specs))
+             (loop :for (fun expected) :on all-specs :by #'cddr
+                :do (assert (eql (funcall (symbol-function slot-name)
+                                          (funcall fun))
+                                 expected)))))
+      ;; Test constructors using the constant symbol and the relevant
+      ;; constant values.
+      (let ((constant-name (gensym)))
+        (define-constant constant-name 1)
+        (destructuring-bind (f-1-c f-1-1 f-1-2)
+            (mapcar #'make `(,constant-name 1 2))
+          (check f-1-c 1 f-1-1 1 f-1-2 2))
+
+        ;; Redefining the constant must not affect the existing
+        ;; constructors. New constructors must use the new value.
+        (define-constant constant-name 2)
+        (destructuring-bind (f-2-c f-2-1 f-2-2)
+            (mapcar #'make `(,constant-name 1 2))
+          (check f-2-c 2 f-2-1 1 f-2-2 2))
+
+        ;; Same for non-atom values, with the additional complication of
+        ;; preserving (non-)same-ness.
+        (let ((a1 '(:a)) (a2 '(:a)) (b '(:b)))
+          (define-constant constant-name a1)
+          (destructuring-bind (f-3-c f-3-a1 f-3-a2 f-3-b)
+              (mapcar #'make (list constant-name `',a1 `',a2 `',b))
+            (check f-3-c a1 f-3-a1 a1 f-3-a2 a2 f-3-b b))
+          (define-constant constant-name b)
+          (destructuring-bind (f-4-c f-4-a1 f-4-a2 f-4-b)
+              (mapcar #'make (list constant-name `',a1 `',a2 `',b))
+            (check f-4-c b f-4-a1 a1 f-4-a2 a2 f-4-b b))))
+
+      ;; A different constant with the same value must not cause
+      ;; aliasing.
+      (let ((constant-name-1 (gensym))
+            (constant-name-2 (gensym)))
+        (define-constant constant-name-1 1)
+        (define-constant constant-name-2 1)
+        (destructuring-bind (f-5-d-c f-5-d-1 f-5-d-2)
+            (mapcar #'make `(,constant-name-1 1 2))
+          (check f-5-d-c 1 f-5-d-1 1 f-5-d-2 2))
+        (destructuring-bind (f-5-e-c f-5-e-1 f-5-e-2)
+            (mapcar #'make `(,constant-name-2 1 2))
+          (check f-5-e-c 1 f-5-e-1 1 f-5-e-2 2))
+        (define-constant constant-name-1 2)
+        (destructuring-bind (f-6-d-c f-6-d-1 f-6-d-2)
+            (mapcar #'make `(,constant-name-1 1 2))
+          (check f-6-d-c 2 f-6-d-1 1 f-6-d-2 2))
+        (destructuring-bind (f-6-e-c f-6-e-1 f-6-e-2)
+            (mapcar #'make `(,constant-name-2 1 2))
+          (check f-6-e-c 1 f-6-e-1 1 f-6-e-2 2))))))

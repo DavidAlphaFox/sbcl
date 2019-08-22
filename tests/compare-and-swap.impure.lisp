@@ -10,7 +10,7 @@
                   (assert (eql nil (compare-and-swap (,op x) nil y)))
                   (assert (eql y (compare-and-swap (,op x) nil z)))
                   (assert (eql y (,op x)))
-                  (let ((x "foo"))
+                  (let ((x (eval "foo"))) ; hide the compile-time type error
                     (multiple-value-bind (res err)
                         (ignore-errors (compare-and-swap (,op x) nil nil))
                       (unless (not res)
@@ -80,7 +80,7 @@
 ;; type of the first argument
 (with-test (:name (:cas :svref :type))
   (multiple-value-bind (res err)
-      (ignore-errors (compare-and-swap (svref "foo" 1) 1 2))
+      (ignore-errors (compare-and-swap (svref (eval "foo") 1) 1 2))
     (assert (not res))
     (assert (typep err 'type-error))))
 
@@ -106,13 +106,13 @@
   (assert
    (eq :error
        (handler-case
-           (sb-ext:compare-and-swap (symbol-value '*a-boolean*) t 42)
+           (sb-ext:compare-and-swap (symbol-value '*a-boolean*) t (eval 42))
          (error () :error))))
   (let ((name '*a-boolean*))
     (assert
      (eq :error
          (handler-case
-             (sb-ext:compare-and-swap (symbol-value name) t 42)
+             (sb-ext:compare-and-swap (symbol-value name) t (eval 42))
            (error () :error))))))
 
 ;;;; ATOMIC-INCF and ATOMIC-DECF (we should probably rename this file atomic-ops...)
@@ -142,7 +142,7 @@
     (assert (= 0 (box-word box)))))
 
 (with-test (:name :atomic-incf-wraparound)
-  (let ((box (make-box :word (1- (ash 1 sb-vm:n-word-bits)))))
+  (let ((box (make-box :word sb-ext:most-positive-word)))
     (sb-ext:atomic-incf (box-word box) 2)
     (assert (= 1 (box-word box)))))
 
@@ -151,27 +151,38 @@
     (sb-ext:atomic-decf (box-word box) 2)
     (assert (= (- (ash 1 sb-vm:n-word-bits) 2) (box-word box)))))
 
+(with-test (:name :cas-raw-instance-ref-word
+            :skipped-on (not (or :x86 :x86-64)))
+  (let ((foo (make-box :word 42)))
+    ;; basic smoke test - not checking for atomicity or anything
+    (assert (eql (cas (box-word foo) 42 43) 42))
+    (assert (eql (cas (box-word foo) 43 44) 43))))
+
 (with-test (:name :atomic-incf-full-call-lp1381867
-            :skipped-on '(not (or :x86 :x86-64 :ppc)))
-  (locally
-   ;; Rebind %RAW-INSTANCE-ATOMIC-INCF/WORD as a local function.
-   ;; Declaring it locally notinline fails because it is marked
-   ;; with the ALWAYS-TRANSLATABLE attribute, so it's a bug to call it
-   ;; even though we've asked to call it. (Maybe that's a bug?)
-   ;; And I don't want to call it explictly - I want the macro to do it
-   ;; so that I don't have to inject any of the sign making noise and such.
-   (declare (disable-package-locks sb-kernel:%raw-instance-atomic-incf/word))
-   (let ((b (make-box :word 0))
-         (delta (- (ash 1 (1- sb-vm:n-word-bits))))
-         (f (eval '#'sb-kernel:%raw-instance-atomic-incf/word)))
-     (flet ((sb-kernel:%raw-instance-atomic-incf/word (a b c)
-              (funcall f a b c)))
-       (assert (= (atomic-incf (box-word b) delta) 0))
-       (assert (= (atomic-incf (box-word b) delta)
-                  (ash 1 (1- sb-vm:n-word-bits))))
-       (assert (= (box-word b) 0))
-       (atomic-decf (box-word b))
-       (assert (= (box-word b) sb-ext:most-positive-word))))))
+            :skipped-on (not (or :x86 :x86-64 :ppc)))
+  ;; contortions to avoid reader errors
+  (let* ((%riai/w (intern "%RAW-INSTANCE-ATOMIC-INCF/WORD" "SB-KERNEL"))
+         (form
+          `(locally
+            ;; Rebind %RAW-INSTANCE-ATOMIC-INCF/WORD as a local
+            ;; function.  Declaring it locally notinline fails because
+            ;; it is marked with the ALWAYS-TRANSLATABLE attribute, so
+            ;; it's a bug to call it even though we've asked to call
+            ;; it. (Maybe that's a bug?)  And I don't want to call it
+            ;; explictly - I want the macro to do it so that I don't
+            ;; have to inject any of the sign masking noise and such.
+            (declare (disable-package-locks ,%riai/w))
+            (let ((b (make-box :word 0))
+                  (delta (- (ash 1 (1- sb-vm:n-word-bits))))
+                  (f (fdefinition ',%riai/w)))
+              (flet ((,%riai/w (a b c) (funcall f a b c)))
+                (assert (= (atomic-incf (box-word b) delta) 0))
+                (assert (= (atomic-incf (box-word b) delta)
+                           (ash 1 (1- sb-vm:n-word-bits))))
+                (assert (= (box-word b) 0))
+                (atomic-decf (box-word b))
+                (assert (= (box-word b) sb-ext:most-positive-word)))))))
+    (eval form)))
 
 #+sb-thread
 (with-test (:name (:atomic-incf/decf :threads))
@@ -506,7 +517,7 @@
     (assert (not (cas bar nil t)))))
 
 (with-test (:name :atomic-push
-            :skipped-on '(not :sb-thread))
+            :skipped-on (not :sb-thread))
   (let ((store (cons nil nil))
         (n 100000))
     (symbol-macrolet ((x (car store))
@@ -541,3 +552,68 @@
                      (declare (special x))
                      (atomic-pop (symbol-value 'x))))))
       1)))
+
+#+x86-64 ; missing symbol sb-vm::signed-sap-cas-32 otherwise
+(with-test (:name :cas-sap-ref
+            :skipped-on :interpreter)
+  (let ((v (make-array 2 :element-type '(signed-byte 32)
+                         :initial-element -1)))
+    (let ((old (sb-sys:%primitive sb-vm::signed-sap-cas-32
+                                  (sb-sys:vector-sap v)
+                                  0 -1 1)))
+      (assert (= old -1))
+      (assert (eql (aref v 0) 1)))))
+
+(in-package "SB-VM")
+
+;;; This file defines a structure, so is an 'impure' test
+(defstruct my-struct
+  ;; The slots under test have to be naturally aligned for a double-Lispword,
+  ;; at least on x86-64, so add a random slot if there is no layout slot.
+  #+compact-instance-header fluff
+  one two three four)
+
+(locally
+  (declare (muffle-conditions style-warning)) ; functions don't exist for non-x86
+  (defun test-a-cons (acons oldcar oldcdr newcar newcdr)
+    (%cons-cas-pair acons oldcar oldcdr newcar newcdr))
+  (defun test-a-vect (avect ind old1 old2 new1 new2)
+    (%vector-cas-pair avect ind old1 old2 new1 new2))
+  (defun test-a-struct (inst ind old1 old2 new1 new2)
+    (%instance-cas-pair inst ind old1 old2 new1 new2))
+
+  (defun test-wide-cmpxchg ()
+    (let ((x (cons 'a 'b)))
+      (multiple-value-bind (old1 old2) (test-a-cons x 'a 'b 'foo 'bar)
+        (assert (and (eq old1 'a) (eq old2 'b) (equal x '(foo . bar)))))
+      (multiple-value-bind (old1 old2) (test-a-cons x 0 0 1 2)
+        (assert (and (eq old1 'foo) (eq old2 'bar) (equal x '(foo . bar))))))
+
+    ;; This is just testing that the offsets are correct.
+    ;; Correct working of the instruction is tested by the CONS example.
+    (let ((x (make-array 6 :initial-element nil)))
+      (multiple-value-bind (old1 old2) (test-a-vect x 2 nil nil 'foo 'bar)
+        (assert (and (null old1) (null old2) (equalp x #(nil nil foo bar nil nil))))))
+
+    ;; Same remark applies - just check that the offset to the slot is right.
+    (let ((s (make-my-struct :three 'the :four 'floor)))
+      ;; in slots 3 and 4 put your bootee (a baby shoe, i.e.) on the floor
+      (multiple-value-bind (old1 old2) (test-a-struct s 3 'the 'floor 'your 'bootee)
+        (assert (and (eq old1 'the) (eq old2 'floor)
+                     (eq (my-struct-three s) 'your)
+                     (eq (my-struct-four s) 'bootee)))))
+    t))
+
+(test-util:with-test (:name :wide-compare-and-exchange
+                      :skipped-on (or :interpreter (not (or :x86 :x86-64))))
+  (multiple-value-bind (a b c d) (%cpu-identification 0 0)
+    (declare (ignore b c d))
+    ;; paranoidly check for whether we can execute function ID 1
+    (or (and (>= a 1) ; the highest function ID
+             (multiple-value-bind (a b c d) (%cpu-identification 1 0)
+               (declare (ignore a b) (ignorable c d))
+               ;; paranoidly check for CMPXCHGxB presence
+               ;; constants from Table 3-20 and 3-21 of Intel manual
+               (and #+x86(logbitp 8 d) #+x86-64(logbitp 13 c)
+                    (test-wide-cmpxchg))))
+        (format t "Double-width compare-and-swap NOT TESTED~%"))))

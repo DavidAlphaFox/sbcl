@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; the branch VOP
 
@@ -35,14 +35,14 @@
 ;;; false. Otherwise, the code must branch to dest if the test was true.
 
 (define-vop (branch-if)
-  (:info dest flags not-p)
+  (:info dest not-p flags)
   (:generator 0
      (when (eq (car flags) 'not)
        (pop flags)
        (setf not-p (not not-p)))
      (flet ((negate-condition (name)
               (let ((code (logxor 1 (conditional-opcode name))))
-                (aref *condition-name-vec* code))))
+                (aref +condition-name-vec+ code))))
        (cond ((null (rest flags))
               (inst jmp
                     (if not-p
@@ -60,17 +60,15 @@
               (dolist (flag flags)
                 (inst jmp flag dest)))))))
 
-(defvar *cmov-ptype-representation-vop*
+(define-load-time-global *cmov-ptype-representation-vop*
   (mapcan (lambda (entry)
             (destructuring-bind (ptypes &optional sc vop)
                 entry
-              (unless (listp ptypes)
-                (setf ptypes (list ptypes)))
               (mapcar (if (and vop sc)
                           (lambda (ptype)
                             (list ptype sc vop))
                           #'list)
-                      ptypes)))
+                      (ensure-list ptypes))))
           '((t descriptor-reg move-if/t)
 
             ((fixnum positive-fixnum)
@@ -81,14 +79,13 @@
             ;; FIXME: Can't use CMOV with byte registers, and characters live
             ;; in such outside of unicode builds. A better solution then just
             ;; disabling MOVE-IF/CHAR should be possible, though.
-            #!+sb-unicode
+            #+sb-unicode
             (character character-reg move-if/char)
 
             ((single-float complex-single-float
               double-float complex-double-float))
 
             (system-area-pointer sap-reg move-if/sap)))
-  #!+sb-doc
   "Alist of primitive type -> (storage-class-name VOP-name)
    if values of such a type should be cmoved, and NIL otherwise.
 
@@ -98,8 +95,8 @@
 
 (defun convert-conditional-move-p (node dst-tn x-tn y-tn)
   (declare (ignore node))
-  (let* ((ptype (sb!c::tn-primitive-type dst-tn))
-         (name  (sb!c::primitive-type-name ptype))
+  (let* ((ptype (sb-c::tn-primitive-type dst-tn))
+         (name  (sb-c::primitive-type-name ptype))
          (param (cdr (or (assoc name *cmov-ptype-representation-vop*)
                          '(t descriptor-reg move-if/t)))))
     (when param
@@ -108,7 +105,10 @@
           (labels ((make-tn ()
                      (make-representation-tn ptype scn))
                    (frob-tn (tn)
-                     (if (immediate-tn-p tn)
+                     ;; Careful not to load constants which require boxing
+                     ;; and may overwrite the flags.
+                     ;; Representation selection should avoid that.
+                     (if (eq (tn-kind tn) :constant)
                          tn
                          (make-tn))))
             (values vop
@@ -125,25 +125,13 @@
        (when not-p (pop flags))
        (flet ((negate-condition (name)
                 (let ((code (logxor 1 (conditional-opcode name))))
-                  (aref *condition-name-vec* code)))
+                  (aref +condition-name-vec+ code)))
               (load-immediate (dst constant-tn
-                                   &optional (sc (sc-name (tn-sc dst))))
-                (let ((val (tn-value constant-tn)))
-                  (etypecase val
-                    (integer
-                     ;; Can't use ZEROIZE here, since XOR will affect
-                     ;; the flags.
-                     (if (memq sc '(any-reg descriptor-reg))
-                         (inst mov dst (fixnumize val))
-                         (inst mov dst val)))
-                    (symbol
-                     (aver (eq sc 'descriptor-reg))
-                     (load-symbol dst val))
-                    (character
-                     (if (eq sc 'descriptor-reg)
-                         (inst mov dst (logior (ash (char-code val) n-widetag-bits)
-                                               character-widetag))
-                         (inst mov dst (char-code val))))))))
+                               &optional (sc (sc-name (tn-sc dst))))
+                ;; Can't use ZEROIZE, since XOR will affect the flags.
+                (inst mov dst
+                      (encode-value-if-immediate constant-tn
+                                                 (memq sc '(any-reg descriptor-reg))))))
          (cond ((null (rest flags))
                 (if (sc-is else immediate)
                     (load-immediate res else)
@@ -199,7 +187,7 @@
   (def-move-if move-if/unsigned unsigned-num unsigned-reg unsigned-stack)
   (def-move-if move-if/signed signed-num signed-reg signed-stack)
   ;; FIXME: See *CMOV-PTYPE-REPRESENTATION-VOP* above.
-  #!+sb-unicode
+  #+sb-unicode
   (def-move-if move-if/char character character-reg character-stack)
   (def-move-if move-if/sap system-area-pointer sap-reg sap-stack))
 
@@ -208,56 +196,29 @@
 ;;; Note: a constant-tn is allowed in CMP; it uses an EA displacement,
 ;;; not immediate data.
 (define-vop (if-eq)
-  (:args (x :scs (any-reg descriptor-reg control-stack constant)
-            :load-if (not (and (sc-is x immediate)
-                               (sc-is y any-reg descriptor-reg
-                                      control-stack constant))))
+  (:args (x :scs (any-reg descriptor-reg control-stack))
          (y :scs (any-reg descriptor-reg immediate)
-            :load-if (not (and (sc-is x any-reg descriptor-reg immediate)
-                               (sc-is y control-stack constant)))))
-  (:temporary (:sc descriptor-reg) temp)
+            :load-if (and (sc-is x control-stack)
+                          (not (sc-is y any-reg descriptor-reg immediate)))))
   (:conditional :e)
   (:policy :fast-safe)
   (:translate eq)
   (:generator 6
     (cond
-     ((sc-is y immediate)
-      (let ((val (tn-value y)))
-        (etypecase val
-          (integer
-           (if (and (zerop val) (sc-is x any-reg descriptor-reg))
-               (inst test x x) ; smaller
-             (let ((fixnumized (fixnumize val)))
-               (if (typep fixnumized
-                          '(or (signed-byte 32) (unsigned-byte 31)))
-                   (inst cmp x fixnumized)
-                 (progn
-                   (inst mov temp fixnumized)
-                   (inst cmp x temp))))))
-          (symbol
-           (inst cmp x (+ nil-value (static-symbol-offset val))))
-          (character
-           (inst cmp x (logior (ash (char-code val) n-widetag-bits)
-                               character-widetag))))))
-     ((sc-is x immediate) ; and y not immediate
-      ;; Swap the order to fit the compare instruction.
-      (let ((val (tn-value x)))
-        (etypecase val
-          (integer
-           (if (and (zerop val) (sc-is y any-reg descriptor-reg))
-               (inst test y y) ; smaller
-             (let ((fixnumized (fixnumize val)))
-               (if (typep fixnumized
-                          '(or (signed-byte 32) (unsigned-byte 31)))
-                   (inst cmp y fixnumized)
-                 (progn
-                   (inst mov temp fixnumized)
-                   (inst cmp y temp))))))
-          (symbol
-           (inst cmp y (+ nil-value (static-symbol-offset val))))
-          (character
-           (inst cmp y (logior (ash (char-code val) n-widetag-bits)
-                               character-widetag))))))
+      ((sc-is y immediate)
+       (let* ((value (encode-value-if-immediate y))
+              (immediate (plausible-signed-imm32-operand-p value)))
+         (cond ((fixup-p value) ; immobile object
+                (inst cmp x value))
+               ((and (zerop value) (sc-is x any-reg descriptor-reg))
+                (inst test x x))
+               (immediate
+                (inst cmp x immediate))
+               ((not (sc-is x control-stack))
+                (inst cmp x (constantize value)))
+               (t
+                (inst mov temp-reg-tn value)
+                (inst cmp x temp-reg-tn)))))
       (t
        (inst cmp x y)))))
 
@@ -281,3 +242,121 @@
   (def fast-if-eq-signed/c fast-if-eql-c/signed 4)
   (def fast-if-eq-unsigned fast-if-eql/unsigned 5)
   (def fast-if-eq-unsigned/c fast-if-eql-c/unsigned 4))
+
+(define-vop (%instance-ref-eq)
+  (:args (instance :scs (descriptor-reg))
+         (x :scs (descriptor-reg any-reg)
+            :load-if (or (not (sc-is x immediate))
+                         (typep (tn-value x)
+                                '(and integer
+                                  (not (signed-byte #.(- 32 n-fixnum-tag-bits))))))))
+  (:arg-types * (:constant (unsigned-byte 16)) *)
+  (:info slot)
+  (:translate %instance-ref-eq)
+  (:conditional :e)
+  (:policy :fast-safe)
+  (:generator 1
+   (inst cmp :qword
+         (ea (+ (- instance-pointer-lowtag)
+                (ash (+ slot instance-slots-offset) word-shift))
+             instance)
+         (encode-value-if-immediate x))))
+
+(define-vop (fixnump-instance-ref)
+  (:args (instance :scs (descriptor-reg)))
+  (:arg-types * (:constant (unsigned-byte 16)))
+  (:info slot)
+  (:translate fixnump-instance-ref)
+  (:conditional :e)
+  (:policy :fast-safe)
+  (:generator 1
+   (inst test :byte
+         (ea (+ (- instance-pointer-lowtag)
+                (ash (+ slot instance-slots-offset) word-shift))
+             instance)
+         fixnum-tag-mask)))
+(macrolet ((def-fixnump-cxr (name index)
+             `(define-vop (,name)
+                (:args (x :scs (descriptor-reg)))
+                (:translate ,name)
+                (:conditional :e)
+                (:policy :fast-safe)
+                (:generator 1
+                 (inst test :byte
+                       (ea (- (ash ,index word-shift) list-pointer-lowtag) x)
+                       fixnum-tag-mask)))))
+  (def-fixnump-cxr fixnump-car cons-car-slot)
+  (def-fixnump-cxr fixnump-cdr cons-cdr-slot))
+
+;;; See comment below about ASSUMPTIONS
+(eval-when (:compile-toplevel)
+  (assert (eql other-pointer-lowtag #b1111))
+  ;; This is also assumed in src/runtime/x86-64-assem.S
+  (assert (eql (min bignum-widetag ratio-widetag single-float-widetag double-float-widetag
+                    complex-widetag complex-single-float-widetag complex-double-float-widetag)
+               bignum-widetag))
+  (assert (eql (max bignum-widetag ratio-widetag single-float-widetag double-float-widetag
+                    complex-widetag complex-single-float-widetag complex-double-float-widetag)
+               complex-double-float-widetag)))
+
+;;; Most uses of EQL are transformed into a non-generic form, but when we need
+;;; the general form, it's possible to make it nearly as efficient as EQ.
+;;; I think it's worth the extra 25 bytes or so per call site versus just
+;;; punting to an assembly routine always.
+(define-vop (if-eql)
+  (:args (x :scs (any-reg descriptor-reg) :target rdi)
+         (y :scs (any-reg descriptor-reg) :target rsi))
+  (:conditional :e)
+  (:policy :fast-safe)
+  (:translate eql)
+  (:temporary (:sc unsigned-reg :offset rdi-offset :from (:argument 0)) rdi)
+  (:temporary (:sc unsigned-reg :offset rsi-offset :from (:argument 1)) rsi)
+  (:temporary (:sc unsigned-reg :offset rax-offset) rax)
+  (:vop-var vop)
+  (:generator 15
+    (inst cmp x y)
+    (inst jmp :e done) ; affirmative
+
+    ;; If they are not both OTHER-POINTER objects, return false.
+    ;; ASSUMPTION: other-pointer-lowtag = #b1111
+    ;; This ANDing trick would be wrong if, e.g., the OTHER-POINTER tag
+    ;; were #b0011 and the two inputs had lowtags #b0111 and #b1011
+    ;; which when ANDed look like #b0011.
+    ;; We use :BYTE rather than :DWORD here because byte-sized
+    ;; operations on the accumulator encode more compactly.
+    (inst mov :byte rax x)
+    (inst and :byte rax y) ; now AL = #x_F only if both lowtags were #xF
+    (inst not :byte rax)   ; now AL = #x_0 only if it was #x_F
+    (inst and :byte rax #b00001111) ; will be all 0 if ok
+    (inst jmp :ne done) ; negative
+
+    ;; If the widetags are not the same, return false.
+    ;; Using a :dword compare gets us the bignum length check almost for free
+    ;; unless the length's representation requires more than 3 bytes.
+    ;; It sounds like a :qword compare would be the right thing, but remember
+    ;; one header bit acts as a concurrent GC mark bit in all headered objects,
+    ;; though we're not really using it yet. (We are, but not concurrently)
+    (inst mov :dword rax (ea (- other-pointer-lowtag) x))
+    (inst cmp :dword rax (ea (- other-pointer-lowtag) y))
+    (inst jmp :ne done) ; negative
+
+    ;; If not a numeric widetag, return false. See ASSUMPTIONS re widetag order.
+    (inst sub :byte rax bignum-widetag)
+    (inst cmp :byte rax (- complex-double-float-widetag bignum-widetag))
+    ;; "above" means CF=0 and ZF=0 so we're returning the right thing here
+    (inst jmp :a done)
+
+    ;; The hand-written assembly code receives args in the C arg registers.
+    ;; It also receives AL holding the biased down widetag.
+    ;; Anything else it needs will be callee-saved.
+    (move rdi x) ; load the C call args
+    (move rsi y)
+
+    (let ((fixup (make-fixup "generic_eql" :foreign)))
+      (cond ((sb-c::code-immobile-p vop))
+            (t
+             (inst mov temp-reg-tn fixup)
+             (setf fixup temp-reg-tn)))
+      (inst call fixup)) ; result => ZF
+
+    DONE))

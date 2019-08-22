@@ -4,7 +4,7 @@
 ;;; Converted for SPARC by William Lott.
 ;;;
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-vop (reset-stack-pointer)
   (:args (ptr :scs (any-reg)))
@@ -19,7 +19,7 @@
   (:results (r-moved-ptrs :scs (any-reg) :more t))
   (:temporary (:sc any-reg) src)
   (:temporary (:sc any-reg) dest)
-  (:temporary (:sc non-descriptor-reg) temp)
+  (:temporary (:sc descriptor-reg) temp)
   (:ignore r-moved-ptrs)
   (:generator 1
     (inst mr dest last-nipped-ptr)
@@ -85,7 +85,7 @@
   (:policy :fast-safe)
   (:results (start :scs (any-reg))
             (count :scs (any-reg)))
-  (:temporary (:scs (descriptor-reg) :type list :from (:argument 0)) list)
+  (:temporary (:scs (descriptor-reg) :from (:argument 0)) list)
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:vop-var vop)
@@ -104,8 +104,8 @@
       (loadw list list cons-cdr-slot list-pointer-lowtag)
       (inst addi csp-tn csp-tn n-word-bytes)
       (storew temp csp-tn -1)
-      (test-type list loop nil (list-pointer-lowtag) :temp ndescr)
-      (error-call vop 'bogus-arg-to-values-list-error list)
+      (test-type list ndescr loop nil (list-pointer-lowtag))
+      (cerror-call vop 'bogus-arg-to-values-list-error list)
 
       (emit-label done)
       (inst sub count csp-tn start))))

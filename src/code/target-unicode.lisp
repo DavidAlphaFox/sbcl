@@ -9,279 +9,148 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!UNICODE")
+(in-package "SB-UNICODE")
 
-(defparameter **special-numerics**
-  '#.(with-open-file (stream
-                     (merge-pathnames
-                      (make-pathname
-                       :directory
-                       '(:relative :up :up "output")
-                       :name "numerics" :type "lisp-expr")
-                      sb!xc:*compile-file-truename*)
-                     :direction :input
-                     :element-type 'character)
-        (read stream)))
-
-(defparameter **block-ranges**
-  '#.(with-open-file (stream
-                     (merge-pathnames
-                      (make-pathname
-                       :directory
-                       '(:relative :up :up "output")
-                       :name "blocks" :type "lisp-expr")
-                      sb!xc:*compile-file-truename*)
-                     :direction :input
-                     :element-type 'character)
-        (read stream)))
+(declaim (type simple-vector **special-numerics**))
+(sb-ext:define-load-time-global **special-numerics**
+  #.(sb-cold:read-from-file "output/numerics.lisp-expr"))
 
 (macrolet ((unicode-property-init ()
-             (let ((proplist-dump
-                    (with-open-file (stream
-                                     (merge-pathnames
-                                      (make-pathname
-                                       :directory
-                                       '(:relative :up :up "output")
-                                       :name "misc-properties" :type "lisp-expr")
-                                      sb!xc:*compile-file-truename*)
-                                     :direction :input
-                                     :element-type 'character)
-                      (read stream)))
-                   (confusable-sets
-                    (with-open-file (stream
-                                     (merge-pathnames
-                                      (make-pathname
-                                       :directory
-                                       '(:relative :up :up "output")
-                                       :name "confusables" :type "lisp-expr")
-                                      sb!xc:*compile-file-truename*)
-                                     :direction :input
-                                     :element-type 'character)
-                      (read stream)))
+             (let ((confusable-sets
+                     (sb-cold:read-from-file "output/confusables.lisp-expr"))
                    (bidi-mirroring-list
-                    (with-open-file (stream
-                                     (merge-pathnames
-                                      (make-pathname
-                                       :directory
-                                       '(:relative :up :up "output")
-                                       :name "bidi-mirrors" :type "lisp-expr")
-                                      sb!xc:*compile-file-truename*)
-                                     :direction :input
-                                     :element-type 'character)
-                      (read stream))))
+                     (sb-cold:read-from-file "output/bidi-mirrors.lisp-expr")))
                `(progn
-                  (sb!impl::defglobal **proplist-properties** ',proplist-dump)
-                  (sb!impl::defglobal **confusables** ',confusable-sets)
-                  (sb!impl::defglobal **bidi-mirroring-glyphs** ',bidi-mirroring-list)
+                  (sb-ext:define-load-time-global **proplist-properties** nil)
+                  (sb-ext:define-load-time-global **confusables**
+                      ',confusable-sets)
+                  (sb-ext:define-load-time-global **bidi-mirroring-glyphs**
+                      ',bidi-mirroring-list)
                   (defun !unicode-properties-cold-init ()
-                    (let ((hash (make-hash-table)) (list ',proplist-dump))
-                      (do ((k (car list) (car list)) (v (cadr list) (cadr list)))
-                          ((not list) hash)
-                        (setf (gethash k hash) v)
-                        (setf list (cddr list)))
-                      (setf **proplist-properties** hash))
-                    (let ((hash (make-hash-table :test #'equal)))
-                      (loop for set in ',confusable-sets
-                         for items = (mapcar #'(lambda (item)
-                                                 (map 'simple-string
-                                                      #'code-char item))
-                                             #!+sb-unicode set
-                                             #!-sb-unicode
-                                             (remove-if-not
-                                              #'(lambda (item)
-                                                  (every
-                                                   #'(lambda (x)
-                                                       (< x sb!xc:char-code-limit))
-                                                   item)) set))
-                         do (dolist (i items)
-                              (setf (gethash i hash) (first items))))
+                    ;;
+                    (let ((hash (make-hash-table :test 'eq))
+                          (list ',(sb-cold:read-from-file
+                                   "output/misc-properties.lisp-expr")))
+                      (setq **proplist-properties** hash)
+                      (loop for (symbol ranges) on list by #'cddr
+                            do (setf (gethash symbol hash)
+                                     (coerce ranges '(vector (unsigned-byte 32))))))
+                    ;;
+                    (let* ((data ',confusable-sets)
+                           (hash (make-hash-table :test #'eq
+                                                  #+sb-unicode :size #+sb-unicode (length data))))
+                      (loop for (source . target) in data
+                            when (and #-sb-unicode
+                                      (< source sb-xc:char-code-limit))
+                            do (flet ((minimize (x)
+                                        (case (length x)
+                                          (1
+                                           (elt x 0))
+                                          (2
+                                           (pack-3-codepoints (elt x 0) (elt x 1)))
+                                          (3
+                                           (pack-3-codepoints (elt x 0) (elt x 1) (elt x 2)))
+                                          (t
+                                           (logically-readonlyize
+                                            (possibly-base-stringize
+                                             (map 'string #'code-char x)))))))
+
+                                 (setf (gethash (code-char source) hash)
+                                       (minimize target))))
                       (setf **confusables** hash))
-                    (let ((hash (make-hash-table)) (list ',bidi-mirroring-list))
+                    ;;
+                    (let* ((list ',bidi-mirroring-list)
+                           (hash (make-hash-table :test #'eq :size (length list))))
                       (loop for (k v) in list do
-                           (setf (gethash k hash) v))
+                            (setf (gethash k hash) v))
                       (setf **bidi-mirroring-glyphs** hash)))))))
   (unicode-property-init))
 
 ;;; Unicode property access
-(defun reverse-ucd-indices (strings)
-  (let ((hash (make-hash-table)))
-    (loop for string in strings
-          for index from 0
-          do (setf (gethash index hash) string))
-    hash))
-
 (defun ordered-ranges-member (item vector)
+  (declare (type (simple-array (unsigned-byte 32) 1) vector)
+           (type char-code item)
+           (optimize speed))
   (labels ((recurse (start end)
+             (declare (type index start end)
+                      (optimize (safety 0)))
              (when (< start end)
-               (let* ((i (+ start (truncate (- end start) 2)))
+               (let* ((i (+ start (truncate (the index (- end start)) 2)))
                       (index (* 2 i))
-                      (elt1 (svref vector index))
-                      (elt2 (svref vector (1+ index))))
+                      (elt1 (aref vector index))
+                      (elt2 (aref vector (1+ index))))
+                 (declare (type index i)
+                          (fixnum elt1 elt2))
                  (cond ((< item elt1)
                         (recurse start i))
                        ((> item elt2)
                         (recurse (+ 1 i) end))
                        (t
                         item))))))
-    (recurse 0 (/ (length vector) 2))))
+    (recurse 0 (truncate (length vector) 2))))
 
 ;; Returns which range `item` was found in or NIL
 ;; First range = 0, second range = 1 ...
 (defun ordered-ranges-position (item vector)
+  (declare (type (simple-array (unsigned-byte 32) (*)) vector)
+           (type fixnum item))
   (labels ((recurse (start end)
+             (declare (type index start end))
              (when (< start end)
                (let* ((i (+ start (truncate (- end start) 2)))
                       (index (* 2 i))
-                      (elt1 (svref vector index))
-                      (elt2 (svref vector (1+ index))))
+                      (elt1 (aref vector index))
+                      (elt2 (aref vector (1+ index))))
+                 (declare (type index i))
                  (cond ((< item elt1)
                         (recurse start i))
                        ((> item elt2)
                         (recurse (+ 1 i) end))
                        (t
                         i))))))
-    (recurse 0 (/ (length vector) 2))))
+    (recurse 0 (truncate (length vector) 2))))
 
 (defun proplist-p (character property)
-  #!+sb-doc
   "Returns T if CHARACTER has the specified PROPERTY.
 PROPERTY is a keyword representing one of the properties from PropList.txt,
 with underscores replaced by dashes."
   (ordered-ranges-member (char-code character)
                          (gethash property **proplist-properties**)))
 
-;; WARNING: These have to be manually kept in sync with the values in ucd.lisp
-(defparameter *general-categories*
-  (reverse-ucd-indices
-   '(:Lu :Ll :Lt :Lm :Lo :Cc :Cf :Co :Cs :Cn :Mc :Me :Mn :Nd
-     :Nl :No :Pc :Pd :Pe :Pf :Pi :Po :Ps :Sc :Sk :Sm :So :Zl
-     :Zp :Zs)))
+(eval-when (:compile-toplevel)
+  (defvar *slurped-random-constants*
+    (sb-cold:read-from-file "tools-for-build/more-ucd-consts.lisp-expr"))
+  (defun read-ucd-constant (symbol)
+    (map 'vector
+         (lambda (x) (keywordicate (substitute #\- #\_ (string-upcase x))))
+         (or (cadr (assoc symbol *slurped-random-constants*))
+             (error "Missing entry in more-ucd-consts for ~S" symbol)))))
 
-(defparameter *bidi-classes*
-  (reverse-ucd-indices
-   '(:BN :AL :AN :B :CS :EN :ES :ET :L :LRE :LRO :NSM :ON
-     :PDF :R :RLE :RLO :S :WS :LRI :RLI :FSI :PDI)))
-
-(defparameter *east-asian-widths*
-  (reverse-ucd-indices '(:N :A :H :W :F :Na)))
-
-(defparameter *scripts*
-  (reverse-ucd-indices
-   '(:Unknown :Common :Latin :Greek :Cyrillic :Armenian :Hebrew :Arabic :Syriac
-     :Thaana :Devanagari :Bengali :Gurmukhi :Gujarati :Oriya :Tamil :Telugu
-     :Kannada :Malayalam :Sinhala :Thai :Lao :Tibetan :Myanmar :Georgian :Hangul
-     :Ethiopic :Cherokee :Canadian-Aboriginal :Ogham :Runic :Khmer :Mongolian
-     :Hiragana :Katakana :Bopomofo :Han :Yi :Old-Italic :Gothic :Deseret
-     :Inherited :Tagalog :Hanunoo :Buhid :Tagbanwa :Limbu :Tai-Le :Linear-B
-     :Ugaritic :Shavian :Osmanya :Cypriot :Braille :Buginese :Coptic :New-Tai-Lue
-     :Glagolitic :Tifinagh :Syloti-Nagri :Old-Persian :Kharoshthi :Balinese
-     :Cuneiform :Phoenician :Phags-Pa :Nko :Sundanese :Lepcha :Ol-Chiki :Vai
-     :Saurashtra :Kayah-Li :Rejang :Lycian :Carian :Lydian :Cham :Tai-Tham
-     :Tai-Viet :Avestan :Egyptian-Hieroglyphs :Samaritan :Lisu :Bamum :Javanese
-     :Meetei-Mayek :Imperial-Aramaic :Old-South-Arabian :Inscriptional-Parthian
-     :Inscriptional-Pahlavi :Old-Turkic :Kaithi :Batak :Brahmi :Mandaic :Chakma
-     :Meroitic-Cursive :Meroitic-Hieroglyphs :Miao :Sharada :Sora-Sompeng
-     :Takri :Bassa-Vah :Mahajani :Pahawh-Hmong :Caucasian-Albanian :Manichaean
-     :Palmyrene :Duployan :Mende-Kikakui :Pau-Cin-Hau :Elbasan :Modi
-     :Psalter-Pahlavi :Grantha :Mro :Siddham :Khojki :Nabataean :Tirhuta
-     :Khudawadi :Old-North-Arabian :Warang-Citi :Linear-A :Old-Permic)))
-
-(defparameter *blocks*
-  #(:Basic-Latin :Latin-1-Supplement :Latin-Extended-A :Latin-Extended-B
-    :IPA-Extensions :Spacing-Modifier-Letters :Combining-Diacritical-Marks
-    :Greek-and-Coptic :Cyrillic :Cyrillic-Supplement :Armenian :Hebrew :Arabic
-    :Syriac :Arabic-Supplement :Thaana :NKo :Samaritan :Mandaic
-    :Arabic-Extended-A :Devanagari :Bengali :Gurmukhi :Gujarati :Oriya :Tamil
-    :Telugu :Kannada :Malayalam :Sinhala :Thai :Lao :Tibetan :Myanmar :Georgian
-    :Hangul-Jamo :Ethiopic :Ethiopic-Supplement :Cherokee
-    :Unified-Canadian-Aboriginal-Syllabics :Ogham :Runic :Tagalog :Hanunoo
-    :Buhid :Tagbanwa :Khmer :Mongolian
-    :Unified-Canadian-Aboriginal-Syllabics-Extended :Limbu :Tai-Le :New-Tai-Lue
-    :Khmer-Symbols :Buginese :Tai-Tham :Combining-Diacritical-Marks-Extended
-    :Balinese :Sundanese :Batak :Lepcha :Ol-Chiki :Sundanese-Supplement
-    :Vedic-Extensions :Phonetic-Extensions :Phonetic-Extensions-Supplement
-    :Combining-Diacritical-Marks-Supplement :Latin-Extended-Additional
-    :Greek-Extended :General-Punctuation :Superscripts-and-Subscripts
-    :Currency-Symbols :Combining-Diacritical-Marks-for-Symbols
-    :Letterlike-Symbols :Number-Forms :Arrows :Mathematical-Operators
-    :Miscellaneous-Technical :Control-Pictures :Optical-Character-Recognition
-    :Enclosed-Alphanumerics :Box-Drawing :Block-Elements :Geometric-Shapes
-    :Miscellaneous-Symbols :Dingbats :Miscellaneous-Mathematical-Symbols-A
-    :Supplemental-Arrows-A :Braille-Patterns :Supplemental-Arrows-B
-    :Miscellaneous-Mathematical-Symbols-B :Supplemental-Mathematical-Operators
-    :Miscellaneous-Symbols-and-Arrows :Glagolitic :Latin-Extended-C :Coptic
-    :Georgian-Supplement :Tifinagh :Ethiopic-Extended :Cyrillic-Extended-A
-    :Supplemental-Punctuation :CJK-Radicals-Supplement :Kangxi-Radicals
-    :Ideographic-Description-Characters :CJK-Symbols-and-Punctuation :Hiragana
-    :Katakana :Bopomofo :Hangul-Compatibility-Jamo :Kanbun :Bopomofo-Extended
-    :CJK-Strokes :Katakana-Phonetic-Extensions :Enclosed-CJK-Letters-and-Months
-    :CJK-Compatibility :CJK-Unified-Ideographs-Extension-A
-    :Yijing-Hexagram-Symbols :CJK-Unified-Ideographs :Yi-Syllables :Yi-Radicals
-    :Lisu :Vai :Cyrillic-Extended-B :Bamum :Modifier-Tone-Letters
-    :Latin-Extended-D :Syloti-Nagri :Common-Indic-Number-Forms :Phags-pa
-    :Saurashtra :Devanagari-Extended :Kayah-Li :Rejang :Hangul-Jamo-Extended-A
-    :Javanese :Myanmar-Extended-B :Cham :Myanmar-Extended-A :Tai-Viet
-    :Meetei-Mayek-Extensions :Ethiopic-Extended-A :Latin-Extended-E
-    :Meetei-Mayek :Hangul-Syllables :Hangul-Jamo-Extended-B :High-Surrogates
-    :High-Private-Use-Surrogates :Low-Surrogates :Private-Use-Area
-    :CJK-Compatibility-Ideographs :Alphabetic-Presentation-Forms
-    :Arabic-Presentation-Forms-A :Variation-Selectors :Vertical-Forms
-    :Combining-Half-Marks :CJK-Compatibility-Forms :Small-Form-Variants
-    :Arabic-Presentation-Forms-B :Halfwidth-and-Fullwidth-Forms :Specials
-    :Linear-B-Syllabary :Linear-B-Ideograms :Aegean-Numbers
-    :Ancient-Greek-Numbers :Ancient-Symbols :Phaistos-Disc :Lycian :Carian
-    :Coptic-Epact-Numbers :Old-Italic :Gothic :Old-Permic :Ugaritic :Old-Persian
-    :Deseret :Shavian :Osmanya :Elbasan :Caucasian-Albanian :Linear-A
-    :Cypriot-Syllabary :Imperial-Aramaic :Palmyrene :Nabataean :Phoenician
-    :Lydian :Meroitic-Hieroglyphs :Meroitic-Cursive :Kharoshthi
-    :Old-South-Arabian :Old-North-Arabian :Manichaean :Avestan
-    :Inscriptional-Parthian :Inscriptional-Pahlavi :Psalter-Pahlavi :Old-Turkic
-    :Rumi-Numeral-Symbols :Brahmi :Kaithi :Sora-Sompeng :Chakma :Mahajani
-    :Sharada :Sinhala-Archaic-Numbers :Khojki :Khudawadi :Grantha :Tirhuta
-    :Siddham :Modi :Takri :Warang-Citi :Pau-Cin-Hau :Cuneiform
-    :Cuneiform-Numbers-and-Punctuation :Egyptian-Hieroglyphs :Bamum-Supplement
-    :Mro :Bassa-Vah :Pahawh-Hmong :Miao :Kana-Supplement :Duployan
-    :Shorthand-Format-Controls :Byzantine-Musical-Symbols :Musical-Symbols
-    :Ancient-Greek-Musical-Notation :Tai-Xuan-Jing-Symbols
-    :Counting-Rod-Numerals :Mathematical-Alphanumeric-Symbols :Mende-Kikakui
-    :Arabic-Mathematical-Alphabetic-Symbols :Mahjong-Tiles :Domino-Tiles
-    :Playing-Cards :Enclosed-Alphanumeric-Supplement
-    :Enclosed-Ideographic-Supplement :Miscellaneous-Symbols-and-Pictographs
-    :Emoticons :Ornamental-Dingbats :Transport-and-Map-Symbols
-    :Alchemical-Symbols :Geometric-Shapes-Extended :Supplemental-Arrows-C
-    :CJK-Unified-Ideographs-Extension-B :CJK-Unified-Ideographs-Extension-C
-    :CJK-Unified-Ideographs-Extension-D :CJK-Compatibility-Ideographs-Supplement
-    :Tags :Variation-Selectors-Supplement :Supplementary-Private-Use-Area-A
-    :Supplementary-Private-Use-Area-B))
-
-(defparameter *line-break-classes*
-  (reverse-ucd-indices
-   '(:XX :AI :AL :B2 :BA :BB :BK :CB :CJ :CL :CM :CP :CR :EX :GL
-     :HL :HY :ID :IN :IS :LF :NL :NS :NU :OP :PO :PR :QU :RI :SA
-     :SG :SP :SY :WJ :ZW)))
+(declaim (inline svref-or-null))
+(defun svref-or-null (vector index)
+  (and (< index (length vector))
+       (svref vector index)))
 
 (defun general-category (character)
-  #!+sb-doc
   "Returns the general category of CHARACTER as it appears in UnicodeData.txt"
-  (gethash (sb!impl::ucd-general-category character) *general-categories*))
+  (svref-or-null #.(read-ucd-constant '*general-categories*)
+                 (sb-impl::ucd-general-category character)))
 
 (defun bidi-class (character)
-  #!+sb-doc
   "Returns the bidirectional class of CHARACTER"
   (if (and (eql (general-category character) :Cn)
            (default-ignorable-p character))
       :Bn
-      (gethash
-       (aref **character-misc-database** (+ 1 (misc-index character)))
-       *bidi-classes*)))
+      (svref-or-null
+       #.(read-ucd-constant '*bidi-classes*)
+       (aref **character-misc-database** (1+ (misc-index character))))))
 
+(declaim (inline combining-class))
 (defun combining-class (character)
-  #!+sb-doc
   "Returns the canonical combining class (CCC) of CHARACTER"
   (aref **character-misc-database** (+ 2 (misc-index character))))
 
 (defun decimal-value (character)
-  #!+sb-doc
   "Returns the decimal digit value associated with CHARACTER or NIL if
 there is no such value.
 
@@ -289,10 +158,9 @@ The only characters in Unicode with a decimal digit value are those
 that are part of a range of characters that encode the digits 0-9.
 Because of this, `(decimal-digit c) <=> (digit-char-p c 10)` in
 #+sb-unicode builds"
-  (sb!impl::ucd-decimal-digit character))
+  (sb-impl::ucd-decimal-digit character))
 
 (defun digit-value (character)
-  #!+sb-doc
   "Returns the Unicode digit value of CHARACTER or NIL if it doesn't exist.
 
 Digit values are guaranteed to be integers between 0 and 9 inclusive.
@@ -305,23 +173,20 @@ that have a digit value but no decimal digit value"
     (if (< %digit 10) %digit nil)))
 
 (defun numeric-value (character)
-  #!+sb-doc
   "Returns the numeric value of CHARACTER or NIL if there is no such value.
-
 Numeric value is the most general of the Unicode numeric properties.
 The only constraint on the numeric value is that it be a rational number."
-  (cdr (or (assoc (char-code character) **special-numerics**)
-           (cons nil (digit-value character)))))
+  (or (double-vector-binary-search (char-code character)
+                                   **special-numerics**)
+      (digit-value character)))
 
 (defun mirrored-p (character)
-  #!+sb-doc
   "Returns T if CHARACTER needs to be mirrored in bidirectional text.
 Otherwise, returns NIL."
   (logbitp 5 (aref **character-misc-database**
                     (+ 5 (misc-index character)))))
 
 (defun bidi-mirroring-glyph (character)
-  #!+sb-doc
   "Returns the mirror image of CHARACTER if it exists.
 Otherwise, returns NIL."
   (when (mirrored-p character)
@@ -329,33 +194,33 @@ Otherwise, returns NIL."
       (when ret (code-char ret)))))
 
 (defun east-asian-width (character)
-  #!+sb-doc
   "Returns the East Asian Width property of CHARACTER as
 one of the keywords :N (Narrow), :A (Ambiguous), :H (Halfwidth),
 :W (Wide), :F (Fullwidth), or :NA (Not applicable)"
-  (gethash (ldb (byte 3 0)
-                (aref **character-misc-database**
-                      (+ 5 (misc-index character))))
-           *east-asian-widths*))
+  (svref-or-null #.(read-ucd-constant '*east-asian-widths*)
+                 (ldb (byte 3 0)
+                      (aref **character-misc-database**
+                            (+ 5 (misc-index character))))))
 
 (defun script (character)
-  #!+sb-doc
   "Returns the Script property of CHARACTER as a keyword.
 If CHARACTER does not have a known script, returns :UNKNOWN"
-  (gethash (aref **character-misc-database** (+ 6 (misc-index character)))
-           *scripts*))
+  (svref-or-null #.(read-ucd-constant '*scripts*)
+                 (aref **character-misc-database** (+ 6 (misc-index character)))))
 
 (defun char-block (character)
-  #!+sb-doc
   "Returns the Unicode block in which CHARACTER resides as a keyword.
 If CHARACTER does not have a known block, returns :NO-BLOCK"
   (let* ((code (char-code character))
-         (block-index (ordered-ranges-position code **block-ranges**)))
+         (block-index (ordered-ranges-position
+                       code
+                       #.(sb-xc:coerce (sb-cold:read-from-file "output/block-ranges.lisp-expr")
+                                       '(vector (unsigned-byte 32))))))
     (if block-index
-        (aref *blocks* block-index) :no-block)))
+        (aref #.(sb-cold:read-from-file "output/block-names.lisp-expr") block-index)
+        :no-block)))
 
 (defun unicode-1-name (character)
-  #!+sb-doc
   "Returns the name assigned to CHARACTER in Unicode 1.0 if it is distinct
 from the name currently assigned to CHARACTER. Otherwise, returns NIL.
 This property has been officially obsoleted by the Unicode standard, and
@@ -367,7 +232,6 @@ is only included for backwards compatibility."
       (huffman-decode h-code **unicode-character-name-huffman-tree**))))
 
 (defun age (character)
-  #!+sb-doc
   "Returns the version of Unicode in which CHARACTER was assigned as a pair
 of values, both integers, representing the major and minor version respectively.
 If CHARACTER is not assigned in Unicode, returns NIL for both values."
@@ -377,7 +241,6 @@ If CHARACTER is not assigned in Unicode, returns NIL for both values."
     (if (zerop value) (values nil nil) (values major minor))))
 
 (defun hangul-syllable-type (character)
-  #!+sb-doc
   "Returns the Hangul syllable type of CHARACTER.
 The syllable type can be one of :L, :V, :T, :LV, or :LVT.
 If the character is not a Hangul syllable or Jamo, returns NIL"
@@ -396,7 +259,6 @@ If the character is not a Hangul syllable or Jamo, returns NIL"
        (if (= 0 (rem (- cp #xac00) 28)) :LV :LVT)))))
 
 (defun line-break-class (character &key resolve)
-  #!+sb-doc
   "Returns the line breaking class of CHARACTER, as specified in UAX #14.
 If :RESOLVE is NIL, returns the character class found in the property file.
 If :RESOLVE is non-NIL, centain line-breaking classes will be mapped to othec
@@ -406,8 +268,8 @@ Ideographic (:ID) class instead of Alphabetic (:AL)."
   (when (and resolve (listp character)) (setf character (car character)))
   (when (and resolve (not character)) (return-from line-break-class :nil))
   (let ((raw-class
-         (gethash (aref **character-misc-database** (+ 7 (misc-index character)))
-           *line-break-classes*))
+         (svref-or-null #.(read-ucd-constant '*line-break-classes*)
+                        (aref **character-misc-database** (+ 7 (misc-index character)))))
         (syllable-type (hangul-syllable-type character)))
     (when syllable-type
       (setf raw-class
@@ -431,23 +293,19 @@ appear in an SBCL string. The line-breaking behavior of surrogates is undefined.
     raw-class))
 
 (defun uppercase-p (character)
-  #!+sb-doc
   "Returns T if CHARACTER has the Unicode property Uppercase and NIL otherwise"
   (or (eql (general-category character) :Lu) (proplist-p character :other-uppercase)))
 
 (defun lowercase-p (character)
-  #!+sb-doc
   "Returns T if CHARACTER has the Unicode property Lowercase and NIL otherwise"
   (or (eql (general-category character) :Ll) (proplist-p character :other-lowercase)))
 
 (defun cased-p (character)
-  #!+sb-doc
   "Returns T if CHARACTER has a (Unicode) case, and NIL otherwise"
   (or (uppercase-p character) (lowercase-p character)
       (eql (general-category character) :Lt)))
 
 (defun case-ignorable-p (character)
-  #!+sb-doc
   "Returns T if CHARACTER is Case Ignorable as defined in Unicode 6.3, Chapter
 3"
   (or (member (general-category character)
@@ -456,45 +314,42 @@ appear in an SBCL string. The line-breaking behavior of surrogates is undefined.
               '(:midletter :midnumlet :single-quote))))
 
 (defun alphabetic-p (character)
-  #!+sb-doc
   "Returns T if CHARACTER is Alphabetic according to the Unicode standard
 and NIL otherwise"
   (or (member (general-category character) '(:Lu :Ll :Lt :Lm :Lo :Nl))
       (proplist-p character :other-alphabetic)))
 
 (defun ideographic-p (character)
-  #!+sb-doc
   "Returns T if CHARACTER has the Unicode property Ideographic,
 which loosely corresponds to the set of \"Chinese characters\""
   (proplist-p character :ideographic))
 
 (defun math-p (character)
-  #!+sb-doc
   "Returns T if CHARACTER is a mathematical symbol according to Unicode and
 NIL otherwise"
   (or (eql (general-category character) :sm) (proplist-p character :other-math)))
 
 (defun whitespace-p (character)
-  #!+sb-doc
   "Returns T if CHARACTER is whitespace according to Unicode
 and NIL otherwise"
   (proplist-p character :white-space))
 
 (defun hex-digit-p (character &key ascii)
-  #!+sb-doc
   "Returns T if CHARACTER is a hexadecimal digit and NIL otherwise.
 If :ASCII is non-NIL, fullwidth equivalents of the Latin letters A through F
 are excluded."
   (proplist-p character (if ascii :ascii-hex-digit :hex-digit)))
 
 (defun soft-dotted-p (character)
-  #!+sb-doc
   "Returns T if CHARACTER has a soft dot (such as the dots on i and j) which
 disappears when accents are placed on top of it. and NIL otherwise"
   (proplist-p character :soft-dotted))
 
+(eval-when (:compile-toplevel)
+  (sb-xc:defmacro coerce-to-ordered-ranges (array)
+    (sb-xc:coerce array '(vector (unsigned-byte 32)))))
+
 (defun default-ignorable-p (character)
-  #!+sb-doc
   "Returns T if CHARACTER is a Default_Ignorable_Code_Point"
   (and
    (or (proplist-p character :other-default-ignorable-code-point)
@@ -504,11 +359,13 @@ disappears when accents are placed on top of it. and NIL otherwise"
     (or (whitespace-p character)
         (ordered-ranges-member
          (char-code character)
-         #(#x0600 #x0604 #x06DD #x06DD #x070F #x070F #xFFF9 #xFFFB
-           #x110BD #x110BD))))))
+         (coerce-to-ordered-ranges
+          #(#x0600 #x0604 #x06DD #x06DD #x070F #x070F #xFFF9 #xFFFB
+            #x110BD #x110BD)))))))
 
 
 ;;; Implements UAX#15: Normalization Forms
+(declaim (inline char-decomposition-info))
 (defun char-decomposition-info (char)
   (let ((value (aref **character-misc-database**
                      (+ 4 (misc-index char)))))
@@ -562,38 +419,43 @@ disappears when accents are placed on top of it. and NIL otherwise"
             (char-decomposition char info callback))
         (funcall callback char))))
 
-(defun decompose-string (string &optional (kind :canonical))
-  (let ((compatibility (ecase kind
-                         (:compatibility t)
-                         (:canonical nil))))
-    (let (chars
-          (length 0)
-          previous-char
-          (previous-combining-class 0))
-      (dx-flet ((callback (char)
-                  (let ((combining-class (combining-class char)))
-                    (incf length)
-                    (cond ((< 0 combining-class previous-combining-class)
-                           ;; Ensure it's sorted
-                           (loop for cons on chars
-                                 for next-char = (cadr cons)
-                                 when (or (not next-char)
-                                          (<= 0 (combining-class next-char) combining-class))
-                                 do (setf (cdr cons)
-                                          (cons char (cdr cons)))
-                                    (return)))
-                          (t
-                           (push char chars)
-                           (setf previous-char char
-                                 previous-combining-class combining-class))))))
-        (loop for char across string
-              do
-              (decompose-char char compatibility #'callback))
-        (let ((result (make-string length)))
-          (loop for char in (nreverse chars)
-                for i from 0
-                do (setf (schar result i) char))
-          result)))))
+(defun decompose-string (string compatibility filter)
+  (let (chars
+        (length 0)
+        (previous-combining-class 0))
+    (declare (type index length))
+    (dx-flet ((callback (char)
+                        (let ((combining-class (combining-class char)))
+                          (incf length)
+                          (cond ((< 0 combining-class previous-combining-class)
+                                 ;; Ensure it's sorted
+                                 (loop for cons on chars
+                                       for next-char = (cadr cons)
+                                       when (or (not next-char)
+                                                (<= 0 (combining-class next-char) combining-class))
+                                       do (setf (cdr cons)
+                                                (cons char (cdr cons)))
+                                          (return)))
+                                (t
+                                 (push char chars)
+                                 (setf previous-combining-class combining-class))))))
+      (sb-kernel:with-array-data ((string string) (start) (end)
+                                  :check-fill-pointer t)
+        (let ((calback (if filter
+                           (let ((filter (sb-kernel:%coerce-callable-to-fun filter)))
+                             (lambda (char)
+                               (when (funcall filter char)
+                                 (callback char))))
+                           #'callback)))
+          (loop for i from start below end
+                for char = (schar string i)
+                do
+                (decompose-char char compatibility calback))))
+      (let ((result (make-string length)))
+        (loop for char in chars
+              for i from (1- length) downto 0
+              do (setf (schar result i) char))
+        result))))
 
 (defun composition-hangul-syllable-type (cp)
   (cond
@@ -716,35 +578,38 @@ disappears when accents are placed on top of it. and NIL otherwise"
         string
         (lstring result))))
 
-(defun normalize-string (string &optional (form :nfd))
-  #!+sb-doc
+(defun normalize-string (string &optional (form :nfd)
+                                          filter)
   "Normalize STRING to the Unicode normalization form form.
-   Acceptable values for form are :NFD, :NFC, :NFKD, and :NFKC"
+Acceptable values for form are :NFD, :NFC, :NFKD, and :NFKC.
+If FILTER is a function it is called on each decomposed character and
+only characters for which it returns T are collected."
   (declare (type (member :nfd :nfkd :nfc :nfkc) form))
-  #!-sb-unicode
+  #-sb-unicode
+  (declare (ignore filter))
+  #-sb-unicode
   (etypecase string
     ((array nil (*)) string)
     (string
      (ecase form
        ((:nfc :nfkc) string)
        ((:nfd :nfkd) (error "Cannot normalize to ~A form in #-SB-UNICODE builds" form)))))
-  #!+sb-unicode
+  #+sb-unicode
   (etypecase string
     (base-string string)
     ((array character (*))
      (ecase form
        ((:nfc)
-        (canonically-compose (decompose-string string)))
+        (canonically-compose (decompose-string string nil filter)))
        ((:nfd)
-        (decompose-string string))
+        (decompose-string string nil filter))
        ((:nfkc)
-        (canonically-compose (decompose-string string :compatibility)))
+        (canonically-compose (decompose-string string t filter)))
        ((:nfkd)
-        (decompose-string string :compatibility))))
+        (decompose-string string t filter))))
     ((array nil (*)) string)))
 
 (defun normalized-p (string &optional (form :nfd))
-  #!+sb-doc
   "Tests if STRING is normalized to FORM"
   ;; FIXME: can be optimized
   (string= string (normalize-string string form)))
@@ -752,29 +617,11 @@ disappears when accents are placed on top of it. and NIL otherwise"
 
 ;;; Unicode case algorithms
 ;; FIXME: Make these parts less redundant (macro?)
-(defparameter **special-titlecases**
-  '#.(with-open-file (stream
-                     (merge-pathnames
-                      (make-pathname
-                       :directory
-                       '(:relative :up :up "output")
-                       :name "titlecases" :type "lisp-expr")
-                      sb!xc:*compile-file-truename*)
-                     :direction :input
-                     :element-type 'character)
-        (read stream)))
+(sb-ext:define-load-time-global **special-titlecases**
+  '#.(sb-cold:read-from-file "output/titlecases.lisp-expr"))
 
-(defparameter **special-casefolds**
-  '#.(with-open-file (stream
-                     (merge-pathnames
-                      (make-pathname
-                       :directory
-                       '(:relative :up :up "output")
-                       :name "foldcases" :type "lisp-expr")
-                      sb!xc:*compile-file-truename*)
-                     :direction :input
-                     :element-type 'character)
-        (read stream)))
+(sb-ext:define-load-time-global **special-casefolds**
+  '#.(sb-cold:read-from-file "output/foldcases.lisp-expr"))
 
 (defun has-case-p (char)
   ;; Bit 6 is the Unicode case flag, as opposed to the Common Lisp one
@@ -782,14 +629,24 @@ disappears when accents are placed on top of it. and NIL otherwise"
 
 (defun char-uppercase (char)
   (if (has-case-p char)
-      (let ((cp (car (char-case-info char))))
-        (if (atom cp) (list (code-char cp)) (mapcar #'code-char cp)))
+      (let ((cp (char-case-info char)))
+        (if (consp cp)
+            (let ((cp (car cp)))
+              (if (atom cp)
+                  (list (code-char cp))
+                  (mapcar #'code-char cp)))
+            (list (code-char (ldb (byte 21 21) cp)))))
       (list char)))
 
 (defun char-lowercase (char)
   (if (has-case-p char)
-      (let ((cp (cdr (char-case-info char))))
-        (if (atom cp) (list (code-char cp)) (mapcar #'code-char cp)))
+      (let ((cp (char-case-info char)))
+        (if (consp cp)
+            (let ((cp (cdr cp)))
+              (if (atom cp)
+                  (list (code-char cp))
+                  (mapcar #'code-char cp)))
+            (list (code-char (ldb (byte 21 0) cp)))))
       (list char)))
 
 (defun char-titlecase (char)
@@ -822,12 +679,12 @@ disappears when accents are placed on top of it. and NIL otherwise"
     (setf result (nreverse result))
     (coerce result 'string)))
 
-(declaim (type function sb!unix::posix-getenv))
+(declaim (type function sb-unix::posix-getenv))
 (defun get-user-locale ()
   (let ((raw-locale
-         #!+(or win32 unix) (or (sb!unix::posix-getenv "LC_ALL")
-                                (sb!unix::posix-getenv "LANG"))
-         #!-(or win32 unix) nil))
+         #+(or win32 unix) (or (sb-unix::posix-getenv "LC_ALL")
+                                (sb-unix::posix-getenv "LANG"))
+         #-(or win32 unix) nil))
     (when raw-locale
       (let ((lang-code (string-upcase
                         (subseq raw-locale 0 (position #\_ raw-locale)))))
@@ -836,7 +693,6 @@ disappears when accents are placed on top of it. and NIL otherwise"
 
 
 (defun uppercase (string &key locale)
-  #!+sb-doc
   "Returns the full uppercase of STRING according to the Unicode standard.
 The result is not guaranteed to have the same length as the input. If :LOCALE
 is NIL, no language-specific case transformations are applied. If :LOCALE is a
@@ -846,8 +702,8 @@ Win32 only)."
   (when (eq locale t) (setf locale (get-user-locale)))
   (string-somethingcase
    #'char-uppercase string
-   #!-sb-unicode (constantly nil)
-   #!+sb-unicode ;; code-char with a constant > 255 breaks the build
+   #-sb-unicode (constantly nil)
+   #+sb-unicode ;; code-char with a constant > 255 breaks the build
    #'(lambda (char index len)
        (declare (ignore len))
        (cond
@@ -866,15 +722,14 @@ Win32 only)."
          (t nil)))))
 
 (defun lowercase (string &key locale)
-  #!+sb-doc
   "Returns the full lowercase of STRING according to the Unicode standard.
 The result is not guaranteed to have the same length as the input.
 :LOCALE has the same semantics as the :LOCALE argument to UPPERCASE."
   (when (eq locale t) (setf locale (get-user-locale)))
   (string-somethingcase
    #'char-lowercase string
-   #!-sb-unicode (constantly nil)
-   #!+sb-unicode
+   #-sb-unicode (constantly nil)
+   #+sb-unicode
    #'(lambda (char index len)
        (cond
          ((and (char= char (code-char #x03A3))
@@ -935,7 +790,6 @@ The result is not guaranteed to have the same length as the input.
        (t nil)))))
 
 (defun titlecase (string &key locale)
-  #!+sb-doc
   "Returns the titlecase of STRING. The resulting string can
 be longer than the input.
 :LOCALE has the same semantics as the :LOCALE argument to UPPERCASE."
@@ -948,11 +802,11 @@ be longer than the input.
       for initial = (char word first-cased)
       for rest = (subseq word (1+ first-cased))
       do (let ((up (char-titlecase initial)) (down (lowercase rest)))
-           #!+sb-unicode
+           #+sb-unicode
            (when (and (or (eql locale :tr) (eql locale :az))
                       (eql initial #\i))
              (setf up (list (code-char #x0130))))
-           #!+sb-unicode
+           #+sb-unicode
            (when (and (eql locale :lt)
                       (soft-dotted-p initial)
                       (eql (char down
@@ -966,9 +820,8 @@ be longer than the input.
    (apply #'concatenate 'string (nreverse cased))))
 
 (defun casefold (string)
-  #!+sb-doc
   "Returns the full casefolding of STRING according to the Unicode standard.
-Casefolding remove case information in a way that allaws the results to be used
+Casefolding removes case information in a way that allows the results to be used
 for case-insensitive comparisons.
 The result is not guaranteed to have the same length as the input."
   (string-somethingcase #'char-foldcase string (constantly nil)))
@@ -983,7 +836,6 @@ The result is not guaranteed to have the same length as the input."
 ;; Word breaking sets this to make their algorithms less tricky
 (defvar *other-break-special-graphemes* nil)
 (defun grapheme-break-class (char)
-  #!+sb-doc
   "Returns the grapheme breaking class of CHARACTER, as specified in UAX #29."
   (let ((cp (when char (char-code char)))
         (gc (when char (general-category char)))
@@ -1015,44 +867,66 @@ The result is not guaranteed to have the same length as the input."
             (not (binary-search cp not-spacing-mark))) :spacing-mark)
       (t (hangul-syllable-type char)))))
 
+(macrolet ((def (name extendedp)
+             `(defun ,name (function string)
+                (do ((length (length string))
+                     (start 0)
+                     (end 1 (1+ end))
+                     (c1 nil)
+                     (c2 (and (> (length string) 0) (grapheme-break-class (char string 0)))))
+                    ((>= end length)
+                     (if (= end length) (progn (funcall function string start end) nil)))
+                  (flet ((brk () (funcall function string start end) (setf start end)))
+                    (declare (truly-dynamic-extent #'brk))
+                    (shiftf c1 c2 (grapheme-break-class (char string end)))
+                    (cond
+                      ((and (eql c1 :cr) (eql c2 :lf)))
+                      ((or (member c1 '(:control :cr :lf))
+                           (member c2 '(:control :cr :lf)))
+                       (brk))
+                      ((or (and (eql c1 :l) (member c2 '(:l :v :lv :lvt)))
+                           (and (or (eql c1 :v) (eql c1 :lv))
+                                (or (eql c2 :v) (eql c2 :t)))
+                           (and (eql c2 :t) (or (eql c1 :lvt) (eql c1 :t)))))
+                      ((and (eql c1 :regional-indicator) (eql c2 :regional-indicator)))
+                      ((eql c2 :extend))
+                      ,@(when extendedp
+                              `(((or (eql c2 :spacing-mark) (eql c1 :prepend)))))
+                      (t (brk))))))))
+  (def map-legacy-grapheme-boundaries nil)
+  (def map-grapheme-boundaries t))
+
+(macrolet ((def (name mapper)
+             `(defun ,name (function string)
+                (let ((array (make-array 0 :element-type (array-element-type string) :adjustable t :displaced-to string)))
+                  (flet ((fun (string start end)
+                           (declare (type string string))
+                           (funcall function (adjust-array array (- end start) :displaced-to string :displaced-index-offset start))))
+                    (declare (truly-dynamic-extent #'fun))
+                    (,mapper #'fun string))))))
+  (def map-legacy-graphemes map-legacy-grapheme-boundaries)
+  (def map-graphemes map-grapheme-boundaries))
+
 (defun graphemes (string)
-  #!+sb-doc
-  "Breaks STRING into graphemes acording to the default
+  "Breaks STRING into graphemes according to the default
 grapheme breaking rules specified in UAX #29, returning a list of strings."
-  (let* ((chars (coerce string 'list)) clusters (cluster (list (car chars))))
-    (do ((first (car chars) second)
-         (tail (cdr chars) (when tail (cdr tail)))
-         (second (cadr chars) (when tail (cadr tail))))
-        ((not first) (nreverse (mapcar #'(lambda (l) (coerce l 'string)) clusters)))
-      (flet ((brk () (push (nreverse cluster) clusters) (setf cluster (list second)))
-             (nobrk () (push second cluster)))
-        (let ((c1 (grapheme-break-class first))
-              (c2 (grapheme-break-class second)))
-          (cond
-            ((and (eql c1 :cr) (eql c2 :lf)) (nobrk))
-            ((or (member c1 '(:control :cr :lf))
-                 (member c2 '(:control :cr :lf))) (brk))
-             ((or (and (eql c1 :l) (member c2 '(:l :v :lv :lvt)))
-                  (and (or (eql c1 :v) (eql c1 :lv))
-                       (or (eql c2 :v) (eql c2 :t)))
-                  (and (eql c2 :t) (or (eql c1 :lvt) (eql c1 :t))))
-              (nobrk))
-             ((and (eql c1 :regional-indicator) (eql c2 :regional-indicator)) (nobrk))
-             ((or (eql c2 :extend) (eql c2 :spacing-mark) (eql c1 :prepend)) (nobrk))
-             (t (brk))))))))
+  (let (result)
+    (map-graphemes (lambda (a) (push (subseq a 0) result)) string)
+    (nreverse result)))
 
 (defun word-break-class (char)
-  #!+sb-doc
   "Returns the word breaking class of CHARACTER, as specified in UAX #29."
   ;; Words use graphemes as characters to deal with the ignore rule
   (when (listp char) (setf char (car char)))
   (let ((cp (when char (char-code char)))
         (gc (when char (general-category char)))
-        (newlines #(#xB #xC #x0085 #x0085 #x2028 #x2029))
+        (newlines
+         (coerce-to-ordered-ranges #(#xB #xC #x0085 #x0085 #x2028 #x2029)))
         (also-katakana
-         #(#x3031 #x3035 #x309B #x309C
-           #x30A0 #x30A0 #x30FC #x30FC
-           #xFF70 #xFF70))
+         (coerce-to-ordered-ranges
+          #(#x3031 #x3035 #x309B #x309C
+            #x30A0 #x30A0 #x30FC #x30FC
+            #xFF70 #xFF70)))
         (midnumlet #(#x002E #x2018 #x2019 #x2024 #xFE52 #xFF07 #xFF0E))
         (midletter
          #(#x003A #x00B7 #x002D7 #x0387 #x05F4 #x2027 #xFE13 #xFE55 #xFF1A))
@@ -1095,8 +969,7 @@ grapheme breaking rules specified in UAX #29, returning a list of strings."
            (push ,%thing ,list)))))
 
 (defun words (string)
-  #!+sb-doc
-  "Breaks STRING into words acording to the default
+  "Breaks STRING into words according to the default
 word breaking rules specified in UAX #29. Returns a list of strings"
   (let ((chars (mapcar
                  #'(lambda (s)
@@ -1149,7 +1022,6 @@ word breaking rules specified in UAX #29. Returns a list of strings"
             (t (brk))))))))
 
 (defun sentence-break-class (char)
-  #!+sb-doc
   "Returns the sentence breaking class of CHARACTER, as specified in UAX #29."
   (when (listp char) (setf char (car char)))
   (let ((cp (when char (char-code char)))
@@ -1182,7 +1054,6 @@ word breaking rules specified in UAX #29. Returns a list of strings"
       (t nil))))
 
 (defun sentence-prebreak (string)
-  #!+sb-doc
   "Pre-combines some sequences of characters to make the sentence-break
 algorithm simpler..
 Specifically,
@@ -1218,8 +1089,7 @@ Specifically,
     (flush) (nreverse clusters))))
 
 (defun sentences (string)
-  #!+sb-doc
-  "Breaks STRING into sentences acording to the default
+  "Breaks STRING into sentences according to the default
 sentence breaking rules specified in UAX #29"
   (let ((special-handling '(:close :sp :sep :cr :lf :scontinue :sterm :aterm))
         (chars (sentence-prebreak string))
@@ -1436,9 +1306,8 @@ sentence breaking rules specified in UAX #29"
     (values list tail)))
 
 (defun lines (string &key (margin *print-right-margin*))
-  #!+sb-doc
   "Breaks STRING into lines that are no wider than :MARGIN according to the
-line breaking rules outlined in UAX #14. Combining marks will awsays be kept
+line breaking rules outlined in UAX #14. Combining marks will always be kept
 together with their base characters, and spaces (but not other types of
 whitespace) will be removed from the end of lines. If :MARGIN is unspecified,
 it defaults to 80 characters"
@@ -1486,28 +1355,21 @@ it defaults to 80 characters"
 
 
 ;;; Collation
-(defparameter **maximum-variable-primary-element**
-  #.(with-open-file (stream
-                     (merge-pathnames
-                      (make-pathname
-                       :directory
-                       '(:relative :up :up "output")
-                       :name "other-collation-info" :type "lisp-expr")
-                      sb!xc:*compile-file-truename*)
-                     :direction :input
-                     :element-type 'character)
-      (read stream)))
+(defconstant +maximum-variable-primary-element+
+  #.(sb-cold:read-from-file "output/other-collation-info.lisp-expr"))
 
 (defun unpack-collation-key (key)
-  (declare (type (simple-array (unsigned-byte 32) (*)) key))
-  (loop for value across key
-        collect
-        (list (ldb (byte 16 16) value)
-              (ldb (byte 11 5) value)
-              (ldb (byte 5 0) value))))
+  (flet ((unpack (value)
+           (list (ldb (byte 16 16) value)
+                 (ldb (byte 11 5) value)
+                 (ldb (byte 5 0) value))))
+    (declare (inline unpack))
+    (loop for i by 32 below (max (integer-length key) 1)
+          collect (unpack (ldb (byte 32 i) key)))))
 
+(declaim (inline variable-p))
 (defun variable-p (x)
-  (<= 1 x **maximum-variable-primary-element**))
+  (<= 1 x +maximum-variable-primary-element+))
 
 (defun collation-key (string start end)
   (let (char1
@@ -1614,7 +1476,6 @@ it defaults to 80 characters"
   (< (length vector1) (length vector2)))
 
 (defun unicode= (string1 string2 &key (start1 0) end1 (start2 0) end2 (strict t))
-  #!+sb-doc
   "Determines whether STRING1 and STRING2 are canonically equivalent according
 to Unicode. The START and END arguments behave like the arguments to STRING=.
 If :STRICT is NIL, UNICODE= tests compatibility equavalence instead."
@@ -1623,7 +1484,6 @@ If :STRICT is NIL, UNICODE= tests compatibility equavalence instead."
     (string= str1 str2)))
 
 (defun unicode-equal (string1 string2 &key (start1 0) end1 (start2 0) end2 (strict t))
-    #!+sb-doc
   "Determines whether STRING1 and STRING2 are canonically equivalent after
 casefoldin8 (that is, ignoring case differences) according to Unicode. The
 START and END arguments behave like the arguments to STRING=. If :STRICT is
@@ -1635,7 +1495,6 @@ NIL, UNICODE= tests compatibility equavalence instead."
      (normalize-string (casefold str2) (if strict :nfd :nfkd)))))
 
 (defun unicode< (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Determines whether STRING1 sorts before STRING2 using the Unicode Collation
 Algorithm, The function uses an untailored Default Unicode Collation Element Table
 to produce the sort keys. The function uses the Shifted method for dealing
@@ -1648,7 +1507,6 @@ with variable-weight characters, as described in UTS #10"
         (vector< k1 k2))))
 
 (defun unicode<= (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Tests if STRING1 and STRING2 are either UNICODE< or UNICODE="
   (or
    (unicode= string1 string2 :start1 start1 :end1 end1
@@ -1657,13 +1515,11 @@ with variable-weight characters, as described in UTS #10"
              :start2 start2 :end2 end2)))
 
 (defun unicode> (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Tests if STRING2 is UNICODE< STRING1."
    (unicode< string2 string1 :start1 start2 :end1 end2
              :start2 start1 :end2 end1))
 
 (defun unicode>= (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Tests if STRING1 and STRING2 are either UNICODE= or UNICODE>"
   (or
    (unicode= string1 string2 :start1 start1 :end1 end1
@@ -1675,26 +1531,22 @@ with variable-weight characters, as described in UTS #10"
 ;;; Confusable detection
 
 (defun canonically-deconfuse (string)
-  (let (ret (i 0) new-i (len (length string))
-            best-node)
-    (loop while (< i len) do
-         (loop for offset from 1 to 5
-            while (<= (+ i offset) len)
-            do
-              (let ((node (gethash (subseq string i (+ i offset))
-                                   **confusables**)))
-                (when node (setf best-node node new-i (+ i offset)))))
-         (cond
-           (best-node (push best-node ret) (setf i new-i))
-           (t (push (subseq string i (1+ i)) ret) (incf i)))
-         (setf best-node nil new-i nil))
-    (apply #'concatenate 'string (nreverse ret))))
+  (let (result)
+    (loop for char across string
+          for deconfused = (gethash char **confusables**)
+          do (cond ((not deconfused)
+                    (push (string char) result))
+                   ((integerp deconfused)
+                    (push (sb-impl::unpack-3-codepoints deconfused)
+                          result))
+                   (t
+                    (push deconfused result))))
+    (apply #'concatenate 'string (nreverse result))))
 
 (defun confusable-p (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Determines whether STRING1 and STRING2 could be visually confusable
 according to the IDNA confusableSummary.txt table"
-    (let* ((form #!+sb-unicode :nfd #!-sb-unicode :nfc)
+    (let* ((form #+sb-unicode :nfd #-sb-unicode :nfc)
            (str1 (normalize-string (subseq string1 start1 end1) form))
            (str2 (normalize-string (subseq string2 start2 end2) form))
            (skeleton1 (normalize-string (canonically-deconfuse str1) form))

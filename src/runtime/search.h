@@ -12,7 +12,12 @@
 #ifndef _SEARCH_H_
 #define _SEARCH_H_
 
-extern boolean search_for_type(int type, lispobj **start, int *count);
-extern boolean search_for_symbol(char *name, lispobj **start, int *count);
+extern lispobj find_package(char*);
+extern lispobj* find_symbol(char*, lispobj, unsigned int*); // Find in a package
+extern struct symbol* lisp_symbol_from_tls_index(lispobj tls_index);
+extern lispobj sb_kernel_package();
+// Find via heap scan
+extern lispobj* search_for_symbol(char *name, lispobj start, lispobj end, boolean);
+lispobj *search_immobile_space(void *pointer);
 
 #endif

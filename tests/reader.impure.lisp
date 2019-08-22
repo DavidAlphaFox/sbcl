@@ -13,13 +13,10 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(load "assertoid.lisp")
-(use-package "ASSERTOID")
-
 ;;; Test that symbols are properly normalized in SB-UNICODE builds
 #+sb-unicode
 (with-test (:name (:normalizing-reader)
-                  :skipped-on '(not :sb-unicode))
+                  :skipped-on (not :sb-unicode))
   (labels ((str (&rest chars)
              (coerce chars 'string))
            (symbol (&rest chars)
@@ -105,7 +102,8 @@
 (defstruct readable-struct a)
 (macrolet
     ((frob (string)
-       `(assert (eq (readable-struct-a (read-from-string ,string)) t))))
+       `(handler-bind ((warning #'muffle-warning))
+          (assert (eq (readable-struct-a (read-from-string ,string)) t)))))
   (frob "#S(READABLE-STRUCT :A T)")
   (frob "#S(READABLE-STRUCT A T)")
   (frob "#S(READABLE-STRUCT \"A\" T)")
@@ -144,7 +142,7 @@
 (assert (eq 'a (read (make-instance 'my-in-stream :last-char nil))))
 
 ;;; NIL as the last argument to SET-SYNTAX-FROM-CHAR in compiled code,
-;;; reported by Levente MÈsz·ros
+;;; reported by Levente M√©sz√°ros
 (let ((fun (compile nil '(lambda ()
                           (set-syntax-from-char #\{ #\( *readtable* nil)))))
   (funcall fun)
@@ -225,11 +223,12 @@
                 :ok))))
 
 (defun cl-user::esoteric-load-thing ()
-  ;; This LOAD-AS-SOURCE will fail if PRINT1 reads as the keyword :PRIN1
+  ;; This LOAD-AS-SOURCE will fail if SET reads as the keyword :SET
   (let ((s (make-string-input-stream
-            "(cl:in-package :cl-user) (prin1 'okey-dokey)")))
+            "(cl:in-package :cl-user) (set 'okey-dokey 3)")))
     (let ((*package* *package*))
-      (sb-impl::load-as-source s :print t :verbose t))))
+      (sb-impl::load-as-source s :print nil :verbose nil))
+    (assert (eql (symbol-value 'cl-user::okey-dokey) 3))))
 
 (with-test (:name :reader-package-in-conditional)
   ;; Sharp-plus binds *package* but not *reader-package* so that if,

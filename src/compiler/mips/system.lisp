@@ -9,19 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; Type frobbing VOPs
-
-(define-vop (lowtag-of)
-  (:translate lowtag-of)
-  (:policy :fast-safe)
-  (:args (object :scs (any-reg descriptor-reg)))
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 1
-    (inst and result object lowtag-mask)))
 
 (define-vop (widetag-of)
   (:translate widetag-of)
@@ -66,6 +57,15 @@
 
     DONE))
 
+(define-vop (%other-pointer-widetag)
+  (:translate %other-pointer-widetag)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg)))
+  (:results (result :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:generator 6
+    (load-type result object (- other-pointer-lowtag))))
+
 (define-vop (fun-subtype)
   (:translate fun-subtype)
   (:policy :fast-safe)
@@ -76,18 +76,15 @@
     (load-type result function (- fun-pointer-lowtag))
     (inst nop)))
 
-(define-vop (set-fun-subtype)
-  (:translate (setf fun-subtype))
+(define-vop (fun-header-data)
+  (:translate fun-header-data)
   (:policy :fast-safe)
-  (:args (type :scs (unsigned-reg) :target result)
-         (function :scs (descriptor-reg)))
-  (:arg-types positive-fixnum *)
-  (:results (result :scs (unsigned-reg)))
+  (:args (x :scs (descriptor-reg)))
+  (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    (inst sb type function (- fun-pointer-lowtag))
-    (move result type)))
-
+    (loadw res x 0 fun-pointer-lowtag)
+    (inst srl res res n-widetag-bits)))
 
 (define-vop (get-header-data)
   (:translate get-header-data)
@@ -97,16 +94,6 @@
   (:result-types positive-fixnum)
   (:generator 6
     (loadw res x 0 other-pointer-lowtag)
-    (inst srl res res n-widetag-bits)))
-
-(define-vop (get-closure-length)
-  (:translate get-closure-length)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
     (inst srl res res n-widetag-bits)))
 
 (define-vop (set-header-data)
@@ -125,7 +112,12 @@
        (inst sll t2 data (- n-widetag-bits n-fixnum-tag-bits))
        (inst or t1 t2))
       (immediate
-       (inst or t1 (ash (tn-value data) n-widetag-bits)))
+       (let ((val (ash (tn-value data) n-widetag-bits)))
+         (cond ((typep val '(unsigned-byte 16))
+                (inst or t1 val))
+               (t
+                (inst li t2 val)
+                (inst or t1 t2)))))
       (zero))
     (storew t1 x 0 other-pointer-lowtag)
     (move res x)))
@@ -179,11 +171,37 @@
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 10
-    (loadw ndescr code 0 other-pointer-lowtag)
-    (inst srl ndescr n-widetag-bits)
-    (inst sll ndescr word-shift)
+    (loadw ndescr code code-boxed-size-slot other-pointer-lowtag)
     (inst subu ndescr other-pointer-lowtag)
     (inst addu sap code ndescr)))
+
+(eval-when (:compile-toplevel)
+  (aver (not (logtest code-header-widetag #b11000000))))
+
+(define-vop (code-trailer-ref)
+  (:translate code-trailer-ref)
+  (:policy :fast-safe)
+  (:args (code :scs (descriptor-reg) :to (:result 0))
+         (offset :scs (signed-reg) :to (:result 0)))
+  (:arg-types * fixnum)
+  (:results (res :scs (unsigned-reg) :from (:argument 0)))
+  (:result-types unsigned-num)
+  (:temporary (:scs (interior-reg)) lip)
+  (:generator 10
+    (loadw res code 0 other-pointer-lowtag)
+    (inst sll res res 2) ; shift out the GC bits
+    ;; Then shift right to clear the widetag, plus 2 more to the right since we just
+    ;; left-shifted to zeroize bits. Then shift left 2 to convert words to bytes.
+    ;; The '>>2' and '<<2' cancel out because we don't need to clear all 8 bits
+    ;; of the widetag, as CODE-HEADER-WIDETAG already has bits 6 and 7 clear.
+    ;; Other places assume the same, though without much commentary.
+    ;; It's brittle magic, save for the AVER above which ensures that it works.
+    (inst srl res res n-widetag-bits)
+    (inst add res offset res)
+    (inst subu res other-pointer-lowtag)
+    (inst add lip code res)
+    (inst lw res lip 0)
+    (inst nop)))
 
 (define-vop (compute-fun)
   (:args (code :scs (descriptor-reg))
@@ -192,9 +210,7 @@
   (:results (func :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:generator 10
-    (loadw ndescr code 0 other-pointer-lowtag)
-    (inst srl ndescr n-widetag-bits)
-    (inst sll ndescr word-shift)
+    (loadw ndescr code code-boxed-size-slot other-pointer-lowtag)
     (inst addu ndescr offset)
     (inst addu ndescr (- fun-pointer-lowtag other-pointer-lowtag))
     (inst addu func code ndescr)))
@@ -203,10 +219,10 @@
 ;;;; Other random VOPs.
 
 
-(defknown sb!unix::receive-pending-interrupt () (values))
-(define-vop (sb!unix::receive-pending-interrupt)
+(defknown sb-unix::receive-pending-interrupt () (values))
+(define-vop (sb-unix::receive-pending-interrupt)
   (:policy :fast-safe)
-  (:translate sb!unix::receive-pending-interrupt)
+  (:translate sb-unix::receive-pending-interrupt)
   (:generator 1
     (inst break 0 pending-interrupt-trap)))
 

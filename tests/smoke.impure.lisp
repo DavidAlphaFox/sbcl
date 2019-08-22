@@ -15,9 +15,10 @@
 (cl:in-package :cl-user)
 
 ;;; ROOM should run without signalling an error. (bug 247)
-(room)
-(room t)
-(room nil)
+(let ((*standard-output* (make-broadcast-stream)))
+  (room)
+  (room t)
+  (room nil))
 
 ;;; COPY-SYMBOL should work without signalling an error, even if the
 ;;; symbol is unbound.
@@ -36,7 +37,8 @@
     (random 1d0))
   (profile profiled-fun)
   (loop repeat 100000 do (profiled-fun))
-  (report))
+  (let ((*trace-output* (make-broadcast-stream)))
+    (report)))
 
 ;;; Defconstant should behave as the documentation specifies,
 ;;; including documented condition type.
@@ -68,9 +70,14 @@
   (assert (= &key 3))
   (assert (null &allow-other-keys)))
 
-(let ((fn (lambda (&foo &rest &bar) (cons &foo &bar))))
-  (assert (equal (funcall fn 1) '(1)))
-  (assert (equal (funcall fn 1 2 3) '(1 2 3))))
+(with-test (:name (:lambda-list :suspicious-variables))
+  (multiple-value-bind (fun failure-p warnings style-warnings)
+      (checked-compile `(lambda (&foo &rest &bar) (cons &foo &bar))
+                       :allow-style-warnings t)
+    (declare (ignore failure-p warnings))
+    (assert (= 2 (length style-warnings)))
+    (assert (equal (funcall fun 1) '(1)))
+    (assert (equal (funcall fun 1 2 3) '(1 2 3)))))
 
 ;;; Failure to save a core is an error
 (with-test (:name :save-lisp-and-die-error)

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 
@@ -235,7 +235,7 @@
 
                           (:res quo any-reg nl2-offset)
                           (:res rem any-reg nl3-offset))
-  (let ((error (generate-error-code nil division-by-zero-error
+  (let ((error (generate-error-code nil 'division-by-zero-error
                                     dividend divisor)))
     (inst beq divisor error)
     (inst nop))
@@ -258,7 +258,7 @@
 
                           (:res quo any-reg nl2-offset)
                           (:res rem any-reg nl3-offset))
-  (let ((error (generate-error-code nil division-by-zero-error
+  (let ((error (generate-error-code nil 'division-by-zero-error
                                     dividend divisor)))
     (inst beq divisor error)
     (inst nop))
@@ -282,7 +282,7 @@
 
                           (:res quo signed-reg nl2-offset)
                           (:res rem signed-reg nl3-offset))
-  (let ((error (generate-error-code nil division-by-zero-error
+  (let ((error (generate-error-code nil 'division-by-zero-error
                                     dividend divisor)))
     (inst beq divisor error)
     (inst nop))

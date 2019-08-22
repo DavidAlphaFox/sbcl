@@ -11,7 +11,8 @@
   (:use #:common-lisp)
   (:import-from #:sb-kernel #:ansi-stream #:charpos #:line-length)
   (:import-from #:sb-gray #:fundamental-stream)
-  #+sb-package-locks
+  (:import-from #:sb-impl
+                #:in-stream-from-designator #:out-stream-from-designator)
   ;; FIXME: Using deffoo! or equivalent might be nicer.
   (:implement #:common-lisp #:sb-kernel #:sb-int)
   (:export ;; Stream classes

@@ -3,15 +3,14 @@
 
 typedef struct os_context_t {
   CONTEXT* win32_context;
+#ifdef LISP_FEATURE_SB_THREAD
   sigset_t sigmask;
+#endif
 } os_context_t;
 
 typedef intptr_t os_context_register_t;
 
-static inline os_context_t *arch_os_get_context(void **void_context)
-{
-    return (os_context_t *) *void_context;
-}
+#include "arch-os-generic.inc"
 
 static inline DWORD NT_GetLastError() {
     return GetLastError();

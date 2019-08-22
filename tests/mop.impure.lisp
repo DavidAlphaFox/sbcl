@@ -15,8 +15,6 @@
 ;;;; However, this seems a good a way as any of ensuring that we have
 ;;;; no regressions.
 
-(load "test-util.lisp")
-
 (defpackage "MOP-TEST"
   (:use "CL" "SB-MOP" "ASSERTOID" "TEST-UTIL"))
 
@@ -303,6 +301,7 @@
   ())
 (defmethod direct-slot-definition-class ((class auto-accessors-class)
                                          &rest initargs)
+  (declare (ignore initargs))
   (let ((dsd-class-name (gensym)))
     (sb-pcl:ensure-class
      dsd-class-name
@@ -311,6 +310,7 @@
      :containing-class-name (class-name class))
     (eval `(defmethod initialize-instance :after ((dsd ,dsd-class-name)
                                                   &rest args)
+            (declare (ignore args))
             (when (and (null (slot-definition-readers dsd))
                        (null (slot-definition-writers dsd)))
               (let* ((containing-class-name
@@ -554,6 +554,9 @@
 (with-test (:name :make-method-lambda-wrapping+return-from)
   (assert (eq :default (wrapped (cons t t)))))
 
+;; This test tests something a little shady - that a method
+;; are accessible by way of FDEFNs. They aren't all.
+;; See the comment in src/pcl/low.lisp at SET-FUN-NAME.
 (with-test (:name :slow-method-is-fboundp)
   (assert (fboundp '(sb-pcl::slow-method wrapped (cons))))
   (assert (eq :default (funcall #'(sb-pcl::slow-method wrapped (cons)) (list (cons t t)) nil))))
@@ -682,9 +685,15 @@
                      (slot-value o 'instance))))))
 
 (defgeneric definitely-a-funcallable-instance (x))
-(with-test (:name (set-funcallable-instance-function :typechecking))
+(with-test (:name (set-funcallable-instance-function :typechecking)
+            ;; This is a bit of a problem. SET-FUNCALLABLE-INSTANCE-FUNCTION
+            ;; accepts any funcallable-instance as its first argument,
+            ;; not just a generic-function.
+            ;; But an interpreted function *is* a funcallable-instance
+            ;; See comment in src/pcl/low about possibly tightening this up.
+            :fails-on :interpreter)
   (assert-error (set-funcallable-instance-function
-                  (lambda (y) nil)
+                  (lambda (y) (declare (ignore y)) nil)
                   #'definitely-a-funcallable-instance)
                  type-error))
 
@@ -692,5 +701,41 @@
   (defstruct nil-slot-name nil)
   (let ((fun (compile nil '(lambda (x) (slot-value x 'nil)))))
     (assert (= 3 (funcall fun (make-nil-slot-name :nil 3))))))
+
+;;; Duplicated initargs in effective slot definition
+
+(defclass duplicated-intiargs.a () ((a :initarg :a)))
+(defclass duplicated-intiargs.b () ((a :initarg :a)))
+(defclass duplicated-intiargs.c (duplicated-intiargs.a duplicated-intiargs.b) ())
+
+(with-test (:name (compute-effective-slot-definition :duplicated-intiargs))
+  (let* ((class (sb-pcl:ensure-class-finalized (find-class 'duplicated-intiargs.c)))
+         (slot (first (class-slots class))))
+    (assert (equal (slot-definition-initargs slot) '(:a)))))
+
 
-;;;; success
+(defclass change-class-test-m (standard-class) ())
+(defmethod validate-superclass ((c1 change-class-test-m) (c2 standard-class))
+  t)
+
+(defmethod slot-value-using-class ((class change-class-test-m) object slot)
+  (call-next-method))
+
+(defclass change-class-test ()
+  ((a :initarg :a)
+   (b :initarg :b
+      :initform nil))
+  (:metaclass change-class-test-m))
+
+(defclass change-class-test-2 ()
+  ((a :initarg :a
+      :initform nil)
+   (b :initarg :b
+      :initform nil))
+  (:metaclass change-class-test-m))
+
+(with-test (:name :change-class-svuc)
+  (let ((new (change-class (make-instance 'change-class-test :b 20)
+                           'change-class-test-2)))
+    (assert (eql (slot-value new 'b) 20))
+    (assert (not (slot-boundp new 'a)))))

@@ -11,7 +11,7 @@
  * in SBCL's own format.
  */
 #ifndef SBCL_GENESIS_PRIMITIVE_OBJECTS
-#define SBCL_GENESIS_PRIMITIVE_OBJECTS 1
+#define SBCL_GENESIS_PRIMITIVE_OBJECTS
 #include "array.h"
 #include "bignum.h"
 #include "binding.h"
@@ -27,9 +27,9 @@
 #include "funcallable-instance.h"
 #include "instance.h"
 #include "ratio.h"
-#include "return-pc.h"
 #include "sap.h"
 #include "simd-pack.h"
+#include "simd-pack-256.h"
 #include "simple-fun.h"
 #include "symbol.h"
 #include "thread.h"
@@ -37,4 +37,4 @@
 #include "value-cell.h"
 #include "vector.h"
 #include "weak-pointer.h"
-#endif /* SBCL_GENESIS_PRIMITIVE-OBJECTS */
+#endif

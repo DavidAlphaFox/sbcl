@@ -1,25 +1,25 @@
 ;;; This file contains the PPC specific runtime stuff.
 ;;;
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(define-alien-type os-context-t (struct os-context-t-struct))
-
-
-;;;; MACHINE-TYPE
-
+#-sb-xc-host
 (defun machine-type ()
   "Returns a string describing the type of the local machine."
   "PowerPC")
 
 ;;;; FIXUP-CODE-OBJECT
 
-(defun fixup-code-object (code offset fixup kind)
+(defconstant-eqx +fixup-kinds+ #(:absolute :b :ba :ha :l) #'equalp)
+(!with-bigvec-or-sap
+(defun fixup-code-object (code offset fixup kind flavor)
   (declare (type index offset))
-  (unless (zerop (rem offset n-word-bytes))
+  (declare (ignore flavor))
+  (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
     (error "Unaligned instruction?  offset=#x~X." offset))
-  (without-gcing
-   (let ((sap (%primitive code-instructions code)))
-     (ecase kind
+  (let ((sap (code-instructions code)))
+    (ecase kind
+       (:absolute
+        (setf (sap-ref-32 sap offset) fixup))
        (:b
         (error "Can't deal with CALL fixups, yet."))
        (:ba
@@ -39,39 +39,20 @@
                  (if (logbitp 15 l) (ldb (byte 16 0) (1+ h)) h))))
        (:l
         (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
-              (ldb (byte 16 0) fixup)))))))
+              (ldb (byte 16 0) fixup)))))
+  nil))
 
 
 ;;;; "Sigcontext" access functions, cut & pasted from x86-vm.lisp then
 ;;;; hacked for types.
 
-(define-alien-routine ("os_context_pc_addr" context-pc-addr) (* unsigned-long)
-  (context (* os-context-t)))
-
-(defun context-pc (context)
-  (declare (type (alien (* os-context-t)) context))
-  (int-sap (deref (context-pc-addr context))))
-
-(define-alien-routine ("os_context_register_addr" context-register-addr)
-  (* unsigned-long)
-  (context (* os-context-t))
-  (index int))
-
-(defun context-register (context index)
-  (declare (type (alien (* os-context-t)) context))
-  (deref (context-register-addr context index)))
-
+#-sb-xc-host (progn
 (define-alien-routine ("os_context_lr_addr" context-lr-addr) (* unsigned-long)
   (context (* os-context-t)))
 
 (defun context-lr (context)
   (declare (type (alien (* os-context-t)) context))
   (int-sap (deref (context-lr-addr context))))
-
-(defun %set-context-register (context index new)
-(declare (type (alien (* os-context-t)) context))
-(setf (deref (context-register-addr context index))
-      new))
 ;;; This is like CONTEXT-REGISTER, but returns the value of a float
 ;;; register. FORMAT is the type of float to return.
 
@@ -97,7 +78,7 @@
 ;;;
 ;;; FIXME: surely this must be accessible somewhere under Darwin?  Or
 ;;; under NetBSD?
-#!+linux
+#+linux
 (define-alien-routine ("os_context_fp_control" context-floating-point-modes)
     (unsigned 32)
   (context (* os-context-t)))
@@ -117,41 +98,29 @@
   (declare (type (alien (* os-context-t)) context))
   (let* ((pc (context-pc context))
          (bad-inst (sap-ref-32 pc 0))
-         (op (ldb (byte 16 16) bad-inst)))
+         (op (ldb (byte 16 16) bad-inst))
+         (regnum (ldb (byte 5 0) op)))
     (declare (type system-area-pointer pc))
     (cond ((= op (logior (ash 3 10) (ash 6 5)))
-           (args-for-unimp-inst context))
-          ((and (= (ldb (byte 6 10) op) 3)
-                (= (ldb (byte 5 5) op) 24))
-           (let* ((regnum (ldb (byte 5 0) op))
-                  (prev (sap-ref-32 (int-sap (- (sap-int pc) 4)) 0)))
-             (if (and (= (ldb (byte 6 26) prev) 3)
-                      (= (ldb (byte 5 21) prev) 0))
+           (let ((trap-number (sap-ref-8 pc 3)))
+             (sb-kernel::decode-internal-error-args (sap+ pc 4) trap-number)))
+          ((and (= (ldb (byte 6 10) op) 3) ;; twi
+                (or (= regnum #.(sc+offset-offset arg-count-sc))
+                    (= (ldb (byte 5 5) op) 24))) ;; :ne
+           ;; Type errors are encoded as
+           ;; twi 0 value-register error-code
+           ;; twi :ne temp-register x
+           (let ((prev (sap-ref-32 (int-sap (- (sap-int pc) 4)) 0)))
+             (if (and (= (ldb (byte 5 5) op) 24) ;; is the condition :ne?
+                      (= (ldb (byte 6 26) prev) 3) ;; is it twi?
+                      (= (ldb (byte 5 21) prev) 0)) ;; is it non-trapping?
                  (values (ldb (byte 16 0) prev)
-                         (list (make-sc-offset any-reg-sc-number
+                         (list (make-sc+offset any-reg-sc-number
                                                (ldb (byte 5 16) prev))))
-                 (values #.(error-number-or-lose
-                            'invalid-arg-count-error)
-                         (list (make-sc-offset any-reg-sc-number regnum))))))
-
+                 ;; arg-count errors are encoded as
+                 ;; twi {:ne :llt :lgt} nargs arg-count
+                 (values #.(error-number-or-lose 'invalid-arg-count-error)
+                         '(#.arg-count-sc)))))
           (t
            (values #.(error-number-or-lose 'unknown-error) nil)))))
-
-(defun args-for-unimp-inst (context)
-  (declare (type (alien (* os-context-t)) context))
-  (let* ((pc (context-pc context))
-         (length (sap-ref-8 pc 4))
-         (vector (make-array length :element-type '(unsigned-byte 8))))
-    (declare (type system-area-pointer pc)
-             (type (unsigned-byte 8) length)
-             (type (simple-array (unsigned-byte 8) (*)) vector))
-    (copy-ub8-from-system-area pc 5 vector 0 length)
-    (let* ((index 0)
-           (error-number (read-var-integer vector index)))
-      (collect ((sc-offsets))
-               (loop
-                (when (>= index length)
-                  (return))
-                (sc-offsets (read-var-integer vector index)))
-               (values error-number (sc-offsets))))))
-
+) ; end PROGN

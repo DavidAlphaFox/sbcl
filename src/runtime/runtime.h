@@ -25,24 +25,31 @@
 #endif
 
 #include <stdint.h>
+#include <inttypes.h>
 
 #if defined(LISP_FEATURE_SB_THREAD)
 #define thread_self() pthread_self()
+#define thread_equal(a,b) pthread_equal(a,b)
 #define thread_kill pthread_kill
+
+#ifdef LISP_FEATURE_WIN32
+#define thread_sigmask _sbcl_pthread_sigmask
+#else
 #define thread_sigmask pthread_sigmask
+#endif
+
 #define thread_mutex_lock(l) pthread_mutex_lock(l)
 #define thread_mutex_unlock(l) pthread_mutex_unlock(l)
 #else
 #define thread_self() 0
+#define thread_equal(a,b) ((a)==(b))
 #define thread_kill kill_safely
 #define thread_sigmask sigprocmask
 #define thread_mutex_lock(l) 0
 #define thread_mutex_unlock(l) 0
 #endif
 
-#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
-void os_preinit();
-#endif
+void os_link_runtime();
 
 #if defined(LISP_FEATURE_SB_SAFEPOINT)
 
@@ -59,10 +66,14 @@ typedef enum {
 
 void map_gc_page();
 void unmap_gc_page();
-int check_pending_interrupts();
 void gc_state_lock();
 void gc_state_wait(gc_phase_t);
+int gc_cycle_active(void);
 void gc_state_unlock();
+
+#define WITH_GC_STATE_LOCK \
+    gc_state_lock(); \
+    RUN_BODY_ONCE(gc_state_lock, gc_state_unlock())
 
 #endif
 
@@ -209,9 +220,6 @@ typedef signed long s64;
 typedef unsigned int u32;
 typedef signed int s32;
 
-/* this is an integral type the same length as a machine pointer */
-typedef uintptr_t pointer_sized_uint_t;
-
 #ifdef _WIN64
 #define AMD64_SYSV_ABI __attribute__((sysv_abi))
 #else
@@ -226,17 +234,23 @@ typedef pthread_t os_thread_t;
 typedef pid_t os_thread_t;
 #endif
 
+#ifndef LISP_FEATURE_ALPHA
 typedef uintptr_t uword_t;
 typedef intptr_t  sword_t;
+#else
+/* The alpha32 port uses non-intptr-sized words */
+typedef u32 uword_t;
+typedef s32 sword_t;
+#endif
 
 /* FIXME: we do things this way because of the alpha32 port.  once
    alpha64 has arrived, all this nastiness can go away */
 //定义指针为lispobj
 //不是struct?
 #if 64 == N_WORD_BITS
-  #define LOW_WORD(c) ((pointer_sized_uint_t)c)
-  #define OBJ_FMTX "lx"
-  typedef uintptr_t lispobj;
+#define LOW_WORD(c) ((uintptr_t)c)
+#define OBJ_FMTX PRIxPTR
+typedef uintptr_t lispobj;
 #else
   #define OBJ_FMTX "x"
   #define LOW_WORD(c) ((long)(c) & 0xFFFFFFFFL)
@@ -251,7 +265,16 @@ lowtag_of(lispobj obj)
 }
 
 static inline int
-widetag_of(lispobj obj)
+widetag_of(lispobj* obj)
+{
+#ifdef LISP_FEATURE_BIG_ENDIAN
+    return ((unsigned char*)obj)[N_WORD_BYTES-1];
+#else
+    return *(unsigned char*)obj;
+#endif
+}
+static inline int
+header_widetag(lispobj obj)
 {
     return obj & WIDETAG_MASK;
 }
@@ -262,23 +285,34 @@ HeaderValue(lispobj obj)
   return obj >> N_WIDETAG_BITS;
 }
 
-static inline struct cons *
-CONS(lispobj obj)
-{
-  return (struct cons *)(obj - LIST_POINTER_LOWTAG);
+static inline int listp(lispobj obj) {
+    return lowtag_of(obj) == LIST_POINTER_LOWTAG;
+}
+static inline int instancep(lispobj obj) {
+    return lowtag_of(obj) == INSTANCE_POINTER_LOWTAG;
+}
+static inline int functionp(lispobj obj) {
+    return lowtag_of(obj) == FUN_POINTER_LOWTAG;
+}
+static inline int simple_vector_p(lispobj obj) {
+    return lowtag_of(obj) == OTHER_POINTER_LOWTAG &&
+           widetag_of((lispobj*)(obj-OTHER_POINTER_LOWTAG)) == SIMPLE_VECTOR_WIDETAG;
 }
 
-static inline struct symbol *
-SYMBOL(lispobj obj)
+static inline uword_t instance_length(lispobj header)
 {
-  return (struct symbol *)(obj - OTHER_POINTER_LOWTAG);
+  return HeaderValue(header) & SHORT_HEADER_MAX_WORDS;
 }
 
-static inline struct fdefn *
-FDEFN(lispobj obj)
-{
-  return (struct fdefn *)(obj - OTHER_POINTER_LOWTAG);
-}
+/* Define an assignable instance_layout() macro taking a native pointer */
+#ifndef LISP_FEATURE_COMPACT_INSTANCE_HEADER
+# define instance_layout(instance_ptr) (instance_ptr)[1]
+#elif defined(LISP_FEATURE_64_BIT) && defined(LISP_FEATURE_LITTLE_ENDIAN)
+  // so that this stays an lvalue, it can't be cast to lispobj
+# define instance_layout(instance_ptr) ((uint32_t*)(instance_ptr))[1]
+#else
+# error "No instance_layout() defined"
+#endif
 
 /* Is the Lisp object obj something with pointer nature (as opposed to
  * e.g. a fixnum or character or unbound marker)? */
@@ -299,12 +333,13 @@ is_lisp_pointer(lispobj obj)
 static inline int
 is_lisp_immediate(lispobj obj)
 {
+    int widetag;
     return (fixnump(obj)
-            || (widetag_of(obj) == CHARACTER_WIDETAG)
+            || ((widetag = header_widetag(obj)) == CHARACTER_WIDETAG)
 #if N_WORD_BITS == 64
-            || (widetag_of(obj) == SINGLE_FLOAT_WIDETAG)
+            || (widetag == SINGLE_FLOAT_WIDETAG)
 #endif
-            || (widetag_of(obj) == UNBOUND_MARKER_WIDETAG));
+            || (widetag == UNBOUND_MARKER_WIDETAG));
 }
 
 /* Convert from a lispobj with type bits to a native (ordinary
@@ -312,7 +347,7 @@ is_lisp_immediate(lispobj obj)
 static inline lispobj *
 native_pointer(lispobj obj)
 {
-    return (lispobj *) ((pointer_sized_uint_t) (obj & ~LOWTAG_MASK));
+    return (lispobj *) ((uintptr_t) (obj & ~LOWTAG_MASK));
 }
 
 /* inverse operation: create a suitably tagged lispobj from a native
@@ -325,7 +360,7 @@ make_lispobj(void *o, int low_tag)
 // 将地址转成固定值
 #define MAKE_FIXNUM(n) (n << N_FIXNUM_TAG_BITS)
 static inline lispobj
-make_fixnum(sword_t n)
+make_fixnum(uword_t n) // '<<' on negatives is _technically_ undefined behavior
 {
     return MAKE_FIXNUM(n);
 }
@@ -333,17 +368,10 @@ make_fixnum(sword_t n)
 static inline sword_t
 fixnum_value(lispobj n)
 {
-    return n >> N_FIXNUM_TAG_BITS;
+    return (sword_t)n >> N_FIXNUM_TAG_BITS;
 }
 
-static inline sword_t
-fixnum_word_value(lispobj n)
-{
-    /* Convert bytes into words, double-word aligned. */
-    sword_t x = ((n >> N_FIXNUM_TAG_BITS) + LOWTAG_MASK) & ~LOWTAG_MASK;
-
-    return x >> WORD_SHIFT;
-}
+#include "align.h"
 
 #if defined(LISP_FEATURE_WIN32)
 /* KLUDGE: Avoid double definition of boolean by rpcndr.h included via
@@ -365,6 +393,23 @@ other_immediate_lowtag_p(lispobj header)
 {
     /* These lowtags are spaced 4 apart throughout the lowtag space. */
     return (lowtag_of(header) & 3) == OTHER_IMMEDIATE_0_LOWTAG;
+}
+
+static inline int
+is_cons_half(lispobj obj)
+{
+    /* A word that satisfies other_immediate_lowtag_p is a headered object
+     * and can not be half of a cons, except that widetags which satisfy
+     * other_immediate and are Lisp immediates can be half of a cons */
+    return !other_immediate_lowtag_p(obj)
+#if N_WORD_BITS == 64
+        || ((uword_t)IMMEDIATE_WIDETAGS_MASK >> (header_widetag(obj) >> 2)) & 1;
+#else
+      /* The above bit-shifting approach is not applicable
+       * since we can't employ a 64-bit unsigned integer constant. */
+      || header_widetag(obj) == CHARACTER_WIDETAG
+      || header_widetag(obj) == UNBOUND_MARKER_WIDETAG;
+#endif
 }
 
 /* KLUDGE: As far as I can tell there's no ANSI C way of saying
@@ -399,8 +444,95 @@ extern char *copied_string (char *string);
  * the naive way: */
 #if defined(LISP_FEATURE_GENCGC) && !defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)
 # define GENCGC_IS_PRECISE 1
+#else
+# define GENCGC_IS_PRECISE 0
 #endif
 
 void *os_dlsym_default(char *name);
+
+struct lisp_startup_options {
+    boolean noinform;
+};
+extern struct lisp_startup_options lisp_startup_options;
+
+/* Even with just -O1, gcc optimizes the jumps in this "loop" away
+ * entirely, giving the ability to define WITH-FOO-style macros. */
+#define RUN_BODY_ONCE(prefix, finally_do)               \
+    int prefix##done = 0;                               \
+    for (; !prefix##done; finally_do, prefix##done = 1)
+
+// casting to void is no longer enough to suppress a warning about unused
+// results of libc functions declared with warn_unused_result.
+// from http://git.savannah.gnu.org/cgit/gnulib.git/tree/lib/ignore-value.h
+#if 3 < __GNUC__ + (4 <= __GNUC_MINOR__)
+# define ignore_value(x) \
+      (__extension__ ({ __typeof__ (x) __x = (x); (void) __x; }))
+#else
+# define ignore_value(x) ((void) (x))
+#endif
+
+#if defined(__GNUC__) && defined(ADDRESS_SANITIZER)
+#define NO_SANITIZE_ADDRESS __attribute__((no_sanitize_address))
+#else
+#define NO_SANITIZE_ADDRESS
+#endif
+
+#if defined(__GNUC__) && defined(MEMORY_SANITIZER)
+#define NO_SANITIZE_MEMORY __attribute__((no_sanitize_memory))
+#else
+#define NO_SANITIZE_MEMORY
+#endif
+
+/// Object sizing macros. One of these days I'd like to rationalize
+/// all our headers making them more intuitive as to which need be
+/// included to get access to various things.
+/// For the time being, this file makes as much sense as anything else.
+
+/// These sizing macros return the number of *payload* words,
+/// exclusive of the object header word. Payload length is always
+/// an odd number so that total word count is an even number.
+
+/* Each size category is designed to allow 1 bit for a GC mark bit,
+ * possibly some flag bits, and the payload length in words.
+ * There are three size categories for most non-vector objects,
+ * differing in how many flag bits versus size bits there are.
+ * The GC mark bit is always in bit index 31 of the header regardless of
+ * machine word size.  Bit index 31 is chosen for consistency between 32-bit
+ * and 64-bit machines. It is a natural choice for 32-bit headers by avoiding
+ * intererence with other header fields. It is also chosen for 64-bit headers
+ * because the upper 32 bits of headers for some objects are already occupied
+ * by other data: symbol TLS index, instance layout, etc.
+ */
+
+/* The largest payload count is expressed in 23 bits. These objects
+ * can't reside in immobile space as there is no room for generation bits.
+ * All sorts of objects fall into this category, but mostly due to inertia.
+ * There are no non-vector boxed objects whose size should be so large.
+ * Header:   size |    tag
+ *          -----   ------
+ *        23 bits | 8 bits
+ */
+#define BOXED_NWORDS(obj) ((HeaderValue(obj) & 0x7FFFFF) | 1)
+
+/* Medium-sized payload count is expressed in 15 bits. Objects in this category
+ * may reside in immobile space: CLOSURE, INSTANCE, FUNCALLABLE-INSTANCE.
+ * The single data bit is used as a closure's NAMED flag,
+ * or an instance's "special GC strategy" flag.
+ *
+ * Header:  gen# |  data |     size |    tag
+ *         -----   -----    -------   ------
+ *        8 bits | 1 bit |  15 bits | 8 bits
+ */
+#define SHORT_BOXED_NWORDS(obj) ((HeaderValue(obj) & SHORT_HEADER_MAX_WORDS) | 1)
+
+/* Tiny payload count is expressed in 8 bits. Objects in this size category
+ * can reside in immobile space: SYMBOL, FDEFN.
+ * Header:  gen# | flags |   size |    tag
+ *         -----   ------  ------   ------
+ *        8 bits   8 bits  8 bits | 8 bits
+ * FDEFN  flag bits: 1 bit for statically-linked
+ * SYMBOL flag bits: 1 bit for present in initial core image
+ */
+#define TINY_BOXED_NWORDS(obj) ((HeaderValue(obj) & 0xFF) | 1)
 
 #endif /* _SBCL_RUNTIME_H_ */

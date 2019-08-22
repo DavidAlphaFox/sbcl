@@ -1,16 +1,7 @@
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; Type frobbing VOPs
-
-(define-vop (lowtag-of)
-  (:translate lowtag-of)
-  (:policy :fast-safe)
-  (:args (object :scs (any-reg descriptor-reg) :target result))
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 1
-    (inst extru object 31 n-lowtag-bits result)))
 
 ;FIX this vop got instruction-exploded after mips convert, look at old hppa
 (define-vop (widetag-of)
@@ -56,6 +47,15 @@
 
     DONE))
 
+(define-vop (%other-pointer-widetag)
+  (:translate %other-pointer-widetag)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg)))
+  (:results (result :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:generator 6
+    (load-type result object (- other-pointer-lowtag))))
+
 (define-vop (fun-subtype)
   (:translate fun-subtype)
   (:policy :fast-safe)
@@ -65,17 +65,15 @@
   (:generator 6
     (load-type result function (- fun-pointer-lowtag))))
 
-(define-vop (set-fun-subtype)
-  (:translate (setf fun-subtype))
+(define-vop (fun-header-data)
+  (:translate fun-header-data)
   (:policy :fast-safe)
-  (:args (type :scs (unsigned-reg) :target result)
-         (function :scs (descriptor-reg)))
-  (:arg-types positive-fixnum *)
-  (:results (result :scs (unsigned-reg)))
+  (:args (x :scs (descriptor-reg)))
+  (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    (inst stb type (- fun-pointer-lowtag) function)
-    (move type result)))
+    (loadw res x 0 fun-pointer-lowtag)
+    (inst srl res n-widetag-bits res)))
 
 (define-vop (get-header-data)
   (:translate get-header-data)
@@ -87,15 +85,6 @@
     (loadw res x 0 other-pointer-lowtag)
     (inst srl res n-widetag-bits res)))
 
-(define-vop (get-closure-length)
-  (:translate get-closure-length)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
-    (inst srl res n-widetag-bits res)))
 ;;; FIXME-lav, not sure we need data of type immediate and zero, test without,
 ;;; if so revert to old hppa code
 (define-vop (set-header-data)
@@ -193,10 +182,10 @@
 ;;;; Other random VOPs.
 
 
-(defknown sb!unix::receive-pending-interrupt () (values))
-(define-vop (sb!unix::receive-pending-interrupt)
+(defknown sb-unix::receive-pending-interrupt () (values))
+(define-vop (sb-unix::receive-pending-interrupt)
   (:policy :fast-safe)
-  (:translate sb!unix::receive-pending-interrupt)
+  (:translate sb-unix::receive-pending-interrupt)
   (:generator 1
     (inst break pending-interrupt-trap)))
 
@@ -205,7 +194,7 @@
   (:generator 1
     (inst break halt-trap)))
 
-#!+hpux
+#+hpux
 (define-vop (setup-return-from-lisp-stub)
   (:results)
   (:save-p t)

@@ -15,7 +15,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; error-handling definitions which are easy to define early and
 ;;;; which are nice to have visible everywhere
@@ -86,10 +86,9 @@
 
 ;;; Signal the appropriate condition. COMPILER-ERROR calls the bailout
 ;;; function so that it never returns (but compilation continues).
-(declaim (ftype (function (t &rest t) nil) compiler-error))
 (defun compiler-error (datum &rest arguments)
-  (let ((condition (coerce-to-condition datum arguments
-                                        'simple-program-error 'compiler-error)))
+  (let ((condition (apply #'coerce-to-condition datum
+                          'simple-program-error 'compiler-error arguments)))
     (restart-case
         (cerror "Replace form with call to ERROR."
                 'compiler-error
@@ -114,17 +113,26 @@
      ,@body))
 
 (defun compiler-warn (datum &rest arguments)
+  ;; WARN isn't actually inlined, however the NOTINLINE avoids use of #'WARN
+  ;; directly as a code constant, without indirection through its #<fdefn>.
+  ;; This matters because:
+  ;;  (1) a layer of indirection is needed for encapulation to work properly
+  ;;      via APPLY, and the minor optimization is hardly worth doing for WARN
+  ;;  (2) WARN is redefined in warm load
+  (declare (notinline warn))
   (apply #'warn datum arguments)
   (values))
 
 (defun compiler-style-warn (datum &rest arguments)
+  (declare (notinline style-warn)) ; same reasoning as above
   (apply #'style-warn datum arguments)
   (values))
 
 (defun source-to-string (source)
-  (write-to-string source
-                   :escape t :readably nil :pretty t
-                   :circle t :array nil))
+  (with-sane-io-syntax
+    (write-to-string source
+                     :escape t :pretty t
+                     :circle t :array nil)))
 
 (defun make-compiler-error-form (condition source)
   `(error 'compiled-program-error
@@ -159,6 +167,9 @@
    (position :reader input-error-in-compile-file-position
              :initarg :position
              :initform nil)
+   (line/col :reader input-error-in-compile-file-line/col
+             :initarg :line/col
+             :initform nil)
    (invoker :reader input-error-in-compile-file-invoker
             :initarg :invoker :initform 'compile-file))
   (:report
@@ -171,10 +182,16 @@
              'read
              (input-error-in-compile-file-invoker condition)
              (encapsulated-condition condition)
-             (when (input-error-in-compile-file-position condition)
-               (sb!kernel::stream-error-position-info
-                (stream-error-stream condition)
-                (input-error-in-compile-file-position condition)))))))
+             (let ((pos (input-error-in-compile-file-position condition)))
+               (acond ((input-error-in-compile-file-line/col condition)
+                       `((:line ,(car it))
+                         (:column ,(cdr it))
+                         (:position
+                          ,(or pos (1- (file-position
+                                        (stream-error-stream condition)))))))
+                      (pos
+                       (stream-error-position-info
+                        (stream-error-stream condition) pos))))))))
 
 (define-condition input-error-in-load (input-error-in-compile-file) ()
   (:default-initargs :invoker 'load))

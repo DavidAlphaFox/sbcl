@@ -35,7 +35,7 @@ echo "//Starting build: $build_started"
 echo "//Options: --prefix='$SBCL_PREFIX' --xc-host='$SBCL_XC_HOST'"
 
 # Enforce the source policy for no bogus whitespace
-tools-for-build/canonicalize-whitespace
+$SBCL_XC_HOST < tools-for-build/canonicalize-whitespace.lisp || exit 1
 
 # The make-host-*.sh scripts are run on the cross-compilation host,
 # and the make-target-*.sh scripts are run on the target machine. In
@@ -64,11 +64,23 @@ tools-for-build/canonicalize-whitespace
 # Or, if you can set up the files somewhere shared (with NFS, AFS, or
 # whatever) between the host machine and the target machine, the basic
 # procedure above should still work, but you can skip the "copy" steps.
-time sh make-host-1.sh
-time sh make-target-1.sh
-time sh make-host-2.sh
-time sh make-target-2.sh
-time sh make-target-contrib.sh
+# If you can use rsync on the host machine, you can call make-config.sh
+# with:
+# --host-location=user@host-machine:<rsync path to host sbcl directory>
+# and the make-target-*.sh scripts will take care of transferring the
+# necessary files.
+maybetime() {
+    if command -v time > /dev/null ; then
+        time $@
+    else
+        $@
+    fi
+}
+maybetime sh make-host-1.sh
+maybetime sh make-target-1.sh
+maybetime sh make-host-2.sh
+maybetime sh make-target-2.sh
+maybetime sh make-target-contrib.sh
 
 NCONTRIBS=`find contrib -name Makefile -print | wc -l`
 NPASSED=`find obj/asdf-cache -name test-passed.test-report -print | wc -l`
@@ -78,10 +90,6 @@ echo "contributed modules. If you would like to run more extensive tests on"
 echo "the new SBCL, you can try:"
 echo
 echo "  cd tests && sh ./run-tests.sh"
-echo
-echo "  (All tests should pass on x86/Linux, x86/FreeBSD4, and ppc/Darwin. On"
-echo "  other platforms some failures are currently expected; patches welcome"
-echo "  as always.)"
 echo
 echo "To build documentation:"
 echo

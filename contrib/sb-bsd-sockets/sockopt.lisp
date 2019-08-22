@@ -35,6 +35,11 @@ Code for options that not every system has should be conditionalised:
        sockint::IP_RECVIF  ...  ))
 |#
 
+(defun unsupported-socket-option (name)
+  (error 'unsupported-operator
+         :format-control "Socket option ~S is not supported in this platform."
+         :format-arguments (list name)))
+
 (defmacro define-socket-option
     (lisp-name documentation
      level number buffer-type mangle-arg mangle-return mangle-setf-buffer
@@ -45,42 +50,41 @@ Code for options that not every system has should be conditionalised:
              `(get-protocol-by-name ,(string-downcase (symbol-name level)))))
         (supportedp (or (null features) (sb-int:featurep features))))
     `(progn
-      (export ',lisp-name)
-      (defun ,lisp-name (socket)
-        ,@(when documentation (list (concatenate 'string documentation " " info)))
-        ,(if supportedp
-             `(sb-alien:with-alien ((size sb-alien:int)
-                                    (buffer ,buffer-type))
-                (setf size (sb-alien:alien-size ,buffer-type :bytes))
-                (socket-error-case
-                    ("getsockopt"
-                     (sockint::getsockopt (socket-file-descriptor socket)
-                                          ,find-level ,number
-                                          (sb-alien:addr buffer)
-                                          #+win32 size
-                                          #-win32 (sb-alien:addr size)))
-                    (,mangle-return buffer size)))
-             `(error 'unsupported-operator
-               :format-control "Socket option ~S is not supported in this platform."
-               :format-arguments (list ',lisp-name))))
-      (defun (setf ,lisp-name) (new-val socket)
-        ,(if supportedp
-             `(sb-alien:with-alien ((buffer ,buffer-type))
-                  (setf buffer ,(if mangle-arg
-                                    `(,mangle-arg new-val)
-                                    `new-val))
-                  (socket-error-case
-                      ("setsockopt"
-                       (sockint::setsockopt
-                        (socket-file-descriptor socket)
-                        ,find-level ,number
-                        (,mangle-setf-buffer buffer)
-                        ,(if (eql buffer-type 'sb-alien:c-string)
-                             `(length new-val)
-                             `(sb-alien:alien-size ,buffer-type :bytes))))))
-             `(error 'unsupported-operator
-               :format-control "Socket option ~S is not supported on this platform."
-               :format-arguments (list ',lisp-name)))))))
+       (export ',lisp-name)
+       (defun ,lisp-name (socket)
+         ,@(when documentation (list (concatenate 'string documentation " " info)))
+         ,@(if supportedp
+               `((sb-alien:with-alien ((size sb-alien:int)
+                                       (buffer ,buffer-type))
+                   (setf size (sb-alien:alien-size ,buffer-type :bytes))
+                   (socket-error-case
+                       ("getsockopt"
+                        (sockint::getsockopt (socket-file-descriptor socket)
+                                             ,find-level ,number
+                                             (sb-alien:addr buffer)
+                                             #+win32 size
+                                             #-win32 (sb-alien:addr size)))
+                       (,mangle-return buffer size))))
+               `((declare (ignore socket))
+                 (unsupported-socket-option ',lisp-name))))
+       (defun (setf ,lisp-name) (new-value socket)
+         ,@(if supportedp
+               `((sb-alien:with-alien ((buffer ,buffer-type))
+                   (setf buffer ,(if mangle-arg
+                                     `(,mangle-arg new-value)
+                                     `new-value))
+                   (socket-error-case
+                       ("setsockopt"
+                        (sockint::setsockopt
+                         (socket-file-descriptor socket)
+                         ,find-level ,number
+                         (,mangle-setf-buffer buffer)
+                         ,(if (eql buffer-type 'sb-alien:c-string)
+                              `(length new-value)
+                              `(sb-alien:alien-size ,buffer-type :bytes))))))
+                 new-value)
+               `((declare (ignore new-value socket))
+                 (unsupported-socket-option ',lisp-name)))))))
 
 ;;; sockopts that have integer arguments
 
@@ -107,11 +111,14 @@ Code for options that not every system has should be conditionalised:
   "Available only on Linux.")
 
 (define-socket-option-int
-  sockopt-tcp-keepcnt :tcp sockint::tcp-keepcnt :linux "Available only on Linux.")
+  sockopt-tcp-keepcnt :tcp sockint::tcp-keepcnt :linux
+  "Available only on Linux.")
 (define-socket-option-int
-  sockopt-tcp-keepidle :tcp sockint::tcp-keepidle :linux "Available only on Linux.")
+  sockopt-tcp-keepidle :tcp sockint::tcp-keepidle :linux
+  "Available only on Linux.")
 (define-socket-option-int
-  sockopt-tcp-keepintvl :tcp sockint::tcp-keepintvl :linux "Available only on Linux.")
+  sockopt-tcp-keepintvl :tcp sockint::tcp-keepintvl :linux
+  "Available only on Linux.")
 
 ;;; boolean options are integers really
 
@@ -157,9 +164,12 @@ Code for options that not every system has should be conditionalised:
   (declare (ignore args))
   x)
 
-(define-socket-option sockopt-bind-to-device nil sockint::sol-socket
-  sockint::so-bindtodevice sb-alien:c-string identity identity-1 identity
-  :linux "Available only on Linux")
+(macrolet ((cast-to-pointer (local-alien)
+             `(sb-alien:deref (sb-alien:cast (sb-alien:addr ,local-alien) (* (* t))) 0)))
+
+  (define-socket-option sockopt-bind-to-device nil sockint::sol-socket
+    sockint::so-bindtodevice sb-alien:c-string nil identity-1 cast-to-pointer
+    :linux "Available only on Linux"))
 
 ;;; other kinds of socket option
 

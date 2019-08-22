@@ -1,5 +1,5 @@
 #!/bin/sh
-set -e
+set -em
 
 # This is a script to be run as part of make.sh. The only time you'd
 # want to run it by itself is if you're trying to cross-compile the
@@ -47,7 +47,7 @@ echo //building runtime system and symbol table file
 # The clean is needed for Darwin's readonlyspace hack.
 $GNUMAKE -C src/runtime clean
 # $GNUMAKE -C src/runtime depend
-$GNUMAKE -C src/runtime all
+$GNUMAKE $SBCL_MAKE_JOBS -C src/runtime all
 
 # Use a little C program to grab stuff from the C header files and
 # smash it into Lisp source code.

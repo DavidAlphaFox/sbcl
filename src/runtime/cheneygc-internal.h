@@ -13,6 +13,7 @@
 
 extern lispobj *from_space;
 extern lispobj *from_space_free_pointer;
+#define compacting_p() (1) /* always */
 
 extern lispobj *new_space;
 extern lispobj *new_space_free_pointer;
@@ -30,7 +31,7 @@ from_space_p(lispobj object)
        descriptors, so this assertion's not applicable
        gc_assert(is_lisp_pointer(object));
     */
-    ptr = (lispobj *) native_pointer(object);
+    ptr = native_pointer(object);
 
     return ((from_space <= ptr) &&
             (ptr < from_space_free_pointer));
@@ -43,7 +44,7 @@ new_space_p(lispobj object)
 
     /*    gc_assert(is_lisp_pointer(object)); */
 
-    ptr = (lispobj *) native_pointer(object);
+    ptr = native_pointer(object);
 
     return ((new_space <= ptr) &&
             (ptr < new_space_free_pointer));
@@ -52,12 +53,12 @@ new_space_p(lispobj object)
 #else
 
 #define from_space_p(ptr) \
-        ((from_space <= ((lispobj *) ((pointer_sized_uint_t) ptr))) && \
-         (((lispobj *) ((pointer_sized_uint_t) ptr))< from_space_free_pointer))
+        ((from_space <= ((lispobj *) ((uintptr_t) ptr))) && \
+         (((lispobj *) ((uintptr_t) ptr))< from_space_free_pointer))
 
 #define new_space_p(ptr) \
-        ((new_space <= ((lispobj *) ((pointer_sized_uint_t) ptr))) && \
-         (((lispobj *) ((pointer_sized_uint_t) ptr)) < new_space_free_pointer))
+        ((new_space <= ((lispobj *) ((uintptr_t) ptr))) && \
+         (((lispobj *) ((uintptr_t) ptr)) < new_space_free_pointer))
 
 #endif
 

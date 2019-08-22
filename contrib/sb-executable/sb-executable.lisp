@@ -48,15 +48,15 @@ exec sbcl --noinform ~{~A ~}--eval \"(with-open-file (i \\\"$0\\\" :element-type
     (write-sequence (map 'vector #'char-code
                          (format nil *exec-header* runtime-flags
                                  (or initial-function 'values))) out)
-    (dolist (input-file (if (listp fasls) fasls (list fasls)))
+    (dolist (input-file (sb-int:ensure-list fasls))
       (with-open-file (in (merge-pathnames input-file
                                            (make-pathname :type "fasl"))
                           :element-type '(unsigned-byte 8))
         (copy-stream in out))))
+  #-win32
   (let* (;; FIXME: use OUT as the pathname designator
          (out-name (namestring (translate-logical-pathname output-file)))
          (prot (elt (multiple-value-list (sb-unix:unix-stat out-name)) 3)))
-    #-win32
     (if prot
         (sb-unix::void-syscall ("chmod" c-string int)
                                out-name
